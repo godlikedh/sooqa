@@ -5,5 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+sooqa-config = { path = "../config" }
+sqlx.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+sqlx.workspace = true
+tokio.workspace = true
+
 [lints]
 workspace = true

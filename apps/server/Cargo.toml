@@ -9,6 +9,7 @@ rust-version.workspace = true
 axum.workspace = true
 sooqa-api = { path = "../../crates/api" }
 sooqa-config = { path = "../../crates/config" }
+sooqa-persistence = { path = "../../crates/persistence" }
 sooqa-runtime = { path = "../../crates/runtime" }
 tokio.workspace = true
 tracing.workspace = true
