@@ -1,0 +1,15 @@
+/target/
+/work-data/
+/config.toml
+
+.env
+.env.*
+!.env.example
+
+*.log
+*.swp
+*.swo
+.DS_Store
+
+.idea/
+.vscode/

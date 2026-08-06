@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/server",
+    "apps/worker",
+    "apps/companion",
+    "crates/config",
+    "crates/runtime",
+    "crates/kernel",
+    "crates/inbox",
+    "crates/library",
+    "crates/publisher",
+    "crates/jobs",
+    "crates/media",
+    "crates/telegram",
+    "crates/persistence",
+    "crates/api",
+    "crates/test-support",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.97.1"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+thiserror = "2"
+toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["limit", "request-id", "timeout", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

@@ -1,0 +1,15 @@
+[package]
+name = "sooqa-companion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sooqa-config = { path = "../../crates/config" }
+sooqa-runtime = { path = "../../crates/runtime" }
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[server]
+listen_address = "0.0.0.0:8080"
+request_body_limit_bytes = 1048576
+request_timeout_seconds = 30
+
+[worker]
+poll_interval_seconds = 5
+
+[companion]
+listen_address = "127.0.0.1:47831"
+
+[observability]
+log_format = "json"
+log_level = "info"
+
+# Keep secrets in the environment rather than committing them to a file.
