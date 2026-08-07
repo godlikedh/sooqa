@@ -17,6 +17,7 @@ mod direct_http;
 mod execute;
 mod ffprobe;
 mod hashing;
+mod image_normalize;
 mod normalize;
 mod workspace;
 mod ytdlp;
@@ -36,6 +37,10 @@ pub use ffprobe::{
     parse_probe_json,
 };
 pub use hashing::{FileDigest, HashError, sha256_file};
+pub use image_normalize::{
+    CanonicalImageFormat, CanonicalImageProfile, ImageNormalizationError, ImageNormalizationPlan,
+    ImageNormalizationResult, ImageNormalizer, ImageProfileError,
+};
 pub use normalize::{
     AudioCodec, CanonicalContainer, CanonicalVideoProfile, NormalizationError, NormalizationMode,
     NormalizationPlan, NormalizationPlanner, PixelFormat, ProfileError, VideoCodec, VideoPreset,

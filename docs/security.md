@@ -13,6 +13,12 @@ Media workspaces use job IDs rather than user-controlled path components. File
 names cannot contain separators or parent-directory components, symlinked
 workspace paths are rejected, and cleanup verifies the workspace is the
 expected direct child of the configured jobs directory before removing it.
+The configured work root is expected to be process-owned and mode 0700, as in
+the single-admin deployment. These checks protect the MVP from untrusted names
+and accidental or pre-existing symlink traversal; they do not claim to defend
+against a separate same-user process replacing directories in the small
+validation-to-open race. A shared or hostile work root would require a future
+descriptor-relative, no-follow filesystem backend.
 
 The yt-dlp adapter accepts only HTTP(S) URLs without embedded credentials,
 disables playlist expansion, passes format selections and output paths as
