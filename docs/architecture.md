@@ -4,13 +4,16 @@ The intended architecture is a modular monolith with separate server, worker,
 and optional Windows companion processes. The module boundaries and durable
 workflow rules are defined in [PROJECT_SPEC.md](PROJECT_SPEC.md).
 
-This document will grow with the implementation. The bootstrap stage contains
-no Telegram integration or production media workflow yet. Shared configuration
-and process lifecycle plumbing lives in sooqa-config and sooqa-runtime. The server exposes
-the initial liveness API through sooqa-api, and sooqa-persistence now provides
-PostgreSQL migrations plus a durable job repository. sooqa-worker now provides
-the bounded polling loop, handler registry, leases, and graceful shutdown; real
-media and Telegram handlers remain future slices.
+This document will grow with the implementation. Shared configuration and
+process lifecycle plumbing lives in sooqa-config and sooqa-runtime. The server
+exposes the HTTP API through sooqa-api, and sooqa-persistence provides
+PostgreSQL migrations plus durable repositories. sooqa-worker provides the
+bounded job loop, handler registry, leases, and graceful shutdown. The H1
+Telegram boundary now adds a project-owned adapter around Teloxide: the server
+can run long polling, authenticate private messages by configured Telegram
+user ID, answer the initial command set, and persist Telegram update receipts
+for restart-safe deduplication. URL ingest, media uploads, and publication
+remain later Telegram slices.
 
 The first Inbox vertical slice now lives in `sooqa-inbox` and
 `sooqa-persistence`. It validates and conservatively normalizes URL
@@ -152,6 +155,24 @@ user-visible state. The request and response shapes are declared in
 OpenAPI Generator recipe can emit Rust model previews without replacing the
 handwritten authentication and orchestration boundary. Token provisioning and
 revocation commands remain a later administration slice.
+
+The H1 Telegram adapter is intentionally narrow. `sooqa-telegram` owns the
+normalized message and command boundary, authorization decision, response
+text, and polling lifecycle. Teloxide types and the Bot API client stay at that
+edge. `sooqa-persistence` owns the `telegram_update_receipts` table and exposes
+claim, complete, and release operations; the server supplies that repository
+to the adapter. Claims have a lease token, completed receipts are durable, and
+failed sends release the claim for retry. A configured bot token enables
+polling in the server, while the configured administrator IDs decide which
+private users may receive command responses. Responses are bounded by a
+per-user/chat in-process rate limiter, unauthorized attempts are structured
+warnings, and group messages never enter Inbox.
+The polling loop advances its Telegram offset only after a handler succeeds;
+failed handlers retain the offset and retry up to five times with a short
+backoff. A still-failing handler returns an error so the server supervisor can
+restart it without acknowledging the update; transient polling errors are
+also retried up to five times, while an invalid bot token is reported as
+terminal.
 
 The E3 Library API adds authenticated read and editorial-write routes over the
 typed Library repository. Search defaults to active items, supports text,

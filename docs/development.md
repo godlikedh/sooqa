@@ -24,6 +24,43 @@ models can be adopted there when the contract and generator output are stable,
 while authentication, persistence, and request orchestration stay in the
 handwritten server layer.
 
+## Telegram adapter
+
+H1 adds the first Telegram vertical boundary. The server enables long polling
+only when `SOOQA_TELEGRAM_BOT_TOKEN` is configured. It also requires at least
+one positive administrator ID when the token is configured:
+
+    SOOQA_TELEGRAM_BOT_TOKEN=123456:secret
+    SOOQA_TELEGRAM_ADMIN_USER_IDS=123456789
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa
+    cargo run -p sooqa-server -- migrate
+    cargo run -p sooqa-server
+
+The equivalent TOML settings are `[telegram].api_base_url`,
+`[telegram].admin_user_ids`, and `[telegram].poll_timeout_seconds`. The API
+base URL accepts only an HTTP(S) URL without credentials, which also supports
+a self-hosted Local Bot API Server. Telegram update IDs are claimed in
+`telegram_update_receipts` before command handling, so redelivered updates do
+not send a second response. Claims have lease tokens and are completed only
+after a response succeeds; a failed response releases the claim for retry.
+The polling loop advances Telegram's offset only after the update handler
+succeeds, so a transient response or persistence failure is retried in the
+same process. Each handler gets five bounded attempts; a still-failing update
+stops the runtime without advancing the offset, allowing a supervisor restart
+to reclaim it. Transient `getUpdates` failures use the same offset and a short
+backoff.
+After five consecutive polling failures, the runtime returns an error so a
+supervisor can surface or restart it instead of spinning forever.
+The initial authorized commands are `/start`, `/help`, and `/status`; only
+private messages from configured administrator IDs are handled. Responses are
+rate-limited per user/chat, and unauthorized attempts produce structured
+warnings without message contents or secrets.
+
+The adapter tests use a mocked API and receipt store, so they do not contact
+Telegram:
+
+    cargo test -p sooqa-telegram
+
 ## Source inspection
 
 The C3 handler is tested with a deterministic fake downloader. Run its

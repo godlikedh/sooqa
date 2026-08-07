@@ -5,9 +5,10 @@ and publishing queue. It is intended for a single administrator first, with a
 durable always-on backend and an optional Windows capture companion.
 
 The product and engineering source of truth is [docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md).
-The repository is currently at the bootstrap stage: the Rust workspace and
-quality gates exist, while database, Telegram, media, and business workflows
-will be introduced in focused increments.
+The repository is being built through focused vertical increments. PostgreSQL
+backed ingest, library, media primitives, and the first Telegram adapter are
+already present; URL ingest through the bot, media storage, and publication are
+still later slices.
 
 ## Development
 
@@ -57,7 +58,9 @@ environment-variable overrides. Start from config.example.toml.
 
 Use SOOQA_CONFIG_FILE when you do not want to repeat --config. Environment
 variables take precedence over TOML values. Configuration summaries redact
-secret values.
+secret values. To enable the current Telegram adapter, configure
+`SOOQA_TELEGRAM_BOT_TOKEN` and `SOOQA_TELEGRAM_ADMIN_USER_IDS`; see
+[operations.md](docs/operations.md) for the startup sequence.
 
 ## PostgreSQL
 

@@ -1,8 +1,8 @@
 # Operations
 
-The development Compose file provides PostgreSQL. Production deployment,
-database backup, Telegram configuration, and media tool requirements will be
-documented as those runtime components are added.
+The development Compose file provides PostgreSQL. Production deployment and
+database backup remain deployment-specific, but the first Telegram runtime is
+now available behind explicit configuration.
 
 ## Local container runtime
 
@@ -44,5 +44,28 @@ The equivalent environment overrides are `SOOQA_MEDIA_FFMPEG_PATH`,
 the worker logs the detected version of each required binary and exits before
 database connection if a binary is unavailable. The server does not require
 these media tools. The current worker still has no production media or
-Telegram handlers; it polls durably stored jobs, executes registered handlers,
-records outcomes, and stops gracefully on SIGTERM or Ctrl-C.
+Telegram media handlers; it polls durably stored jobs, executes registered
+handlers, records outcomes, and stops gracefully on SIGTERM or Ctrl-C.
+
+## Telegram bot
+
+Apply migrations before starting a configured bot; migration `0008` creates
+the durable `telegram_update_receipts` table:
+
+    DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa cargo run -p sooqa-server -- migrate
+
+Configure the bot token as a secret and provide the administrator's Telegram
+user ID:
+
+    SOOQA_TELEGRAM_BOT_TOKEN=123456:secret
+    SOOQA_TELEGRAM_ADMIN_USER_IDS=123456789
+    SOOQA_TELEGRAM_API_BASE_URL=https://api.telegram.org
+    SOOQA_TELEGRAM_POLL_TIMEOUT_SECONDS=30
+
+The server starts polling alongside the HTTP API only when the bot token is
+configured. It ignores group messages, rejects non-admin private users with a
+generic response, and supports `/start`, `/help`, and `/status` for configured
+admins. Update receipts are retained as durable deduplication records. A
+five-minute claim lease allows an abandoned in-progress update to be reclaimed;
+failed API calls release their claim immediately. H1 does not yet ingest URLs,
+upload media, or publish channel posts; those are later Telegram slices.

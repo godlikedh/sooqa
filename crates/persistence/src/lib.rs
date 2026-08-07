@@ -4,6 +4,7 @@ mod device_tokens;
 mod inbox;
 mod jobs;
 mod library;
+mod telegram;
 
 pub use device_tokens::{
     DeviceToken, DeviceTokenRepository, DeviceTokenRepositoryError, hash_device_token,
@@ -11,6 +12,10 @@ pub use device_tokens::{
 pub use inbox::{CreateIngestResult, InboxRepository, InboxRepositoryError, SourceInspectionStart};
 pub use jobs::{JobRepository, JobRepositoryError};
 pub use library::{LibraryRepository, LibraryRepositoryError};
+pub use telegram::{
+    TelegramRepository, TelegramRepositoryError, TelegramUpdateClaim, TelegramUpdateClaimResult,
+    TelegramUpdateReceipt,
+};
 
 use sooqa_config::SecretString;
 use sqlx::{
@@ -66,6 +71,10 @@ impl Database {
 
     pub fn library(&self) -> LibraryRepository {
         LibraryRepository::new(self.pool.clone())
+    }
+
+    pub fn telegram(&self) -> TelegramRepository {
+        TelegramRepository::new(self.pool.clone())
     }
 
     pub fn pool(&self) -> &PgPool {

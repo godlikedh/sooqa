@@ -27,6 +27,7 @@ async fn migrations_are_idempotent_and_create_core_tables() {
         "storage_objects",
         "duplicate_candidates",
         "duplicate_candidate_events",
+        "telegram_update_receipts",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{}", table))
