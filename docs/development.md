@@ -119,6 +119,22 @@ Run its focused tests with:
 
     cargo test -p sooqa-media image_normalize::tests
 
+## Frame fingerprinting
+
+G1 adds `FrameExtractor` for the versioned `frame_dhash_v1` fingerprint. It
+uses ffprobe's validated duration, extracts stable relative timestamps through
+the shell-free ffmpeg runner, keeps frame files in the workspace `frames`
+area, and hashes decoded images on Tokio's blocking pool. The 64-bit dHash is
+computed from a grayscale 9×8 image by comparing adjacent horizontal pixels;
+very short inputs collapse duplicate timestamp positions. Frame decoding has
+byte, pixel, and conservative working-set limits, and valid frame outputs are
+reused on retry so partial extraction can resume. G2 will add scoring,
+candidate persistence, and similarity thresholds.
+
+Run its focused tests with:
+
+    cargo test -p sooqa-media fingerprint::tests
+
 ## Normalization planner
 
 F1 adds a pure planner for the canonical video profile. It selects a remux for

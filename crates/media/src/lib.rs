@@ -16,6 +16,7 @@ mod diagnostics;
 mod direct_http;
 mod execute;
 mod ffprobe;
+mod fingerprint;
 mod hashing;
 mod image_normalize;
 mod normalize;
@@ -35,6 +36,11 @@ pub use execute::{
 pub use ffprobe::{
     FfprobeAdapter, FrameRate, MediaProbe, MediaStream, MediaStreamKind, ProbeError,
     parse_probe_json,
+};
+pub use fingerprint::{
+    FRAME_DHASH_V1, FingerprintVersion, FrameDecodeLimits, FrameExtractionError,
+    FrameExtractionResult, FrameExtractor, FrameFingerprint, FrameTimestamp, VideoFingerprint,
+    frame_dhash_v1, select_fingerprint_timestamps,
 };
 pub use hashing::{FileDigest, HashError, sha256_file};
 pub use image_normalize::{
