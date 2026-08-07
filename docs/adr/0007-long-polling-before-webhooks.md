@@ -16,8 +16,9 @@ command flow and would make local operation harder to verify.
 Use Telegram long polling for the initial adapter. The server constructs the
 polling client with a configurable Bot API base URL and timeout, deletes an
 existing webhook before polling, and persists each Telegram update ID in
-PostgreSQL before handling it. Teloxide remains behind the project-owned
-`sooqa-telegram` boundary.
+PostgreSQL before handling it. Receipt claims use a lease token, complete only
+after a response succeeds, and are released on a failed response. Teloxide
+remains behind the project-owned `sooqa-telegram` boundary.
 
 The adapter does not expose a public webhook route in H1. A future webhook
 implementation must preserve the same normalized update boundary and durable
@@ -28,8 +29,10 @@ replay behavior before replacing polling.
 
 - Local and private-network deployments need only outbound access to the Bot
   API.
-- Restarted polling does not answer the same update twice after its receipt is
-  committed.
+- Restarted polling does not answer a completed update twice, while abandoned
+  claims can be reclaimed after five minutes.
+- A failed response can be retried, with the usual Telegram ambiguity if the
+  network fails after Telegram accepted the request.
 - Receipt rows are durable operational data and need retention/cleanup policy
   in a later operations slice.
 - Long polling is not the final answer for every deployment; webhooks remain a

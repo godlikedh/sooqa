@@ -12,7 +12,9 @@ pub use device_tokens::{
 pub use inbox::{CreateIngestResult, InboxRepository, InboxRepositoryError, SourceInspectionStart};
 pub use jobs::{JobRepository, JobRepositoryError};
 pub use library::{LibraryRepository, LibraryRepositoryError};
-pub use telegram::{TelegramRepository, TelegramRepositoryError, TelegramUpdateReceipt};
+pub use telegram::{
+    TelegramRepository, TelegramRepositoryError, TelegramUpdateClaim, TelegramUpdateReceipt,
+};
 
 use sooqa_config::SecretString;
 use sqlx::{

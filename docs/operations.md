@@ -65,6 +65,7 @@ user ID:
 The server starts polling alongside the HTTP API only when the bot token is
 configured. It ignores group messages, rejects non-admin private users with a
 generic response, and supports `/start`, `/help`, and `/status` for configured
-admins. Update receipts are retained as durable deduplication records. H1 does
-not yet ingest URLs, upload media, or publish channel posts; those are later
-Telegram slices.
+admins. Update receipts are retained as durable deduplication records. A
+five-minute claim lease allows an abandoned in-progress update to be reclaimed;
+failed API calls release their claim immediately. H1 does not yet ingest URLs,
+upload media, or publish channel posts; those are later Telegram slices.

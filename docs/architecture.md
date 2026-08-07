@@ -160,10 +160,13 @@ The H1 Telegram adapter is intentionally narrow. `sooqa-telegram` owns the
 normalized message and command boundary, authorization decision, response
 text, and polling lifecycle. Teloxide types and the Bot API client stay at that
 edge. `sooqa-persistence` owns the `telegram_update_receipts` table and exposes
-an idempotent claim operation; the server supplies that repository to the
-adapter. A configured bot token enables polling in the server, while the
-configured administrator IDs decide which private users may receive command
-responses. Group messages and non-admin private messages never enter Inbox.
+claim, complete, and release operations; the server supplies that repository
+to the adapter. Claims have a lease token, completed receipts are durable, and
+failed sends release the claim for retry. A configured bot token enables
+polling in the server, while the configured administrator IDs decide which
+private users may receive command responses. Responses are bounded by a
+per-user/chat in-process rate limiter, unauthorized attempts are structured
+warnings, and group messages never enter Inbox.
 
 The E3 Library API adds authenticated read and editorial-write routes over the
 typed Library repository. Search defaults to active items, supports text,

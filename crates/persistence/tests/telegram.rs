@@ -13,15 +13,31 @@ async fn telegram_update_claim_is_idempotent() {
 
     let update_id = (Uuid::new_v4().as_u128() % 9_000_000_000_000_000_000 + 1) as i64;
     let repository = database.telegram();
-    assert!(repository.claim_update(update_id).await.expect("first claim should succeed"));
-    assert!(!repository.claim_update(update_id).await.expect("second claim should succeed"));
+    let claim = repository
+        .claim_update(update_id)
+        .await
+        .expect("first claim should succeed")
+        .expect("first claim should be available");
+    assert!(
+        repository.claim_update(update_id).await.expect("second claim should succeed").is_none()
+    );
+    repository.release_update(claim).await.expect("claim should release");
+    let retry = repository
+        .claim_update(update_id)
+        .await
+        .expect("released claim should succeed")
+        .expect("released claim should be available");
+    repository.complete_update(retry).await.expect("claim should complete");
+    assert!(
+        repository.claim_update(update_id).await.expect("completed claim should succeed").is_none()
+    );
     assert_eq!(
         repository
             .receipt(update_id)
             .await
             .expect("receipt lookup should succeed")
-            .map(|receipt| receipt.update_id),
-        Some(update_id)
+            .map(|receipt| (receipt.update_id, receipt.completed_at.is_some())),
+        Some((update_id, true))
     );
 
     sqlx::query("DELETE FROM telegram_update_receipts WHERE update_id = $1")

@@ -2180,11 +2180,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "reqwest",
+ "serde_json",
  "teloxide",
  "thiserror",
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

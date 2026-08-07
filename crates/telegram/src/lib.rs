@@ -1,6 +1,11 @@
 //! Telegram adapter and editorial interaction boundaries for sooqa.
 
-use std::{collections::BTreeSet, error::Error, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    error::Error,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use teloxide::{
@@ -8,17 +13,20 @@ use teloxide::{
     dispatching::Dispatcher,
     dptree,
     error_handlers::LoggingErrorHandler,
-    prelude::Requester,
+    prelude::{Request, Requester},
     types::{Update, UpdateKind},
     update_listeners::Polling,
 };
 use thiserror::Error as ThisError;
+use tracing::warn;
 use url::Url;
+use uuid::Uuid;
 
 pub const START_RESPONSE: &str = "sooqa is ready. You are authorized.";
 pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorization\n/help — show this help\n/status — show service status";
 pub const STATUS_RESPONSE: &str = "sooqa is online.";
 pub const UNAUTHORIZED_RESPONSE: &str = "This bot is restricted to its configured administrator.";
+const RESPONSE_RATE_LIMIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct IncomingMessage {
@@ -34,6 +42,7 @@ pub enum HandleOutcome {
     DuplicateIgnored,
     NonMessageIgnored,
     NonPrivateIgnored,
+    RateLimited,
     Unauthorized,
     UnrecognizedIgnored,
     Responded(Command),
@@ -44,6 +53,12 @@ pub enum Command {
     Start,
     Help,
     Status,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct UpdateClaim {
+    pub update_id: i64,
+    pub claim_token: Uuid,
 }
 
 #[derive(Debug, ThisError)]
@@ -71,7 +86,11 @@ pub trait TelegramApi: Clone + Send + Sync + 'static {
 pub trait UpdateStore: Clone + Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
-    async fn claim_update(&self, update_id: i64) -> Result<bool, Self::Error>;
+    async fn claim_update(&self, update_id: i64) -> Result<Option<UpdateClaim>, Self::Error>;
+
+    async fn complete_update(&self, claim: UpdateClaim) -> Result<(), Self::Error>;
+
+    async fn release_update(&self, claim: UpdateClaim) -> Result<(), Self::Error>;
 }
 
 #[derive(Clone)]
@@ -79,6 +98,13 @@ pub struct TelegramService<A, S> {
     api: A,
     update_store: S,
     admin_user_ids: Arc<BTreeSet<i64>>,
+    response_limiter: Arc<Mutex<HashMap<RateLimitKey, Instant>>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+struct RateLimitKey {
+    user_id: Option<i64>,
+    chat_id: i64,
 }
 
 impl<A, S> TelegramService<A, S>
@@ -87,41 +113,76 @@ where
     S: UpdateStore,
 {
     pub fn new(api: A, update_store: S, admin_user_ids: impl IntoIterator<Item = i64>) -> Self {
-        Self { api, update_store, admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()) }
+        Self {
+            api,
+            update_store,
+            admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
+            response_limiter: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub async fn handle_message(
         &self,
         message: IncomingMessage,
     ) -> Result<HandleOutcome, TelegramError> {
-        if !self.claim(message.update_id).await? {
+        let Some(claim) = self.claim(message.update_id).await? else {
             return Ok(HandleOutcome::DuplicateIgnored);
-        }
+        };
         if !message.is_private {
+            self.complete(claim).await?;
             return Ok(HandleOutcome::NonPrivateIgnored);
         }
         if !message.user_id.is_some_and(|id| self.admin_user_ids.contains(&id)) {
-            self.send(message.chat_id, UNAUTHORIZED_RESPONSE).await?;
+            warn!(
+                target: "sooqa.telegram",
+                update_id = message.update_id,
+                user_id = ?message.user_id,
+                chat_id = message.chat_id,
+                "unauthorized Telegram command attempt"
+            );
+            if !self.allow_response(message.user_id, message.chat_id) {
+                self.complete(claim).await?;
+                return Ok(HandleOutcome::RateLimited);
+            }
+            self.send_and_complete(
+                claim,
+                message.chat_id,
+                UNAUTHORIZED_RESPONSE,
+                RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
+            )
+            .await?;
             return Ok(HandleOutcome::Unauthorized);
         }
         let Some(command) = message.text.as_deref().and_then(parse_command) else {
+            self.complete(claim).await?;
             return Ok(HandleOutcome::UnrecognizedIgnored);
         };
+        if !self.allow_response(message.user_id, message.chat_id) {
+            self.complete(claim).await?;
+            return Ok(HandleOutcome::RateLimited);
+        }
         let response = match command {
             Command::Start => START_RESPONSE,
             Command::Help => HELP_RESPONSE,
             Command::Status => STATUS_RESPONSE,
         };
-        self.send(message.chat_id, response).await?;
+        self.send_and_complete(
+            claim,
+            message.chat_id,
+            response,
+            RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
+        )
+        .await?;
         Ok(HandleOutcome::Responded(command))
     }
 
     pub async fn handle_update(&self, update: Update) -> Result<HandleOutcome, TelegramError> {
         let update_id = i64::from(update.id.0);
         let UpdateKind::Message(message) = update.kind else {
-            if !self.claim(update_id).await? {
+            let Some(claim) = self.claim(update_id).await? else {
                 return Ok(HandleOutcome::DuplicateIgnored);
-            }
+            };
+            self.complete(claim).await?;
             return Ok(HandleOutcome::NonMessageIgnored);
         };
         self.handle_message(IncomingMessage {
@@ -134,15 +195,66 @@ where
         .await
     }
 
-    async fn claim(&self, update_id: i64) -> Result<bool, TelegramError> {
+    async fn claim(&self, update_id: i64) -> Result<Option<UpdateClaim>, TelegramError> {
         self.update_store
             .claim_update(update_id)
             .await
             .map_err(|error| TelegramError::UpdateStore(Box::new(error)))
     }
 
-    async fn send(&self, chat_id: i64, text: &str) -> Result<(), TelegramError> {
-        self.api.send_text(chat_id, text).await.map_err(|error| TelegramError::Api(Box::new(error)))
+    async fn complete(&self, claim: UpdateClaim) -> Result<(), TelegramError> {
+        self.update_store
+            .complete_update(claim)
+            .await
+            .map_err(|error| TelegramError::UpdateStore(Box::new(error)))
+    }
+
+    async fn release(&self, claim: UpdateClaim) -> Result<(), TelegramError> {
+        self.update_store
+            .release_update(claim)
+            .await
+            .map_err(|error| TelegramError::UpdateStore(Box::new(error)))
+    }
+
+    async fn send_and_complete(
+        &self,
+        claim: UpdateClaim,
+        chat_id: i64,
+        text: &str,
+        rate_limit_key: RateLimitKey,
+    ) -> Result<(), TelegramError> {
+        if let Err(error) = self
+            .api
+            .send_text(chat_id, text)
+            .await
+            .map_err(|error| TelegramError::Api(Box::new(error)))
+        {
+            self.clear_response(rate_limit_key);
+            self.release(claim).await?;
+            return Err(error);
+        }
+        self.complete(claim).await
+    }
+
+    fn allow_response(&self, user_id: Option<i64>, chat_id: i64) -> bool {
+        let now = Instant::now();
+        let mut limiter =
+            self.response_limiter.lock().expect("Telegram rate limiter is not poisoned");
+        limiter.retain(|_, last_response| {
+            now.saturating_duration_since(*last_response) < RESPONSE_RATE_LIMIT
+        });
+        let key = RateLimitKey { user_id, chat_id };
+        if limiter.get(&key).is_some_and(|last_response| {
+            now.saturating_duration_since(*last_response) < RESPONSE_RATE_LIMIT
+        }) {
+            return false;
+        }
+        limiter.insert(key, now);
+        true
+    }
+
+    fn clear_response(&self, key: RateLimitKey) {
+        self.response_limiter.lock().expect("Telegram rate limiter is not poisoned").remove(&key);
     }
 }
 
@@ -229,11 +341,13 @@ where
     }
 
     pub async fn run(self) -> Result<(), TelegramError> {
-        let listener = Polling::builder(self.api.bot())
-            .timeout(self.poll_timeout)
+        self.api
+            .bot()
             .delete_webhook()
+            .send()
             .await
-            .build();
+            .map_err(|error| TelegramError::Api(Box::new(error)))?;
+        let listener = Polling::builder(self.api.bot()).timeout(self.poll_timeout).build();
         let service = self.service;
         let handler = dptree::entry().endpoint(move |update: Update| {
             let service = service.clone();
@@ -256,11 +370,17 @@ where
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
     use super::*;
 
     #[derive(Clone, Default)]
     struct MockApi {
         messages: Arc<Mutex<Vec<(i64, String)>>>,
+        fail: Arc<Mutex<bool>>,
     }
 
     #[derive(Debug, ThisError)]
@@ -272,6 +392,9 @@ mod tests {
         type Error = MockError;
 
         async fn send_text(&self, chat_id: i64, text: &str) -> Result<(), Self::Error> {
+            if *self.fail.lock().expect("mock mutex should not be poisoned") {
+                return Err(MockError);
+            }
             self.messages
                 .lock()
                 .expect("mock mutex should not be poisoned")
@@ -283,14 +406,49 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockStore {
         claimed: Arc<Mutex<BTreeSet<i64>>>,
+        completed: Arc<Mutex<BTreeSet<i64>>>,
     }
 
     #[async_trait]
     impl UpdateStore for MockStore {
         type Error = MockError;
 
-        async fn claim_update(&self, update_id: i64) -> Result<bool, Self::Error> {
-            Ok(self.claimed.lock().expect("mock mutex should not be poisoned").insert(update_id))
+        async fn claim_update(&self, update_id: i64) -> Result<Option<UpdateClaim>, Self::Error> {
+            if self
+                .completed
+                .lock()
+                .expect("mock mutex should not be poisoned")
+                .contains(&update_id)
+                || self
+                    .claimed
+                    .lock()
+                    .expect("mock mutex should not be poisoned")
+                    .contains(&update_id)
+            {
+                return Ok(None);
+            }
+            self.claimed.lock().expect("mock mutex should not be poisoned").insert(update_id);
+            Ok(Some(UpdateClaim { update_id, claim_token: Uuid::new_v4() }))
+        }
+
+        async fn complete_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
+            self.claimed
+                .lock()
+                .expect("mock mutex should not be poisoned")
+                .remove(&claim.update_id);
+            self.completed
+                .lock()
+                .expect("mock mutex should not be poisoned")
+                .insert(claim.update_id);
+            Ok(())
+        }
+
+        async fn release_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
+            self.claimed
+                .lock()
+                .expect("mock mutex should not be poisoned")
+                .remove(&claim.update_id);
+            Ok(())
         }
     }
 
@@ -344,6 +502,90 @@ mod tests {
 
         assert_eq!(service.handle_message(update).await.unwrap(), HandleOutcome::NonPrivateIgnored);
         assert!(api.messages.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn command_responses_are_rate_limited_per_user_and_chat() {
+        let api = MockApi::default();
+        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+
+        assert_eq!(
+            service.handle_message(message(4, Some(123), "/status")).await.unwrap(),
+            HandleOutcome::Responded(Command::Status)
+        );
+        assert_eq!(
+            service.handle_message(message(5, Some(123), "/help")).await.unwrap(),
+            HandleOutcome::RateLimited
+        );
+        assert_eq!(api.messages.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_response_releases_update_for_retry() {
+        let api = MockApi::default();
+        *api.fail.lock().unwrap() = true;
+        let store = MockStore::default();
+        let service = TelegramService::new(api.clone(), store, [123]);
+
+        assert!(service.handle_message(message(6, Some(123), "/status")).await.is_err());
+        *api.fail.lock().unwrap() = false;
+        assert_eq!(
+            service.handle_message(message(6, Some(123), "/status")).await.unwrap(),
+            HandleOutcome::Responded(Command::Status)
+        );
+    }
+
+    #[tokio::test]
+    async fn teloxide_message_mapping_uses_private_chat_and_sender_id() {
+        let message: teloxide::types::Message = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "from": {"id": 123, "is_bot": false, "first_name": "Admin"},
+            "chat": {"id": 42, "type": "private", "first_name": "Admin"},
+            "date": 0,
+            "text": "/status"
+        }))
+        .expect("Telegram message fixture should deserialize");
+        let update =
+            Update { id: teloxide::types::UpdateId(7), kind: UpdateKind::Message(message) };
+        let api = MockApi::default();
+        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+
+        assert_eq!(
+            service.handle_update(update).await.unwrap(),
+            HandleOutcome::Responded(Command::Status)
+        );
+        assert_eq!(api.messages.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn teloxide_api_uses_configured_bot_api_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("fake API should accept");
+            let mut request = [0_u8; 4096];
+            let bytes = stream.read(&mut request).await.expect("request should be readable");
+            let request = String::from_utf8_lossy(&request[..bytes]).into_owned();
+            let body = r#"{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":42,"type":"private","first_name":"Admin"},"text":"hello"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.expect("response should be writable");
+            request
+        });
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted");
+
+        api.send_text(42, "hello").await.expect("fake API response should parse");
+        let request = server.await.expect("fake API task should finish");
+        assert!(
+            request.contains("/bottest-token/SendMessage")
+                && request.contains("\"text\":\"hello\""),
+            "unexpected request: {request}"
+        );
     }
 
     #[test]

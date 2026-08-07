@@ -5,7 +5,7 @@ use std::error::Error;
 use axum::Router;
 use sooqa_config::{AppConfig, AppRole, CliCommand, CliOptions, ConfigError};
 use sooqa_persistence::{TelegramRepository, TelegramRepositoryError};
-use sooqa_telegram::{TelegramRuntime, UpdateStore};
+use sooqa_telegram::{TelegramRuntime, UpdateClaim, UpdateStore};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -91,7 +91,30 @@ struct DatabaseUpdateStore {
 impl UpdateStore for DatabaseUpdateStore {
     type Error = TelegramRepositoryError;
 
-    async fn claim_update(&self, update_id: i64) -> Result<bool, Self::Error> {
-        self.repository.claim_update(update_id).await
+    async fn claim_update(&self, update_id: i64) -> Result<Option<UpdateClaim>, Self::Error> {
+        self.repository.claim_update(update_id).await.map(|claim| {
+            claim.map(|claim| UpdateClaim {
+                update_id: claim.update_id,
+                claim_token: claim.claim_token,
+            })
+        })
+    }
+
+    async fn complete_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
+        self.repository
+            .complete_update(sooqa_persistence::TelegramUpdateClaim {
+                update_id: claim.update_id,
+                claim_token: claim.claim_token,
+            })
+            .await
+    }
+
+    async fn release_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
+        self.repository
+            .release_update(sooqa_persistence::TelegramUpdateClaim {
+                update_id: claim.update_id,
+                claim_token: claim.claim_token,
+            })
+            .await
     }
 }
