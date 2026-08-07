@@ -498,7 +498,7 @@ components:
           schema:
             $ref: '#/components/schemas/ApiErrorEnvelope'
     Conflict:
-      description: Idempotency key conflicts with a different payload
+      description: The request conflicts with an earlier operation or resource state
       content:
         application/json:
           schema:
