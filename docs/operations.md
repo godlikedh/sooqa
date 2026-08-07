@@ -23,6 +23,8 @@ The B1 migration command is:
 The migration set now includes the initial Library tables for content items,
 media assets, source records, tags, and storage objects. Apply migrations with
 the same command after upgrading the application; migrations are forward-only.
+The E2 migration also adds general SHA-256 lookup and canonical-asset
+uniqueness indexes.
 
 After migrations are applied, the worker can be started with:
 

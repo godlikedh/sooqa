@@ -33,4 +33,17 @@ async fn migrations_are_idempotent_and_create_core_tables() {
             .expect("table existence query should succeed");
         assert!(exists, "expected table {} to exist", table);
     }
+
+    for index in [
+        "media_assets_sha256_idx",
+        "media_assets_canonical_sha256_idx",
+        "media_assets_content_canonical_idx",
+    ] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("public.{}", index))
+            .fetch_one(database.pool())
+            .await
+            .expect("index existence query should succeed");
+        assert!(exists, "expected index {} to exist", index);
+    }
 }
