@@ -42,8 +42,15 @@ The D4 `YtDlpDownloader` uses the same runner for supported page metadata and
 downloads, with single-item mode, configured format selection, bounded output,
 and a final destination-size check. Its parsed metadata is reduced to the
 project-owned `YtDlpMetadata` summary; raw yt-dlp JSON does not cross the
-adapter boundary. Normalization and production media-job wiring remain later
-slices.
+adapter boundary. Production media-job wiring remains a later slice.
+
+The F1 normalization slice adds a pure `NormalizationPlanner` in
+`sooqa-media`. A validated `CanonicalVideoProfile` describes the default MP4,
+H.264, `yuv420p`, AAC, 1080p-capped representation. Compatible inputs receive
+a shell-free remux command; other video probes receive an aspect-preserving
+transcode command with explicit codec, bitrate, frame-rate, fast-start, and
+metadata arguments. The planner only constructs an `ExternalCommand`; F2
+will execute and validate it.
 
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,

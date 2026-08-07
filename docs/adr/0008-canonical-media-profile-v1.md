@@ -1,0 +1,53 @@
+# ADR 0008: Canonical media profile v1
+
+## Status
+
+Accepted
+
+## Context
+
+Library storage and publication need one predictable video representation, but
+the input may already be Telegram-compatible or may require re-encoding. The
+normalization decision must be explainable and testable without invoking
+`ffmpeg`, and command arguments must remain separate from shell syntax.
+
+## Decision
+
+F1 defines a project-owned `CanonicalVideoProfile` in `sooqa-media` with an MP4
+container, H.264 video, `yuv420p`, AAC audio, 1080p maximum dimensions without
+upscaling, a configurable frame-rate cap, medium x264 preset, CRF 23, 128 kbps
+audio, fast start, and stripped incidental metadata by default.
+
+`NormalizationPlanner` selects a remux plan only when the probe proves the
+input is MP4-compatible, within profile limits, unrotated, and already uses
+the target codecs. Other valid video inputs receive a transcode plan with an
+aspect-preserving scale filter. Missing video streams and invalid profile
+values are rejected before command construction.
+
+The planner returns an `ExternalCommand` containing an argument vector. It
+does not execute the command or persist assets; execution, progress,
+validation, and size adaptation belong to later normalization slices.
+
+## Consequences
+
+- Remuxes avoid unnecessary quality loss and CPU work.
+- Portrait and landscape inputs share one aspect-preserving scale expression.
+- Profile and command decisions can be unit-tested with synthetic probes.
+- The profile is intentionally video-only; image normalization is a later
+  slice.
+- Changing the profile or algorithm requires explicit versioning/documentation
+  before existing canonical assets are reprocessed.
+
+## Alternatives considered
+
+- Always transcode: simpler but wastes resources and can reduce quality for
+  already-compatible media.
+- Copy the illustrative specification command directly: rejected because the
+  planner needs typed policy decisions and shell-free argument construction.
+- Let worker handlers build arguments: rejected because it would spread media
+  policy across orchestration code.
+
+## Follow-up
+
+F2 will execute the plan, parse progress, validate output with ffprobe, and
+record the canonical asset and its SHA-256.

@@ -75,7 +75,24 @@ size. Its Unix fake-executable test verifies that URLs, format strings, and
 paths are not shell-interpolated. Normal CI does not contact live third-party
 sites.
 
-Normalization and production media-job wiring remain later slices.
+Production normalization execution and media-job wiring remain later slices.
+
+## Normalization planner
+
+F1 adds a pure planner for the canonical video profile. It selects a remux for
+already-compatible MP4/H.264/`yuv420p`/AAC inputs within the configured
+dimensions and frame-rate cap; all other video probes receive a deterministic
+transcode command with aspect-preserving scaling. The planner returns the
+shell-free `ExternalCommand` but does not run ffmpeg.
+
+Run its tests with:
+
+    cargo test -p sooqa-media normalize::tests
+
+The profile defaults to MP4, H.264, `yuv420p`, AAC, 1920×1080 maximum
+dimensions, 60 fps maximum, x264 medium, CRF 23, 128 kbps audio, fast start,
+and stripped incidental metadata. See [ADR 0008](adr/0008-canonical-media-profile-v1.md)
+for the decision boundary and the F2 follow-up.
 
 ## Library persistence
 
