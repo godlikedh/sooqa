@@ -2,25 +2,23 @@ use std::env;
 
 use axum::{
     body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    http::{HeaderValue, Request, StatusCode},
 };
 use serde_json::{Value, json};
 use sooqa_api::{ApiSettings, ApiState, router};
 use sooqa_library::{
-    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem, NewMediaAssetDraft,
-    NewSourceRecordDraft, SourceType, StorageState,
+    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem,
+    NewDuplicateCandidate, NewMediaAssetDraft, NewSourceRecordDraft, SourceType, StorageState,
 };
 use sooqa_persistence::{Database, hash_device_token};
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
-const READ_TOKEN: &str = "e3-read-token-with-enough-entropy";
-const WRITE_TOKEN: &str = "e3-write-token-with-enough-entropy";
-
 struct Fixture {
     database: Database,
     read_token: String,
     write_token: String,
+    token_prefix: String,
     content_ids: Vec<Uuid>,
     tag_ids: Vec<Uuid>,
 }
@@ -33,17 +31,16 @@ impl Fixture {
             Database::connect(&database_url, 10).await.expect("database should be reachable");
         database.migrate().await.expect("migrations should succeed");
 
-        sqlx::query("DELETE FROM device_tokens WHERE token_prefix IN ('e3-rea', 'e3-wri')")
-            .execute(database.pool())
-            .await
-            .expect("old device tokens should clean up");
+        let token_prefix = format!("e3-{}", Uuid::new_v4());
+        let read_token = format!("{token_prefix}-read-token-with-enough-entropy");
+        let write_token = format!("{token_prefix}-write-token-with-enough-entropy");
 
-        for (name, prefix, token, scopes) in [
-            ("e3-read", "e3-rea", READ_TOKEN, vec!["library:read".to_owned()]),
+        for (name, suffix, token, scopes) in [
+            ("e3-read", "read", &read_token, vec!["library:read".to_owned()]),
             (
                 "e3-write",
-                "e3-wri",
-                WRITE_TOKEN,
+                "write",
+                &write_token,
                 vec!["library:read".to_owned(), "library:write".to_owned()],
             ),
         ] {
@@ -54,7 +51,7 @@ impl Fixture {
                 "#,
             )
             .bind(name)
-            .bind(prefix)
+            .bind(format!("{token_prefix}-{suffix}"))
             .bind(hash_device_token(token))
             .bind(scopes)
             .execute(database.pool())
@@ -64,8 +61,9 @@ impl Fixture {
 
         Self {
             database,
-            read_token: READ_TOKEN.to_owned(),
-            write_token: WRITE_TOKEN.to_owned(),
+            read_token,
+            write_token,
+            token_prefix,
             content_ids: Vec::new(),
             tag_ids: Vec::new(),
         }
@@ -154,7 +152,8 @@ impl Fixture {
                 .await
                 .expect("test tags should clean up");
         }
-        sqlx::query("DELETE FROM device_tokens WHERE token_prefix IN ('e3-rea', 'e3-wri')")
+        sqlx::query("DELETE FROM device_tokens WHERE token_prefix LIKE $1")
+            .bind(format!("{}-%", self.token_prefix))
             .execute(self.database.pool())
             .await
             .expect("test device tokens should clean up");
@@ -238,7 +237,7 @@ async fn authenticated_library_api_supports_search_edit_tags_and_archive() {
     let first_page = app(&fixture)
         .oneshot(request(
             "GET",
-            "/api/v1/library/items?limit=1".to_owned(),
+            "/api/v1/library/items?q=Reaction&limit=1".to_owned(),
             &fixture.read_token,
             None,
         ))
@@ -252,7 +251,7 @@ async fn authenticated_library_api_supports_search_edit_tags_and_archive() {
     let second_page = app(&fixture)
         .oneshot(request(
             "GET",
-            format!("/api/v1/library/items?limit=1&cursor={cursor}"),
+            format!("/api/v1/library/items?q=Reaction&limit=1&cursor={cursor}"),
             &fixture.read_token,
             None,
         ))
@@ -380,4 +379,139 @@ async fn authenticated_library_api_supports_search_edit_tags_and_archive() {
     assert_eq!(response_json(archived_search).await["items"][0]["id"], cat_id.to_string());
 
     fixture.clean_up().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn authenticated_duplicate_candidate_api_supports_review_actions() {
+    let mut fixture = Fixture::create().await;
+    let left_id = fixture.seed_item("Candidate left", "candidate-left", 41).await;
+    let right_id = fixture.seed_item("Candidate right", "candidate-right", 42).await;
+    let candidate = fixture
+        .database
+        .library()
+        .upsert_duplicate_candidate(
+            NewDuplicateCandidate::try_new(
+                right_id,
+                left_id,
+                "frame_dhash_v1",
+                9_100,
+                json!({"final_score": 0.91, "frame_distances": []}),
+            )
+            .expect("candidate should be valid"),
+        )
+        .await
+        .expect("candidate should be stored");
+
+    let listed = app(&fixture)
+        .oneshot(request(
+            "GET",
+            "/api/v1/duplicate-candidates?status=pending".to_owned(),
+            &fixture.read_token,
+            None,
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed_body = response_json(listed).await;
+    assert!(
+        listed_body["items"]
+            .as_array()
+            .expect("items should be an array")
+            .iter()
+            .any(|item| item["id"] == candidate.id.to_string())
+    );
+
+    let read_detail = app(&fixture)
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/duplicate-candidates/{}", candidate.id),
+            &fixture.read_token,
+            None,
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(read_detail.status(), StatusCode::OK);
+    let read_detail_body = response_json(read_detail).await;
+    assert_eq!(read_detail_body["candidate"]["status"], "pending");
+    assert!(read_detail_body["events"].as_array().expect("events should be an array").is_empty());
+
+    let malformed_detail = app(&fixture)
+        .oneshot(request(
+            "GET",
+            "/api/v1/duplicate-candidates/not-a-uuid".to_owned(),
+            &fixture.read_token,
+            None,
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(malformed_detail.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(malformed_detail).await["error"]["code"], "invalid_candidate_id");
+
+    let read_cannot_decide = app(&fixture)
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/duplicate-candidates/{}/confirm-variant", candidate.id),
+            &fixture.read_token,
+            None,
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(read_cannot_decide.status(), StatusCode::FORBIDDEN);
+
+    let confirmed = app(&fixture)
+        .oneshot(request_with_idempotency_key(
+            "POST",
+            format!("/api/v1/duplicate-candidates/{}/confirm-variant", candidate.id),
+            &fixture.write_token,
+            "candidate-confirm",
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(confirmed.status(), StatusCode::OK);
+    let confirmed_body = response_json(confirmed).await;
+    assert_eq!(confirmed_body["candidate"]["status"], "confirmed_variant");
+    assert_eq!(confirmed_body["events"][0]["action"], "confirm_variant");
+
+    let replayed = app(&fixture)
+        .oneshot(request_with_idempotency_key(
+            "POST",
+            format!("/api/v1/duplicate-candidates/{}/confirm-variant", candidate.id),
+            &fixture.write_token,
+            "candidate-confirm",
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(replayed.status(), StatusCode::OK);
+    let replayed_body = response_json(replayed).await;
+    assert_eq!(replayed_body["candidate"]["status"], "confirmed_variant");
+    assert_eq!(replayed_body["events"].as_array().expect("events should be an array").len(), 1);
+
+    let second_decision = app(&fixture)
+        .oneshot(request_with_idempotency_key(
+            "POST",
+            format!("/api/v1/duplicate-candidates/{}/dismiss", candidate.id),
+            &fixture.write_token,
+            "candidate-dismiss",
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(second_decision.status(), StatusCode::CONFLICT);
+    assert_eq!(response_json(second_decision).await["error"]["code"], "invalid_candidate_state");
+
+    fixture.clean_up().await;
+}
+
+fn request_with_idempotency_key(
+    method: &str,
+    uri: String,
+    token: &str,
+    idempotency_key: &str,
+) -> Request<Body> {
+    let mut request = request(method, uri, token, None);
+    request.headers_mut().insert(
+        "idempotency-key",
+        HeaderValue::from_str(idempotency_key).expect("idempotency key should be valid"),
+    );
+    request
 }

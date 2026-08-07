@@ -157,6 +157,21 @@ Run the PostgreSQL candidate integration test with:
 
     DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --test library duplicate_candidates_upsert_ordered_pairs_and_evidence -- --ignored
 
+## Duplicate resolution API
+
+G3 exposes duplicate candidates through the authenticated API. Library readers
+can list candidates by status or inspect one with its audit events. Library
+writers can confirm a variant, keep the pair separate, or dismiss it. Each
+action is a single PostgreSQL transaction that locks the candidate, allows only
+the pending state, and records the acting device token and `Idempotency-Key`.
+Retrying the same action with the same key replays the decision; a different
+key returns a stable conflict. The API does not automatically merge or delete
+content.
+
+Run its PostgreSQL API integration test with:
+
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-api --test library authenticated_duplicate_candidate_api_supports_review_actions -- --ignored
+
 ## Normalization planner
 
 F1 adds a pure planner for the canonical video profile. It selects a remux for

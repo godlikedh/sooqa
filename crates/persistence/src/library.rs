@@ -1,6 +1,7 @@
 use serde_json::Value;
 use sooqa_library::{
-    AssetRole, ContentItem, ContentItemUpdate, DuplicateCandidate, ExactDuplicateRequest,
+    AssetRole, ContentItem, ContentItemUpdate, DuplicateCandidate, DuplicateCandidateAction,
+    DuplicateCandidateEvent, DuplicateCandidateStatus, ExactDuplicateRequest,
     ExactDuplicateResolution, LibraryCursor, LibraryItemDetail, LibraryItemSummary,
     LibrarySearchPage, LibrarySearchQuery, MediaAsset, NewContentItem, NewDuplicateCandidate,
     NewMediaAsset, NewSourceRecord, NewSourceRecordDraft, NewStorageObject, NewTag, SourceRecord,
@@ -91,6 +92,169 @@ impl LibraryRepository {
         .fetch_optional(&self.pool)
         .await?;
         row.map(DuplicateCandidateRow::into_duplicate_candidate).transpose()
+    }
+
+    pub async fn find_duplicate_candidate_by_id(
+        &self,
+        candidate_id: Uuid,
+    ) -> Result<Option<DuplicateCandidate>, LibraryRepositoryError> {
+        let row = sqlx::query_as::<_, DuplicateCandidateRow>(
+            r#"
+            SELECT
+                id, left_content_item_id, right_content_item_id, algorithm_version,
+                score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
+            FROM duplicate_candidates
+            WHERE id = $1
+            "#,
+        )
+        .bind(candidate_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(DuplicateCandidateRow::into_duplicate_candidate).transpose()
+    }
+
+    pub async fn list_duplicate_candidates(
+        &self,
+        status: Option<DuplicateCandidateStatus>,
+        limit: u32,
+    ) -> Result<Vec<DuplicateCandidate>, LibraryRepositoryError> {
+        if !(1..=100).contains(&limit) {
+            return Err(LibraryRepositoryError::InvalidLimit { value: limit });
+        }
+        let rows = if let Some(status) = status {
+            sqlx::query_as::<_, DuplicateCandidateRow>(
+                r#"
+                SELECT
+                    id, left_content_item_id, right_content_item_id, algorithm_version,
+                    score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
+                FROM duplicate_candidates
+                WHERE status = $1
+                ORDER BY score_basis_points DESC, updated_at DESC, id
+                LIMIT $2
+                "#,
+            )
+            .bind(status.as_str())
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, DuplicateCandidateRow>(
+                r#"
+                SELECT
+                    id, left_content_item_id, right_content_item_id, algorithm_version,
+                    score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
+                FROM duplicate_candidates
+                ORDER BY score_basis_points DESC, updated_at DESC, id
+                LIMIT $1
+                "#,
+            )
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?
+        };
+        rows.into_iter().map(DuplicateCandidateRow::into_duplicate_candidate).collect()
+    }
+
+    pub async fn decide_duplicate_candidate(
+        &self,
+        candidate_id: Uuid,
+        action: DuplicateCandidateAction,
+        actor_device_token_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<DuplicateCandidate, LibraryRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let current = sqlx::query_as::<_, DuplicateCandidateRow>(
+            r#"
+            SELECT
+                id, left_content_item_id, right_content_item_id, algorithm_version,
+                score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
+            FROM duplicate_candidates
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(candidate_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(LibraryRepositoryError::DuplicateCandidateMissing(candidate_id))?;
+        let current_status = DuplicateCandidateStatus::try_from(current.status.as_str())
+            .map_err(|_| LibraryRepositoryError::Invariant("unknown duplicate candidate status"))?;
+        if let Some(existing_action) = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT action
+            FROM duplicate_candidate_events
+            WHERE candidate_id = $1
+              AND actor_device_token_id = $2
+              AND idempotency_key = $3
+            "#,
+        )
+        .bind(candidate_id)
+        .bind(actor_device_token_id)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            if existing_action == action.as_str() {
+                transaction.commit().await?;
+                return current.into_duplicate_candidate();
+            }
+            return Err(LibraryRepositoryError::DuplicateCandidateIdempotencyConflict(
+                candidate_id,
+            ));
+        }
+        if current_status != DuplicateCandidateStatus::Pending {
+            return Err(LibraryRepositoryError::InvalidCandidateState {
+                id: candidate_id,
+                status: current_status,
+            });
+        }
+        let updated = sqlx::query_as::<_, DuplicateCandidateRow>(
+            r#"
+            UPDATE duplicate_candidates
+            SET status = $2, resolved_at = now(), updated_at = now()
+            WHERE id = $1
+            RETURNING
+                id, left_content_item_id, right_content_item_id, algorithm_version,
+                score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
+            "#,
+        )
+        .bind(candidate_id)
+        .bind(action.resulting_status().as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO duplicate_candidate_events
+                (candidate_id, action, actor_device_token_id, idempotency_key)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(candidate_id)
+        .bind(action.as_str())
+        .bind(actor_device_token_id)
+        .bind(idempotency_key)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        updated.into_duplicate_candidate()
+    }
+
+    pub async fn list_duplicate_candidate_events(
+        &self,
+        candidate_id: Uuid,
+    ) -> Result<Vec<DuplicateCandidateEvent>, LibraryRepositoryError> {
+        let rows = sqlx::query_as::<_, DuplicateCandidateEventRow>(
+            r#"
+            SELECT id, candidate_id, action, actor_device_token_id, created_at
+            FROM duplicate_candidate_events
+            WHERE candidate_id = $1
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )
+        .bind(candidate_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(DuplicateCandidateEventRow::into_duplicate_candidate_event).collect()
     }
 
     pub async fn resolve_exact_duplicate(
@@ -1294,6 +1458,12 @@ pub enum LibraryRepositoryError {
     InvalidLimit { value: u32 },
     #[error("duplicate candidate validation failed: {0}")]
     InvalidDuplicateCandidate(#[from] sooqa_library::DuplicateCandidateValidationError),
+    #[error("duplicate candidate {0} was not found")]
+    DuplicateCandidateMissing(Uuid),
+    #[error("duplicate candidate {id} is already in status {status:?}")]
+    InvalidCandidateState { id: Uuid, status: DuplicateCandidateStatus },
+    #[error("idempotency key conflicts with an earlier decision for duplicate candidate {0}")]
+    DuplicateCandidateIdempotencyConflict(Uuid),
 }
 
 #[derive(Debug, FromRow)]
@@ -1325,6 +1495,39 @@ impl DuplicateCandidateRow {
             created_at: self.created_at,
             updated_at: self.updated_at,
             resolved_at: self.resolved_at,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct DuplicateCandidateEventRow {
+    id: Uuid,
+    candidate_id: Uuid,
+    action: String,
+    actor_device_token_id: Option<Uuid>,
+    created_at: OffsetDateTime,
+}
+
+impl DuplicateCandidateEventRow {
+    fn into_duplicate_candidate_event(
+        self,
+    ) -> Result<DuplicateCandidateEvent, LibraryRepositoryError> {
+        let action = match self.action.as_str() {
+            "confirm_variant" => DuplicateCandidateAction::ConfirmVariant,
+            "keep_separate" => DuplicateCandidateAction::KeepSeparate,
+            "dismiss" => DuplicateCandidateAction::Dismiss,
+            _ => {
+                return Err(LibraryRepositoryError::Invariant(
+                    "unknown duplicate candidate action",
+                ));
+            }
+        };
+        Ok(DuplicateCandidateEvent {
+            id: self.id,
+            candidate_id: self.candidate_id,
+            action,
+            actor_device_token_id: self.actor_device_token_id,
+            created_at: self.created_at,
         })
     }
 }

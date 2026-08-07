@@ -1,5 +1,6 @@
 //! HTTP API boundary for sooqa.
 
+mod duplicate_candidates;
 mod library;
 
 use std::time::Duration;
@@ -65,6 +66,7 @@ pub fn router(settings: ApiSettings, state: ApiState) -> Router {
         .route("/api/v1/ingest-requests", post(create_ingest))
         .route("/api/v1/ingest-requests/{id}", get(get_ingest))
         .merge(library::routes())
+        .merge(duplicate_candidates::routes())
         .with_state(state);
 
     add_layers(router, settings)
@@ -273,6 +275,11 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
         LibraryRepositoryError::ResourceMissing(_) => {
             ApiError::not_found("library_item_not_found", "The library item was not found", headers)
         }
+        LibraryRepositoryError::DuplicateCandidateMissing(_) => ApiError::not_found(
+            "duplicate_candidate_not_found",
+            "The duplicate candidate was not found",
+            headers,
+        ),
         LibraryRepositoryError::OptimisticConflict(_) => ApiError::conflict(
             "library_item_changed",
             "The library item changed since it was read",
@@ -289,6 +296,16 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
                 "archive" => "The library item cannot be archived in its current state",
                 _ => "The library item cannot be changed in its current state",
             },
+            headers,
+        ),
+        LibraryRepositoryError::InvalidCandidateState { .. } => ApiError::conflict(
+            "invalid_candidate_state",
+            "The duplicate candidate has already been resolved",
+            headers,
+        ),
+        LibraryRepositoryError::DuplicateCandidateIdempotencyConflict(_) => ApiError::conflict(
+            "idempotency_conflict",
+            "The Idempotency-Key conflicts with an earlier decision",
             headers,
         ),
         LibraryRepositoryError::TagNotAttached => ApiError::not_found(
