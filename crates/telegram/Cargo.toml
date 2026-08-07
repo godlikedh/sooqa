@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+sooqa-library = { path = "../library" }
+sooqa-media = { path = "../media" }
 teloxide.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -17,6 +19,7 @@ url.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+time.workspace = true
 
 [lints]
 workspace = true

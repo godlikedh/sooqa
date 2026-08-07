@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 sooqa-inbox = { path = "../inbox" }
 sooqa-jobs = { path = "../jobs" }
 sooqa-library = { path = "../library" }

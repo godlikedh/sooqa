@@ -19,6 +19,14 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
+mod storage;
+
+pub use storage::{
+    StorageUploadApiError, StorageUploadError, StorageUploadInput, StorageUploadOutcome,
+    StorageUploadProvider, StorageUploadRequest, StorageUploadResult, TELEGRAM_STORAGE_PROVIDER,
+    TelegramStorageApi,
+};
+
 pub const START_RESPONSE: &str = "sooqa is ready. You are authorized.";
 pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorization\n/help — show this help\n/add <url> — queue a URL\n/status — show service status";
 pub const STATUS_RESPONSE: &str = "sooqa is online.";
@@ -531,6 +539,7 @@ pub struct TelegramRuntime<S, I> {
     api: TeloxideApi,
     service: TelegramService<TeloxideApi, S, I>,
     poll_timeout: Duration,
+    storage_chat_id: Option<i64>,
 }
 
 impl<S, I> TelegramRuntime<S, I>
@@ -544,15 +553,23 @@ where
         poll_timeout: Duration,
         update_store: S,
         admin_user_ids: impl IntoIterator<Item = i64>,
+        storage_chat_id: Option<i64>,
         ingest_service: I,
     ) -> Result<Self, TelegramError> {
         let api = TeloxideApi::new(token, api_base_url, poll_timeout)?;
         let service =
             TelegramService::with_ingest(api.clone(), update_store, admin_user_ids, ingest_service);
-        Ok(Self { api, service, poll_timeout })
+        Ok(Self { api, service, poll_timeout, storage_chat_id })
     }
 
     pub async fn run(self) -> Result<(), TelegramError> {
+        if let Some(storage_chat_id) = self.storage_chat_id {
+            self.api
+                .verify_storage_chat(storage_chat_id)
+                .await
+                .map_err(|error| TelegramError::Api(Box::new(error)))?;
+            tracing::info!(storage_chat_id, "Telegram storage chat is reachable");
+        }
         self.api
             .bot()
             .delete_webhook()

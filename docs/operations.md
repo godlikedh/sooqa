@@ -61,6 +61,7 @@ user ID:
     SOOQA_TELEGRAM_ADMIN_USER_IDS=123456789
     SOOQA_TELEGRAM_API_BASE_URL=https://api.telegram.org
     SOOQA_TELEGRAM_POLL_TIMEOUT_SECONDS=30
+    SOOQA_TELEGRAM_STORAGE_CHAT_ID=-1001234567890
 
 The server starts polling alongside the HTTP API only when the bot token is
 configured. It ignores group messages, rejects non-admin private users with a
@@ -72,3 +73,9 @@ five-minute claim lease allows an abandoned in-progress update to be reclaimed;
 failed API or Inbox calls release their claim immediately. URL source
 inspection, downloading, media processing, uploads, and channel publication
 remain later Telegram slices.
+
+For H3 storage, make the bot an administrator of a private storage channel and
+set `SOOQA_TELEGRAM_STORAGE_CHAT_ID` to its negative chat ID. The server checks
+that chat during Telegram startup. Upload intents are durable in
+`idempotency_records`; a pending intent is treated as unresolved after an
+ambiguous process failure and must be reconciled before retrying.

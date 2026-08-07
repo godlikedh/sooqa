@@ -37,7 +37,8 @@ one positive administrator ID when the token is configured:
     cargo run -p sooqa-server
 
 The equivalent TOML settings are `[telegram].api_base_url`,
-`[telegram].admin_user_ids`, and `[telegram].poll_timeout_seconds`. The API
+`[telegram].admin_user_ids`, `[telegram].poll_timeout_seconds`, and optional
+`[telegram].storage_chat_id`. The API
 base URL accepts only an HTTP(S) URL without credentials, which also supports
 a self-hosted Local Bot API Server. Telegram update IDs are claimed in
 `telegram_update_receipts` before command handling, so redelivered updates do
@@ -68,6 +69,15 @@ The adapter tests use a mocked API and receipt store, so they do not contact
 Telegram:
 
     cargo test -p sooqa-telegram
+
+H3 storage tests use a mocked Telegram API and a fake upload store:
+
+    cargo test -p sooqa-telegram storage
+
+The storage provider requires a negative Telegram chat ID, hashes the local
+canonical asset before upload, and persists references only after Telegram
+returns a message. A configured server performs a startup `getChat` check for
+the storage chat; it does not upload media from the polling process yet.
 
 ## Source inspection
 

@@ -1,11 +1,11 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 use sooqa_library::{
     AssetRole, ContentItem, ContentItemUpdate, DuplicateCandidate, DuplicateCandidateAction,
     DuplicateCandidateEvent, DuplicateCandidateStatus, ExactDuplicateRequest,
     ExactDuplicateResolution, LibraryCursor, LibraryItemDetail, LibraryItemSummary,
     LibrarySearchPage, LibrarySearchQuery, MediaAsset, NewContentItem, NewDuplicateCandidate,
     NewMediaAsset, NewSourceRecord, NewSourceRecordDraft, NewStorageObject, NewTag, SourceRecord,
-    StorageObject, Tag,
+    StorageObject, StorageUploadReservation, StorageUploadStore, Tag,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
@@ -992,6 +992,181 @@ impl LibraryRepository {
     }
 }
 
+const STORAGE_UPLOAD_IDEMPOTENCY_SCOPE: &str = "storage:upload";
+
+#[async_trait::async_trait]
+impl StorageUploadStore for LibraryRepository {
+    type Error = LibraryRepositoryError;
+
+    async fn find_active_storage_object(
+        &self,
+        asset_id: Uuid,
+        provider: &str,
+    ) -> Result<Option<StorageObject>, Self::Error> {
+        let row = sqlx::query_as::<_, StorageObjectRow>(
+            r#"
+            SELECT
+                id, asset_id, provider, storage_chat_id, storage_message_id,
+                telegram_file_id, telegram_file_unique_id, media_kind,
+                stored_at, verified_at, status
+            FROM storage_objects
+            WHERE asset_id = $1 AND provider = $2 AND status = 'active'
+            ORDER BY stored_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(asset_id)
+        .bind(provider)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(StorageObjectRow::into_storage_object).transpose()
+    }
+
+    async fn reserve_storage_upload(
+        &self,
+        asset_id: Uuid,
+        provider: &str,
+        idempotency_key: &str,
+        request_hash: &[u8],
+    ) -> Result<StorageUploadReservation, Self::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let inserted = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO idempotency_records (
+                scope, idempotency_key, request_hash, resource_type
+            )
+            VALUES ($1, $2, $3, 'storage_object')
+            ON CONFLICT (scope, idempotency_key) DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
+        .bind(idempotency_key)
+        .bind(request_hash)
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        if let Some(intent_id) = inserted {
+            transaction.commit().await?;
+            return Ok(StorageUploadReservation::Reserved { intent_id });
+        }
+
+        let existing = sqlx::query_as::<_, StorageUploadIntentRow>(
+            r#"
+            SELECT request_hash, resource_id
+            FROM idempotency_records
+            WHERE scope = $1 AND idempotency_key = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
+        .bind(idempotency_key)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        if existing.request_hash.as_slice() != request_hash {
+            return Err(LibraryRepositoryError::StorageUploadIdempotencyConflict {
+                key: idempotency_key.to_owned(),
+            });
+        }
+
+        let reservation = match existing.resource_id {
+            Some(storage_object_id) => {
+                let object = sqlx::query_as::<_, StorageObjectRow>(
+                    r#"
+                    SELECT
+                        id, asset_id, provider, storage_chat_id, storage_message_id,
+                        telegram_file_id, telegram_file_unique_id, media_kind,
+                        stored_at, verified_at, status
+                    FROM storage_objects
+                    WHERE id = $1 AND asset_id = $2 AND provider = $3 AND status = 'active'
+                    "#,
+                )
+                .bind(storage_object_id)
+                .bind(asset_id)
+                .bind(provider)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(LibraryRepositoryError::StorageUploadObjectMissing(storage_object_id))?;
+                StorageUploadReservation::Reused(object.into_storage_object()?)
+            }
+            None => StorageUploadReservation::InProgress,
+        };
+        transaction.commit().await?;
+        Ok(reservation)
+    }
+
+    async fn complete_storage_upload(
+        &self,
+        intent_id: Uuid,
+        object: NewStorageObject,
+    ) -> Result<StorageObject, Self::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, StorageObjectRow>(
+            r#"
+            INSERT INTO storage_objects (
+                asset_id, provider, storage_chat_id, storage_message_id,
+                telegram_file_id, telegram_file_unique_id, media_kind
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING
+                id, asset_id, provider, storage_chat_id, storage_message_id,
+                telegram_file_id, telegram_file_unique_id, media_kind,
+                stored_at, verified_at, status
+            "#,
+        )
+        .bind(object.asset_id)
+        .bind(&object.provider)
+        .bind(object.storage_chat_id)
+        .bind(object.storage_message_id)
+        .bind(&object.telegram_file_id)
+        .bind(&object.telegram_file_unique_id)
+        .bind(object.media_kind.as_str())
+        .fetch_one(&mut *transaction)
+        .await?;
+        let storage_object = row.into_storage_object()?;
+
+        let updated_intent = sqlx::query(
+            r#"
+            UPDATE idempotency_records
+            SET resource_id = $2,
+                response_status = 201,
+                response_body = $3
+            WHERE id = $1 AND resource_id IS NULL
+            "#,
+        )
+        .bind(intent_id)
+        .bind(storage_object.id)
+        .bind(json!({ "id": storage_object.id, "status": storage_object.status.as_str() }))
+        .execute(&mut *transaction)
+        .await?;
+        if updated_intent.rows_affected() != 1 {
+            return Err(LibraryRepositoryError::StorageUploadIntentMissing(intent_id));
+        }
+
+        let updated_asset =
+            sqlx::query("UPDATE media_assets SET storage_state = 'uploaded' WHERE id = $1")
+                .bind(object.asset_id)
+                .execute(&mut *transaction)
+                .await?;
+        if updated_asset.rows_affected() != 1 {
+            return Err(LibraryRepositoryError::ResourceMissing(object.asset_id));
+        }
+
+        transaction.commit().await?;
+        Ok(storage_object)
+    }
+
+    async fn release_storage_upload(&self, intent_id: Uuid) -> Result<(), Self::Error> {
+        sqlx::query("DELETE FROM idempotency_records WHERE id = $1 AND resource_id IS NULL")
+            .bind(intent_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
 const SHA256_LENGTH: usize = 32;
 
 fn validate_canonical_asset(
@@ -1464,6 +1639,18 @@ pub enum LibraryRepositoryError {
     InvalidCandidateState { id: Uuid, status: DuplicateCandidateStatus },
     #[error("idempotency key conflicts with an earlier decision for duplicate candidate {0}")]
     DuplicateCandidateIdempotencyConflict(Uuid),
+    #[error("storage upload idempotency key conflicts with an earlier upload: {key}")]
+    StorageUploadIdempotencyConflict { key: String },
+    #[error("storage upload object {0} was not found after a completed intent")]
+    StorageUploadObjectMissing(Uuid),
+    #[error("storage upload intent {0} was not found or already completed")]
+    StorageUploadIntentMissing(Uuid),
+}
+
+#[derive(Debug, FromRow)]
+struct StorageUploadIntentRow {
+    request_hash: Vec<u8>,
+    resource_id: Option<Uuid>,
 }
 
 #[derive(Debug, FromRow)]

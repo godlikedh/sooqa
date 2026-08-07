@@ -5,6 +5,7 @@ use sooqa_library::{
     AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem,
     NewDuplicateCandidate, NewMediaAsset, NewMediaAssetDraft, NewSourceRecord,
     NewSourceRecordDraft, NewStorageObject, NewTag, SourceType, StorageState,
+    StorageUploadReservation, StorageUploadStore,
 };
 use sooqa_persistence::Database;
 use uuid::Uuid;
@@ -225,6 +226,88 @@ async fn library_repositories_round_trip_content_sources_tags_and_storage() {
     assert_eq!(storage.provider, "telegram");
 
     clean_up(&database, content.id, tag.id, &normalized_url).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let library = database.library();
+    let content = library
+        .create_content_item(NewContentItem::new(ContentKind::Video))
+        .await
+        .expect("content item should be created");
+    let sha256 = vec![13; 32];
+    let asset = library
+        .create_media_asset(canonical_asset(content.id, sha256.clone()))
+        .await
+        .expect("asset should be created");
+    let idempotency_key = format!("telegram:storage:{}:v1", asset.id);
+
+    let reservation = library
+        .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+        .await
+        .expect("upload intent should be reserved");
+    let StorageUploadReservation::Reserved { intent_id } = reservation else {
+        panic!("first upload should reserve an intent");
+    };
+    assert_eq!(
+        library
+            .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+            .await
+            .expect("duplicate reservation should load"),
+        StorageUploadReservation::InProgress
+    );
+
+    let stored = library
+        .complete_storage_upload(
+            intent_id,
+            NewStorageObject {
+                asset_id: asset.id,
+                provider: "telegram".to_owned(),
+                storage_chat_id: -100123,
+                storage_message_id: 789,
+                telegram_file_id: Some("file-id".to_owned()),
+                telegram_file_unique_id: Some("unique-id".to_owned()),
+                media_kind: MediaKind::Video,
+            },
+        )
+        .await
+        .expect("upload intent should complete");
+    assert_eq!(stored.asset_id, asset.id);
+    assert_eq!(
+        library
+            .find_media_asset(asset.id)
+            .await
+            .expect("asset should load")
+            .expect("asset should exist")
+            .storage_state,
+        StorageState::Uploaded
+    );
+    assert_eq!(
+        library
+            .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+            .await
+            .expect("completed reservation should replay"),
+        StorageUploadReservation::Reused(stored.clone())
+    );
+
+    sqlx::query("DELETE FROM idempotency_records WHERE idempotency_key = $1")
+        .bind(&idempotency_key)
+        .execute(database.pool())
+        .await
+        .expect("upload intent should clean up");
+    sqlx::query("DELETE FROM storage_objects WHERE asset_id = $1")
+        .bind(asset.id)
+        .execute(database.pool())
+        .await
+        .expect("storage object should clean up");
+    clean_up_content(&database, content.id).await;
 }
 
 #[tokio::test]

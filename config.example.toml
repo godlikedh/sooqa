@@ -18,6 +18,8 @@ max_connections = 20
 api_base_url = "https://api.telegram.org"
 admin_user_ids = []
 poll_timeout_seconds = 30
+# Private Telegram channel or group used for durable media storage.
+# storage_chat_id = -1001234567890
 
 [observability]
 log_format = "json"

@@ -164,6 +164,7 @@ pub struct TelegramConfig {
     pub api_base_url: String,
     pub admin_user_ids: Vec<i64>,
     pub poll_timeout_seconds: u64,
+    pub storage_chat_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -294,6 +295,7 @@ impl AppConfig {
                     .telegram
                     .poll_timeout_seconds
                     .unwrap_or(DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS),
+                storage_chat_id: raw.telegram.storage_chat_id,
             },
             observability: ObservabilityConfig { log_format, log_level },
             secrets: SecretConfig {
@@ -305,7 +307,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -323,6 +325,7 @@ impl AppConfig {
             self.telegram.api_base_url,
             self.telegram.admin_user_ids.len(),
             self.telegram.poll_timeout_seconds,
+            self.telegram.storage_chat_id,
             self.observability.log_format,
             self.observability.log_level,
             configured_state(self.secrets.database_url.as_ref()),
@@ -398,6 +401,13 @@ impl AppConfig {
                     reason: "expected a positive integer",
                 })?;
         }
+        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_STORAGE_CHAT_ID")? {
+            self.telegram.storage_chat_id =
+                Some(value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_TELEGRAM_STORAGE_CHAT_ID".to_owned(),
+                    reason: "expected a negative Telegram chat ID",
+                })?);
+        }
         Ok(())
     }
 
@@ -463,6 +473,12 @@ impl AppConfig {
                 reason: "must be greater than zero",
             });
         }
+        if self.telegram.storage_chat_id.is_some_and(|id| id >= 0) {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.storage_chat_id".to_owned(),
+                reason: "must be a negative Telegram channel or group ID",
+            });
+        }
         if self.secrets.telegram_bot_token.as_ref().is_some_and(SecretString::is_configured)
             && self.telegram.admin_user_ids.is_empty()
         {
@@ -526,6 +542,7 @@ struct RawTelegramConfig {
     api_base_url: Option<String>,
     admin_user_ids: Vec<i64>,
     poll_timeout_seconds: Option<u64>,
+    storage_chat_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -763,7 +780,7 @@ mod tests {
         let config = AppConfig::from_toml_str(
             AppRole::Server,
             None,
-            "[telegram]\napi_base_url = \"http://telegram-bot-api:8081\"\nadmin_user_ids = [123456789]\npoll_timeout_seconds = 45\n",
+            "[telegram]\napi_base_url = \"http://telegram-bot-api:8081\"\nadmin_user_ids = [123456789]\npoll_timeout_seconds = 45\nstorage_chat_id = -1001234567890\n",
         )
         .expect("TOML should parse");
 
@@ -771,6 +788,18 @@ mod tests {
         assert_eq!(config.telegram.api_base_url, "http://telegram-bot-api:8081");
         assert_eq!(config.telegram.admin_user_ids, vec![123456789]);
         assert_eq!(config.telegram.poll_timeout_seconds, 45);
+        assert_eq!(config.telegram.storage_chat_id, Some(-1001234567890));
+    }
+
+    #[test]
+    fn telegram_storage_chat_must_be_negative() {
+        let config =
+            AppConfig::from_toml_str(AppRole::Server, None, "[telegram]\nstorage_chat_id = 123\n")
+                .expect("TOML should parse");
+
+        assert!(
+            matches!(config.validate(), Err(ConfigError::InvalidValue { name, .. }) if name == "telegram.storage_chat_id")
+        );
     }
 
     #[test]

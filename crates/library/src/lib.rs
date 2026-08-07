@@ -1,5 +1,6 @@
 //! Content catalogue and duplicate-management boundaries for sooqa.
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -677,6 +678,40 @@ pub struct NewStorageObject {
     pub telegram_file_id: Option<String>,
     pub telegram_file_unique_id: Option<String>,
     pub media_kind: MediaKind,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum StorageUploadReservation {
+    Reserved { intent_id: Uuid },
+    Reused(StorageObject),
+    InProgress,
+}
+
+#[async_trait]
+pub trait StorageUploadStore: Clone + Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn find_active_storage_object(
+        &self,
+        asset_id: Uuid,
+        provider: &str,
+    ) -> Result<Option<StorageObject>, Self::Error>;
+
+    async fn reserve_storage_upload(
+        &self,
+        asset_id: Uuid,
+        provider: &str,
+        idempotency_key: &str,
+        request_hash: &[u8],
+    ) -> Result<StorageUploadReservation, Self::Error>;
+
+    async fn complete_storage_upload(
+        &self,
+        intent_id: Uuid,
+        object: NewStorageObject,
+    ) -> Result<StorageObject, Self::Error>;
+
+    async fn release_storage_upload(&self, intent_id: Uuid) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]

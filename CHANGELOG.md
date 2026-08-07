@@ -23,3 +23,6 @@ All notable changes to sooqa will be documented here.
   update-id deduplication receipts.
 - Added private Telegram URL ingest through `/add` or a single bare URL,
   durable Inbox request acknowledgements, and versioned status callback data.
+- Added the Telegram storage provider with canonical hash verification,
+  idempotent upload intents, Telegram file reference persistence, active-object
+  reuse, and storage-chat startup diagnostics.
