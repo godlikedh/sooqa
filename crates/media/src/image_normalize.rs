@@ -21,6 +21,7 @@ const DEFAULT_THUMBNAIL_MAX_HEIGHT: u32 = 320;
 const DEFAULT_JPEG_QUALITY: u8 = 85;
 const DEFAULT_MAX_INPUT_PIXELS: u64 = 100_000_000;
 const DEFAULT_MAX_INPUT_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_MAX_WORKING_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalImageProfile {
@@ -31,6 +32,7 @@ pub struct CanonicalImageProfile {
     pub jpeg_quality: u8,
     pub max_input_pixels: u64,
     pub max_input_bytes: u64,
+    pub max_working_bytes: u64,
 }
 
 impl Default for CanonicalImageProfile {
@@ -43,6 +45,7 @@ impl Default for CanonicalImageProfile {
             jpeg_quality: DEFAULT_JPEG_QUALITY,
             max_input_pixels: DEFAULT_MAX_INPUT_PIXELS,
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_working_bytes: DEFAULT_MAX_WORKING_BYTES,
         }
     }
 }
@@ -69,6 +72,9 @@ impl CanonicalImageProfile {
         }
         if self.max_input_bytes == 0 {
             return Err(ImageProfileError::InvalidInputByteLimit);
+        }
+        if self.max_working_bytes == 0 {
+            return Err(ImageProfileError::InvalidWorkingSetLimit);
         }
         Ok(())
     }
@@ -177,8 +183,20 @@ impl ImageNormalizer {
         let encoded = tokio::task::spawn_blocking(move || encode_image(&plan, profile))
             .await
             .map_err(ImageNormalizationError::TaskJoin)??;
-        let canonical_digest = sha256_file(&encoded.canonical_path).await?;
-        let thumbnail_digest = sha256_file(&encoded.thumbnail_path).await?;
+        let canonical_digest = match sha256_file(&encoded.canonical_path).await {
+            Ok(digest) => digest,
+            Err(error) => {
+                cleanup_outputs(&encoded).await;
+                return Err(error.into());
+            }
+        };
+        let thumbnail_digest = match sha256_file(&encoded.thumbnail_path).await {
+            Ok(digest) => digest,
+            Err(error) => {
+                cleanup_outputs(&encoded).await;
+                return Err(error.into());
+            }
+        };
         Ok(ImageNormalizationResult {
             canonical_path: encoded.canonical_path,
             thumbnail_path: encoded.thumbnail_path,
@@ -194,6 +212,11 @@ impl ImageNormalizer {
     }
 }
 
+async fn cleanup_outputs(encoded: &EncodedImage) {
+    let _ = tokio::fs::remove_file(&encoded.canonical_path).await;
+    let _ = tokio::fs::remove_file(&encoded.thumbnail_path).await;
+}
+
 #[derive(Debug, Error)]
 pub enum ImageProfileError {
     #[error("canonical image dimensions must be greater than zero, got {width}x{height}")]
@@ -206,6 +229,8 @@ pub enum ImageProfileError {
     InvalidInputPixelLimit,
     #[error("maximum input bytes must be greater than zero")]
     InvalidInputByteLimit,
+    #[error("maximum working bytes must be greater than zero")]
+    InvalidWorkingSetLimit,
 }
 
 #[derive(Debug, Error)]
@@ -224,6 +249,8 @@ pub enum ImageNormalizationError {
     InputTooLarge { path: PathBuf, limit: u64 },
     #[error("image input exceeds the {limit}-pixel limit: {path}")]
     InputTooManyPixels { path: PathBuf, limit: u64 },
+    #[error("image input estimated working set exceeds the {limit}-byte limit: {path}")]
+    InputWorkingSetTooLarge { path: PathBuf, limit: u64 },
     #[error("animated PNG inputs are not supported by the static image path: {path}")]
     AnimatedPng { path: PathBuf },
     #[error("could not decode image input {path}: {source}")]
@@ -319,7 +346,8 @@ fn decode_image(
     validate_input_path(path, profile.max_input_bytes)?;
     let input_path = path.to_owned();
     let mut limits = Limits::default();
-    limits.max_alloc = Some(profile.max_input_pixels.saturating_mul(4));
+    limits.max_alloc =
+        Some(profile.max_input_pixels.saturating_mul(4).min(profile.max_working_bytes / 2).max(1));
     let reader = ImageReader::open(&input_path)
         .map_err(|source| ImageNormalizationError::InputFile { path: input_path.clone(), source })?
         .with_guessed_format()
@@ -366,6 +394,17 @@ fn decode_image(
         return Err(ImageNormalizationError::InputTooManyPixels {
             path: input_path.clone(),
             limit: profile.max_input_pixels,
+        });
+    }
+    let estimated_working_bytes =
+        pixels.checked_mul(16).ok_or(ImageNormalizationError::InputWorkingSetTooLarge {
+            path: input_path.clone(),
+            limit: profile.max_working_bytes,
+        })?;
+    if estimated_working_bytes > profile.max_working_bytes {
+        return Err(ImageNormalizationError::InputWorkingSetTooLarge {
+            path: input_path.clone(),
+            limit: profile.max_working_bytes,
         });
     }
     let orientation = decoder
@@ -638,6 +677,15 @@ mod tests {
         )
         .expect_err("pixel limit should be enforced before decoding");
         assert!(matches!(error, ImageNormalizationError::InputTooManyPixels { limit: 50, .. }));
+        let error = decode_image(
+            &large_input,
+            CanonicalImageProfile { max_working_bytes: 1_000, ..Default::default() },
+        )
+        .expect_err("working-set limit should be enforced before decoding");
+        assert!(matches!(
+            error,
+            ImageNormalizationError::InputWorkingSetTooLarge { limit: 1_000, .. }
+        ));
         let error = decode_image(
             &large_input,
             CanonicalImageProfile { max_input_bytes: 1, ..Default::default() },

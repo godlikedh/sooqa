@@ -64,10 +64,10 @@ transparency remain PNG. Canonical images and same-format thumbnails preserve
 aspect ratio and never upscale smaller inputs. The result exposes dimensions,
 format, output paths, and independent SHA-256 digests. Image plans are built
 from `MediaWorkspace` paths, input paths must be regular files, output files
-are published with same-directory atomic no-clobber links, EXIF orientation is
-applied before metadata is discarded, and animated PNGs are rejected by the
-static image path. Persistence and production job composition remain outside
-the media crate.
+are published with same-directory atomic no-clobber links, and the decoder and
+working-set budgets are explicit. EXIF orientation is applied before metadata
+is discarded, and animated PNGs are rejected by the static image path.
+Persistence and production job composition remain outside the media crate.
 
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,
