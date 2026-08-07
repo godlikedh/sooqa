@@ -6,9 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sooqa-jobs = { path = "../jobs" }
 sooqa-config = { path = "../config" }
+serde_json.workspace = true
 sqlx.workspace = true
+time.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 sqlx.workspace = true
