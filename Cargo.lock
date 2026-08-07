@@ -1302,9 +1302,16 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "serde",
+ "serde_json",
+ "sooqa-inbox",
+ "sooqa-persistence",
+ "sqlx",
+ "time",
  "tokio",
  "tower",
  "tower-http",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1365,6 +1372,7 @@ name = "sooqa-persistence"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2",
  "sooqa-config",
  "sooqa-inbox",
  "sooqa-jobs",

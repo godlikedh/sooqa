@@ -40,12 +40,20 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     sooqa_runtime::init_tracing(&config.observability)?;
+    let database_url =
+        config.secrets.database_url.as_ref().ok_or(ConfigError::MissingSecret("database URL"))?;
+    let database =
+        sooqa_persistence::Database::connect_secret(database_url, config.database.max_connections)
+            .await?;
     let listener = TcpListener::bind(&config.server.listen_address).await?;
     let api_settings = sooqa_api::ApiSettings {
         request_body_limit_bytes: config.server.request_body_limit_bytes,
         request_timeout_seconds: config.server.request_timeout_seconds,
     };
-    let app: Router = sooqa_api::router(api_settings);
+    let app: Router = sooqa_api::router(
+        api_settings,
+        sooqa_api::ApiState::new(database.inbox(), database.device_tokens()),
+    );
 
     tracing::info!(role = %config.role, "sooqa server started");
     sooqa_server::serve(listener, app, sooqa_runtime::shutdown_signal()).await?;

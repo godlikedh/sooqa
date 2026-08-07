@@ -18,5 +18,13 @@ submissions, models the user-visible ingest state machine, stores
 `ingest_requests`, and atomically creates the first `inspect_source` job.
 Idempotency records bind a request key and payload hash to the original ingest
 request, so a repeated request returns the existing resource while a changed
-payload is rejected. The HTTP ingest routes and real source-inspection handler
-are still future slices.
+payload is rejected. The real source-inspection handler is still a future
+slice.
+
+The server now connects to PostgreSQL for the authenticated ingest API. Device
+tokens are stored as SHA-256 hashes with scopes and revocation timestamps; the
+API requires `ingest:create` for submission and `ingest:read` for status reads.
+`POST /api/v1/ingest-requests` accepts a generic URL and returns a durable
+request ID, while `GET /api/v1/ingest-requests/{id}` exposes its current
+user-visible state. Token provisioning and revocation commands remain a later
+administration slice.
