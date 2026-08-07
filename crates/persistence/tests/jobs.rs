@@ -54,7 +54,9 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
         .retry(
             claimed.id,
             &claiming_worker,
-            OffsetDateTime::now_utc(),
+            // Keep the immediate retry safely behind the database clock; the
+            // caller and PostgreSQL can differ by a few milliseconds.
+            OffsetDateTime::now_utc() - time::Duration::seconds(1),
             "temporary_network",
             "upstream unavailable",
         )

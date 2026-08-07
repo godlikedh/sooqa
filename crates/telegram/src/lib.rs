@@ -3,16 +3,19 @@
 use std::{
     collections::{BTreeSet, HashMap},
     error::Error,
+    io,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
+use sooqa_library::MediaKind;
 use teloxide::{
     Bot,
     payloads::GetUpdatesSetters,
     prelude::{Request, Requester},
-    types::{Update, UpdateKind},
+    types::{ChatId, FileId, Message, Update, UpdateKind},
 };
 use thiserror::Error as ThisError;
 use tracing::warn;
@@ -32,6 +35,7 @@ pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorizat
 pub const STATUS_RESPONSE: &str = "sooqa is online.";
 pub const UNAUTHORIZED_RESPONSE: &str = "This bot is restricted to its configured administrator.";
 pub const ADD_USAGE_RESPONSE: &str = "Send one http(s) URL after /add, or send a bare URL.";
+const TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 const RESPONSE_RATE_LIMIT: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_HANDLER_ATTEMPTS: usize = 5;
@@ -40,10 +44,29 @@ const MAX_POLLING_ATTEMPTS: usize = 5;
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct IncomingMessage {
     pub update_id: i64,
+    pub message_id: i64,
     pub user_id: Option<i64>,
     pub chat_id: i64,
     pub is_private: bool,
     pub text: Option<String>,
+    pub caption: Option<String>,
+    pub media: Option<TelegramMedia>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TelegramMedia {
+    Supported {
+        media_kind: MediaKind,
+        file_id: String,
+        file_unique_id: String,
+        file_size: Option<u32>,
+        mime_type: Option<String>,
+        file_name: Option<String>,
+    },
+    UnsupportedDocument {
+        file_name: Option<String>,
+        mime_type: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -52,6 +75,7 @@ pub enum HandleOutcome {
     NonMessageIgnored,
     NonPrivateIgnored,
     RateLimited,
+    MediaRejected,
     Unauthorized,
     UnrecognizedIgnored,
     Responded(Command),
@@ -86,6 +110,23 @@ pub struct UrlIngestCommand {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MediaIngestCommand {
+    pub update_id: i64,
+    pub message_id: i64,
+    pub chat_id: i64,
+    pub submitted_by_user_id: i64,
+    pub media_kind: MediaKind,
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub file_size: Option<u32>,
+    pub mime_type: Option<String>,
+    pub file_name: Option<String>,
+    pub caption: Option<String>,
+    pub local_work_path: PathBuf,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct IngestAccepted {
     pub request_id: Uuid,
     pub status: String,
@@ -96,6 +137,11 @@ pub trait IngestService: Clone + Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
     async fn create_url(&self, command: UrlIngestCommand) -> Result<IngestAccepted, Self::Error>;
+
+    async fn create_media(
+        &self,
+        command: MediaIngestCommand,
+    ) -> Result<IngestAccepted, Self::Error>;
 }
 
 #[derive(Debug, ThisError)]
@@ -107,6 +153,13 @@ impl IngestService for () {
     type Error = IngestUnavailable;
 
     async fn create_url(&self, _command: UrlIngestCommand) -> Result<IngestAccepted, Self::Error> {
+        Err(IngestUnavailable)
+    }
+
+    async fn create_media(
+        &self,
+        _command: MediaIngestCommand,
+    ) -> Result<IngestAccepted, Self::Error> {
         Err(IngestUnavailable)
     }
 }
@@ -129,6 +182,20 @@ pub enum TelegramError {
     UpdateInProgress(i64),
     #[error("Telegram URL ingest failed: {0}")]
     Ingest(#[source] Box<dyn Error + Send + Sync>),
+    #[error("Telegram media download failed: {0}")]
+    MediaDownload(#[source] Box<dyn Error + Send + Sync>),
+}
+
+#[derive(Debug, ThisError)]
+pub enum TelegramApiError {
+    #[error("Telegram API request failed: {0}")]
+    Api(#[source] teloxide::RequestError),
+    #[error("Telegram file download failed: {0}")]
+    Download(#[source] teloxide::DownloadError),
+    #[error("Telegram download destination could not be opened: {0}")]
+    Io(#[source] io::Error),
+    #[error("Telegram Bot API download limit is {limit} bytes; file is {size} bytes")]
+    DownloadLimit { size: u64, limit: u64 },
 }
 
 #[async_trait]
@@ -136,6 +203,10 @@ pub trait TelegramApi: Clone + Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
     async fn send_text(&self, chat_id: i64, text: &str) -> Result<(), Self::Error>;
+
+    async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), Self::Error>;
+
+    fn is_retryable_error(error: &Self::Error) -> bool;
 }
 
 #[async_trait]
@@ -237,6 +308,9 @@ where
             .await?;
             return Ok(HandleOutcome::Unauthorized);
         }
+        if let Some(media) = message.media.clone() {
+            return self.handle_media_message(message, claim, media).await;
+        }
         let action =
             message.text.as_deref().map(parse_message_action).unwrap_or(MessageAction::Ignore);
         match action {
@@ -308,6 +382,96 @@ where
         }
     }
 
+    async fn handle_media_message(
+        &self,
+        message: IncomingMessage,
+        claim: UpdateClaim,
+        media: TelegramMedia,
+    ) -> Result<HandleOutcome, TelegramError> {
+        let rate_limit_key = RateLimitKey { user_id: message.user_id, chat_id: message.chat_id };
+        let response = match media {
+            TelegramMedia::UnsupportedDocument { file_name, mime_type } => {
+                let response = format!(
+                    "⚠️ Unsupported Telegram document{}{}",
+                    file_name.map(|value| format!(": {value}")).unwrap_or_default(),
+                    mime_type.map(|value| format!(" ({value})")).unwrap_or_default()
+                );
+                if !self.allow_response(message.user_id, message.chat_id) {
+                    self.complete(claim).await?;
+                    return Ok(HandleOutcome::RateLimited);
+                }
+                self.send_and_complete(claim, message.chat_id, &response, rate_limit_key).await?;
+                return Ok(HandleOutcome::MediaRejected);
+            }
+            TelegramMedia::Supported {
+                media_kind,
+                file_id,
+                file_unique_id,
+                file_size,
+                mime_type,
+                file_name,
+            } => {
+                let user_id = message.user_id.expect("authorized Telegram messages have a user ID");
+                let local_work_path = telegram_download_path(message.update_id);
+                if let Err(error) = self.api.download_file(&file_id, &local_work_path).await {
+                    self.clear_response(rate_limit_key);
+                    if A::is_retryable_error(&error) {
+                        self.release(claim).await?;
+                        return Err(TelegramError::MediaDownload(Box::new(error)));
+                    }
+                    let response = format!("⚠️ Telegram file cannot be downloaded: {error}");
+                    if !self.allow_response(message.user_id, message.chat_id) {
+                        self.complete(claim).await?;
+                        return Ok(HandleOutcome::RateLimited);
+                    }
+                    self.send_and_complete(claim, message.chat_id, &response, rate_limit_key)
+                        .await?;
+                    return Ok(HandleOutcome::MediaRejected);
+                }
+
+                let Some(ingest_service) = self.ingest_service.as_ref() else {
+                    self.release(claim).await?;
+                    return Err(TelegramError::Ingest(Box::new(IngestUnavailable)));
+                };
+                let accepted = match ingest_service
+                    .create_media(MediaIngestCommand {
+                        update_id: message.update_id,
+                        message_id: message.message_id,
+                        chat_id: message.chat_id,
+                        submitted_by_user_id: user_id,
+                        media_kind,
+                        file_id,
+                        file_unique_id,
+                        file_size,
+                        mime_type,
+                        file_name,
+                        caption: message.caption.clone(),
+                        local_work_path,
+                        idempotency_key: format!("telegram:update:{}:v1", message.update_id),
+                    })
+                    .await
+                {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        self.clear_response(rate_limit_key);
+                        self.release(claim).await?;
+                        return Err(TelegramError::Ingest(Box::new(error)));
+                    }
+                };
+                format!(
+                    "✅ Ingest queued\nID: {}\nStatus: {}",
+                    accepted.request_id, accepted.status
+                )
+            }
+        };
+        if !self.allow_response(message.user_id, message.chat_id) {
+            self.complete(claim).await?;
+            return Ok(HandleOutcome::RateLimited);
+        }
+        self.send_and_complete(claim, message.chat_id, &response, rate_limit_key).await?;
+        Ok(HandleOutcome::Responded(Command::Add))
+    }
+
     pub async fn handle_update(&self, update: Update) -> Result<HandleOutcome, TelegramError> {
         let update_id = i64::from(update.id.0);
         let UpdateKind::Message(message) = update.kind else {
@@ -323,10 +487,13 @@ where
         };
         self.handle_message(IncomingMessage {
             update_id,
+            message_id: i64::from(message.id.0),
             user_id: message.from.as_ref().and_then(|user| i64::try_from(user.id.0).ok()),
             chat_id: message.chat.id.0,
             is_private: message.chat.is_private(),
             text: message.text().map(str::to_owned),
+            caption: message.caption().map(str::to_owned),
+            media: message_media(&message),
         })
         .await
     }
@@ -391,6 +558,88 @@ where
 
     fn clear_response(&self, key: RateLimitKey) {
         self.response_limiter.lock().expect("Telegram rate limiter is not poisoned").remove(&key);
+    }
+}
+
+fn telegram_download_path(update_id: i64) -> PathBuf {
+    std::env::temp_dir().join(format!("sooqa-telegram-{update_id}.bin"))
+}
+
+fn message_media(message: &Message) -> Option<TelegramMedia> {
+    if let Some(photo) = message.photo().and_then(|photos| photos.last()) {
+        return Some(TelegramMedia::Supported {
+            media_kind: MediaKind::Image,
+            file_id: photo.file.id.to_string(),
+            file_unique_id: photo.file.unique_id.to_string(),
+            file_size: Some(photo.file.size),
+            mime_type: Some("image/jpeg".to_owned()),
+            file_name: None,
+        });
+    }
+    if let Some(video) = message.video() {
+        return Some(TelegramMedia::Supported {
+            media_kind: MediaKind::Video,
+            file_id: video.file.id.to_string(),
+            file_unique_id: video.file.unique_id.to_string(),
+            file_size: Some(video.file.size),
+            mime_type: video.mime_type.as_ref().map(ToString::to_string),
+            file_name: video.file_name.clone(),
+        });
+    }
+    if let Some(animation) = message.animation() {
+        return Some(TelegramMedia::Supported {
+            media_kind: MediaKind::Animation,
+            file_id: animation.file.id.to_string(),
+            file_unique_id: animation.file.unique_id.to_string(),
+            file_size: Some(animation.file.size),
+            mime_type: animation.mime_type.as_ref().map(ToString::to_string),
+            file_name: animation.file_name.clone(),
+        });
+    }
+    let document = message.document()?;
+    let mime_type = document.mime_type.as_ref().map(ToString::to_string);
+    let media_kind = document_media_kind(mime_type.as_deref(), document.file_name.as_deref());
+    match media_kind {
+        Some(media_kind) => Some(TelegramMedia::Supported {
+            media_kind,
+            file_id: document.file.id.to_string(),
+            file_unique_id: document.file.unique_id.to_string(),
+            file_size: Some(document.file.size),
+            mime_type,
+            file_name: document.file_name.clone(),
+        }),
+        None => Some(TelegramMedia::UnsupportedDocument {
+            file_name: document.file_name.clone(),
+            mime_type,
+        }),
+    }
+}
+
+fn document_media_kind(mime_type: Option<&str>, file_name: Option<&str>) -> Option<MediaKind> {
+    let mime_type = mime_type.unwrap_or_default().to_ascii_lowercase();
+    if mime_type.starts_with("video/") {
+        return Some(MediaKind::Video);
+    }
+    if mime_type == "image/gif" {
+        return Some(MediaKind::Animation);
+    }
+    if mime_type.starts_with("image/") {
+        return Some(MediaKind::Image);
+    }
+    if mime_type.starts_with("audio/") {
+        return Some(MediaKind::Audio);
+    }
+
+    let extension = file_name
+        .and_then(|name| Path::new(name).extension())
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("gif") => Some(MediaKind::Animation),
+        Some("jpg" | "jpeg" | "png" | "webp" | "avif") => Some(MediaKind::Image),
+        Some("mp4" | "webm" | "mkv" | "mov" | "avi") => Some(MediaKind::Video),
+        Some("mp3" | "m4a" | "wav" | "flac" | "ogg") => Some(MediaKind::Audio),
+        _ => None,
     }
 }
 
@@ -489,6 +738,7 @@ impl CallbackData {
 #[derive(Clone)]
 pub struct TeloxideApi {
     bot: Bot,
+    cloud_download_limit_bytes: Option<u64>,
 }
 
 impl TeloxideApi {
@@ -518,7 +768,12 @@ impl TeloxideApi {
             .timeout(client_timeout)
             .build()
             .map_err(TelegramError::HttpClient)?;
-        Ok(Self { bot: Bot::with_client(token, client).set_api_url(api_base_url) })
+        let cloud_download_limit_bytes = (api_base_url.host_str() == Some("api.telegram.org"))
+            .then_some(TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES);
+        Ok(Self {
+            bot: Bot::with_client(token, client).set_api_url(api_base_url),
+            cloud_download_limit_bytes,
+        })
     }
 
     fn bot(&self) -> Bot {
@@ -528,10 +783,50 @@ impl TeloxideApi {
 
 #[async_trait]
 impl TelegramApi for TeloxideApi {
-    type Error = teloxide::RequestError;
+    type Error = TelegramApiError;
+
+    fn is_retryable_error(error: &Self::Error) -> bool {
+        match error {
+            TelegramApiError::Api(teloxide::RequestError::Api(
+                teloxide::errors::ApiError::Unknown(_),
+            ))
+            | TelegramApiError::Api(teloxide::RequestError::Network(_))
+            | TelegramApiError::Api(teloxide::RequestError::InvalidJson { .. })
+            | TelegramApiError::Api(teloxide::RequestError::RetryAfter(_))
+            | TelegramApiError::Download(teloxide::DownloadError::Network(_)) => true,
+            TelegramApiError::DownloadLimit { .. }
+            | TelegramApiError::Api(_)
+            | TelegramApiError::Download(_)
+            | TelegramApiError::Io(_) => false,
+        }
+    }
 
     async fn send_text(&self, chat_id: i64, text: &str) -> Result<(), Self::Error> {
-        self.bot.send_message(teloxide::types::ChatId(chat_id), text.to_owned()).await.map(|_| ())
+        self.bot
+            .send_message(ChatId(chat_id), text.to_owned())
+            .await
+            .map(|_| ())
+            .map_err(TelegramApiError::Api)
+    }
+
+    async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), Self::Error> {
+        let file = self
+            .bot()
+            .get_file(FileId(file_id.to_owned()))
+            .send()
+            .await
+            .map_err(TelegramApiError::Api)?;
+        let size = u64::from(file.meta.size);
+        if let Some(limit) = self.cloud_download_limit_bytes
+            && size > limit
+        {
+            return Err(TelegramApiError::DownloadLimit { size, limit });
+        }
+        let mut output =
+            tokio::fs::File::create(destination).await.map_err(TelegramApiError::Io)?;
+        teloxide::net::Download::download_file(&self.bot(), &file.path, &mut output)
+            .await
+            .map_err(TelegramApiError::Download)
     }
 }
 
@@ -705,6 +1000,18 @@ mod tests {
                 .push((chat_id, text.to_owned()));
             Ok(())
         }
+
+        async fn download_file(
+            &self,
+            _file_id: &str,
+            _destination: &Path,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn is_retryable_error(_error: &Self::Error) -> bool {
+            false
+        }
     }
 
     #[derive(Clone, Default)]
@@ -716,6 +1023,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockIngestService {
         commands: Arc<Mutex<Vec<UrlIngestCommand>>>,
+        media_commands: Arc<Mutex<Vec<MediaIngestCommand>>>,
         fail: Arc<Mutex<bool>>,
     }
 
@@ -731,6 +1039,17 @@ mod tests {
                 return Err(MockError);
             }
             self.commands.lock().expect("mock mutex should not be poisoned").push(command);
+            Ok(IngestAccepted { request_id: Uuid::from_u128(1), status: "queued".to_owned() })
+        }
+
+        async fn create_media(
+            &self,
+            command: MediaIngestCommand,
+        ) -> Result<IngestAccepted, Self::Error> {
+            if *self.fail.lock().expect("mock mutex should not be poisoned") {
+                return Err(MockError);
+            }
+            self.media_commands.lock().expect("mock mutex should not be poisoned").push(command);
             Ok(IngestAccepted { request_id: Uuid::from_u128(1), status: "queued".to_owned() })
         }
     }
@@ -780,10 +1099,13 @@ mod tests {
     fn message(update_id: i64, user_id: Option<i64>, text: &str) -> IncomingMessage {
         IncomingMessage {
             update_id,
+            message_id: update_id,
             user_id,
             chat_id: 42,
             is_private: true,
             text: Some(text.to_owned()),
+            caption: None,
+            media: None,
         }
     }
 
@@ -889,6 +1211,83 @@ mod tests {
                 "✅ Ingest queued\nID: 00000000-0000-0000-0000-000000000001\nStatus: queued"
                     .to_owned()
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_media_is_downloaded_and_ingested_with_metadata() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        let service =
+            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+        let message = IncomingMessage {
+            update_id: 11,
+            message_id: 99,
+            user_id: Some(123),
+            chat_id: 42,
+            is_private: true,
+            text: None,
+            caption: Some("a caption".to_owned()),
+            media: Some(TelegramMedia::Supported {
+                media_kind: MediaKind::Video,
+                file_id: "file-id".to_owned(),
+                file_unique_id: "unique-id".to_owned(),
+                file_size: Some(1234),
+                mime_type: Some("video/webm".to_owned()),
+                file_name: Some("clip.webm".to_owned()),
+            }),
+        };
+
+        assert_eq!(
+            service.handle_message(message).await.unwrap(),
+            HandleOutcome::Responded(Command::Add)
+        );
+        assert_eq!(
+            ingest.media_commands.lock().unwrap().as_slice(),
+            &[MediaIngestCommand {
+                update_id: 11,
+                message_id: 99,
+                chat_id: 42,
+                submitted_by_user_id: 123,
+                media_kind: MediaKind::Video,
+                file_id: "file-id".to_owned(),
+                file_unique_id: "unique-id".to_owned(),
+                file_size: Some(1234),
+                mime_type: Some("video/webm".to_owned()),
+                file_name: Some("clip.webm".to_owned()),
+                caption: Some("a caption".to_owned()),
+                local_work_path: telegram_download_path(11),
+                idempotency_key: "telegram:update:11:v1".to_owned(),
+            }]
+        );
+        assert_eq!(api.messages.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unsupported_telegram_document_is_rejected_without_download() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        let service =
+            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+        let message = IncomingMessage {
+            update_id: 12,
+            message_id: 100,
+            user_id: Some(123),
+            chat_id: 42,
+            is_private: true,
+            text: None,
+            caption: None,
+            media: Some(TelegramMedia::UnsupportedDocument {
+                file_name: Some("archive.zip".to_owned()),
+                mime_type: Some("application/zip".to_owned()),
+            }),
+        };
+
+        assert_eq!(service.handle_message(message).await.unwrap(), HandleOutcome::MediaRejected);
+        assert!(ingest.media_commands.lock().unwrap().is_empty());
+        assert_eq!(
+            api.messages.lock().unwrap().as_slice(),
+            &[(42, "⚠️ Unsupported Telegram document: archive.zip (application/zip)".to_owned())]
         );
     }
 
@@ -1015,11 +1414,38 @@ mod tests {
     }
 
     #[test]
+    fn cloud_bot_api_limit_is_only_applied_to_cloud_endpoint() {
+        let cloud =
+            TeloxideApi::new("test-token", "https://api.telegram.org", Duration::from_secs(1))
+                .expect("cloud Bot API URL should be accepted");
+        assert_eq!(cloud.cloud_download_limit_bytes, Some(20 * 1024 * 1024));
+
+        let local =
+            TeloxideApi::new("test-token", "http://telegram-bot-api:8081", Duration::from_secs(1))
+                .expect("Local Bot API URL should be accepted");
+        assert_eq!(local.cloud_download_limit_bytes, None);
+    }
+
+    #[test]
     fn command_parser_accepts_bot_suffix_and_rejects_other_text() {
         assert_eq!(parse_command("/start@sooqa_bot"), Some(Command::Start));
         assert_eq!(parse_command("/HELP extra"), Some(Command::Help));
         assert_eq!(parse_command("hello /status"), None);
         assert_eq!(parse_command("/add"), Some(Command::Add));
+    }
+
+    #[test]
+    fn document_media_kind_uses_mime_then_safe_filename_fallback() {
+        assert_eq!(
+            document_media_kind(Some("video/mp4"), Some("not-video.txt")),
+            Some(MediaKind::Video)
+        );
+        assert_eq!(document_media_kind(None, Some("clip.WEBM")), Some(MediaKind::Video));
+        assert_eq!(
+            document_media_kind(Some("image/gif"), Some("animation.bin")),
+            Some(MediaKind::Animation)
+        );
+        assert_eq!(document_media_kind(Some("application/zip"), Some("archive.zip")), None);
     }
 
     #[test]

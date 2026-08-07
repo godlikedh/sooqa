@@ -82,7 +82,12 @@ impl InboxRepository {
             .transition_to(IngestStatus::Queued)
             .expect("received ingest requests must be queueable");
         insert_request(&mut transaction, &request).await?;
-        insert_inspect_job(&mut transaction, &request).await?;
+        match request.kind {
+            IngestKind::Url => insert_inspect_job(&mut transaction, &request).await?,
+            IngestKind::TelegramMessage | IngestKind::Upload => {
+                insert_probe_job(&mut transaction, &request).await?
+            }
+        }
 
         transaction.commit().await?;
         Ok(CreateIngestResult { request, created: true })
@@ -282,6 +287,25 @@ async fn insert_inspect_job(
     .bind(job.job_type().as_str())
     .bind(job.payload_json())
     .bind(format!("ingest:{}:inspect_source:v1", request.id))
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn insert_probe_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &IngestRequest,
+) -> Result<(), sqlx::Error> {
+    let job = NewJob::probe_asset(request.id);
+    sqlx::query(
+        r#"
+        INSERT INTO jobs (job_type, payload_json, idempotency_key)
+        VALUES ($1, $2, $3)
+        "#,
+    )
+    .bind(job.job_type().as_str())
+    .bind(job.payload_json())
+    .bind(format!("ingest:{}:probe_asset:v1", request.id))
     .execute(&mut **transaction)
     .await?;
     Ok(())

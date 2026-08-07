@@ -65,6 +65,15 @@ but callback buttons and status refreshes are not implemented yet. Responses
 are rate-limited per user/chat, and unauthorized attempts produce structured
 warnings without message contents or secrets.
 
+H4 also accepts photo, video, animation, audio, and recognizable document
+messages from the same administrators. The adapter downloads them through the
+configured Bot API, preserves Telegram message/file metadata and captions in
+the Inbox request, and enqueues a typed `probe_asset` job. Telegram's cloud
+Bot API limit of 20 MiB is rejected before download; a Local Bot API Server is
+used when configured through `api_base_url` and is not subject to that
+cloud-only check. Unsupported document types receive a warning and do not
+create an ingest request.
+
 The adapter tests use a mocked API and receipt store, so they do not contact
 Telegram:
 
@@ -73,6 +82,17 @@ Telegram:
 H3 storage tests use a mocked Telegram API and a fake upload store:
 
     cargo test -p sooqa-telegram storage
+
+H4 direct media tests use the mocked Telegram API and exercise metadata
+preservation, document type detection, idempotent update handling, and
+unsupported-document rejection:
+
+    cargo test -p sooqa-telegram authorized_media
+
+The PostgreSQL-backed H4 persistence test verifies that a Telegram submission
+creates one `telegram_message` request and one idempotent `probe_asset` job:
+
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --test ingest creates_telegram_ingest_and_probe_job_atomically -- --ignored
 
 The storage provider requires a negative Telegram chat ID, loads the canonical
 asset hash from PostgreSQL, hashes the local file before upload, and persists

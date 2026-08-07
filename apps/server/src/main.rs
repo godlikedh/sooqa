@@ -4,12 +4,15 @@ use std::error::Error;
 
 use axum::Router;
 use sooqa_config::{AppConfig, AppRole, CliCommand, CliOptions, ConfigError};
-use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, IngestValidationError, SubmittedVia};
+use sooqa_inbox::{
+    IngestSubmission, IngestSubmissionInput, IngestValidationError, SubmittedVia,
+    TelegramSubmissionInput,
+};
 use sooqa_persistence::InboxRepository;
 use sooqa_persistence::{TelegramRepository, TelegramRepositoryError};
 use sooqa_telegram::{
-    IngestAccepted, IngestService, TelegramRuntime, UpdateClaim, UpdateClaimResult, UpdateStore,
-    UrlIngestCommand,
+    IngestAccepted, IngestService, MediaIngestCommand, TelegramRuntime, UpdateClaim,
+    UpdateClaimResult, UpdateStore, UrlIngestCommand,
 };
 use tokio::net::TcpListener;
 
@@ -115,6 +118,40 @@ impl IngestService for DatabaseIngestService {
         let mut input = IngestSubmissionInput::new(command.source_url, SubmittedVia::TelegramBot);
         input.idempotency_key = Some(command.idempotency_key);
         let submission = IngestSubmission::try_new(input)?;
+        let result = self.repository.create_ingest(submission).await?;
+        Ok(IngestAccepted {
+            request_id: result.request.id,
+            status: result.request.status.as_str().to_owned(),
+        })
+    }
+
+    async fn create_media(
+        &self,
+        command: MediaIngestCommand,
+    ) -> Result<IngestAccepted, Self::Error> {
+        let source_reference = format!("telegram://{}/{}", command.chat_id, command.message_id);
+        let original_input = serde_json::json!({
+            "source_type": "telegram",
+            "telegram_update_id": command.update_id,
+            "telegram_chat_id": command.chat_id,
+            "telegram_message_id": command.message_id,
+            "telegram_user_id": command.submitted_by_user_id,
+            "telegram_file_id": command.file_id,
+            "telegram_file_unique_id": command.file_unique_id,
+            "file_size": command.file_size,
+            "mime_type": command.mime_type,
+            "file_name": command.file_name,
+            "media_kind": command.media_kind.as_str(),
+            "local_work_path": command.local_work_path,
+        });
+        let submission = IngestSubmission::try_new_telegram(TelegramSubmissionInput {
+            source_reference,
+            submitted_via: SubmittedVia::TelegramBot,
+            submitted_by_admin_id: None,
+            original_input,
+            supplied_caption: command.caption,
+            idempotency_key: Some(command.idempotency_key),
+        })?;
         let result = self.repository.create_ingest(submission).await?;
         Ok(IngestAccepted {
             request_id: result.request.id,

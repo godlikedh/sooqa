@@ -1,6 +1,8 @@
 use std::env;
 
-use sooqa_inbox::{IngestStatus, IngestSubmission, IngestSubmissionInput, SubmittedVia};
+use sooqa_inbox::{
+    IngestStatus, IngestSubmission, IngestSubmissionInput, SubmittedVia, TelegramSubmissionInput,
+};
 use sooqa_persistence::{Database, InboxRepositoryError};
 use uuid::Uuid;
 
@@ -8,6 +10,24 @@ fn submission(url: &str, key: &str) -> IngestSubmission {
     let mut input = IngestSubmissionInput::new(url, SubmittedVia::Api);
     input.idempotency_key = Some(key.to_owned());
     IngestSubmission::try_new(input).expect("submission should be valid")
+}
+
+fn telegram_submission(key: &str) -> IngestSubmission {
+    IngestSubmission::try_new_telegram(TelegramSubmissionInput {
+        source_reference: "telegram://42/99".to_owned(),
+        submitted_via: SubmittedVia::TelegramBot,
+        submitted_by_admin_id: None,
+        original_input: serde_json::json!({
+            "telegram_chat_id": 42,
+            "telegram_message_id": 99,
+            "telegram_file_unique_id": "unique-file",
+            "media_kind": "video",
+            "local_work_path": "/tmp/sooqa-telegram-11.bin",
+        }),
+        supplied_caption: Some("caption".to_owned()),
+        idempotency_key: Some(key.to_owned()),
+    })
+    .expect("Telegram submission should be valid")
 }
 
 async fn clean_up(database: &Database, key_prefix: &str) {
@@ -109,6 +129,53 @@ async fn creates_ingest_and_inspect_job_atomically_with_idempotency() {
         Err(InboxRepositoryError::IdempotencyConflict { key: conflict_key })
             if conflict_key == key
     ));
+
+    clean_up(&database, &key_prefix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn creates_telegram_ingest_and_probe_job_atomically() {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let key_prefix = format!("h4-{}-", Uuid::new_v4());
+    clean_up(&database, &key_prefix).await;
+    let key = format!("{}telegram", key_prefix);
+    let first = database
+        .inbox()
+        .create_ingest(telegram_submission(&key))
+        .await
+        .expect("Telegram ingest should be created");
+
+    assert!(first.created);
+    assert_eq!(first.request.kind.as_str(), "telegram_message");
+    assert_eq!(first.request.status, IngestStatus::Queued);
+    assert_eq!(first.request.source_url, "telegram://42/99");
+    assert_eq!(first.request.supplied_caption.as_deref(), Some("caption"));
+    assert_eq!(first.request.original_input["telegram_file_unique_id"], "unique-file");
+
+    let (job_type, payload, job_key): (String, serde_json::Value, String) = sqlx::query_as(
+        "SELECT job_type, payload_json, idempotency_key FROM jobs WHERE payload_json->>'ingest_request_id' = $1",
+    )
+    .bind(first.request.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("probe job should exist");
+    assert_eq!(job_type, "probe_asset");
+    assert_eq!(payload["ingest_request_id"], first.request.id.to_string());
+    assert_eq!(job_key, format!("ingest:{}:probe_asset:v1", first.request.id));
+
+    let repeated = database
+        .inbox()
+        .create_ingest(telegram_submission(&key))
+        .await
+        .expect("repeated Telegram ingest should be idempotent");
+    assert!(!repeated.created);
+    assert_eq!(repeated.request.id, first.request.id);
 
     clean_up(&database, &key_prefix).await;
 }

@@ -68,11 +68,15 @@ configured. It ignores group messages, rejects non-admin private users with a
 generic response, and supports `/start`, `/help`, `/add`, and `/status` for
 configured admins. `/add <url>` and a bare single-URL message create the same
 durable Inbox request as the HTTP API; the response includes its request ID
-and status. Update receipts are retained as durable deduplication records. A
-five-minute claim lease allows an abandoned in-progress update to be reclaimed;
-failed API or Inbox calls release their claim immediately. URL source
-inspection, downloading, media processing, and channel publication remain
-later Telegram slices.
+and status. Update receipts are retained as durable deduplication records.
+Failed API or Inbox calls release their claim immediately. Photo, video,
+animation, audio, and recognizable document messages are downloaded into a
+temporary work path and create a durable Telegram ingest request plus a
+`probe_asset` job. The standard cloud Bot API rejects files over 20 MiB before
+download; configure a Local Bot API Server in `SOOQA_TELEGRAM_API_BASE_URL`
+when larger downloads are required. Unsupported documents are rejected with a
+warning. Media probing/normalization orchestration and channel publication
+remain later slices.
 
 For H3 storage, make the bot an administrator of a private storage channel and
 set `SOOQA_TELEGRAM_STORAGE_CHAT_ID` to its negative chat ID. The server checks
