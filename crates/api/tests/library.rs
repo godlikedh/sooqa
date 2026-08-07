@@ -237,7 +237,7 @@ async fn authenticated_library_api_supports_search_edit_tags_and_archive() {
     let first_page = app(&fixture)
         .oneshot(request(
             "GET",
-            "/api/v1/library/items?limit=1".to_owned(),
+            "/api/v1/library/items?q=Reaction&limit=1".to_owned(),
             &fixture.read_token,
             None,
         ))
@@ -251,7 +251,7 @@ async fn authenticated_library_api_supports_search_edit_tags_and_archive() {
     let second_page = app(&fixture)
         .oneshot(request(
             "GET",
-            format!("/api/v1/library/items?limit=1&cursor={cursor}"),
+            format!("/api/v1/library/items?q=Reaction&limit=1&cursor={cursor}"),
             &fixture.read_token,
             None,
         ))
