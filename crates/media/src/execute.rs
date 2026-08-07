@@ -1,0 +1,550 @@
+use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::{
+    CommandError, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommandRunner, FfprobeAdapter, FileDigest,
+    HashError, MediaProbe, MediaStreamKind, NormalizationPlan, ProbeError, sha256_file,
+};
+
+const MAX_PROGRESS_LINE_BYTES: usize = 4096;
+const MAX_PROGRESS_LINES: usize = 4096;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FfmpegProgressState {
+    Continue,
+    End,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FfmpegProgress {
+    pub frame: Option<u64>,
+    pub out_time_ms: Option<i64>,
+    pub state: FfmpegProgressState,
+}
+
+pub fn parse_ffmpeg_progress(output: &[u8]) -> Result<FfmpegProgress, ProgressError> {
+    let output = std::str::from_utf8(output).map_err(|_| ProgressError::InvalidUtf8)?;
+    let mut frame = None;
+    let mut out_time_ms = None;
+    let mut state = None;
+    let mut line_count = 0;
+
+    for line in output.lines() {
+        line_count += 1;
+        if line_count > MAX_PROGRESS_LINES {
+            return Err(ProgressError::TooManyLines { limit: MAX_PROGRESS_LINES });
+        }
+        if line.len() > MAX_PROGRESS_LINE_BYTES {
+            return Err(ProgressError::LineTooLong { limit: MAX_PROGRESS_LINE_BYTES });
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(ProgressError::InvalidLine(line.to_owned()));
+        };
+        match key {
+            "frame" => frame = parse_optional_u64(value, "frame")?,
+            "out_time_ms" => out_time_ms = parse_optional_i64(value, "out_time_ms")?,
+            "progress" => {
+                state = Some(match value {
+                    "continue" => FfmpegProgressState::Continue,
+                    "end" => FfmpegProgressState::End,
+                    _ => {
+                        return Err(ProgressError::InvalidValue {
+                            field: "progress",
+                            value: value.to_owned(),
+                        });
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    match state {
+        Some(state) => Ok(FfmpegProgress { frame, out_time_ms, state }),
+        None => Err(ProgressError::MissingState),
+    }
+}
+
+fn parse_optional_u64(value: &str, field: &'static str) -> Result<Option<u64>, ProgressError> {
+    if value == "N/A" {
+        return Ok(None);
+    }
+    value
+        .parse()
+        .map(Some)
+        .map_err(|_| ProgressError::InvalidValue { field, value: value.to_owned() })
+}
+
+fn parse_optional_i64(value: &str, field: &'static str) -> Result<Option<i64>, ProgressError> {
+    if value == "N/A" {
+        return Ok(None);
+    }
+    value
+        .parse()
+        .map(Some)
+        .map_err(|_| ProgressError::InvalidValue { field, value: value.to_owned() })
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NormalizationResult {
+    pub output_path: PathBuf,
+    pub progress: FfmpegProgress,
+    pub probe: MediaProbe,
+    pub digest: FileDigest,
+}
+
+#[derive(Clone)]
+pub struct FfmpegExecutor {
+    runner: Arc<dyn ExternalCommandRunner>,
+    ffprobe: FfprobeAdapter,
+    timeout: Duration,
+    max_output_bytes: usize,
+}
+
+impl FfmpegExecutor {
+    pub fn new(
+        runner: Arc<dyn ExternalCommandRunner>,
+        ffprobe_executable: impl Into<PathBuf>,
+        timeout: Duration,
+    ) -> Self {
+        let max_output_bytes = DEFAULT_MAX_OUTPUT_BYTES;
+        let ffprobe = FfprobeAdapter::with_runner(
+            ffprobe_executable,
+            timeout,
+            max_output_bytes,
+            Arc::clone(&runner),
+        );
+        Self { runner, ffprobe, timeout, max_output_bytes }
+    }
+
+    pub fn with_runner(
+        runner: Arc<dyn ExternalCommandRunner>,
+        ffprobe: FfprobeAdapter,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Self {
+        Self { runner, ffprobe, timeout, max_output_bytes }
+    }
+
+    pub async fn execute<F>(
+        &self,
+        plan: &NormalizationPlan,
+        cancellation: F,
+    ) -> Result<NormalizationResult, NormalizationExecutionError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        let command = plan
+            .command_with_progress()
+            .timeout(self.timeout)
+            .max_output_bytes(self.max_output_bytes);
+        tokio::pin!(cancellation);
+        let command_output = tokio::select! {
+            result = self.runner.run(command) => result.map_err(NormalizationExecutionError::Command)?,
+            _ = &mut cancellation => return Err(NormalizationExecutionError::Cancelled),
+        };
+
+        if command_output.stdout_truncated || command_output.stderr_truncated {
+            return Err(NormalizationExecutionError::OutputLimitExceeded {
+                limit: self.max_output_bytes,
+            });
+        }
+        if !command_output.success {
+            return Err(NormalizationExecutionError::ProcessFailed {
+                exit_code: command_output.exit_code,
+                stderr: bounded_text(&command_output.stderr),
+            });
+        }
+        let progress = parse_ffmpeg_progress(&command_output.stdout)?;
+        if progress.state != FfmpegProgressState::End {
+            return Err(NormalizationExecutionError::ProgressDidNotEnd);
+        }
+
+        let output_path = plan.output().to_owned();
+        let metadata = tokio::fs::metadata(&output_path).await.map_err(|source| {
+            NormalizationExecutionError::OutputFile { path: output_path.clone(), source }
+        })?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(NormalizationExecutionError::InvalidOutput { path: output_path });
+        }
+
+        let probe = self.ffprobe.probe(&output_path).await?;
+        validate_output_probe(&probe)?;
+        let digest = sha256_file(&output_path).await?;
+        Ok(NormalizationResult { output_path, progress, probe, digest })
+    }
+}
+
+fn validate_output_probe(probe: &MediaProbe) -> Result<(), NormalizationExecutionError> {
+    let is_mp4 = probe.container_format.as_deref().is_some_and(|value| {
+        value.split(',').any(|format| {
+            let format = format.trim();
+            format.eq_ignore_ascii_case("mp4") || format.eq_ignore_ascii_case("mov")
+        })
+    });
+    if !is_mp4 {
+        return Err(NormalizationExecutionError::InvalidOutputFormat {
+            format: probe.container_format.clone(),
+        });
+    }
+    if !probe.streams.iter().any(|stream| stream.kind == MediaStreamKind::Video) {
+        return Err(NormalizationExecutionError::OutputHasNoVideo);
+    }
+    Ok(())
+}
+
+fn bounded_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_owned()
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Error)]
+pub enum ProgressError {
+    #[error("ffmpeg progress output was not valid UTF-8")]
+    InvalidUtf8,
+    #[error("ffmpeg progress output line exceeded the {limit}-byte limit")]
+    LineTooLong { limit: usize },
+    #[error("ffmpeg progress output exceeded the {limit}-line limit")]
+    TooManyLines { limit: usize },
+    #[error("ffmpeg progress output line is invalid: {0}")]
+    InvalidLine(String),
+    #[error("ffmpeg progress field {field} contained invalid value {value:?}")]
+    InvalidValue { field: &'static str, value: String },
+    #[error("ffmpeg progress output did not contain a progress state")]
+    MissingState,
+}
+
+#[derive(Debug, Error)]
+pub enum NormalizationExecutionError {
+    #[error("ffmpeg command failed: {0}")]
+    Command(#[source] CommandError),
+    #[error("normalization was cancelled")]
+    Cancelled,
+    #[error("ffmpeg output exceeded the {limit}-byte capture limit")]
+    OutputLimitExceeded { limit: usize },
+    #[error("ffmpeg exited unsuccessfully with status {exit_code:?}: {stderr}")]
+    ProcessFailed { exit_code: Option<i32>, stderr: String },
+    #[error("could not parse ffmpeg progress: {0}")]
+    Progress(#[from] ProgressError),
+    #[error("ffmpeg progress did not end successfully")]
+    ProgressDidNotEnd,
+    #[error("could not inspect normalized output {path}: {source}")]
+    OutputFile { path: PathBuf, source: std::io::Error },
+    #[error("normalized output is missing or empty: {path}")]
+    InvalidOutput { path: PathBuf },
+    #[error("normalized output has an unsupported container: {format:?}")]
+    InvalidOutputFormat { format: Option<String> },
+    #[error("normalized output contains no video stream")]
+    OutputHasNoVideo,
+    #[error("could not validate normalized output: {0}")]
+    Probe(#[from] ProbeError),
+    #[error("could not hash normalized output: {0}")]
+    Hash(#[from] HashError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
+    use async_trait::async_trait;
+    use tokio::time::sleep;
+
+    use super::*;
+    use crate::{
+        CanonicalVideoProfile, ExternalCommand, ExternalCommandOutput, FrameRate, MediaStream,
+        NormalizationPlanner,
+    };
+
+    const PROBE_JSON: &[u8] = br#"{
+      "streams": [{
+        "index": 0,
+        "codec_type": "video",
+        "codec_name": "h264",
+        "profile": "High",
+        "pix_fmt": "yuv420p",
+        "width": 320,
+        "height": 240,
+        "avg_frame_rate": "25/1",
+        "bit_rate": "100000"
+      }],
+      "format": {
+        "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+        "duration": "1.000000",
+        "size": "8",
+        "bit_rate": "100000"
+      }
+    }"#;
+
+    #[derive(Clone)]
+    struct SequenceRunner {
+        commands: Arc<Mutex<Vec<ExternalCommand>>>,
+        outputs: Arc<Mutex<VecDeque<Result<ExternalCommandOutput, CommandError>>>>,
+    }
+
+    impl SequenceRunner {
+        fn new(outputs: Vec<Result<ExternalCommandOutput, CommandError>>) -> Self {
+            Self {
+                commands: Arc::new(Mutex::new(Vec::new())),
+                outputs: Arc::new(Mutex::new(outputs.into_iter().collect())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExternalCommandRunner for SequenceRunner {
+        async fn run(
+            &self,
+            command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            self.commands.lock().expect("commands mutex should not be poisoned").push(command);
+            self.outputs
+                .lock()
+                .expect("outputs mutex should not be poisoned")
+                .pop_front()
+                .expect("test runner should have an output")
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct BlockingRunner;
+
+    #[async_trait]
+    impl ExternalCommandRunner for BlockingRunner {
+        async fn run(
+            &self,
+            _command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            std::future::pending().await
+        }
+    }
+
+    fn planner() -> NormalizationPlanner {
+        NormalizationPlanner::new("ffmpeg", CanonicalVideoProfile::default())
+            .expect("default profile should be valid")
+    }
+
+    fn probe() -> MediaProbe {
+        MediaProbe {
+            container_format: Some("mp4".to_owned()),
+            duration_ms: Some(1_000),
+            size_bytes: 8,
+            bit_rate: Some(100_000),
+            streams: vec![MediaStream {
+                index: 0,
+                kind: MediaStreamKind::Video,
+                codec: Some("h264".to_owned()),
+                profile: Some("High".to_owned()),
+                pixel_format: Some("yuv420p".to_owned()),
+                width: Some(320),
+                height: Some(240),
+                display_aspect_ratio: Some("4:3".to_owned()),
+                frame_rate: Some(FrameRate { numerator: 25, denominator: 1 }),
+                rotation_degrees: Some(0),
+                sample_rate_hz: None,
+                channels: None,
+                bit_rate: Some(100_000),
+            }],
+        }
+    }
+
+    fn success(stdout: &[u8]) -> Result<ExternalCommandOutput, CommandError> {
+        Ok(ExternalCommandOutput {
+            success: true,
+            exit_code: Some(0),
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        })
+    }
+
+    #[test]
+    fn parses_bounded_progress_and_keeps_last_values() {
+        let progress = parse_ffmpeg_progress(
+            b"frame=12\nout_time_ms=400000\nprogress=continue\nframe=24\nout_time_ms=800000\nprogress=end\n",
+        )
+        .expect("progress should parse");
+        assert_eq!(progress.frame, Some(24));
+        assert_eq!(progress.out_time_ms, Some(800000));
+        assert_eq!(progress.state, FfmpegProgressState::End);
+    }
+
+    #[test]
+    fn rejects_unbounded_progress_lines_and_missing_final_state() {
+        assert!(matches!(
+            parse_ffmpeg_progress(&vec![b'x'; MAX_PROGRESS_LINE_BYTES + 1]),
+            Err(ProgressError::LineTooLong { .. })
+        ));
+        assert_eq!(parse_ffmpeg_progress(b"frame=1\n"), Err(ProgressError::MissingState));
+    }
+
+    #[tokio::test]
+    async fn executes_plan_probes_output_and_hashes_it() {
+        let output_path =
+            std::env::temp_dir().join(format!("sooqa-normalized-{}.mp4", uuid::Uuid::new_v4()));
+        tokio::fs::write(&output_path, b"canonical output")
+            .await
+            .expect("output should be writable");
+        let runner = Arc::new(SequenceRunner::new(vec![
+            success(b"frame=25\nout_time_ms=1000000\nprogress=end\n"),
+            success(PROBE_JSON),
+        ]));
+        let ffprobe = FfprobeAdapter::with_runner(
+            "ffprobe",
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+        );
+        let executor = FfmpegExecutor::with_runner(
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            ffprobe,
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        let plan = planner().plan("input.mp4", &output_path, &probe()).expect("plan should build");
+
+        let result = executor
+            .execute(&plan, std::future::pending())
+            .await
+            .expect("execution should succeed");
+        assert_eq!(result.output_path, output_path);
+        assert_eq!(result.progress.state, FfmpegProgressState::End);
+        assert_eq!(result.probe.container_format.as_deref(), Some("mov,mp4,m4a,3gp,3g2,mj2"));
+        assert_eq!(result.digest.bytes, b"canonical output".len() as u64);
+        assert_eq!(runner.commands.lock().expect("commands mutex should not be poisoned").len(), 2);
+        let ffmpeg_args = runner.commands.lock().expect("commands mutex should not be poisoned")[0]
+            .args()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(ffmpeg_args.windows(2).any(|pair| pair == ["-progress", "pipe:1"]));
+        tokio::fs::remove_file(output_path).await.expect("output should be removed");
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_waiting_for_ffmpeg() {
+        let runner: Arc<dyn ExternalCommandRunner> = Arc::new(BlockingRunner);
+        let ffprobe = FfprobeAdapter::with_runner(
+            "ffprobe",
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+            Arc::clone(&runner),
+        );
+        let executor = FfmpegExecutor::with_runner(
+            Arc::clone(&runner),
+            ffprobe,
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        let output =
+            std::env::temp_dir().join(format!("sooqa-cancel-{}.mp4", uuid::Uuid::new_v4()));
+        let plan = planner().plan("input.mp4", &output, &probe()).expect("plan should build");
+
+        let error = executor
+            .execute(&plan, sleep(Duration::from_millis(10)))
+            .await
+            .expect_err("cancellation should stop execution");
+        assert!(matches!(error, NormalizationExecutionError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn process_failure_is_reported_without_probing_or_hashing() {
+        let runner = Arc::new(SequenceRunner::new(vec![Ok(ExternalCommandOutput {
+            success: false,
+            exit_code: Some(1),
+            stdout: Vec::new(),
+            stderr: b"encoder failed".to_vec(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        })]));
+        let ffprobe = FfprobeAdapter::with_runner(
+            "ffprobe",
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+        );
+        let executor = FfmpegExecutor::with_runner(
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            ffprobe,
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        let output =
+            std::env::temp_dir().join(format!("sooqa-failure-{}.mp4", uuid::Uuid::new_v4()));
+        let plan = planner().plan("input.mp4", &output, &probe()).expect("plan should build");
+
+        let error = executor
+            .execute(&plan, std::future::pending())
+            .await
+            .expect_err("failure should be reported");
+        assert!(matches!(
+            error,
+            NormalizationExecutionError::ProcessFailed { exit_code: Some(1), .. }
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe installed on the test host"]
+    async fn executes_generated_mp4_with_real_ffmpeg_and_ffprobe() {
+        let input =
+            std::env::temp_dir().join(format!("sooqa-generated-{}.mp4", uuid::Uuid::new_v4()));
+        let output =
+            std::env::temp_dir().join(format!("sooqa-canonical-{}.mp4", uuid::Uuid::new_v4()));
+        let runner: Arc<dyn ExternalCommandRunner> = Arc::new(crate::ProcessCommandRunner);
+        let generated = ExternalCommand::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("testsrc=size=320x240:rate=25")
+            .arg("-t")
+            .arg("1")
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-an")
+            .arg(&input);
+        runner.run(generated).await.expect("generated fixture should be created");
+
+        let ffprobe = FfprobeAdapter::with_runner(
+            "ffprobe",
+            Duration::from_secs(30),
+            DEFAULT_MAX_OUTPUT_BYTES,
+            Arc::clone(&runner),
+        );
+        let input_probe = ffprobe.probe(&input).await.expect("generated input should probe");
+        let planner = NormalizationPlanner::new("ffmpeg", CanonicalVideoProfile::default())
+            .expect("default profile should be valid");
+        let plan = planner.plan(&input, &output, &input_probe).expect("plan should build");
+        let executor = FfmpegExecutor::with_runner(
+            Arc::clone(&runner),
+            ffprobe,
+            Duration::from_secs(30),
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        let result = executor
+            .execute(&plan, std::future::pending())
+            .await
+            .expect("generated media should normalize");
+        assert!(result.digest.bytes > 0);
+        assert_eq!(result.progress.state, FfmpegProgressState::End);
+        assert!(result.probe.streams.iter().any(|stream| stream.kind == MediaStreamKind::Video));
+
+        let _ = tokio::fs::remove_file(input).await;
+        let _ = tokio::fs::remove_file(output).await;
+    }
+}

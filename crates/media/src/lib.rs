@@ -14,6 +14,7 @@ use uuid::Uuid;
 mod command;
 mod diagnostics;
 mod direct_http;
+mod execute;
 mod ffprobe;
 mod hashing;
 mod normalize;
@@ -26,6 +27,10 @@ pub use command::{
 };
 pub use diagnostics::{BinaryCheck, BinaryDiagnostic, diagnose_binaries};
 pub use direct_http::{DirectHttpDownloader, HostResolver, ResolvedAddress};
+pub use execute::{
+    FfmpegExecutor, FfmpegProgress, FfmpegProgressState, NormalizationExecutionError,
+    NormalizationResult, ProgressError, parse_ffmpeg_progress,
+};
 pub use ffprobe::{
     FfprobeAdapter, FrameRate, MediaProbe, MediaStream, MediaStreamKind, ProbeError,
     parse_probe_json,

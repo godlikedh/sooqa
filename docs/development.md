@@ -75,7 +75,28 @@ size. Its Unix fake-executable test verifies that URLs, format strings, and
 paths are not shell-interpolated. Normal CI does not contact live third-party
 sites.
 
-Production normalization execution and media-job wiring remain later slices.
+## Normalization execution
+
+F2 adds `FfmpegExecutor` for running a planner result. It adds
+`-progress pipe:1`, bounds captured output, reports process failures and
+cancellation, requires a final `progress=end` record, validates the generated
+MP4 with ffprobe, and hashes it incrementally. The executor should be called
+before opening the short persistence transaction; database transactions must
+not span ffmpeg, ffprobe, or hashing.
+
+Run its focused tests with:
+
+    cargo test -p sooqa-media execute::tests
+
+The generated-media test is intentionally ignored in normal runs because it
+requires local ffmpeg and ffprobe binaries. Run it explicitly with:
+
+    cargo test -p sooqa-media execute::tests::executes_generated_mp4_with_real_ffmpeg_and_ffprobe -- --ignored
+
+After successful execution, convert the digest to the library's 32-byte SHA
+representation and call `LibraryRepository::record_canonical_asset`. That
+method is idempotent for a replay of the same content and digest and rejects a
+canonical digest already attached to another content item.
 
 ## Normalization planner
 
