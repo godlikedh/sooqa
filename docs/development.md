@@ -45,7 +45,10 @@ not send a second response. Claims have lease tokens and are completed only
 after a response succeeds; a failed response releases the claim for retry.
 The polling loop advances Telegram's offset only after the update handler
 succeeds, so a transient response or persistence failure is retried in the
-same process.
+same process. Each handler gets five bounded attempts; a still-failing update
+stops the runtime without advancing the offset, allowing a supervisor restart
+to reclaim it. Transient `getUpdates` failures use the same offset and a short
+backoff.
 The initial authorized commands are `/start`, `/help`, and `/status`; only
 private messages from configured administrator IDs are handled. Responses are
 rate-limited per user/chat, and unauthorized attempts produce structured

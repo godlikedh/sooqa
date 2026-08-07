@@ -24,6 +24,8 @@ pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorizat
 pub const STATUS_RESPONSE: &str = "sooqa is online.";
 pub const UNAUTHORIZED_RESPONSE: &str = "This bot is restricted to its configured administrator.";
 const RESPONSE_RATE_LIMIT: Duration = Duration::from_secs(1);
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_HANDLER_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct IncomingMessage {
@@ -340,8 +342,6 @@ where
     }
 
     pub async fn run(self) -> Result<(), TelegramError> {
-        const RETRY_DELAY: Duration = Duration::from_secs(1);
-
         self.api
             .bot()
             .delete_webhook()
@@ -365,24 +365,69 @@ where
                     .offset(offset)
                     .timeout(self.poll_timeout.as_secs() as u32)
                     .send() => {
-                    let updates = result.map_err(|error| TelegramError::Api(Box::new(error)))?;
-                    let mut retry = false;
-                    for update in updates {
-                        let next_offset = update.id.as_offset();
-                        if let Err(error) = service.handle_update(update).await {
-                            tracing::warn!(?error, offset, "Telegram update handling failed; retaining polling offset for retry");
-                            retry = true;
-                            break;
+                    match result {
+                        Ok(updates) => {
+                            for update in updates {
+                                offset = handle_update_with_retries(&service, update).await?;
+                            }
                         }
-                        offset = next_offset;
-                    }
-                    if retry {
-                        tokio::time::sleep(RETRY_DELAY).await;
+                        Err(error) => {
+                            let error = TelegramError::Api(Box::new(error));
+                            if is_terminal_bot_error(&error) {
+                                return Err(error);
+                            }
+                            tracing::warn!(?error, offset, "Telegram polling failed; retaining offset for retry");
+                            tokio::time::sleep(retry_delay(&error)).await;
+                        }
                     }
                 }
             }
         }
     }
+}
+
+async fn handle_update_with_retries<A, S>(
+    service: &TelegramService<A, S>,
+    update: Update,
+) -> Result<i32, TelegramError>
+where
+    A: TelegramApi,
+    S: UpdateStore,
+{
+    for attempt in 1..=MAX_HANDLER_ATTEMPTS {
+        match service.handle_update(update.clone()).await {
+            Ok(_) => return Ok(update.id.as_offset()),
+            Err(error) if attempt < MAX_HANDLER_ATTEMPTS => {
+                tracing::warn!(
+                    ?error,
+                    update_id = update.id.0,
+                    attempt,
+                    "Telegram update handling failed; retrying before advancing offset"
+                );
+                tokio::time::sleep(retry_delay(&error)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the bounded Telegram retry loop always returns")
+}
+
+fn is_terminal_bot_error(error: &TelegramError) -> bool {
+    let TelegramError::Api(source) = error else { return false };
+    source.downcast_ref::<teloxide::RequestError>().is_some_and(|error| {
+        matches!(error, teloxide::RequestError::Api(teloxide::ApiError::InvalidToken))
+    })
+}
+
+fn retry_delay(error: &TelegramError) -> Duration {
+    let TelegramError::Api(source) = error else { return RETRY_DELAY };
+    source
+        .downcast_ref::<teloxide::RequestError>()
+        .and_then(|error| match error {
+            teloxide::RequestError::RetryAfter(seconds) => Some(seconds.duration()),
+            _ => None,
+        })
+        .unwrap_or(RETRY_DELAY)
 }
 
 #[cfg(test)]
@@ -400,6 +445,7 @@ mod tests {
     struct MockApi {
         messages: Arc<Mutex<Vec<(i64, String)>>>,
         fail: Arc<Mutex<bool>>,
+        failures_remaining: Arc<Mutex<u8>>,
     }
 
     #[derive(Debug, ThisError)]
@@ -411,7 +457,11 @@ mod tests {
         type Error = MockError;
 
         async fn send_text(&self, chat_id: i64, text: &str) -> Result<(), Self::Error> {
-            if *self.fail.lock().expect("mock mutex should not be poisoned") {
+            let fail = *self.fail.lock().expect("mock mutex should not be poisoned");
+            let mut failures_remaining =
+                self.failures_remaining.lock().expect("mock mutex should not be poisoned");
+            if fail || *failures_remaining > 0 {
+                *failures_remaining = failures_remaining.saturating_sub(1);
                 return Err(MockError);
             }
             self.messages
@@ -552,6 +602,26 @@ mod tests {
             service.handle_message(message(6, Some(123), "/status")).await.unwrap(),
             HandleOutcome::Responded(Command::Status)
         );
+    }
+
+    #[tokio::test]
+    async fn failed_update_retries_before_offset_advances() {
+        let api = MockApi::default();
+        *api.failures_remaining.lock().unwrap() = 1;
+        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+        let message: teloxide::types::Message = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "from": {"id": 123, "is_bot": false, "first_name": "Admin"},
+            "chat": {"id": 42, "type": "private", "first_name": "Admin"},
+            "date": 0,
+            "text": "/status"
+        }))
+        .expect("Telegram message fixture should deserialize");
+        let update =
+            Update { id: teloxide::types::UpdateId(7), kind: UpdateKind::Message(message) };
+
+        assert_eq!(handle_update_with_retries(&service, update).await.unwrap(), 8);
+        assert_eq!(api.messages.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

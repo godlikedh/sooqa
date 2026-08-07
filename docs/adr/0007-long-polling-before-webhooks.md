@@ -22,6 +22,11 @@ loop advances its Telegram offset only after the handler succeeds; failed
 handlers retain the offset and retry with a short backoff. Teloxide remains
 behind the project-owned `sooqa-telegram` boundary.
 
+The runtime makes five handler attempts. If an update still fails, it returns
+an error without advancing the offset so a process supervisor can restart the
+server and reclaim the update. Transient `getUpdates` errors are retried with
+backoff; an invalid bot token is terminal and is surfaced immediately.
+
 The adapter does not expose a public webhook route in H1. A future webhook
 implementation must preserve the same normalized update boundary and durable
 deduplication semantics, and must add deployment-specific authentication and
