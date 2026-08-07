@@ -512,6 +512,80 @@ impl LibraryRepository {
         row.into_media_asset()
     }
 
+    /// Records the result of normalization after all external work has finished.
+    ///
+    /// The transaction only protects the content item and its canonical pointer. It
+    /// is intentionally separate from ffmpeg, ffprobe, and hashing calls so a slow
+    /// subprocess cannot hold a database transaction open.
+    pub async fn record_canonical_asset(
+        &self,
+        content_item_id: Uuid,
+        new_asset: NewMediaAsset,
+    ) -> Result<MediaAsset, LibraryRepositoryError> {
+        validate_canonical_asset(content_item_id, &new_asset)?;
+        let sha256 = new_asset.sha256.as_deref().ok_or(LibraryRepositoryError::MissingSha256)?;
+        let mut transaction = self.pool.begin().await?;
+        let content = sqlx::query_as::<_, ContentItemRow>(
+            r#"
+            SELECT
+                id, kind, status, canonical_asset_id, preferred_title,
+                editorial_description, notes, created_at, updated_at, archived_at
+            FROM content_items
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(content_item_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(LibraryRepositoryError::ResourceMissing(content_item_id))?;
+
+        let existing = if let Some(asset_id) = content.canonical_asset_id {
+            Some(find_media_asset_in_transaction(&mut transaction, asset_id).await?.ok_or(
+                LibraryRepositoryError::Invariant(
+                    "content item referred to a missing canonical asset",
+                ),
+            )?)
+        } else {
+            find_canonical_asset_for_content(&mut transaction, content_item_id).await?
+        };
+
+        let asset_row = if let Some(existing) = existing {
+            if existing.sha256.as_deref() != Some(sha256) {
+                return Err(LibraryRepositoryError::CanonicalAssetConflict {
+                    asset_id: existing.id,
+                    content_item_id: existing.content_item_id,
+                });
+            }
+            existing
+        } else if let Some(inserted) =
+            insert_canonical_media_asset_in_transaction(&mut transaction, &new_asset).await?
+        {
+            inserted
+        } else {
+            let existing = find_canonical_asset_for_content(&mut transaction, content_item_id)
+                .await?
+                .or(find_canonical_asset_by_sha256(&mut transaction, sha256).await?);
+            existing.ok_or(LibraryRepositoryError::Invariant(
+                "canonical asset conflict had no matching asset",
+            ))?
+        };
+
+        if asset_row.content_item_id != content_item_id {
+            return Err(LibraryRepositoryError::CanonicalAssetConflict {
+                asset_id: asset_row.id,
+                content_item_id: asset_row.content_item_id,
+            });
+        }
+
+        let asset = asset_row.into_media_asset()?;
+        if content.canonical_asset_id != Some(asset.id) {
+            set_canonical_asset_in_transaction(&mut transaction, content_item_id, asset.id).await?;
+        }
+        transaction.commit().await?;
+        Ok(asset)
+    }
+
     pub async fn find_media_asset(
         &self,
         id: Uuid,
@@ -683,6 +757,29 @@ impl LibraryRepository {
 
 const SHA256_LENGTH: usize = 32;
 
+fn validate_canonical_asset(
+    content_item_id: Uuid,
+    asset: &NewMediaAsset,
+) -> Result<(), LibraryRepositoryError> {
+    if asset.content_item_id != content_item_id {
+        return Err(LibraryRepositoryError::ContentItemMismatch {
+            expected: content_item_id,
+            actual: asset.content_item_id,
+        });
+    }
+    if asset.role != AssetRole::Canonical {
+        return Err(LibraryRepositoryError::InvalidCanonicalAssetRole);
+    }
+    let sha256 = asset.sha256.as_ref().ok_or(LibraryRepositoryError::MissingSha256)?;
+    if sha256.len() != SHA256_LENGTH {
+        return Err(LibraryRepositoryError::InvalidSha256Length { actual: sha256.len() });
+    }
+    to_database_u64(asset.duration_ms, "duration_ms")?;
+    to_database_u64(asset.bit_rate, "bit_rate")?;
+    to_database_u64(asset.file_size_bytes, "file_size_bytes")?;
+    Ok(())
+}
+
 fn validate_exact_duplicate_request(
     request: &ExactDuplicateRequest,
 ) -> Result<(), LibraryRepositoryError> {
@@ -745,6 +842,47 @@ async fn insert_canonical_asset_in_transaction(
         "#,
     )
     .bind(content_item_id)
+    .bind(asset.media_kind.as_str())
+    .bind(asset.mime_type.as_deref())
+    .bind(asset.container.as_deref())
+    .bind(asset.video_codec.as_deref())
+    .bind(asset.audio_codec.as_deref())
+    .bind(asset.width)
+    .bind(asset.height)
+    .bind(duration_ms)
+    .bind(bit_rate)
+    .bind(file_size_bytes)
+    .bind(asset.sha256.clone())
+    .bind(asset.local_work_path.as_deref())
+    .bind(asset.storage_state.as_str())
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
+async fn insert_canonical_media_asset_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    asset: &NewMediaAsset,
+) -> Result<Option<MediaAssetRow>, LibraryRepositoryError> {
+    let duration_ms = to_database_u64(asset.duration_ms, "duration_ms")?;
+    let bit_rate = to_database_u64(asset.bit_rate, "bit_rate")?;
+    let file_size_bytes = to_database_u64(asset.file_size_bytes, "file_size_bytes")?;
+
+    Ok(sqlx::query_as::<_, MediaAssetRow>(
+        r#"
+        INSERT INTO media_assets (
+            content_item_id, role, media_kind, mime_type, container,
+            video_codec, audio_codec, width, height, duration_ms, bit_rate,
+            file_size_bytes, sha256, local_work_path, storage_state
+        )
+        VALUES ($1, 'canonical', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        ON CONFLICT DO NOTHING
+        RETURNING
+            id, content_item_id, role, media_kind, mime_type, container,
+            video_codec, audio_codec, width, height, duration_ms, bit_rate,
+            file_size_bytes, sha256, local_work_path, storage_state, created_at
+        "#,
+    )
+    .bind(asset.content_item_id)
     .bind(asset.media_kind.as_str())
     .bind(asset.mime_type.as_deref())
     .bind(asset.container.as_deref())
@@ -843,6 +981,25 @@ async fn find_media_asset_by_sha256(
         WHERE sha256 = $1
         ORDER BY (role = 'canonical') DESC, created_at ASC, id ASC
         LIMIT 1
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
+async fn find_canonical_asset_by_sha256(
+    transaction: &mut Transaction<'_, Postgres>,
+    sha256: &[u8],
+) -> Result<Option<MediaAssetRow>, LibraryRepositoryError> {
+    Ok(sqlx::query_as::<_, MediaAssetRow>(
+        r#"
+        SELECT
+            id, content_item_id, role, media_kind, mime_type, container,
+            video_codec, audio_codec, width, height, duration_ms, bit_rate,
+            file_size_bytes, sha256, local_work_path, storage_state, created_at
+        FROM media_assets
+        WHERE role = 'canonical' AND sha256 = $1
         "#,
     )
     .bind(sha256)
@@ -1038,6 +1195,8 @@ pub enum LibraryRepositoryError {
     InvalidNumber { field: &'static str },
     #[error("exact duplicate resolution requires a canonical asset")]
     InvalidCanonicalAssetRole,
+    #[error("canonical asset belongs to content item {actual}, expected {expected}")]
+    ContentItemMismatch { expected: Uuid, actual: Uuid },
     #[error("exact duplicate resolution requires a SHA-256 digest")]
     MissingSha256,
     #[error("SHA-256 digest must contain exactly 32 bytes, got {actual}")]
@@ -1046,6 +1205,8 @@ pub enum LibraryRepositoryError {
     InvalidSourceIdentity,
     #[error("database invariant violated: {0}")]
     Invariant(&'static str),
+    #[error("canonical asset {asset_id} already belongs to content item {content_item_id}")]
+    CanonicalAssetConflict { asset_id: Uuid, content_item_id: Uuid },
     #[error("library item {0} was not found")]
     ResourceMissing(Uuid),
     #[error("library item {0} was changed by another request")]

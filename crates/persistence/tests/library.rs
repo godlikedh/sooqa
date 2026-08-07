@@ -65,6 +65,28 @@ async fn clean_up_content(database: &Database, content_id: Uuid) {
         .expect("content item should clean up");
 }
 
+fn canonical_asset(content_item_id: Uuid, sha256: Vec<u8>) -> NewMediaAsset {
+    NewMediaAsset {
+        content_item_id,
+        role: AssetRole::Canonical,
+        media_kind: MediaKind::Video,
+        mime_type: Some("video/mp4".to_owned()),
+        container: Some("mp4".to_owned()),
+        video_codec: Some("h264".to_owned()),
+        audio_codec: Some("aac".to_owned()),
+        width: Some(320),
+        height: Some(240),
+        duration_ms: Some(1_000),
+        bit_rate: Some(100_000),
+        file_size_bytes: Some(8),
+        sha256: Some(sha256),
+        local_work_path: Some(format!(
+            "/var/lib/sooqa/work/jobs/test/{content_item_id}/normalized.mp4"
+        )),
+        storage_state: StorageState::Local,
+    }
+}
+
 fn exact_duplicate_request(sha256: Vec<u8>, normalized_url: &str) -> ExactDuplicateRequest {
     ExactDuplicateRequest {
         content_item: NewContentItem {
@@ -338,4 +360,58 @@ async fn exact_duplicate_resolution_converges_under_concurrency() {
     assert_eq!(source_count, 2);
 
     clean_up_content(&database, left.content_item.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn recording_canonical_asset_is_idempotent_and_hash_unique() {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+    let library = database.library();
+    let first = library
+        .create_content_item(NewContentItem::new(ContentKind::Video))
+        .await
+        .expect("first content item should be created");
+    let second = library
+        .create_content_item(NewContentItem::new(ContentKind::Video))
+        .await
+        .expect("second content item should be created");
+    let sha256 = vec![12; 32];
+
+    let recorded = library
+        .record_canonical_asset(first.id, canonical_asset(first.id, sha256.clone()))
+        .await
+        .expect("canonical asset should be recorded");
+    let replayed = library
+        .record_canonical_asset(first.id, canonical_asset(first.id, sha256.clone()))
+        .await
+        .expect("same canonical asset should be idempotent");
+    assert_eq!(replayed.id, recorded.id);
+    assert_eq!(
+        library
+            .find_content_item(first.id)
+            .await
+            .expect("first content item should load")
+            .expect("first content item should exist")
+            .canonical_asset_id,
+        Some(recorded.id)
+    );
+
+    let conflict = library
+        .record_canonical_asset(second.id, canonical_asset(second.id, sha256))
+        .await
+        .expect_err("one canonical SHA-256 cannot belong to two content items");
+    assert!(matches!(
+        conflict,
+        sooqa_persistence::LibraryRepositoryError::CanonicalAssetConflict {
+            asset_id,
+            content_item_id
+        } if asset_id == recorded.id && content_item_id == first.id
+    ));
+
+    clean_up_content(&database, first.id).await;
+    clean_up_content(&database, second.id).await;
 }

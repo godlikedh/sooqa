@@ -145,6 +145,7 @@ pub enum NormalizationMode {
 pub struct NormalizationPlan {
     mode: NormalizationMode,
     command: ExternalCommand,
+    output: PathBuf,
 }
 
 impl NormalizationPlan {
@@ -154,6 +155,24 @@ impl NormalizationPlan {
 
     pub fn command(&self) -> &ExternalCommand {
         &self.command
+    }
+
+    pub fn command_with_progress(&self) -> ExternalCommand {
+        let args = self.command.args();
+        let Some(output) = args.last().cloned() else {
+            return self.command.clone();
+        };
+        let mut command = ExternalCommand::new(self.command.program().to_owned())
+            .timeout(self.command.timeout_duration())
+            .max_output_bytes(self.command.max_output_bytes_limit());
+        for arg in &args[..args.len() - 1] {
+            command = command.arg(arg.clone());
+        }
+        command.arg("-progress").arg("pipe:1").arg(output)
+    }
+
+    pub fn output(&self) -> &Path {
+        &self.output
     }
 }
 
@@ -194,7 +213,7 @@ impl NormalizationPlanner {
                 self.transcode_command(input.as_ref(), output.as_ref(), video)
             }
         };
-        Ok(NormalizationPlan { mode, command })
+        Ok(NormalizationPlan { mode, command, output: output.as_ref().to_owned() })
     }
 
     fn remux_command(&self, input: &Path, output: &Path) -> ExternalCommand {

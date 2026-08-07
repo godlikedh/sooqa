@@ -44,13 +44,18 @@ and a final destination-size check. Its parsed metadata is reduced to the
 project-owned `YtDlpMetadata` summary; raw yt-dlp JSON does not cross the
 adapter boundary. Production media-job wiring remains a later slice.
 
-The F1 normalization slice adds a pure `NormalizationPlanner` in
-`sooqa-media`. A validated `CanonicalVideoProfile` describes the default MP4,
-H.264, `yuv420p`, AAC, 1080p-capped representation. Compatible inputs receive
-a shell-free remux command; other video probes receive an aspect-preserving
-transcode command with explicit codec, bitrate, frame-rate, fast-start, and
-metadata arguments. The planner only constructs an `ExternalCommand`; F2
-will execute and validate it.
+The F1/F2 normalization slices live in `sooqa-media`. A validated
+`CanonicalVideoProfile` describes the default MP4, H.264, `yuv420p`, AAC,
+1080p-capped representation. Compatible inputs receive a shell-free remux
+command; other video probes receive an aspect-preserving transcode command with
+explicit codec, bitrate, frame-rate, fast-start, and metadata arguments.
+`FfmpegExecutor` runs that plan with bounded machine-readable progress output,
+supports cancellation by dropping the child future, validates the generated
+file with ffprobe, and computes its SHA-256 digest. The executor performs no
+database work. A separate `LibraryRepository::record_canonical_asset` call
+locks the content row briefly, idempotently records the canonical asset, and
+updates `content_items.canonical_asset_id` after external work has completed.
+Production media-job wiring remains a later slice.
 
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,
