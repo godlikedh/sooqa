@@ -25,6 +25,7 @@ async fn migrations_are_idempotent_and_create_core_tables() {
         "tags",
         "content_item_tags",
         "storage_objects",
+        "duplicate_candidates",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{}", table))
@@ -38,6 +39,7 @@ async fn migrations_are_idempotent_and_create_core_tables() {
         "media_assets_sha256_idx",
         "media_assets_canonical_sha256_idx",
         "media_assets_content_canonical_idx",
+        "duplicate_candidates_pending_idx",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{}", index))

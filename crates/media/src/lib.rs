@@ -20,6 +20,7 @@ mod fingerprint;
 mod hashing;
 mod image_normalize;
 mod normalize;
+mod similarity;
 mod workspace;
 mod ytdlp;
 
@@ -50,6 +51,11 @@ pub use image_normalize::{
 pub use normalize::{
     AudioCodec, CanonicalContainer, CanonicalVideoProfile, NormalizationError, NormalizationMode,
     NormalizationPlan, NormalizationPlanner, PixelFormat, ProfileError, VideoCodec, VideoPreset,
+};
+pub use similarity::{
+    FrameDistance, PrefilterRejection, SimilarityClassification, SimilarityConfig, SimilarityError,
+    SimilarityEvidence, SimilarityResult, SimilarityThresholds, VideoSimilarityInput,
+    compare_videos,
 };
 pub use workspace::{
     ManifestEntry, MediaWorkspace, WorkspaceArea, WorkspaceError, WorkspaceManifest,

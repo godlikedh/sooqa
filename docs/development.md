@@ -135,6 +135,28 @@ Run its focused tests with:
 
     cargo test -p sooqa-media fingerprint::tests
 
+## Similarity scoring and duplicate candidates
+
+G2 adds pure `compare_videos` scoring for G1 fingerprints. Duration and aspect
+ratio prefilters avoid expensive comparisons for clearly unrelated inputs;
+remaining frames are matched by relative timestamp and scored with median
+64-bit Hamming distance. The default score combines visual, duration, and
+structure signals, with 0.90 likely-duplicate and 0.75 possible-duplicate
+thresholds. Evidence is versioned and serializable for later review.
+
+The library and persistence boundaries add the ordered `duplicate_candidates`
+record. Upserts preserve a candidate's review status while refreshing its
+score/evidence, and the unique algorithm-versioned pair makes rescans
+idempotent. G3 will add review actions and the read API.
+
+Run focused media tests with:
+
+    cargo test -p sooqa-media similarity::tests
+
+Run the PostgreSQL candidate integration test with:
+
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --test library duplicate_candidates_upsert_ordered_pairs_and_evidence -- --ignored
+
 ## Normalization planner
 
 F1 adds a pure planner for the canonical video profile. It selects a remux for
