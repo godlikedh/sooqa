@@ -17,6 +17,7 @@ mod direct_http;
 mod ffprobe;
 mod hashing;
 mod workspace;
+mod ytdlp;
 
 pub use command::{
     CommandError, DEFAULT_COMMAND_TIMEOUT, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommand,
@@ -32,6 +33,7 @@ pub use hashing::{FileDigest, HashError, sha256_file};
 pub use workspace::{
     ManifestEntry, MediaWorkspace, WorkspaceArea, WorkspaceError, WorkspaceManifest,
 };
+pub use ytdlp::{YtDlpConfig, YtDlpConfigError, YtDlpDownloader, YtDlpMetadata};
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceInput {

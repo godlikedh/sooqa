@@ -38,7 +38,12 @@ content sniffing. The D3 ffprobe adapter now runs external commands through a
 shell-free Tokio process boundary with separate arguments, bounded stdout and
 stderr capture, and a timeout. It converts ffprobe JSON into the project-owned
 `MediaProbe` model instead of leaking tool-specific JSON into business logic.
-yt-dlp, normalization, and production media-job wiring remain later slices.
+The D4 `YtDlpDownloader` uses the same runner for supported page metadata and
+downloads, with single-item mode, configured format selection, bounded output,
+and a final destination-size check. Its parsed metadata is reduced to the
+project-owned `YtDlpMetadata` summary; raw yt-dlp JSON does not cross the
+adapter boundary. Normalization and production media-job wiring remain later
+slices.
 
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,

@@ -17,6 +17,7 @@ const DEFAULT_COMPANION_LISTEN_ADDRESS: &str = "127.0.0.1:47831";
 const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
 const DEFAULT_FFPROBE_PATH: &str = "ffprobe";
 const DEFAULT_YTDLP_PATH: &str = "yt-dlp";
+const DEFAULT_YTDLP_FORMAT: &str = "bestvideo*+bestaudio/best";
 const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_LEVEL: &str = "info";
 
@@ -148,6 +149,7 @@ pub struct MediaConfig {
     pub ffmpeg_path: PathBuf,
     pub ffprobe_path: PathBuf,
     pub ytdlp_path: PathBuf,
+    pub ytdlp_format: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -257,6 +259,10 @@ impl AppConfig {
                     .ytdlp_path
                     .unwrap_or_else(|| DEFAULT_YTDLP_PATH.to_owned())
                     .into(),
+                ytdlp_format: raw
+                    .media
+                    .ytdlp_format
+                    .unwrap_or_else(|| DEFAULT_YTDLP_FORMAT.to_owned()),
             },
             companion: CompanionConfig {
                 listen_address: raw
@@ -278,7 +284,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} companion.listen_address={} database.url_env={} database.max_connections={} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -289,6 +295,7 @@ impl AppConfig {
             self.media.ffmpeg_path.display(),
             self.media.ffprobe_path.display(),
             self.media.ytdlp_path.display(),
+            self.media.ytdlp_format,
             self.companion.listen_address,
             self.database.url_env,
             self.database.max_connections,
@@ -325,6 +332,9 @@ impl AppConfig {
         }
         if let Some(value) = optional_env_string("SOOQA_MEDIA_YTDLP_PATH")? {
             self.media.ytdlp_path = PathBuf::from(value);
+        }
+        if let Some(value) = optional_env_string("SOOQA_MEDIA_YTDLP_FORMAT")? {
+            self.media.ytdlp_format = value;
         }
         if let Some(value) = optional_env_string("SOOQA_COMPANION_LISTEN_ADDRESS")? {
             self.companion.listen_address = value;
@@ -405,6 +415,20 @@ impl AppConfig {
                 });
             }
         }
+        if self.media.ytdlp_format.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                name: "media.ytdlp_format".to_owned(),
+                reason: "must not be empty",
+            });
+        }
+        if self.media.ytdlp_format.starts_with('-')
+            || self.media.ytdlp_format.chars().any(char::is_control)
+        {
+            return Err(ConfigError::InvalidValue {
+                name: "media.ytdlp_format".to_owned(),
+                reason: "must not start with an option prefix or contain control characters",
+            });
+        }
         Ok(())
     }
 }
@@ -449,6 +473,7 @@ struct RawMediaConfig {
     ffmpeg_path: Option<String>,
     ffprobe_path: Option<String>,
     ytdlp_path: Option<String>,
+    ytdlp_format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -634,5 +659,19 @@ mod tests {
         assert_eq!(config.media.ffmpeg_path, PathBuf::from("ffmpeg"));
         assert_eq!(config.media.ffprobe_path, PathBuf::from("/opt/bin/ffprobe"));
         assert_eq!(config.media.ytdlp_path, PathBuf::from("yt-dlp"));
+        assert_eq!(config.media.ytdlp_format, "bestvideo*+bestaudio/best");
+    }
+
+    #[test]
+    fn unsafe_ytdlp_format_is_rejected() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media]\nytdlp_format = \"--exec=whoami\"\n",
+        )
+        .expect("TOML should parse");
+
+        let error = config.validate().expect_err("option-looking format must fail");
+        assert!(error.to_string().contains("option prefix"));
     }
 }
