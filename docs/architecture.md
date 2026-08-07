@@ -207,6 +207,20 @@ Telegram storage configuration is present, and startup verifies that the bot
 can post to the configured private channel without holding a database
 transaction.
 
+H4 adds the direct Telegram media entry point. The adapter accepts supported
+photo, video, animation, audio, and recognizable document messages only from
+authorized private administrators. It downloads the file through the
+configured Bot API, keeps the Telegram update/chat/message/user and file
+references with the ingest request, and uses the update ID as the same
+idempotency key across retries. The standard cloud Bot API's 20 MiB download
+limit is detected before transfer; a configured Local Bot API Server is not
+given that cloud-only limit. Unsupported documents are rejected without a
+download. Accepted files are stored under a deterministic workspace path inside
+the shared configured media root and create a typed `probe_asset` job. The
+worker revalidates that workspace boundary, runs ffprobe, and records probe
+metadata in the Inbox before normalization and publication remain later
+orchestration work.
+
 The E3 Library API adds authenticated read and editorial-write routes over the
 typed Library repository. Search defaults to active items, supports text,
 kind, status, all-tag filtering, and opaque `(updated_at, id)` cursor pages.

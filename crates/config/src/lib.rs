@@ -18,6 +18,7 @@ const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
 const DEFAULT_FFPROBE_PATH: &str = "ffprobe";
 const DEFAULT_YTDLP_PATH: &str = "yt-dlp";
 const DEFAULT_YTDLP_FORMAT: &str = "bestvideo*+bestaudio/best";
+const DEFAULT_MEDIA_WORK_ROOT: &str = "/var/lib/sooqa/work";
 const DEFAULT_TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
 const DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_LOG_FORMAT: &str = "json";
@@ -148,6 +149,7 @@ pub struct WorkerConfig {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MediaConfig {
+    pub work_root: PathBuf,
     pub ffmpeg_path: PathBuf,
     pub ffprobe_path: PathBuf,
     pub ytdlp_path: PathBuf,
@@ -255,6 +257,11 @@ impl AppConfig {
                     .unwrap_or(DEFAULT_WORKER_LEASE_DURATION_SECONDS),
             },
             media: MediaConfig {
+                work_root: raw
+                    .media
+                    .work_root
+                    .unwrap_or_else(|| DEFAULT_MEDIA_WORK_ROOT.to_owned())
+                    .into(),
                 ffmpeg_path: raw
                     .media
                     .ffmpeg_path
@@ -307,7 +314,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -315,6 +322,7 @@ impl AppConfig {
             self.server.listen_address,
             self.worker.poll_interval_seconds,
             self.worker.lease_duration_seconds,
+            self.media.work_root.display(),
             self.media.ffmpeg_path.display(),
             self.media.ffprobe_path.display(),
             self.media.ytdlp_path.display(),
@@ -353,6 +361,9 @@ impl AppConfig {
         }
         if let Some(value) = optional_env_string("SOOQA_MEDIA_FFMPEG_PATH")? {
             self.media.ffmpeg_path = PathBuf::from(value);
+        }
+        if let Some(value) = optional_env_string("SOOQA_MEDIA_WORK_ROOT")? {
+            self.media.work_root = PathBuf::from(value);
         }
         if let Some(value) = optional_env_string("SOOQA_MEDIA_FFPROBE_PATH")? {
             self.media.ffprobe_path = PathBuf::from(value);
@@ -494,6 +505,7 @@ impl AppConfig {
             });
         }
         for (name, path) in [
+            ("media.work_root", &self.media.work_root),
             ("media.ffmpeg_path", &self.media.ffmpeg_path),
             ("media.ffprobe_path", &self.media.ffprobe_path),
             ("media.ytdlp_path", &self.media.ytdlp_path),
@@ -570,6 +582,7 @@ struct RawWorkerConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawMediaConfig {
+    work_root: Option<String>,
     ffmpeg_path: Option<String>,
     ffprobe_path: Option<String>,
     ytdlp_path: Option<String>,
@@ -770,6 +783,7 @@ mod tests {
         .expect("TOML should parse");
 
         assert_eq!(config.media.ffmpeg_path, PathBuf::from("ffmpeg"));
+        assert_eq!(config.media.work_root, PathBuf::from("/var/lib/sooqa/work"));
         assert_eq!(config.media.ffprobe_path, PathBuf::from("/opt/bin/ffprobe"));
         assert_eq!(config.media.ytdlp_path, PathBuf::from("yt-dlp"));
         assert_eq!(config.media.ytdlp_format, "bestvideo*+bestaudio/best");

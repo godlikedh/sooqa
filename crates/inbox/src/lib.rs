@@ -179,6 +179,16 @@ pub struct IngestSubmissionInput {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TelegramSubmissionInput {
+    pub source_reference: String,
+    pub submitted_via: SubmittedVia,
+    pub submitted_by_admin_id: Option<Uuid>,
+    pub original_input: Value,
+    pub supplied_caption: Option<String>,
+    pub idempotency_key: Option<String>,
+}
+
 impl IngestSubmissionInput {
     pub fn new(source_url: impl Into<String>, submitted_via: SubmittedVia) -> Self {
         Self {
@@ -201,6 +211,7 @@ pub struct IngestSubmission {
     pub submitted_by_admin_id: Option<Uuid>,
     pub original_url: String,
     pub normalized_url: String,
+    pub original_input: Value,
     pub page_url: Option<String>,
     pub page_title: Option<String>,
     pub supplied_caption: Option<String>,
@@ -227,28 +238,54 @@ impl IngestSubmission {
             }
         }
 
+        let page_title = normalize_optional_text(input.page_title);
+        let supplied_caption = normalize_optional_text(input.supplied_caption);
+        let original_input = json!({
+            "url": &original_url,
+            "page_url": &page_url,
+            "page_title": &page_title,
+            "selected_text": &supplied_caption,
+            "tags": &supplied_tags,
+        });
+
         Ok(Self {
             kind: IngestKind::Url,
             submitted_via: input.submitted_via,
             submitted_by_admin_id: input.submitted_by_admin_id,
             original_url,
             normalized_url,
+            original_input,
             page_url,
-            page_title: normalize_optional_text(input.page_title),
-            supplied_caption: normalize_optional_text(input.supplied_caption),
+            page_title,
+            supplied_caption,
             supplied_tags,
             idempotency_key,
         })
     }
 
-    pub fn original_input(&self) -> Value {
-        json!({
-            "url": self.original_url,
-            "page_url": self.page_url,
-            "page_title": self.page_title,
-            "selected_text": self.supplied_caption,
-            "tags": self.supplied_tags,
+    pub fn try_new_telegram(input: TelegramSubmissionInput) -> Result<Self, IngestValidationError> {
+        let source_reference = input.source_reference.trim().to_owned();
+        if source_reference.is_empty() {
+            return Err(IngestValidationError::EmptyUrl("Telegram source reference"));
+        }
+        let idempotency_key = normalize_idempotency_key(input.idempotency_key)?;
+        Ok(Self {
+            kind: IngestKind::TelegramMessage,
+            submitted_via: input.submitted_via,
+            submitted_by_admin_id: input.submitted_by_admin_id,
+            original_url: source_reference.clone(),
+            normalized_url: source_reference,
+            original_input: input.original_input,
+            page_url: None,
+            page_title: None,
+            supplied_caption: normalize_optional_text(input.supplied_caption),
+            supplied_tags: Vec::new(),
+            idempotency_key,
         })
+    }
+
+    pub fn original_input(&self) -> Value {
+        self.original_input.clone()
     }
 
     pub fn request_hash(&self) -> [u8; 32] {
@@ -476,6 +513,29 @@ mod tests {
         assert_eq!(value.supplied_tags, ["cats", "fun"]);
         assert_eq!(value.page_title.as_deref(), Some("Title"));
         assert_eq!(value.supplied_caption.as_deref(), Some("Caption"));
+    }
+
+    #[test]
+    fn telegram_submission_preserves_media_metadata_and_kind() {
+        let submission = IngestSubmission::try_new_telegram(TelegramSubmissionInput {
+            source_reference: " telegram://42/99 ".to_owned(),
+            submitted_via: SubmittedVia::TelegramBot,
+            submitted_by_admin_id: None,
+            original_input: json!({
+                "telegram_message_id": 99,
+                "telegram_file_unique_id": "unique-file",
+                "media_kind": "video",
+            }),
+            supplied_caption: Some(" caption ".to_owned()),
+            idempotency_key: Some("telegram:update:11:v1".to_owned()),
+        })
+        .expect("Telegram submission should be valid");
+
+        assert_eq!(submission.kind, IngestKind::TelegramMessage);
+        assert_eq!(submission.original_url, "telegram://42/99");
+        assert_eq!(submission.normalized_url, "telegram://42/99");
+        assert_eq!(submission.supplied_caption.as_deref(), Some("caption"));
+        assert_eq!(submission.original_input["telegram_file_unique_id"], "unique-file");
     }
 
     #[test]

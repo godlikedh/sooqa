@@ -14,9 +14,11 @@ use std::{
 use sooqa_inbox::IngestStatus;
 use sooqa_jobs::{Job, JobCommand, JobStatus, JobType};
 use sooqa_library::StorageUploadStore;
+use sooqa_media::{FfprobeAdapter, MediaWorkspace, WorkspaceArea, WorkspaceError};
 use sooqa_media::{SourceDownloader, SourceInput};
 use sooqa_persistence::{
-    InboxRepository, InboxRepositoryError, JobRepository, JobRepositoryError, SourceInspectionStart,
+    AssetProbeStart, InboxRepository, InboxRepositoryError, JobRepository, JobRepositoryError,
+    SourceInspectionStart,
 };
 use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramStorageApi};
 use thiserror::Error;
@@ -90,6 +92,132 @@ where
         let provider = provider.clone();
         Box::pin(async move { upload_storage_asset(&provider, job).await })
     })
+}
+
+pub fn probe_asset_handler(
+    inbox: InboxRepository,
+    work_root: impl Into<std::path::PathBuf>,
+    ffprobe: FfprobeAdapter,
+) -> HandlerFn {
+    let work_root = work_root.into();
+    Arc::new(move |job| {
+        let inbox = inbox.clone();
+        let work_root = work_root.clone();
+        let ffprobe = ffprobe.clone();
+        Box::pin(async move { probe_asset(&inbox, &work_root, &ffprobe, job).await })
+    })
+}
+
+async fn probe_asset(
+    inbox: &InboxRepository,
+    work_root: &std::path::Path,
+    ffprobe: &FfprobeAdapter,
+    job: Job,
+) -> Result<(), HandlerFailure> {
+    let ingest_request_id = match &job.command {
+        JobCommand::ProbeAsset(payload) => payload.ingest_request_id,
+        _ => {
+            return Err(HandlerFailure::permanent(
+                "invalid_payload",
+                "probe_asset handler received a different job command",
+            ));
+        }
+    };
+
+    let request = match inbox.begin_asset_probe(ingest_request_id).await {
+        Ok(AssetProbeStart::Ready(request)) => request,
+        Ok(AssetProbeStart::AlreadyAdvanced(_)) => return Ok(()),
+        Err(error) => return Err(map_inbox_error(error)),
+    };
+    let workspace_id = match request.original_input["telegram_workspace_id"]
+        .as_str()
+        .and_then(|value| value.parse().ok())
+    {
+        Some(workspace_id) => workspace_id,
+        None => {
+            return fail_probe(
+                inbox,
+                ingest_request_id,
+                HandlerFailure::permanent(
+                    "invalid_ingest_state",
+                    "Telegram ingest request has no valid workspace ID",
+                ),
+            )
+            .await;
+        }
+    };
+    let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return fail_probe(inbox, ingest_request_id, map_workspace_error(error)).await;
+        }
+    };
+    if let Err(error) = workspace.validate() {
+        return fail_probe(inbox, ingest_request_id, map_workspace_error(error)).await;
+    }
+    let input_path = match workspace.path(WorkspaceArea::Source, "telegram-input.bin") {
+        Ok(path) => path,
+        Err(error) => {
+            return fail_probe(inbox, ingest_request_id, map_workspace_error(error)).await;
+        }
+    };
+
+    let probe = match ffprobe.probe(&input_path).await {
+        Ok(probe) => probe,
+        Err(error) => {
+            let terminal = !error.is_retryable() || job.attempt_count >= job.max_attempts;
+            let class = error.class().to_owned();
+            let message = error.to_string();
+            inbox
+                .fail_asset_probe(
+                    ingest_request_id,
+                    if terminal {
+                        IngestStatus::FailedTerminal
+                    } else {
+                        IngestStatus::FailedRetryable
+                    },
+                    &class,
+                    &message,
+                )
+                .await
+                .map_err(map_inbox_error)?;
+            return Err(if terminal {
+                HandlerFailure::permanent(class, message)
+            } else {
+                HandlerFailure::retryable(class, message)
+            });
+        }
+    };
+
+    inbox
+        .complete_asset_probe(
+            ingest_request_id,
+            serde_json::to_value(probe).expect("probe is serializable"),
+        )
+        .await
+        .map_err(map_inbox_error)?;
+    Ok(())
+}
+
+fn map_workspace_error(error: WorkspaceError) -> HandlerFailure {
+    HandlerFailure::permanent("workspace_error", error.to_string())
+}
+
+async fn fail_probe(
+    inbox: &InboxRepository,
+    ingest_request_id: uuid::Uuid,
+    failure: HandlerFailure,
+) -> Result<(), HandlerFailure> {
+    let status = if failure.retryable {
+        IngestStatus::FailedRetryable
+    } else {
+        IngestStatus::FailedTerminal
+    };
+    inbox
+        .fail_asset_probe(ingest_request_id, status, &failure.class, &failure.message)
+        .await
+        .map_err(map_inbox_error)?;
+    Err(failure)
 }
 
 async fn upload_storage_asset<A, S>(

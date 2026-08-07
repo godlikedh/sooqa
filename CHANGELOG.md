@@ -26,3 +26,6 @@ All notable changes to sooqa will be documented here.
 - Added the Telegram storage provider with canonical hash verification,
   idempotent upload intents, Telegram file reference persistence, active-object
   reuse, and storage-chat startup diagnostics.
+- Added direct Telegram photo/video/document ingest with Bot API downloads,
+  cloud download-limit detection, preserved source metadata, shared workspace
+  handoff, and typed ffprobe job consumption.

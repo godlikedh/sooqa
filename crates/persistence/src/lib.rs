@@ -9,7 +9,10 @@ mod telegram;
 pub use device_tokens::{
     DeviceToken, DeviceTokenRepository, DeviceTokenRepositoryError, hash_device_token,
 };
-pub use inbox::{CreateIngestResult, InboxRepository, InboxRepositoryError, SourceInspectionStart};
+pub use inbox::{
+    AssetProbeStart, CreateIngestResult, InboxRepository, InboxRepositoryError,
+    SourceInspectionStart,
+};
 pub use jobs::{JobRepository, JobRepositoryError};
 pub use library::{LibraryRepository, LibraryRepositoryError};
 pub use telegram::{

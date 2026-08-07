@@ -284,6 +284,10 @@ impl NewJob {
         Self::new(JobCommand::UploadStorageAsset(AssetJobPayload { asset_id }))
     }
 
+    pub fn probe_asset(ingest_request_id: Uuid) -> Self {
+        Self::new(JobCommand::ProbeAsset(IngestJobPayload { ingest_request_id }))
+    }
+
     pub fn cleanup_workspace() -> Self {
         Self::new(JobCommand::CleanupWorkspace(EmptyJobPayload {}))
     }

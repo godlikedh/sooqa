@@ -4,12 +4,12 @@ use std::{error::Error, sync::Arc, time::Duration};
 
 use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
 use sooqa_jobs::JobType;
-use sooqa_media::{BinaryCheck, ProcessCommandRunner, diagnose_binaries};
+use sooqa_media::{BinaryCheck, FfprobeAdapter, ProcessCommandRunner, diagnose_binaries};
 use sooqa_persistence::Database;
 use uuid::Uuid;
 
 use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
-use sooqa_worker::{HandlerRegistry, Worker, upload_storage_asset_handler};
+use sooqa_worker::{HandlerRegistry, Worker, probe_asset_handler, upload_storage_asset_handler};
 
 #[tokio::main]
 async fn main() {
@@ -77,6 +77,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
         config.secrets.database_url.as_ref().ok_or(ConfigError::MissingSecret("database URL"))?;
     let database = Database::connect_secret(database_url, config.database.max_connections).await?;
     let mut handlers = HandlerRegistry::new();
+    let probe_handler = probe_asset_handler(
+        database.inbox(),
+        config.media.work_root.clone(),
+        FfprobeAdapter::new(config.media.ffprobe_path.clone(), Duration::from_secs(30)),
+    );
+    handlers.register(JobType::ProbeAsset, move |job| probe_handler(job));
+    tracing::info!("Telegram and upload ingest probe job handler enabled");
     match (
         config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured()),
         config.telegram.storage_chat_id,
