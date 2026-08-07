@@ -2167,9 +2167,11 @@ dependencies = [
  "axum",
  "sooqa-api",
  "sooqa-config",
+ "sooqa-inbox",
  "sooqa-persistence",
  "sooqa-runtime",
  "sooqa-telegram",
+ "thiserror",
  "tokio",
  "tracing",
 ]

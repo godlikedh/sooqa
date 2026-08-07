@@ -20,9 +20,10 @@ use url::Url;
 use uuid::Uuid;
 
 pub const START_RESPONSE: &str = "sooqa is ready. You are authorized.";
-pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorization\n/help — show this help\n/status — show service status";
+pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorization\n/help — show this help\n/add <url> — queue a URL\n/status — show service status";
 pub const STATUS_RESPONSE: &str = "sooqa is online.";
 pub const UNAUTHORIZED_RESPONSE: &str = "This bot is restricted to its configured administrator.";
+pub const ADD_USAGE_RESPONSE: &str = "Send one http(s) URL after /add, or send a bare URL.";
 const RESPONSE_RATE_LIMIT: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_HANDLER_ATTEMPTS: usize = 5;
@@ -52,6 +53,7 @@ pub enum HandleOutcome {
 pub enum Command {
     Start,
     Help,
+    Add,
     Status,
 }
 
@@ -66,6 +68,39 @@ pub enum UpdateClaimResult {
     Claimed(UpdateClaim),
     Completed,
     InProgress,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct UrlIngestCommand {
+    pub source_url: String,
+    pub idempotency_key: String,
+    pub submitted_by_user_id: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IngestAccepted {
+    pub request_id: Uuid,
+    pub status: String,
+}
+
+#[async_trait]
+pub trait IngestService: Clone + Send + Sync + 'static {
+    type Error: Error + Send + Sync + 'static;
+
+    async fn create_url(&self, command: UrlIngestCommand) -> Result<IngestAccepted, Self::Error>;
+}
+
+#[derive(Debug, ThisError)]
+#[error("Telegram URL ingest service is not configured")]
+pub struct IngestUnavailable;
+
+#[async_trait]
+impl IngestService for () {
+    type Error = IngestUnavailable;
+
+    async fn create_url(&self, _command: UrlIngestCommand) -> Result<IngestAccepted, Self::Error> {
+        Err(IngestUnavailable)
+    }
 }
 
 #[derive(Debug, ThisError)]
@@ -84,6 +119,8 @@ pub enum TelegramError {
     Shutdown(#[source] std::io::Error),
     #[error("Telegram update is still being processed: {0}")]
     UpdateInProgress(i64),
+    #[error("Telegram URL ingest failed: {0}")]
+    Ingest(#[source] Box<dyn Error + Send + Sync>),
 }
 
 #[async_trait]
@@ -105,9 +142,10 @@ pub trait UpdateStore: Clone + Send + Sync + 'static {
 }
 
 #[derive(Clone)]
-pub struct TelegramService<A, S> {
+pub struct TelegramService<A, S, I = ()> {
     api: A,
     update_store: S,
+    ingest_service: Option<I>,
     admin_user_ids: Arc<BTreeSet<i64>>,
     response_limiter: Arc<Mutex<HashMap<RateLimitKey, Instant>>>,
 }
@@ -118,7 +156,7 @@ struct RateLimitKey {
     chat_id: i64,
 }
 
-impl<A, S> TelegramService<A, S>
+impl<A, S> TelegramService<A, S, ()>
 where
     A: TelegramApi,
     S: UpdateStore,
@@ -127,6 +165,29 @@ where
         Self {
             api,
             update_store,
+            ingest_service: None,
+            admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
+            response_limiter: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<A, S, I> TelegramService<A, S, I>
+where
+    A: TelegramApi,
+    S: UpdateStore,
+    I: IngestService,
+{
+    pub fn with_ingest(
+        api: A,
+        update_store: S,
+        admin_user_ids: impl IntoIterator<Item = i64>,
+        ingest_service: I,
+    ) -> Self {
+        Self {
+            api,
+            update_store,
+            ingest_service: Some(ingest_service),
             admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
             response_limiter: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -168,27 +229,75 @@ where
             .await?;
             return Ok(HandleOutcome::Unauthorized);
         }
-        let Some(command) = message.text.as_deref().and_then(parse_command) else {
-            self.complete(claim).await?;
-            return Ok(HandleOutcome::UnrecognizedIgnored);
-        };
-        if !self.allow_response(message.user_id, message.chat_id) {
-            self.complete(claim).await?;
-            return Ok(HandleOutcome::RateLimited);
+        let action =
+            message.text.as_deref().map(parse_message_action).unwrap_or(MessageAction::Ignore);
+        match action {
+            MessageAction::Url(source_url) => {
+                if !self.allow_response(message.user_id, message.chat_id) {
+                    self.complete(claim).await?;
+                    return Ok(HandleOutcome::RateLimited);
+                }
+                let Some(ingest_service) = self.ingest_service.as_ref() else {
+                    self.release(claim).await?;
+                    return Err(TelegramError::Ingest(Box::new(IngestUnavailable)));
+                };
+                let user_id = message.user_id.expect("authorized Telegram messages have a user ID");
+                let accepted = match ingest_service
+                    .create_url(UrlIngestCommand {
+                        source_url,
+                        idempotency_key: format!("telegram:update:{}:v1", message.update_id),
+                        submitted_by_user_id: user_id,
+                    })
+                    .await
+                {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        self.clear_response(RateLimitKey {
+                            user_id: message.user_id,
+                            chat_id: message.chat_id,
+                        });
+                        self.release(claim).await?;
+                        return Err(TelegramError::Ingest(Box::new(error)));
+                    }
+                };
+                let response = format!(
+                    "✅ Ingest queued\nID: {}\nStatus: {}",
+                    accepted.request_id, accepted.status
+                );
+                self.send_and_complete(
+                    claim,
+                    message.chat_id,
+                    &response,
+                    RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
+                )
+                .await?;
+                Ok(HandleOutcome::Responded(Command::Add))
+            }
+            MessageAction::Command(command) => {
+                if !self.allow_response(message.user_id, message.chat_id) {
+                    self.complete(claim).await?;
+                    return Ok(HandleOutcome::RateLimited);
+                }
+                let response = match command {
+                    Command::Start => START_RESPONSE,
+                    Command::Help => HELP_RESPONSE,
+                    Command::Status => STATUS_RESPONSE,
+                    Command::Add => ADD_USAGE_RESPONSE,
+                };
+                self.send_and_complete(
+                    claim,
+                    message.chat_id,
+                    response,
+                    RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
+                )
+                .await?;
+                Ok(HandleOutcome::Responded(command))
+            }
+            MessageAction::Ignore => {
+                self.complete(claim).await?;
+                Ok(HandleOutcome::UnrecognizedIgnored)
+            }
         }
-        let response = match command {
-            Command::Start => START_RESPONSE,
-            Command::Help => HELP_RESPONSE,
-            Command::Status => STATUS_RESPONSE,
-        };
-        self.send_and_complete(
-            claim,
-            message.chat_id,
-            response,
-            RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
-        )
-        .await?;
-        Ok(HandleOutcome::Responded(command))
     }
 
     pub async fn handle_update(&self, update: Update) -> Result<HandleOutcome, TelegramError> {
@@ -283,8 +392,86 @@ fn parse_command(text: &str) -> Option<Command> {
     match command.to_ascii_lowercase().as_str() {
         "start" => Some(Command::Start),
         "help" => Some(Command::Help),
+        "add" => Some(Command::Add),
         "status" => Some(Command::Status),
         _ => None,
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MessageAction {
+    Command(Command),
+    Url(String),
+    Ignore,
+}
+
+fn parse_message_action(text: &str) -> MessageAction {
+    if let Some(command) = parse_command(text) {
+        return if command == Command::Add {
+            parse_single_url(text).map_or(MessageAction::Command(Command::Add), MessageAction::Url)
+        } else {
+            MessageAction::Command(command)
+        };
+    }
+    if text.trim_start().starts_with('/') {
+        MessageAction::Ignore
+    } else {
+        parse_single_url(text).map_or(MessageAction::Ignore, MessageAction::Url)
+    }
+}
+
+fn parse_single_url(text: &str) -> Option<String> {
+    let mut tokens = text.split_whitespace();
+    if let Some(first) = tokens.next() {
+        if first.starts_with('/') {
+            let command = first.strip_prefix('/')?.split('@').next()?;
+            if !command.eq_ignore_ascii_case("add") {
+                return None;
+            }
+        } else {
+            tokens = text.split_whitespace();
+        }
+    }
+
+    let urls = tokens
+        .map(|token| token.trim_matches(|character: char| "<>[](){}.,!?;".contains(character)))
+        .filter_map(|token| {
+            let url = Url::parse(token).ok()?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+            {
+                return None;
+            }
+            Some(token.to_owned())
+        })
+        .collect::<Vec<_>>();
+    (urls.len() == 1).then(|| urls.into_iter().next().expect("one URL exists"))
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CallbackData {
+    IngestStatus { request_id: Uuid },
+}
+
+impl CallbackData {
+    pub fn encode(self) -> String {
+        match self {
+            Self::IngestStatus { request_id } => format!("v1:ingest_status:{request_id}"),
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut parts = value.split(':');
+        if parts.next()? != "v1" || parts.next()? != "ingest_status" {
+            return None;
+        }
+        let request_id = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self::IngestStatus { request_id })
     }
 }
 
@@ -337,15 +524,16 @@ impl TelegramApi for TeloxideApi {
     }
 }
 
-pub struct TelegramRuntime<S> {
+pub struct TelegramRuntime<S, I> {
     api: TeloxideApi,
-    service: TelegramService<TeloxideApi, S>,
+    service: TelegramService<TeloxideApi, S, I>,
     poll_timeout: Duration,
 }
 
-impl<S> TelegramRuntime<S>
+impl<S, I> TelegramRuntime<S, I>
 where
     S: UpdateStore,
+    I: IngestService,
 {
     pub fn new(
         token: impl Into<String>,
@@ -353,9 +541,11 @@ where
         poll_timeout: Duration,
         update_store: S,
         admin_user_ids: impl IntoIterator<Item = i64>,
+        ingest_service: I,
     ) -> Result<Self, TelegramError> {
         let api = TeloxideApi::new(token, api_base_url, poll_timeout)?;
-        let service = TelegramService::new(api.clone(), update_store, admin_user_ids);
+        let service =
+            TelegramService::with_ingest(api.clone(), update_store, admin_user_ids, ingest_service);
         Ok(Self { api, service, poll_timeout })
     }
 
@@ -410,13 +600,14 @@ where
     }
 }
 
-async fn handle_update_with_retries<A, S>(
-    service: &TelegramService<A, S>,
+async fn handle_update_with_retries<A, S, I>(
+    service: &TelegramService<A, S, I>,
     update: Update,
 ) -> Result<i32, TelegramError>
 where
     A: TelegramApi,
     S: UpdateStore,
+    I: IngestService,
 {
     for attempt in 1..=MAX_HANDLER_ATTEMPTS {
         match service.handle_update(update.clone()).await {
@@ -500,6 +691,28 @@ mod tests {
     struct MockStore {
         claimed: Arc<Mutex<BTreeSet<i64>>>,
         completed: Arc<Mutex<BTreeSet<i64>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockIngestService {
+        commands: Arc<Mutex<Vec<UrlIngestCommand>>>,
+        fail: Arc<Mutex<bool>>,
+    }
+
+    #[async_trait]
+    impl IngestService for MockIngestService {
+        type Error = MockError;
+
+        async fn create_url(
+            &self,
+            command: UrlIngestCommand,
+        ) -> Result<IngestAccepted, Self::Error> {
+            if *self.fail.lock().expect("mock mutex should not be poisoned") {
+                return Err(MockError);
+            }
+            self.commands.lock().expect("mock mutex should not be poisoned").push(command);
+            Ok(IngestAccepted { request_id: Uuid::from_u128(1), status: "queued".to_owned() })
+        }
     }
 
     #[async_trait]
@@ -628,6 +841,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn url_messages_create_ingest_and_return_status() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        let service =
+            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+
+        assert_eq!(
+            service
+                .handle_message(message(7, Some(123), "/add https://example.test/video.webm"))
+                .await
+                .unwrap(),
+            HandleOutcome::Responded(Command::Add)
+        );
+        assert_eq!(
+            ingest.commands.lock().unwrap().as_slice(),
+            &[UrlIngestCommand {
+                source_url: "https://example.test/video.webm".to_owned(),
+                idempotency_key: "telegram:update:7:v1".to_owned(),
+                submitted_by_user_id: 123,
+            }]
+        );
+        assert_eq!(
+            api.messages.lock().unwrap().as_slice(),
+            &[(
+                42,
+                "✅ Ingest queued\nID: 00000000-0000-0000-0000-000000000001\nStatus: queued"
+                    .to_owned()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_failure_releases_update_and_rate_limit() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        *ingest.fail.lock().unwrap() = true;
+        let store = MockStore::default();
+        let service = TelegramService::with_ingest(api.clone(), store, [123], ingest.clone());
+
+        assert!(
+            service
+                .handle_message(message(8, Some(123), "https://example.test/video.webm"))
+                .await
+                .is_err()
+        );
+        *ingest.fail.lock().unwrap() = false;
+        assert_eq!(
+            service
+                .handle_message(message(8, Some(123), "https://example.test/video.webm"))
+                .await
+                .unwrap(),
+            HandleOutcome::Responded(Command::Add)
+        );
+    }
+
+    #[tokio::test]
     async fn failed_update_retries_before_offset_advances() {
         let api = MockApi::default();
         *api.failures_remaining.lock().unwrap() = 1;
@@ -705,6 +974,37 @@ mod tests {
         assert_eq!(parse_command("/start@sooqa_bot"), Some(Command::Start));
         assert_eq!(parse_command("/HELP extra"), Some(Command::Help));
         assert_eq!(parse_command("hello /status"), None);
-        assert_eq!(parse_command("/add"), None);
+        assert_eq!(parse_command("/add"), Some(Command::Add));
+    }
+
+    #[test]
+    fn message_parser_accepts_one_http_url_only() {
+        assert_eq!(
+            parse_message_action("/add https://example.test/video.webm"),
+            MessageAction::Url("https://example.test/video.webm".to_owned())
+        );
+        assert_eq!(
+            parse_message_action("https://example.test/video.webm"),
+            MessageAction::Url("https://example.test/video.webm".to_owned())
+        );
+        assert_eq!(parse_message_action("/add"), MessageAction::Command(Command::Add));
+        assert_eq!(
+            parse_message_action("https://one.test/a https://two.test/b"),
+            MessageAction::Ignore
+        );
+        assert_eq!(parse_message_action("ftp://example.test/file"), MessageAction::Ignore);
+    }
+
+    #[test]
+    fn callback_data_round_trips_and_rejects_unknown_shapes() {
+        let request_id = Uuid::from_u128(2);
+        let encoded = CallbackData::IngestStatus { request_id }.encode();
+        assert_eq!(encoded, "v1:ingest_status:00000000-0000-0000-0000-000000000002");
+        assert_eq!(CallbackData::parse(&encoded), Some(CallbackData::IngestStatus { request_id }));
+        assert_eq!(
+            CallbackData::parse("v2:ingest_status:00000000-0000-0000-0000-000000000002"),
+            None
+        );
+        assert_eq!(CallbackData::parse(&format!("{encoded}:extra")), None);
     }
 }

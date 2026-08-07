@@ -174,6 +174,18 @@ restart it without acknowledging the update; transient polling errors are
 also retried up to five times, while an invalid bot token is reported as
 terminal.
 
+H2 adds the first Telegram-to-Inbox path. The adapter accepts either `/add
+<url>` or a private message containing exactly one HTTP(S) URL, then calls a
+small `IngestService` port. The server adapter turns that command into the
+same typed `IngestSubmission` used by the HTTP API and delegates the durable
+request/job transaction to `InboxRepository`. The Telegram update ID becomes
+the idempotency key (`telegram:update:<id>:v1`), so handler retries cannot
+create a second request. The Telegram user ID remains in the adapter command;
+the current administrator configuration has no user repository to map it to
+the existing UUID foreign key, so persistence of that mapping is deferred to
+the administration slice. Callback data is versioned as
+`v1:ingest_status:<request-id>`; callback handling is a later UI increment.
+
 The E3 Library API adds authenticated read and editorial-write routes over the
 typed Library repository. Search defaults to active items, supports text,
 kind, status, all-tag filtering, and opaque `(updated_at, id)` cursor pages.

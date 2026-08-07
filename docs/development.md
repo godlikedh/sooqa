@@ -51,9 +51,15 @@ to reclaim it. Transient `getUpdates` failures use the same offset and a short
 backoff.
 After five consecutive polling failures, the runtime returns an error so a
 supervisor can surface or restart it instead of spinning forever.
-The initial authorized commands are `/start`, `/help`, and `/status`; only
-private messages from configured administrator IDs are handled. Responses are
-rate-limited per user/chat, and unauthorized attempts produce structured
+The initial authorized commands are `/start`, `/help`, `/add`, and `/status`;
+only private messages from configured administrator IDs are handled. Send a
+URL as `/add https://example.test/video.webm` or as a bare message containing
+one URL to create a durable Inbox request. The bot replies with the request ID
+and current status. A failed Inbox call releases the Telegram receipt and
+clears its response rate-limit entry so the update can be retried safely.
+Callback data uses the versioned `v1:ingest_status:<request-id>` convention,
+but callback buttons and status refreshes are not implemented yet. Responses
+are rate-limited per user/chat, and unauthorized attempts produce structured
 warnings without message contents or secrets.
 
 The adapter tests use a mocked API and receipt store, so they do not contact

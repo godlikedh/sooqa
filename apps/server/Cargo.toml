@@ -10,9 +10,11 @@ async-trait.workspace = true
 axum.workspace = true
 sooqa-api = { path = "../../crates/api" }
 sooqa-config = { path = "../../crates/config" }
+sooqa-inbox = { path = "../../crates/inbox" }
 sooqa-persistence = { path = "../../crates/persistence" }
 sooqa-runtime = { path = "../../crates/runtime" }
 sooqa-telegram = { path = "../../crates/telegram" }
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
