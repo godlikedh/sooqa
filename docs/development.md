@@ -76,3 +76,15 @@ paths are not shell-interpolated. Normal CI does not contact live third-party
 sites.
 
 Normalization and production media-job wiring remain later slices.
+
+## Library persistence
+
+The E1 library migration is `migrations/0004_library.sql`. It creates
+`content_items`, `media_assets`, `source_records`, `tags`,
+`content_item_tags`, and `storage_objects`. The repository round-trip test is
+ignored unless PostgreSQL is available:
+
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --test library -- --ignored
+
+Exact duplicate resolution, canonical-asset decisions, and Library search are
+later slices.

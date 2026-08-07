@@ -3,12 +3,14 @@
 mod device_tokens;
 mod inbox;
 mod jobs;
+mod library;
 
 pub use device_tokens::{
     DeviceToken, DeviceTokenRepository, DeviceTokenRepositoryError, hash_device_token,
 };
 pub use inbox::{CreateIngestResult, InboxRepository, InboxRepositoryError, SourceInspectionStart};
 pub use jobs::{JobRepository, JobRepositoryError};
+pub use library::{LibraryRepository, LibraryRepositoryError};
 
 use sooqa_config::SecretString;
 use sqlx::{
@@ -60,6 +62,10 @@ impl Database {
 
     pub fn device_tokens(&self) -> DeviceTokenRepository {
         DeviceTokenRepository::new(self.pool.clone())
+    }
+
+    pub fn library(&self) -> LibraryRepository {
+        LibraryRepository::new(self.pool.clone())
     }
 
     pub fn pool(&self) -> &PgPool {
