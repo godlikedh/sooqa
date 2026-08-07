@@ -83,7 +83,9 @@ duration directly); ffmpeg extracts one PNG at each stable 5%, 15%, 30%, 50%,
 Frames are decoded on Tokio's blocking pool and converted to the versioned
 `frame_dhash_v1` 64-bit horizontal difference hash. The result stores the
 algorithm version, duration, relative timestamp basis points, and hashes;
-similarity scoring and durable candidate persistence remain G2.
+extracted frame decoding has byte, pixel, and conservative working-set caps;
+valid frames are reused on retry so partial extraction can resume. Similarity
+scoring and durable candidate persistence remain G2.
 
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,

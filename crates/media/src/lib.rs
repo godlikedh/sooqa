@@ -38,9 +38,9 @@ pub use ffprobe::{
     parse_probe_json,
 };
 pub use fingerprint::{
-    FRAME_DHASH_V1, FingerprintVersion, FrameExtractionError, FrameExtractionResult,
-    FrameExtractor, FrameFingerprint, FrameTimestamp, VideoFingerprint, frame_dhash_v1,
-    select_fingerprint_timestamps,
+    FRAME_DHASH_V1, FingerprintVersion, FrameDecodeLimits, FrameExtractionError,
+    FrameExtractionResult, FrameExtractor, FrameFingerprint, FrameTimestamp, VideoFingerprint,
+    frame_dhash_v1, select_fingerprint_timestamps,
 };
 pub use hashing::{FileDigest, HashError, sha256_file};
 pub use image_normalize::{

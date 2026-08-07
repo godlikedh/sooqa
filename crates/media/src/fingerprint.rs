@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use image::{DynamicImage, ImageReader, imageops::FilterType};
+use image::{DynamicImage, ImageDecoder, ImageReader, Limits, imageops::FilterType};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -17,6 +17,9 @@ use crate::{
 const FRAME_RATIOS_BPS: [u16; 7] = [500, 1500, 3000, 5000, 7000, 8500, 9500];
 const FRAME_DHASH_WIDTH: u32 = 9;
 const FRAME_DHASH_HEIGHT: u32 = 8;
+const DEFAULT_MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_MAX_FRAME_PIXELS: u64 = 16_000_000;
+const DEFAULT_MAX_FRAME_WORKING_BYTES: u64 = 128 * 1024 * 1024;
 
 pub const FRAME_DHASH_V1: &str = "frame_dhash_v1";
 
@@ -73,12 +76,30 @@ pub struct FrameExtractionResult {
     pub frame_paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct FrameDecodeLimits {
+    pub max_bytes: u64,
+    pub max_pixels: u64,
+    pub max_working_bytes: u64,
+}
+
+impl Default for FrameDecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_MAX_FRAME_BYTES,
+            max_pixels: DEFAULT_MAX_FRAME_PIXELS,
+            max_working_bytes: DEFAULT_MAX_FRAME_WORKING_BYTES,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct FrameExtractor {
     ffmpeg_executable: PathBuf,
     runner: Arc<dyn ExternalCommandRunner>,
     timeout: Duration,
     max_output_bytes: usize,
+    decode_limits: FrameDecodeLimits,
 }
 
 impl FrameExtractor {
@@ -97,7 +118,18 @@ impl FrameExtractor {
         max_output_bytes: usize,
         runner: Arc<dyn ExternalCommandRunner>,
     ) -> Self {
-        Self { ffmpeg_executable: ffmpeg_executable.into(), runner, timeout, max_output_bytes }
+        Self {
+            ffmpeg_executable: ffmpeg_executable.into(),
+            runner,
+            timeout,
+            max_output_bytes,
+            decode_limits: FrameDecodeLimits::default(),
+        }
+    }
+
+    pub fn with_decode_limits(mut self, decode_limits: FrameDecodeLimits) -> Self {
+        self.decode_limits = decode_limits;
+        self
     }
 
     pub async fn extract(
@@ -124,36 +156,42 @@ impl FrameExtractor {
             let frame_name = format!("frame-dhash-v1-{index:02}.png");
             let output_path = match workspace.path(WorkspaceArea::Frames, &frame_name) {
                 Ok(path) => path,
-                Err(error) => {
-                    cleanup_frames(&frame_paths).await;
-                    return Err(error.into());
-                }
+                Err(error) => return Err(error.into()),
             };
-            if let Err(error) = self.extract_frame(&input_path, &output_path, *timestamp).await {
-                cleanup_frames(&frame_paths).await;
-                return Err(error);
+            match tokio::fs::symlink_metadata(&output_path).await {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink()
+                        || !metadata.is_file()
+                        || metadata.len() == 0
+                    {
+                        return Err(FrameExtractionError::InvalidOutput { path: output_path });
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.extract_frame(&input_path, &output_path, *timestamp).await?;
+                }
+                Err(source) => {
+                    return Err(FrameExtractionError::OutputFile { path: output_path, source });
+                }
             }
             frame_paths.push(output_path);
         }
 
         let paths_for_hashing = frame_paths.clone();
+        let decode_limits = self.decode_limits;
         let frames = match tokio::task::spawn_blocking(move || {
             paths_for_hashing
                 .iter()
-                .map(|path| decode_and_hash(path))
+                .map(|path| decode_and_hash(path, decode_limits))
                 .collect::<Result<Vec<_>, _>>()
         })
         .await
         {
             Ok(result) => match result {
                 Ok(frames) => frames,
-                Err(error) => {
-                    cleanup_frames(&frame_paths).await;
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             },
             Err(error) => {
-                cleanup_frames(&frame_paths).await;
                 return Err(FrameExtractionError::TaskJoin(error));
             }
         };
@@ -225,6 +263,8 @@ impl FrameExtractor {
             .arg("-nostdin")
             .arg("-i")
             .arg(input_path.as_os_str())
+            .arg("-map")
+            .arg("0:v:0")
             .arg("-ss")
             .arg(format_timestamp(timestamp.timestamp_ms))
             .arg("-frames:v")
@@ -280,13 +320,53 @@ fn format_timestamp(timestamp_ms: u64) -> String {
     format!("{}.{:03}", timestamp_ms / 1_000, timestamp_ms % 1_000)
 }
 
-fn decode_and_hash(path: &Path) -> Result<u64, FrameExtractionError> {
-    let reader = ImageReader::open(path)
+fn decode_and_hash(path: &Path, limits: FrameDecodeLimits) -> Result<u64, FrameExtractionError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|source| FrameExtractionError::InputFile { path: path.to_owned(), source })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(FrameExtractionError::InputNotFile { path: path.to_owned() });
+    }
+    if metadata.len() > limits.max_bytes {
+        return Err(FrameExtractionError::FrameTooLarge {
+            path: path.to_owned(),
+            limit: limits.max_bytes,
+        });
+    }
+    let mut reader = ImageReader::open(path)
         .map_err(|source| FrameExtractionError::InputFile { path: path.to_owned(), source })?
         .with_guessed_format()
         .map_err(|source| FrameExtractionError::InputFile { path: path.to_owned(), source })?;
-    let image = reader
-        .decode()
+    let mut image_limits = Limits::default();
+    image_limits.max_alloc = Some(limits.max_working_bytes.saturating_div(4).max(1));
+    reader.limits(image_limits);
+    let decoder = reader
+        .into_decoder()
+        .map_err(|source| FrameExtractionError::Decode { path: path.to_owned(), source })?;
+    let (width, height) = decoder.dimensions();
+    let pixels = u64::from(width).checked_mul(u64::from(height)).ok_or(
+        FrameExtractionError::FrameTooManyPixels {
+            path: path.to_owned(),
+            limit: limits.max_pixels,
+        },
+    )?;
+    if pixels > limits.max_pixels {
+        return Err(FrameExtractionError::FrameTooManyPixels {
+            path: path.to_owned(),
+            limit: limits.max_pixels,
+        });
+    }
+    let estimated_working_bytes =
+        pixels.checked_mul(12).ok_or(FrameExtractionError::FrameWorkingSetTooLarge {
+            path: path.to_owned(),
+            limit: limits.max_working_bytes,
+        })?;
+    if estimated_working_bytes > limits.max_working_bytes {
+        return Err(FrameExtractionError::FrameWorkingSetTooLarge {
+            path: path.to_owned(),
+            limit: limits.max_working_bytes,
+        });
+    }
+    let image = DynamicImage::from_decoder(decoder)
         .map_err(|source| FrameExtractionError::Decode { path: path.to_owned(), source })?;
     Ok(frame_dhash_v1(&image))
 }
@@ -313,12 +393,6 @@ pub fn frame_dhash_v1(image: &DynamicImage) -> u64 {
     hash
 }
 
-async fn cleanup_frames(paths: &[PathBuf]) {
-    for path in paths {
-        let _ = tokio::fs::remove_file(path).await;
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum FrameExtractionError {
     #[error("video duration must be greater than zero")]
@@ -343,6 +417,12 @@ pub enum FrameExtractionError {
     InputFile { path: PathBuf, source: std::io::Error },
     #[error("video input is not a regular file: {path}")]
     InputNotFile { path: PathBuf },
+    #[error("extracted frame exceeds the {limit}-byte limit: {path}")]
+    FrameTooLarge { path: PathBuf, limit: u64 },
+    #[error("extracted frame exceeds the {limit}-pixel limit: {path}")]
+    FrameTooManyPixels { path: PathBuf, limit: u64 },
+    #[error("extracted frame estimated working set exceeds the {limit}-byte limit: {path}")]
+    FrameWorkingSetTooLarge { path: PathBuf, limit: u64 },
     #[error("could not decode extracted frame {path}: {source}")]
     Decode { path: PathBuf, source: image::ImageError },
     #[error("frame hashing task failed: {0}")]
@@ -453,14 +533,37 @@ mod tests {
         assert_eq!(result.frame_paths.len(), 7);
         assert!(result.fingerprint.frames.iter().all(|frame| frame.hash != 0));
         assert_eq!(runner.commands.lock().expect("runner lock should not be poisoned").len(), 7);
+        let first_command = runner
+            .commands
+            .lock()
+            .expect("runner lock should not be poisoned")
+            .front()
+            .cloned()
+            .expect("first command should be recorded");
+        let args = first_command.args();
+        assert!(args.windows(2).any(|pair| {
+            pair[0].to_string_lossy() == "-map" && pair[1].to_string_lossy() == "0:v:0"
+        }));
+        assert!(args.windows(2).any(|pair| {
+            pair[0].to_string_lossy() == "-ss" && pair[1].to_string_lossy() == "0.500"
+        }));
         for path in &result.frame_paths {
             assert!(path.is_file());
         }
-        let error = extractor
+        let rerun = extractor
             .extract(&workspace, "input.mp4", 10_000)
             .await
-            .expect_err("existing frame output should not be overwritten");
-        assert!(matches!(error, FrameExtractionError::OutputExists { .. }));
+            .expect("existing valid frames should be reused");
+        assert_eq!(rerun.fingerprint, result.fingerprint);
+        assert_eq!(runner.commands.lock().expect("runner lock should not be poisoned").len(), 7);
+
+        let bounded_extractor = extractor
+            .with_decode_limits(FrameDecodeLimits { max_bytes: 1, ..FrameDecodeLimits::default() });
+        let error = bounded_extractor
+            .extract(&workspace, "input.mp4", 10_000)
+            .await
+            .expect_err("frame byte limit should be enforced");
+        assert!(matches!(error, FrameExtractionError::FrameTooLarge { limit: 1, .. }));
 
         workspace.cleanup().await.expect("workspace should be removed");
     }
