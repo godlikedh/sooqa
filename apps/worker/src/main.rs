@@ -1,8 +1,9 @@
 //! Durable job worker entry point for sooqa.
 
-use std::{error::Error, time::Duration};
+use std::{error::Error, sync::Arc, time::Duration};
 
 use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
+use sooqa_media::{BinaryCheck, ProcessCommandRunner, diagnose_binaries};
 use sooqa_persistence::Database;
 use uuid::Uuid;
 
@@ -26,6 +27,50 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     sooqa_runtime::init_tracing(&config.observability)?;
+    let binary_diagnostics = diagnose_binaries(
+        Arc::new(ProcessCommandRunner),
+        &[
+            BinaryCheck::new("ffmpeg", config.media.ffmpeg_path.clone(), ["-version"]),
+            BinaryCheck::new("ffprobe", config.media.ffprobe_path.clone(), ["-version"]),
+            BinaryCheck::new("yt-dlp", config.media.ytdlp_path.clone(), ["--version"]),
+        ],
+        Duration::from_secs(5),
+    )
+    .await;
+    for diagnostic in &binary_diagnostics {
+        match (&diagnostic.version, &diagnostic.error) {
+            (Some(version), None) => tracing::info!(
+                binary = %diagnostic.name,
+                executable = %diagnostic.executable.display(),
+                version = %version,
+                "external binary detected"
+            ),
+            (_, Some(error)) => tracing::error!(
+                binary = %diagnostic.name,
+                executable = %diagnostic.executable.display(),
+                error = %error,
+                "required external binary is unavailable"
+            ),
+            _ => tracing::error!(
+                binary = %diagnostic.name,
+                executable = %diagnostic.executable.display(),
+                "required external binary returned no version"
+            ),
+        }
+    }
+    let missing_binaries = binary_diagnostics
+        .iter()
+        .filter(|diagnostic| !diagnostic.available())
+        .map(|diagnostic| diagnostic.name.as_str())
+        .collect::<Vec<_>>();
+    if !missing_binaries.is_empty() {
+        return Err(format!(
+            "required worker binaries are unavailable: {}",
+            missing_binaries.join(", ")
+        )
+        .into());
+    }
+
     let database_url =
         config.secrets.database_url.as_ref().ok_or(ConfigError::MissingSecret("database URL"))?;
     let database = Database::connect_secret(database_url, config.database.max_connections).await?;

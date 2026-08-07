@@ -52,4 +52,20 @@ output areas, writes a diagnostic manifest, and cleans up only its own
 directory. `sha256_file` reads fixed-size chunks and returns both byte count and
 lowercase SHA-256.
 
-yt-dlp integration, ffprobe, and worker production wiring remain later slices.
+The D3 ffprobe adapter is also covered by `cargo test -p sooqa-media`. Its
+parser maps container, duration, size, bitrate, stream, codec, video geometry,
+frame-rate, rotation, and audio metadata into `MediaProbe`. The process runner
+passes arguments directly, captures output with a fixed limit, and terminates
+timed-out commands. The ignored `ffprobe` test generates a tiny WAV fixture in
+the system temporary directory and requires a locally installed `ffprobe`:
+
+    cargo test -p sooqa-media ffprobe::tests::probes_generated_wav_fixture_with_real_ffprobe -- --ignored
+
+The worker reads `media.ffmpeg_path`, `media.ffprobe_path`, and
+`media.ytdlp_path` from TOML, with `SOOQA_MEDIA_*_PATH` environment overrides.
+Normal worker startup reports each binary version and exits if one is missing;
+`--check-config` only validates and prints configuration, so it remains usable
+on machines without media binaries.
+
+yt-dlp integration, normalization, and production media-job wiring remain
+later slices.

@@ -5,8 +5,8 @@ and optional Windows companion processes. The module boundaries and durable
 workflow rules are defined in [PROJECT_SPEC.md](PROJECT_SPEC.md).
 
 This document will grow with the implementation. The bootstrap stage contains
-no Telegram or media integrations yet. Shared configuration and process
-lifecycle plumbing lives in sooqa-config and sooqa-runtime. The server exposes
+no Telegram integration or production media workflow yet. Shared configuration
+and process lifecycle plumbing lives in sooqa-config and sooqa-runtime. The server exposes
 the initial liveness API through sooqa-api, and sooqa-persistence now provides
 PostgreSQL migrations plus a durable job repository. sooqa-worker now provides
 the bounded polling loop, handler registry, leases, and graceful shutdown; real
@@ -34,8 +34,11 @@ credentials and private/special IP ranges, resolves domains before connecting,
 pins the selected validated address in the HTTP client, and manually follows
 bounded redirects so every target is checked again. It streams downloads to a
 caller-provided path, enforces byte and timeout limits, and performs bounded
-content sniffing. yt-dlp, ffprobe, workspaces, and production worker wiring
-remain later slices.
+content sniffing. The D3 ffprobe adapter now runs external commands through a
+shell-free Tokio process boundary with separate arguments, bounded stdout and
+stderr capture, and a timeout. It converts ffprobe JSON into the project-owned
+`MediaProbe` model instead of leaking tool-specific JSON into business logic.
+yt-dlp, normalization, and production media-job wiring remain later slices.
 
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,
@@ -45,6 +48,11 @@ cleanup is restricted to the workspace's expected jobs root, and
 `sha256_file` hashes files incrementally without loading them into memory.
 The manifest is diagnostic convenience only; PostgreSQL remains the source of
 truth for durable workflow state.
+
+Worker startup now checks the configured `ffmpeg`, `ffprobe`, and `yt-dlp`
+executables and logs their detected versions. A worker exits before connecting
+to PostgreSQL when a required media binary is missing or cannot report a
+version; the HTTP server does not perform these checks.
 
 Jobs have a typed command boundary. `Job` contains one `JobCommand` variant,
 such as `InspectSource` or `DownloadSource`, with a payload struct specific to

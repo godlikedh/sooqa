@@ -14,6 +14,9 @@ const DEFAULT_SERVER_LISTEN_ADDRESS: &str = "0.0.0.0:8080";
 const DEFAULT_WORKER_POLL_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_WORKER_LEASE_DURATION_SECONDS: u64 = 60;
 const DEFAULT_COMPANION_LISTEN_ADDRESS: &str = "127.0.0.1:47831";
+const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
+const DEFAULT_FFPROBE_PATH: &str = "ffprobe";
+const DEFAULT_YTDLP_PATH: &str = "yt-dlp";
 const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_LEVEL: &str = "info";
 
@@ -141,6 +144,13 @@ pub struct WorkerConfig {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MediaConfig {
+    pub ffmpeg_path: PathBuf,
+    pub ffprobe_path: PathBuf,
+    pub ytdlp_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CompanionConfig {
     pub listen_address: String,
 }
@@ -173,6 +183,7 @@ pub struct AppConfig {
     pub config_path: Option<PathBuf>,
     pub server: ServerConfig,
     pub worker: WorkerConfig,
+    pub media: MediaConfig,
     pub companion: CompanionConfig,
     pub database: DatabaseConfig,
     pub observability: ObservabilityConfig,
@@ -230,6 +241,23 @@ impl AppConfig {
                     .lease_duration_seconds
                     .unwrap_or(DEFAULT_WORKER_LEASE_DURATION_SECONDS),
             },
+            media: MediaConfig {
+                ffmpeg_path: raw
+                    .media
+                    .ffmpeg_path
+                    .unwrap_or_else(|| DEFAULT_FFMPEG_PATH.to_owned())
+                    .into(),
+                ffprobe_path: raw
+                    .media
+                    .ffprobe_path
+                    .unwrap_or_else(|| DEFAULT_FFPROBE_PATH.to_owned())
+                    .into(),
+                ytdlp_path: raw
+                    .media
+                    .ytdlp_path
+                    .unwrap_or_else(|| DEFAULT_YTDLP_PATH.to_owned())
+                    .into(),
+            },
             companion: CompanionConfig {
                 listen_address: raw
                     .companion
@@ -250,7 +278,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} companion.listen_address={} database.url_env={} database.max_connections={} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} companion.listen_address={} database.url_env={} database.max_connections={} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -258,6 +286,9 @@ impl AppConfig {
             self.server.listen_address,
             self.worker.poll_interval_seconds,
             self.worker.lease_duration_seconds,
+            self.media.ffmpeg_path.display(),
+            self.media.ffprobe_path.display(),
+            self.media.ytdlp_path.display(),
             self.companion.listen_address,
             self.database.url_env,
             self.database.max_connections,
@@ -285,6 +316,15 @@ impl AppConfig {
                     name: "SOOQA_WORKER_LEASE_DURATION_SECONDS".to_owned(),
                     reason: "expected a positive integer",
                 })?;
+        }
+        if let Some(value) = optional_env_string("SOOQA_MEDIA_FFMPEG_PATH")? {
+            self.media.ffmpeg_path = PathBuf::from(value);
+        }
+        if let Some(value) = optional_env_string("SOOQA_MEDIA_FFPROBE_PATH")? {
+            self.media.ffprobe_path = PathBuf::from(value);
+        }
+        if let Some(value) = optional_env_string("SOOQA_MEDIA_YTDLP_PATH")? {
+            self.media.ytdlp_path = PathBuf::from(value);
         }
         if let Some(value) = optional_env_string("SOOQA_COMPANION_LISTEN_ADDRESS")? {
             self.companion.listen_address = value;
@@ -353,6 +393,18 @@ impl AppConfig {
                 reason: "must be greater than zero",
             });
         }
+        for (name, path) in [
+            ("media.ffmpeg_path", &self.media.ffmpeg_path),
+            ("media.ffprobe_path", &self.media.ffprobe_path),
+            ("media.ytdlp_path", &self.media.ytdlp_path),
+        ] {
+            if path.as_os_str().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    name: name.to_owned(),
+                    reason: "must not be empty",
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -362,6 +414,7 @@ impl AppConfig {
 struct RawConfig {
     server: RawServerConfig,
     worker: RawWorkerConfig,
+    media: RawMediaConfig,
     companion: RawCompanionConfig,
     database: RawDatabaseConfig,
     observability: RawObservabilityConfig,
@@ -388,6 +441,14 @@ struct RawServerConfig {
 struct RawWorkerConfig {
     poll_interval_seconds: Option<u64>,
     lease_duration_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawMediaConfig {
+    ffmpeg_path: Option<String>,
+    ffprobe_path: Option<String>,
+    ytdlp_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -559,5 +620,19 @@ mod tests {
 
         assert!(options.check_config);
         assert_eq!(options.config_path, Some(PathBuf::from("config.toml")));
+    }
+
+    #[test]
+    fn media_binary_paths_are_configurable() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media]\nffprobe_path = \"/opt/bin/ffprobe\"\n",
+        )
+        .expect("TOML should parse");
+
+        assert_eq!(config.media.ffmpeg_path, PathBuf::from("ffmpeg"));
+        assert_eq!(config.media.ffprobe_path, PathBuf::from("/opt/bin/ffprobe"));
+        assert_eq!(config.media.ytdlp_path, PathBuf::from("yt-dlp"));
     }
 }
