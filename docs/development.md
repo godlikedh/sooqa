@@ -37,5 +37,13 @@ mapper, where the database `job_type` discriminator is checked against the
 payload before a `Job` enters the worker. New enqueue sites should use a typed
 `NewJob` constructor rather than constructing JSON directly.
 
-Real HTTP resolution, redirect policy, streaming, and `yt-dlp` integration are
-deferred to the D1 downloader slice.
+The D1 direct HTTP adapter has focused unit tests with a local fake server:
+
+    cargo test -p sooqa-media
+
+It performs DNS/IP policy checks before every request, disables automatic
+redirect handling, validates each redirect target, and streams downloads with
+byte and timeout limits. The worker binary still uses explicit handler
+composition; D1 does not yet register this adapter in production.
+
+yt-dlp integration, ffprobe, and isolated media workspaces remain later slices.

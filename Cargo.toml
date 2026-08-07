@@ -26,6 +26,8 @@ rust-version = "1.97.1"
 
 [workspace.dependencies]
 async-trait = "0.1"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -40,7 +42,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "uuid",
 ] }
 time = { version = "0.3", features = ["serde"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 thiserror = "2"
 toml = "0.9"
 tower = { version = "0.5", features = ["util"] }

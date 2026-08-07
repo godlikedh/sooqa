@@ -26,7 +26,16 @@ outside any database transaction, then atomically moves the request to
 `downloading` and enqueues the durable `download_source` job. Inspection
 results travel in that job's typed `DownloadSource` command until a source
 record is introduced. The current implementation uses a deterministic fake in
-integration tests; real HTTP and page adapters remain the D1 scope.
+integration tests; the D1 `DirectHttpDownloader` now provides the separate
+direct-HTTP adapter, while worker composition remains intentionally deferred.
+
+The direct HTTP adapter validates only `http` and `https` URLs, rejects
+credentials and private/special IP ranges, resolves domains before connecting,
+pins the selected validated address in the HTTP client, and manually follows
+bounded redirects so every target is checked again. It streams downloads to a
+caller-provided path, enforces byte and timeout limits, and performs bounded
+content sniffing. yt-dlp, ffprobe, workspaces, and production worker wiring
+remain later slices.
 
 Jobs have a typed command boundary. `Job` contains one `JobCommand` variant,
 such as `InspectSource` or `DownloadSource`, with a payload struct specific to

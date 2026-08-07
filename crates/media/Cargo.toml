@@ -7,9 +7,13 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 thiserror.workspace = true
+url.workspace = true
 uuid.workspace = true
 
 [lints]
