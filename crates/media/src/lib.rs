@@ -11,11 +11,23 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod command;
+mod diagnostics;
 mod direct_http;
+mod ffprobe;
 mod hashing;
 mod workspace;
 
+pub use command::{
+    CommandError, DEFAULT_COMMAND_TIMEOUT, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommand,
+    ExternalCommandOutput, ExternalCommandRunner, ProcessCommandRunner,
+};
+pub use diagnostics::{BinaryCheck, BinaryDiagnostic, diagnose_binaries};
 pub use direct_http::{DirectHttpDownloader, HostResolver, ResolvedAddress};
+pub use ffprobe::{
+    FfprobeAdapter, FrameRate, MediaProbe, MediaStream, MediaStreamKind, ProbeError,
+    parse_probe_json,
+};
 pub use hashing::{FileDigest, HashError, sha256_file};
 pub use workspace::{
     ManifestEntry, MediaWorkspace, WorkspaceArea, WorkspaceError, WorkspaceManifest,
