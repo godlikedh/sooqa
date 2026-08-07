@@ -14,13 +14,11 @@ use sooqa_persistence::{Database, hash_device_token};
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
-const READ_TOKEN: &str = "e3-read-token-with-enough-entropy";
-const WRITE_TOKEN: &str = "e3-write-token-with-enough-entropy";
-
 struct Fixture {
     database: Database,
     read_token: String,
     write_token: String,
+    token_prefix: String,
     content_ids: Vec<Uuid>,
     tag_ids: Vec<Uuid>,
 }
@@ -33,17 +31,16 @@ impl Fixture {
             Database::connect(&database_url, 10).await.expect("database should be reachable");
         database.migrate().await.expect("migrations should succeed");
 
-        sqlx::query("DELETE FROM device_tokens WHERE token_prefix IN ('e3-rea', 'e3-wri')")
-            .execute(database.pool())
-            .await
-            .expect("old device tokens should clean up");
+        let token_prefix = format!("e3-{}", Uuid::new_v4());
+        let read_token = format!("{token_prefix}-read-token-with-enough-entropy");
+        let write_token = format!("{token_prefix}-write-token-with-enough-entropy");
 
-        for (name, prefix, token, scopes) in [
-            ("e3-read", "e3-rea", READ_TOKEN, vec!["library:read".to_owned()]),
+        for (name, suffix, token, scopes) in [
+            ("e3-read", "read", &read_token, vec!["library:read".to_owned()]),
             (
                 "e3-write",
-                "e3-wri",
-                WRITE_TOKEN,
+                "write",
+                &write_token,
                 vec!["library:read".to_owned(), "library:write".to_owned()],
             ),
         ] {
@@ -54,7 +51,7 @@ impl Fixture {
                 "#,
             )
             .bind(name)
-            .bind(prefix)
+            .bind(format!("{token_prefix}-{suffix}"))
             .bind(hash_device_token(token))
             .bind(scopes)
             .execute(database.pool())
@@ -64,8 +61,9 @@ impl Fixture {
 
         Self {
             database,
-            read_token: READ_TOKEN.to_owned(),
-            write_token: WRITE_TOKEN.to_owned(),
+            read_token,
+            write_token,
+            token_prefix,
             content_ids: Vec::new(),
             tag_ids: Vec::new(),
         }
@@ -154,7 +152,8 @@ impl Fixture {
                 .await
                 .expect("test tags should clean up");
         }
-        sqlx::query("DELETE FROM device_tokens WHERE token_prefix IN ('e3-rea', 'e3-wri')")
+        sqlx::query("DELETE FROM device_tokens WHERE token_prefix LIKE $1")
+            .bind(format!("{}-%", self.token_prefix))
             .execute(self.database.pool())
             .await
             .expect("test device tokens should clean up");
