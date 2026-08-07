@@ -71,6 +71,11 @@ before metadata is discarded, and animated PNGs are rejected by the static
 image path.
 Persistence and production job composition remain outside the media crate.
 
+The MVP assumes the media work root is process-owned and mode 0700. Workspace
+validation is deliberately path-based and is not a defense against a separate
+same-user process racing directory replacement between validation and I/O; a
+shared hostile work root would need descriptor-relative no-follow operations.
+
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,
 and logs directories plus a diagnostic `manifest.json`. Output names are
