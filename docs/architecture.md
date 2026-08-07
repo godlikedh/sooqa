@@ -37,6 +37,15 @@ caller-provided path, enforces byte and timeout limits, and performs bounded
 content sniffing. yt-dlp, ffprobe, workspaces, and production worker wiring
 remain later slices.
 
+The D2 media primitives now provide an isolated workspace at
+`<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,
+and logs directories plus a diagnostic `manifest.json`. Output names are
+single validated components, symlinked directories and files are rejected,
+cleanup is restricted to the workspace's expected jobs root, and
+`sha256_file` hashes files incrementally without loading them into memory.
+The manifest is diagnostic convenience only; PostgreSQL remains the source of
+truth for durable workflow state.
+
 Jobs have a typed command boundary. `Job` contains one `JobCommand` variant,
 such as `InspectSource` or `DownloadSource`, with a payload struct specific to
 that command. PostgreSQL still stores the durable queue using its

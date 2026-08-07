@@ -12,8 +12,14 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod direct_http;
+mod hashing;
+mod workspace;
 
 pub use direct_http::{DirectHttpDownloader, HostResolver, ResolvedAddress};
+pub use hashing::{FileDigest, HashError, sha256_file};
+pub use workspace::{
+    ManifestEntry, MediaWorkspace, WorkspaceArea, WorkspaceError, WorkspaceManifest,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceInput {
