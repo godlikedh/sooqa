@@ -5,6 +5,7 @@ request_timeout_seconds = 30
 
 [worker]
 poll_interval_seconds = 5
+lease_duration_seconds = 60
 
 [companion]
 listen_address = "127.0.0.1:47831"

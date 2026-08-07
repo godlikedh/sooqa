@@ -6,10 +6,19 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sooqa-jobs = { path = "../../crates/jobs" }
 sooqa-config = { path = "../../crates/config" }
+sooqa-persistence = { path = "../../crates/persistence" }
 sooqa-runtime = { path = "../../crates/runtime" }
+thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+sqlx.workspace = true

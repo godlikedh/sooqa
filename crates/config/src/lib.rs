@@ -12,6 +12,7 @@ use thiserror::Error;
 
 const DEFAULT_SERVER_LISTEN_ADDRESS: &str = "0.0.0.0:8080";
 const DEFAULT_WORKER_POLL_INTERVAL_SECONDS: u64 = 5;
+const DEFAULT_WORKER_LEASE_DURATION_SECONDS: u64 = 60;
 const DEFAULT_COMPANION_LISTEN_ADDRESS: &str = "127.0.0.1:47831";
 const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_LEVEL: &str = "info";
@@ -136,6 +137,7 @@ pub struct DatabaseConfig {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WorkerConfig {
     pub poll_interval_seconds: u64,
+    pub lease_duration_seconds: u64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -223,6 +225,10 @@ impl AppConfig {
                     .worker
                     .poll_interval_seconds
                     .unwrap_or(DEFAULT_WORKER_POLL_INTERVAL_SECONDS),
+                lease_duration_seconds: raw
+                    .worker
+                    .lease_duration_seconds
+                    .unwrap_or(DEFAULT_WORKER_LEASE_DURATION_SECONDS),
             },
             companion: CompanionConfig {
                 listen_address: raw
@@ -244,13 +250,14 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} companion.listen_address={} database.url_env={} database.max_connections={} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} companion.listen_address={} database.url_env={} database.max_connections={} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
             self.role,
             self.config_path
                 .as_deref()
                 .map_or_else(|| "<defaults>".to_owned(), |path| path.display().to_string()),
             self.server.listen_address,
             self.worker.poll_interval_seconds,
+            self.worker.lease_duration_seconds,
             self.companion.listen_address,
             self.database.url_env,
             self.database.max_connections,
@@ -269,6 +276,13 @@ impl AppConfig {
             self.worker.poll_interval_seconds =
                 value.parse().map_err(|_| ConfigError::InvalidValue {
                     name: "SOOQA_WORKER_POLL_INTERVAL_SECONDS".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
+        }
+        if let Some(value) = optional_env_string("SOOQA_WORKER_LEASE_DURATION_SECONDS")? {
+            self.worker.lease_duration_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_WORKER_LEASE_DURATION_SECONDS".to_owned(),
                     reason: "expected a positive integer",
                 })?;
         }
@@ -312,6 +326,12 @@ impl AppConfig {
         if self.worker.poll_interval_seconds == 0 {
             return Err(ConfigError::InvalidValue {
                 name: "worker.poll_interval_seconds".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.worker.lease_duration_seconds == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "worker.lease_duration_seconds".to_owned(),
                 reason: "must be greater than zero",
             });
         }
@@ -367,6 +387,7 @@ struct RawServerConfig {
 #[serde(default)]
 struct RawWorkerConfig {
     poll_interval_seconds: Option<u64>,
+    lease_duration_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -495,6 +516,19 @@ mod tests {
         .expect("TOML should parse");
 
         let error = config.validate().expect_err("zero interval must fail");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn worker_lease_duration_must_be_positive() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[worker]\nlease_duration_seconds = 0\n",
+        )
+        .expect("TOML should parse");
+
+        let error = config.validate().expect_err("zero lease duration must fail");
         assert!(error.to_string().contains("greater than zero"));
     }
 

@@ -16,3 +16,5 @@ All notable changes to sooqa will be documented here.
   migration, and migration integration test harness.
 - Added typed durable job values and a PostgreSQL repository with atomic
   claiming, leases, retries, attempt history, and stale-lease recovery.
+- Added the bounded worker loop, worker identity, handler registry, graceful
+  shutdown, structured job logs, and in-process worker metrics.

@@ -25,5 +25,6 @@ db-migrate:
 
 test-integration:
     DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --tests -- --ignored
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-worker --test worker -- --ignored
 
 check: fmt-check lint test

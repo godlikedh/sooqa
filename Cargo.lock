@@ -1404,10 +1404,17 @@ version = "0.1.0"
 name = "sooqa-worker"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "sooqa-config",
+ "sooqa-jobs",
+ "sooqa-persistence",
  "sooqa-runtime",
+ "sqlx",
+ "thiserror",
+ "time",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
