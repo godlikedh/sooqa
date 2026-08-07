@@ -4,8 +4,13 @@ use std::error::Error;
 
 use axum::Router;
 use sooqa_config::{AppConfig, AppRole, CliCommand, CliOptions, ConfigError};
+use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, IngestValidationError, SubmittedVia};
+use sooqa_persistence::InboxRepository;
 use sooqa_persistence::{TelegramRepository, TelegramRepositoryError};
-use sooqa_telegram::{TelegramRuntime, UpdateClaim, UpdateClaimResult, UpdateStore};
+use sooqa_telegram::{
+    IngestAccepted, IngestService, TelegramRuntime, UpdateClaim, UpdateClaimResult, UpdateStore,
+    UrlIngestCommand,
+};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -68,6 +73,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             std::time::Duration::from_secs(config.telegram.poll_timeout_seconds),
             DatabaseUpdateStore { repository: database.telegram() },
             config.telegram.admin_user_ids.clone(),
+            DatabaseIngestService { repository: database.inbox() },
         )?;
         tracing::info!(api_base_url = %config.telegram.api_base_url, "Telegram bot polling enabled");
         tokio::select! {
@@ -85,6 +91,35 @@ async fn run() -> Result<(), Box<dyn Error>> {
 #[derive(Clone)]
 struct DatabaseUpdateStore {
     repository: TelegramRepository,
+}
+
+#[derive(Clone)]
+struct DatabaseIngestService {
+    repository: InboxRepository,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum TelegramIngestError {
+    #[error("Telegram URL validation failed: {0}")]
+    Validation(#[from] IngestValidationError),
+    #[error("Telegram ingest repository failed: {0}")]
+    Repository(#[from] sooqa_persistence::InboxRepositoryError),
+}
+
+#[async_trait::async_trait]
+impl IngestService for DatabaseIngestService {
+    type Error = TelegramIngestError;
+
+    async fn create_url(&self, command: UrlIngestCommand) -> Result<IngestAccepted, Self::Error> {
+        let mut input = IngestSubmissionInput::new(command.source_url, SubmittedVia::TelegramBot);
+        input.idempotency_key = Some(command.idempotency_key);
+        let submission = IngestSubmission::try_new(input)?;
+        let result = self.repository.create_ingest(submission).await?;
+        Ok(IngestAccepted {
+            request_id: result.request.id,
+            status: result.request.status.as_str().to_owned(),
+        })
+    }
 }
 
 #[async_trait::async_trait]

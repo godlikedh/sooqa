@@ -21,3 +21,5 @@ All notable changes to sooqa will be documented here.
 - Added the first Telegram adapter with configurable long polling, private
   administrator authorization, `/start`, `/help`, and `/status`, plus durable
   update-id deduplication receipts.
+- Added private Telegram URL ingest through `/add` or a single bare URL,
+  durable Inbox request acknowledgements, and versioned status callback data.
