@@ -309,6 +309,46 @@ pub struct NewMediaAsset {
     pub storage_state: StorageState,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NewMediaAssetDraft {
+    pub role: AssetRole,
+    pub media_kind: MediaKind,
+    pub mime_type: Option<String>,
+    pub container: Option<String>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub bit_rate: Option<u64>,
+    pub file_size_bytes: Option<u64>,
+    pub sha256: Option<Vec<u8>>,
+    pub local_work_path: Option<String>,
+    pub storage_state: StorageState,
+}
+
+impl NewMediaAssetDraft {
+    pub fn for_content_item(self, content_item_id: Uuid) -> NewMediaAsset {
+        NewMediaAsset {
+            content_item_id,
+            role: self.role,
+            media_kind: self.media_kind,
+            mime_type: self.mime_type,
+            container: self.container,
+            video_codec: self.video_codec,
+            audio_codec: self.audio_codec,
+            width: self.width,
+            height: self.height,
+            duration_ms: self.duration_ms,
+            bit_rate: self.bit_rate,
+            file_size_bytes: self.file_size_bytes,
+            sha256: self.sha256,
+            local_work_path: self.local_work_path,
+            storage_state: self.storage_state,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceRecord {
     pub id: Uuid,
@@ -341,6 +381,56 @@ pub struct NewSourceRecord {
     pub source_description: Option<String>,
     pub source_published_at: Option<OffsetDateTime>,
     pub metadata_json: Value,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NewSourceRecordDraft {
+    pub ingest_request_id: Option<Uuid>,
+    pub source_type: SourceType,
+    pub original_url: Option<String>,
+    pub normalized_url: Option<String>,
+    pub platform: Option<String>,
+    pub platform_content_id: Option<String>,
+    pub author_name: Option<String>,
+    pub source_title: Option<String>,
+    pub source_description: Option<String>,
+    pub source_published_at: Option<OffsetDateTime>,
+    pub metadata_json: Value,
+}
+
+impl NewSourceRecordDraft {
+    pub fn for_content_item(self, content_item_id: Uuid) -> NewSourceRecord {
+        NewSourceRecord {
+            content_item_id,
+            ingest_request_id: self.ingest_request_id,
+            source_type: self.source_type,
+            original_url: self.original_url,
+            normalized_url: self.normalized_url,
+            platform: self.platform,
+            platform_content_id: self.platform_content_id,
+            author_name: self.author_name,
+            source_title: self.source_title,
+            source_description: self.source_description,
+            source_published_at: self.source_published_at,
+            metadata_json: self.metadata_json,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExactDuplicateRequest {
+    pub content_item: NewContentItem,
+    pub asset: NewMediaAssetDraft,
+    pub source: NewSourceRecordDraft,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExactDuplicateResolution {
+    pub content_item: ContentItem,
+    pub canonical_asset: MediaAsset,
+    pub source_record: SourceRecord,
+    pub content_created: bool,
+    pub source_created: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

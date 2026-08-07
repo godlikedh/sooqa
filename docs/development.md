@@ -86,5 +86,20 @@ ignored unless PostgreSQL is available:
 
     DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --test library -- --ignored
 
-Exact duplicate resolution, canonical-asset decisions, and Library search are
-later slices.
+Library search remains a later slice.
+
+## Exact duplicate resolution
+
+The E2 repository flow accepts typed content, canonical-asset, and source
+drafts. It checks normalized URLs and platform identities first, then uses the
+asset SHA-256. Exact matches reuse the existing content and canonical asset;
+new source metadata is attached when its identity is new. The insert paths use
+PostgreSQL conflict handling inside one transaction, so concurrent requests do
+not create a second canonical asset.
+
+Run the focused PostgreSQL tests with:
+
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --test library -- --ignored
+
+The concurrency test submits two different source URLs for the same SHA-256
+and verifies one content item, one canonical asset, and two source records.

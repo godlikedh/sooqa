@@ -59,8 +59,15 @@ assets, source records, tags, and provider storage objects. The `sooqa-library`
 crate owns typed enums and records, while `sooqa-persistence::LibraryRepository`
 converts database discriminators and signed PostgreSQL integer fields at the
 adapter boundary. Tags are normalized and attached through an explicit join
-table; duplicate resolution, canonical-asset decisions, and search remain
-later slices.
+table; perceptual duplicate candidates and search remain later slices.
+
+The E2 exact-duplicate boundary is implemented by a transaction-level method
+on `LibraryRepository`. It checks normalized source URLs and platform IDs before
+looking up the downloaded SHA-256, then inserts a canonical asset and source
+with conflict-safe re-reads. Concurrent requests therefore converge on one
+content item and canonical asset; a new source can still attach to that item.
+Migration `0005_exact_duplicates.sql` keeps a general SHA lookup index while
+making canonical SHA-256 values and one canonical asset per content item unique.
 
 Worker startup now checks the configured `ffmpeg`, `ffprobe`, and `yt-dlp`
 executables and logs their detected versions. A worker exits before connecting
