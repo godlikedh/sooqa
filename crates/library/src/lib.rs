@@ -691,6 +691,9 @@ pub enum StorageUploadReservation {
 pub trait StorageUploadStore: Clone + Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
 
+    async fn find_canonical_asset(&self, asset_id: Uuid)
+    -> Result<Option<MediaAsset>, Self::Error>;
+
     async fn find_active_storage_object(
         &self,
         asset_id: Uuid,
@@ -712,6 +715,11 @@ pub trait StorageUploadStore: Clone + Send + Sync + 'static {
     ) -> Result<StorageObject, Self::Error>;
 
     async fn release_storage_upload(&self, intent_id: Uuid) -> Result<(), Self::Error>;
+
+    /// Preserve an intent after an external request whose outcome is unknown.
+    /// A later reconciliation can complete the same intent with the returned
+    /// Telegram message reference instead of sending another message.
+    async fn mark_storage_upload_unknown(&self, intent_id: Uuid) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]

@@ -74,10 +74,13 @@ H3 storage tests use a mocked Telegram API and a fake upload store:
 
     cargo test -p sooqa-telegram storage
 
-The storage provider requires a negative Telegram chat ID, hashes the local
-canonical asset before upload, and persists references only after Telegram
-returns a message. A configured server performs a startup `getChat` check for
-the storage chat; it does not upload media from the polling process yet.
+The storage provider requires a negative Telegram chat ID, loads the canonical
+asset hash from PostgreSQL, hashes the local file before upload, and persists
+references only after Telegram returns a message. Definitive API rejections
+can release a pending intent; ambiguous failures remain unknown for
+reconciliation. The server and worker verify that the bot is an administrator
+with posting rights in the configured private channel. The worker registers
+`upload_storage_asset` when the Telegram token and storage chat are configured.
 
 ## Source inspection
 

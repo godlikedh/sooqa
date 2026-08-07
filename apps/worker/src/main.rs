@@ -3,11 +3,13 @@
 use std::{error::Error, sync::Arc, time::Duration};
 
 use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
+use sooqa_jobs::JobType;
 use sooqa_media::{BinaryCheck, ProcessCommandRunner, diagnose_binaries};
 use sooqa_persistence::Database;
 use uuid::Uuid;
 
-use sooqa_worker::{HandlerRegistry, Worker};
+use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
+use sooqa_worker::{HandlerRegistry, Worker, upload_storage_asset_handler};
 
 #[tokio::main]
 async fn main() {
@@ -74,10 +76,34 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let database_url =
         config.secrets.database_url.as_ref().ok_or(ConfigError::MissingSecret("database URL"))?;
     let database = Database::connect_secret(database_url, config.database.max_connections).await?;
+    let mut handlers = HandlerRegistry::new();
+    match (
+        config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured()),
+        config.telegram.storage_chat_id,
+    ) {
+        (Some(token), Some(storage_chat_id)) => {
+            let api = TeloxideApi::new(
+                token.expose_secret(),
+                &config.telegram.api_base_url,
+                Duration::from_secs(config.telegram.poll_timeout_seconds),
+            )?;
+            let provider = StorageUploadProvider::new(api, database.library(), storage_chat_id)?;
+            provider.verify_storage_chat().await?;
+            let storage_handler = upload_storage_asset_handler(provider);
+            handlers.register(JobType::UploadStorageAsset, move |job| storage_handler(job));
+            tracing::info!(storage_chat_id, "Telegram storage upload job handler enabled");
+        }
+        (None, Some(_)) => {
+            return Err(ConfigError::MissingSecret("Telegram bot token").into());
+        }
+        _ => {
+            tracing::warn!("Telegram storage upload job handler is disabled");
+        }
+    }
     let worker_id = format!("worker-{}", Uuid::new_v4());
     let worker = Worker::new(
         database.jobs(),
-        HandlerRegistry::default(),
+        handlers,
         worker_id,
         Duration::from_secs(config.worker.poll_interval_seconds),
         Duration::from_secs(config.worker.lease_duration_seconds),

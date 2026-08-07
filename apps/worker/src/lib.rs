@@ -13,10 +13,12 @@ use std::{
 
 use sooqa_inbox::IngestStatus;
 use sooqa_jobs::{Job, JobCommand, JobStatus, JobType};
+use sooqa_library::StorageUploadStore;
 use sooqa_media::{SourceDownloader, SourceInput};
 use sooqa_persistence::{
     InboxRepository, InboxRepositoryError, JobRepository, JobRepositoryError, SourceInspectionStart,
 };
+use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramStorageApi};
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::time::sleep;
@@ -76,6 +78,45 @@ pub fn inspect_source_handler(
         let inbox = inbox.clone();
         let downloader = Arc::clone(&downloader);
         Box::pin(async move { inspect_source(&inbox, downloader.as_ref(), job).await })
+    })
+}
+
+pub fn upload_storage_asset_handler<A, S>(provider: StorageUploadProvider<A, S>) -> HandlerFn
+where
+    A: TelegramStorageApi,
+    S: StorageUploadStore,
+{
+    Arc::new(move |job| {
+        let provider = provider.clone();
+        Box::pin(async move { upload_storage_asset(&provider, job).await })
+    })
+}
+
+async fn upload_storage_asset<A, S>(
+    provider: &StorageUploadProvider<A, S>,
+    job: Job,
+) -> Result<(), HandlerFailure>
+where
+    A: TelegramStorageApi,
+    S: StorageUploadStore,
+{
+    let asset_id = match &job.command {
+        JobCommand::UploadStorageAsset(payload) => payload.asset_id,
+        _ => {
+            return Err(HandlerFailure::permanent(
+                "invalid_payload",
+                "upload_storage_asset handler received a different job command",
+            ));
+        }
+    };
+
+    provider.upload(StorageUploadInput { asset_id }).await.map(|_| ()).map_err(|error| {
+        let message = error.to_string();
+        if error.is_retryable() && job.attempt_count < job.max_attempts {
+            HandlerFailure::retryable("storage_upload", message)
+        } else {
+            HandlerFailure::permanent("storage_upload", message)
+        }
     })
 }
 

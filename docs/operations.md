@@ -71,11 +71,13 @@ durable Inbox request as the HTTP API; the response includes its request ID
 and status. Update receipts are retained as durable deduplication records. A
 five-minute claim lease allows an abandoned in-progress update to be reclaimed;
 failed API or Inbox calls release their claim immediately. URL source
-inspection, downloading, media processing, uploads, and channel publication
-remain later Telegram slices.
+inspection, downloading, media processing, and channel publication remain
+later Telegram slices.
 
 For H3 storage, make the bot an administrator of a private storage channel and
 set `SOOQA_TELEGRAM_STORAGE_CHAT_ID` to its negative chat ID. The server checks
 that chat during Telegram startup. Upload intents are durable in
-`idempotency_records`; a pending intent is treated as unresolved after an
-ambiguous process failure and must be reconciled before retrying.
+`idempotency_records`; a pending intent has a short pre-send lease, while an
+ambiguous process/API failure is retained as unknown and must be reconciled
+before retrying. The worker enables the upload job only when the Telegram token
+and storage chat are configured.

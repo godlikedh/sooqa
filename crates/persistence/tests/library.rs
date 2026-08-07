@@ -263,6 +263,31 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
             .expect("duplicate reservation should load"),
         StorageUploadReservation::InProgress
     );
+    sqlx::query(
+        "UPDATE idempotency_records SET expires_at = now() - interval '1 minute' WHERE id = $1",
+    )
+    .bind(intent_id)
+    .execute(database.pool())
+    .await
+    .expect("upload lease should be adjustable in the fixture");
+    assert!(matches!(
+        library
+            .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+            .await
+            .expect("expired upload lease should be reclaimable"),
+        StorageUploadReservation::Reserved { intent_id: reclaimed } if reclaimed == intent_id
+    ));
+    library
+        .mark_storage_upload_unknown(intent_id)
+        .await
+        .expect("upload intent should be markable as unknown");
+    assert_eq!(
+        library
+            .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+            .await
+            .expect("unknown upload should load"),
+        StorageUploadReservation::InProgress
+    );
 
     let stored = library
         .complete_storage_upload(

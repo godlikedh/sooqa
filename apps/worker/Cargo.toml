@@ -7,11 +7,13 @@ rust-version.workspace = true
 
 [dependencies]
 sooqa-inbox = { path = "../../crates/inbox" }
+sooqa-library = { path = "../../crates/library" }
 sooqa-media = { path = "../../crates/media" }
 sooqa-jobs = { path = "../../crates/jobs" }
 sooqa-config = { path = "../../crates/config" }
 sooqa-persistence = { path = "../../crates/persistence" }
 sooqa-runtime = { path = "../../crates/runtime" }
+sooqa-telegram = { path = "../../crates/telegram" }
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true

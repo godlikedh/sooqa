@@ -166,7 +166,7 @@ pub enum JobCommand {
     NormalizeAsset(IngestJobPayload),
     ComputeFingerprint(IngestJobPayload),
     CheckSimilarity(IngestJobPayload),
-    UploadStorageAsset(IngestJobPayload),
+    UploadStorageAsset(AssetJobPayload),
     FinalizeIngest(IngestJobPayload),
     PublishPost(PublishPostPayload),
     VerifyStorageObject(AssetJobPayload),
@@ -208,7 +208,7 @@ impl JobCommand {
             JobType::NormalizeAsset => decode!(IngestJobPayload, NormalizeAsset),
             JobType::ComputeFingerprint => decode!(IngestJobPayload, ComputeFingerprint),
             JobType::CheckSimilarity => decode!(IngestJobPayload, CheckSimilarity),
-            JobType::UploadStorageAsset => decode!(IngestJobPayload, UploadStorageAsset),
+            JobType::UploadStorageAsset => decode!(AssetJobPayload, UploadStorageAsset),
             JobType::FinalizeIngest => decode!(IngestJobPayload, FinalizeIngest),
             JobType::PublishPost => decode!(PublishPostPayload, PublishPost),
             JobType::VerifyStorageObject => decode!(AssetJobPayload, VerifyStorageObject),
@@ -278,6 +278,10 @@ impl NewJob {
 
     pub fn publish_post(post_id: impl Into<String>) -> Self {
         Self::new(JobCommand::PublishPost(PublishPostPayload { post_id: post_id.into() }))
+    }
+
+    pub fn upload_storage_asset(asset_id: Uuid) -> Self {
+        Self::new(JobCommand::UploadStorageAsset(AssetJobPayload { asset_id }))
     }
 
     pub fn cleanup_workspace() -> Self {

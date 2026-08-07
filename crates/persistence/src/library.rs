@@ -993,10 +993,21 @@ impl LibraryRepository {
 }
 
 const STORAGE_UPLOAD_IDEMPOTENCY_SCOPE: &str = "storage:upload";
+const STORAGE_UPLOAD_COMPLETED_STATUS: i32 = 201;
 
 #[async_trait::async_trait]
 impl StorageUploadStore for LibraryRepository {
     type Error = LibraryRepositoryError;
+
+    async fn find_canonical_asset(
+        &self,
+        asset_id: Uuid,
+    ) -> Result<Option<MediaAsset>, Self::Error> {
+        Ok(self
+            .find_media_asset(asset_id)
+            .await?
+            .filter(|asset| asset.role == AssetRole::Canonical))
+    }
 
     async fn find_active_storage_object(
         &self,
@@ -1034,9 +1045,14 @@ impl StorageUploadStore for LibraryRepository {
         let inserted = sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO idempotency_records (
-                scope, idempotency_key, request_hash, resource_type
+                scope, idempotency_key, request_hash, resource_type,
+                response_body, expires_at
             )
-            VALUES ($1, $2, $3, 'storage_object')
+            VALUES (
+                $1, $2, $3, 'storage_object',
+                '{"state":"pending"}'::jsonb,
+                now() + interval '15 minutes'
+            )
             ON CONFLICT (scope, idempotency_key) DO NOTHING
             RETURNING id
             "#,
@@ -1054,7 +1070,7 @@ impl StorageUploadStore for LibraryRepository {
 
         let existing = sqlx::query_as::<_, StorageUploadIntentRow>(
             r#"
-            SELECT request_hash, resource_id
+            SELECT request_hash, resource_id, id, response_body, expires_at
             FROM idempotency_records
             WHERE scope = $1 AND idempotency_key = $2
             FOR UPDATE
@@ -1071,6 +1087,11 @@ impl StorageUploadStore for LibraryRepository {
             });
         }
 
+        let existing_state = existing
+            .response_body
+            .as_ref()
+            .and_then(|body| body.get("state"))
+            .and_then(Value::as_str);
         let reservation = match existing.resource_id {
             Some(storage_object_id) => {
                 let object = sqlx::query_as::<_, StorageObjectRow>(
@@ -1090,6 +1111,25 @@ impl StorageUploadStore for LibraryRepository {
                 .await?
                 .ok_or(LibraryRepositoryError::StorageUploadObjectMissing(storage_object_id))?;
                 StorageUploadReservation::Reused(object.into_storage_object()?)
+            }
+            None if existing_state == Some("unknown") => StorageUploadReservation::InProgress,
+            None if existing_state == Some("pending")
+                && existing
+                    .expires_at
+                    .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc()) =>
+            {
+                sqlx::query(
+                    r#"
+                    UPDATE idempotency_records
+                    SET response_body = '{"state":"pending"}'::jsonb,
+                        expires_at = now() + interval '15 minutes'
+                    WHERE id = $1 AND resource_id IS NULL
+                    "#,
+                )
+                .bind(existing.id)
+                .execute(&mut *transaction)
+                .await?;
+                StorageUploadReservation::Reserved { intent_id: existing.id }
             }
             None => StorageUploadReservation::InProgress,
         };
@@ -1131,14 +1171,19 @@ impl StorageUploadStore for LibraryRepository {
             r#"
             UPDATE idempotency_records
             SET resource_id = $2,
-                response_status = 201,
-                response_body = $3
-            WHERE id = $1 AND resource_id IS NULL
+                response_status = $4,
+                response_body = $3,
+                expires_at = NULL
+            WHERE id = $1
+              AND resource_id IS NULL
+              AND response_status IS NULL
+              AND response_body->>'state' IN ('pending', 'unknown')
             "#,
         )
         .bind(intent_id)
         .bind(storage_object.id)
         .bind(json!({ "id": storage_object.id, "status": storage_object.status.as_str() }))
+        .bind(STORAGE_UPLOAD_COMPLETED_STATUS)
         .execute(&mut *transaction)
         .await?;
         if updated_intent.rows_affected() != 1 {
@@ -1159,10 +1204,27 @@ impl StorageUploadStore for LibraryRepository {
     }
 
     async fn release_storage_upload(&self, intent_id: Uuid) -> Result<(), Self::Error> {
-        sqlx::query("DELETE FROM idempotency_records WHERE id = $1 AND resource_id IS NULL")
+        sqlx::query(
+            "DELETE FROM idempotency_records WHERE id = $1 AND resource_id IS NULL AND response_status IS NULL AND response_body->>'state' = 'pending'",
+        )
             .bind(intent_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    async fn mark_storage_upload_unknown(&self, intent_id: Uuid) -> Result<(), Self::Error> {
+        sqlx::query(
+            r#"
+            UPDATE idempotency_records
+            SET response_body = '{"state":"unknown"}'::jsonb,
+                expires_at = NULL
+            WHERE id = $1 AND resource_id IS NULL
+            "#,
+        )
+        .bind(intent_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 }
@@ -1651,6 +1713,9 @@ pub enum LibraryRepositoryError {
 struct StorageUploadIntentRow {
     request_hash: Vec<u8>,
     resource_id: Option<Uuid>,
+    id: Uuid,
+    response_body: Option<Value>,
+    expires_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, FromRow)]

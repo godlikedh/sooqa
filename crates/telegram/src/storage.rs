@@ -8,7 +8,7 @@ use sooqa_media::sha256_file;
 use teloxide::{
     payloads::{SendAnimationSetters, SendAudioSetters, SendPhotoSetters, SendVideoSetters},
     prelude::{Request, Requester},
-    types::{ChatId, InputFile},
+    types::{ChatFullInfoKind, ChatFullInfoPublicKind, ChatId, ChatMemberKind, InputFile},
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -20,10 +20,6 @@ pub const TELEGRAM_STORAGE_PROVIDER: &str = "telegram";
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StorageUploadInput {
     pub asset_id: Uuid,
-    pub content_item_id: Uuid,
-    pub media_kind: MediaKind,
-    pub local_work_path: PathBuf,
-    pub expected_sha256: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -57,6 +53,8 @@ pub trait TelegramStorageApi: Clone + Send + Sync + 'static {
     ) -> Result<StorageUploadResult, Self::Error>;
 
     async fn verify_storage_chat(&self, chat_id: i64) -> Result<(), Self::Error>;
+
+    fn is_ambiguous_error(error: &Self::Error) -> bool;
 }
 
 #[derive(Debug, Error)]
@@ -65,12 +63,24 @@ pub enum StorageUploadApiError {
     Api(#[source] teloxide::RequestError),
     #[error("Telegram returned no {media_kind:?} file reference")]
     MissingFileReference { media_kind: MediaKind },
+    #[error("Telegram storage chat must be a private channel")]
+    StorageChatNotPrivateChannel,
+    #[error("Telegram bot is not an administrator of the storage channel")]
+    StorageBotNotAdministrator,
+    #[error("Telegram bot administrator cannot post messages to the storage channel")]
+    StorageBotCannotPost,
 }
 
 #[derive(Debug, Error)]
 pub enum StorageUploadError {
     #[error("Telegram storage chat ID must be negative")]
     InvalidStorageChatId,
+    #[error("canonical asset {0} was not found")]
+    CanonicalAssetMissing(Uuid),
+    #[error("canonical asset {0} has no recorded SHA-256")]
+    CanonicalAssetMissingSha256(Uuid),
+    #[error("canonical asset {0} has no local work path")]
+    CanonicalAssetMissingWorkPath(Uuid),
     #[error("canonical asset SHA-256 must contain 32 bytes, got {actual}")]
     InvalidSha256Length { actual: usize },
     #[error("canonical asset file is not available at {path}")]
@@ -79,12 +89,23 @@ pub enum StorageUploadError {
     Hash(#[source] sooqa_media::HashError),
     #[error("canonical asset hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
-    #[error("storage upload is already in progress for this asset")]
+    #[error("storage upload is already in progress or requires reconciliation for this asset")]
     InProgress,
     #[error("storage persistence failed: {0}")]
     Persistence(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Telegram storage API failed: {0}")]
     Api(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Telegram storage API result is ambiguous; upload intent remains pending: {0}")]
+    AmbiguousApi(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl StorageUploadError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::InProgress | Self::Persistence(_) | Self::Api(_) | Self::AmbiguousApi(_)
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -117,23 +138,36 @@ where
         &self,
         input: StorageUploadInput,
     ) -> Result<StorageUploadOutcome, StorageUploadError> {
-        if input.expected_sha256.len() != 32 {
+        let asset = self
+            .store
+            .find_canonical_asset(input.asset_id)
+            .await
+            .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?
+            .ok_or(StorageUploadError::CanonicalAssetMissing(input.asset_id))?;
+        let expected_sha256_bytes = asset
+            .sha256
+            .clone()
+            .ok_or(StorageUploadError::CanonicalAssetMissingSha256(input.asset_id))?;
+        if expected_sha256_bytes.len() != 32 {
             return Err(StorageUploadError::InvalidSha256Length {
-                actual: input.expected_sha256.len(),
+                actual: expected_sha256_bytes.len(),
             });
         }
+        let local_work_path = asset
+            .local_work_path
+            .clone()
+            .map(PathBuf::from)
+            .ok_or(StorageUploadError::CanonicalAssetMissingWorkPath(input.asset_id))?;
 
-        let metadata = tokio::fs::metadata(&input.local_work_path).await.map_err(|_| {
-            StorageUploadError::LocalFileUnavailable { path: input.local_work_path.clone() }
+        let metadata = tokio::fs::metadata(&local_work_path).await.map_err(|_| {
+            StorageUploadError::LocalFileUnavailable { path: local_work_path.clone() }
         })?;
         if !metadata.is_file() {
-            return Err(StorageUploadError::LocalFileUnavailable {
-                path: input.local_work_path.clone(),
-            });
+            return Err(StorageUploadError::LocalFileUnavailable { path: local_work_path.clone() });
         }
 
-        let expected_sha256 = hex_encode(&input.expected_sha256);
-        let digest = sha256_file(&input.local_work_path).await.map_err(StorageUploadError::Hash)?;
+        let expected_sha256 = hex_encode(&expected_sha256_bytes);
+        let digest = sha256_file(&local_work_path).await.map_err(StorageUploadError::Hash)?;
         if digest.sha256 != expected_sha256 {
             return Err(StorageUploadError::HashMismatch {
                 expected: expected_sha256,
@@ -157,7 +191,7 @@ where
                 input.asset_id,
                 TELEGRAM_STORAGE_PROVIDER,
                 &idempotency_key,
-                &input.expected_sha256,
+                &expected_sha256_bytes,
             )
             .await
             .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
@@ -171,13 +205,19 @@ where
 
         let request = StorageUploadRequest {
             storage_chat_id: self.storage_chat_id,
-            media_kind: input.media_kind,
-            local_work_path: input.local_work_path,
-            caption: storage_caption(input.asset_id, input.content_item_id, &expected_sha256),
+            media_kind: asset.media_kind,
+            local_work_path,
+            caption: storage_caption(input.asset_id, asset.content_item_id, &expected_sha256),
         };
         let uploaded = match self.api.upload_media(request).await {
             Ok(uploaded) => uploaded,
             Err(error) => {
+                if A::is_ambiguous_error(&error) {
+                    self.store.mark_storage_upload_unknown(intent_id).await.map_err(
+                        |mark_error| StorageUploadError::Persistence(Box::new(mark_error)),
+                    )?;
+                    return Err(StorageUploadError::AmbiguousApi(Box::new(error)));
+                }
                 self.store.release_storage_upload(intent_id).await.map_err(|release_error| {
                     StorageUploadError::Persistence(Box::new(release_error))
                 })?;
@@ -185,7 +225,7 @@ where
             }
         };
 
-        let object = self
+        let object = match self
             .store
             .complete_storage_upload(
                 intent_id,
@@ -196,11 +236,20 @@ where
                     storage_message_id: uploaded.storage_message_id,
                     telegram_file_id: Some(uploaded.telegram_file_id),
                     telegram_file_unique_id: Some(uploaded.telegram_file_unique_id),
-                    media_kind: input.media_kind,
+                    media_kind: asset.media_kind,
                 },
             )
             .await
-            .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
+        {
+            Ok(object) => object,
+            Err(error) => {
+                self.store
+                    .mark_storage_upload_unknown(intent_id)
+                    .await
+                    .map_err(|mark_error| StorageUploadError::Persistence(Box::new(mark_error)))?;
+                return Err(StorageUploadError::Persistence(Box::new(error)));
+            }
+        };
         Ok(StorageUploadOutcome::Uploaded(object))
     }
 }
@@ -225,6 +274,21 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[async_trait]
 impl TelegramStorageApi for TeloxideApi {
     type Error = StorageUploadApiError;
+
+    fn is_ambiguous_error(error: &Self::Error) -> bool {
+        match error {
+            StorageUploadApiError::Api(error) => !matches!(
+                error,
+                teloxide::RequestError::Api(_)
+                    | teloxide::RequestError::MigrateToChatId(_)
+                    | teloxide::RequestError::RetryAfter(_)
+            ),
+            StorageUploadApiError::MissingFileReference { .. } => true,
+            StorageUploadApiError::StorageChatNotPrivateChannel
+            | StorageUploadApiError::StorageBotNotAdministrator
+            | StorageUploadApiError::StorageBotCannotPost => false,
+        }
+    }
 
     async fn upload_media(
         &self,
@@ -287,12 +351,34 @@ impl TelegramStorageApi for TeloxideApi {
     }
 
     async fn verify_storage_chat(&self, chat_id: i64) -> Result<(), Self::Error> {
-        self.bot()
+        let chat = self
+            .bot()
             .get_chat(ChatId(chat_id))
             .send()
             .await
-            .map(|_| ())
-            .map_err(StorageUploadApiError::Api)
+            .map_err(StorageUploadApiError::Api)?;
+        let is_private_channel = matches!(
+            chat.kind,
+            ChatFullInfoKind::Public(public)
+                if matches!(&public.kind, ChatFullInfoPublicKind::Channel(channel) if channel.username.is_none())
+        );
+        if !is_private_channel {
+            return Err(StorageUploadApiError::StorageChatNotPrivateChannel);
+        }
+
+        let bot_user = self.bot().get_me().send().await.map_err(StorageUploadApiError::Api)?;
+        let member = self
+            .bot()
+            .get_chat_member(ChatId(chat_id), bot_user.id)
+            .send()
+            .await
+            .map_err(StorageUploadApiError::Api)?;
+        match member.kind {
+            ChatMemberKind::Owner(_) => Ok(()),
+            ChatMemberKind::Administrator(admin) if admin.can_post_messages => Ok(()),
+            ChatMemberKind::Administrator(_) => Err(StorageUploadApiError::StorageBotCannotPost),
+            _ => Err(StorageUploadApiError::StorageBotNotAdministrator),
+        }
     }
 }
 
@@ -300,7 +386,7 @@ impl TelegramStorageApi for TeloxideApi {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use sooqa_library::StorageObjectStatus;
+    use sooqa_library::{AssetRole, MediaAsset, StorageObjectStatus, StorageState};
     use time::OffsetDateTime;
 
     use super::*;
@@ -309,22 +395,31 @@ mod tests {
     struct MockApi {
         requests: Arc<Mutex<Vec<StorageUploadRequest>>>,
         fail: Arc<Mutex<bool>>,
+        ambiguous: Arc<Mutex<bool>>,
     }
 
     #[derive(Debug, Error)]
     #[error("mock storage error")]
-    struct MockError;
+    struct MockError {
+        ambiguous: bool,
+    }
 
     #[async_trait]
     impl TelegramStorageApi for MockApi {
         type Error = MockError;
+
+        fn is_ambiguous_error(error: &Self::Error) -> bool {
+            error.ambiguous
+        }
 
         async fn upload_media(
             &self,
             request: StorageUploadRequest,
         ) -> Result<StorageUploadResult, Self::Error> {
             if *self.fail.lock().expect("mock mutex should not be poisoned") {
-                return Err(MockError);
+                return Err(MockError {
+                    ambiguous: *self.ambiguous.lock().expect("mock mutex should not be poisoned"),
+                });
             }
             self.requests.lock().expect("mock mutex should not be poisoned").push(request);
             Ok(StorageUploadResult {
@@ -341,14 +436,23 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct MockStore {
+        canonical: Arc<Mutex<Option<MediaAsset>>>,
         active: Arc<Mutex<Option<StorageObject>>>,
         reserved: Arc<Mutex<bool>>,
         released: Arc<Mutex<bool>>,
+        unknown: Arc<Mutex<bool>>,
     }
 
     #[async_trait]
     impl StorageUploadStore for MockStore {
         type Error = MockError;
+
+        async fn find_canonical_asset(
+            &self,
+            _asset_id: Uuid,
+        ) -> Result<Option<MediaAsset>, Self::Error> {
+            Ok(self.canonical.lock().expect("mock mutex should not be poisoned").clone())
+        }
 
         async fn find_active_storage_object(
             &self,
@@ -399,15 +503,36 @@ mod tests {
             *self.released.lock().expect("mock mutex should not be poisoned") = true;
             Ok(())
         }
+
+        async fn mark_storage_upload_unknown(&self, _intent_id: Uuid) -> Result<(), Self::Error> {
+            *self.unknown.lock().expect("mock mutex should not be poisoned") = true;
+            Ok(())
+        }
     }
 
-    fn input(path: PathBuf, expected_sha256: Vec<u8>) -> StorageUploadInput {
-        StorageUploadInput {
-            asset_id: Uuid::from_u128(1),
+    fn input() -> StorageUploadInput {
+        StorageUploadInput { asset_id: Uuid::from_u128(1) }
+    }
+
+    fn canonical_asset(path: &std::path::Path, sha256: Vec<u8>) -> MediaAsset {
+        MediaAsset {
+            id: Uuid::from_u128(1),
             content_item_id: Uuid::from_u128(2),
+            role: AssetRole::Canonical,
             media_kind: MediaKind::Video,
-            local_work_path: path,
-            expected_sha256,
+            mime_type: Some("video/mp4".to_owned()),
+            container: Some("mp4".to_owned()),
+            video_codec: None,
+            audio_codec: None,
+            width: None,
+            height: None,
+            duration_ms: None,
+            bit_rate: None,
+            file_size_bytes: None,
+            sha256: Some(sha256),
+            local_work_path: Some(path.to_string_lossy().into_owned()),
+            storage_state: StorageState::Local,
+            created_at: OffsetDateTime::now_utc(),
         }
     }
 
@@ -416,23 +541,20 @@ mod tests {
         let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
         tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
         let digest = sha256_file(&path).await.expect("fixture should hash");
-        let expected = hex_to_bytes(&digest.sha256);
         let api = MockApi::default();
         let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
         let provider = StorageUploadProvider::new(api.clone(), store.clone(), -100123)
             .expect("storage chat ID should be valid");
 
-        let outcome =
-            provider.upload(input(path.clone(), expected)).await.expect("upload should succeed");
+        let outcome = provider.upload(input()).await.expect("upload should succeed");
         assert!(matches!(outcome, StorageUploadOutcome::Uploaded(_)));
         let request = api.requests.lock().unwrap().pop().expect("one upload should be sent");
         assert!(request.caption.contains("asset: 00000000-0000-0000-0000-000000000001"));
         assert!(request.caption.contains("content: 00000000-0000-0000-0000-000000000002"));
 
-        let outcome = provider
-            .upload(input(path.clone(), hex_to_bytes(&digest.sha256)))
-            .await
-            .expect("stored object should be reused");
+        let outcome = provider.upload(input()).await.expect("stored object should be reused");
         assert!(matches!(outcome, StorageUploadOutcome::Reused(_)));
         assert!(api.requests.lock().unwrap().is_empty());
         tokio::fs::remove_file(path).await.expect("fixture should be removed");
@@ -446,11 +568,33 @@ mod tests {
         let api = MockApi::default();
         *api.fail.lock().unwrap() = true;
         let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
         let provider = StorageUploadProvider::new(api, store.clone(), -100123)
             .expect("storage chat ID should be valid");
 
-        assert!(provider.upload(input(path.clone(), hex_to_bytes(&digest.sha256))).await.is_err());
+        assert!(provider.upload(input()).await.is_err());
         assert!(*store.released.lock().unwrap());
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_upload_keeps_intent_for_reconciliation() {
+        let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let digest = sha256_file(&path).await.expect("fixture should hash");
+        let api = MockApi::default();
+        *api.fail.lock().unwrap() = true;
+        *api.ambiguous.lock().unwrap() = true;
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
+        let provider = StorageUploadProvider::new(api, store.clone(), -100123)
+            .expect("storage chat ID should be valid");
+
+        assert!(matches!(provider.upload(input()).await, Err(StorageUploadError::AmbiguousApi(_))));
+        assert!(*store.unknown.lock().unwrap());
+        assert!(!*store.released.lock().unwrap());
         tokio::fs::remove_file(path).await.expect("fixture should be removed");
     }
 
