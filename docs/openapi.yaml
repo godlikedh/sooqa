@@ -11,6 +11,8 @@ servers:
 tags:
   - name: ingest
     description: Durable content submissions
+  - name: library
+    description: Search and editorial Library operations
 paths:
   /api/v1/ingest-requests:
     post:
@@ -73,6 +75,209 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalError'
+  /api/v1/library/items:
+    get:
+      tags: [library]
+      operationId: listLibraryItems
+      summary: Search Library items
+      security:
+        - bearerAuth: []
+      x-required-scope: library:read
+      parameters:
+        - name: q
+          in: query
+          description: Case-insensitive text search across editorial and source metadata.
+          schema:
+            type: string
+        - name: tags
+          in: query
+          description: Comma-separated tags; all supplied tags must match.
+          schema:
+            type: string
+        - name: kind
+          in: query
+          schema:
+            $ref: '#/components/schemas/ContentKind'
+        - name: status
+          in: query
+          description: Defaults to active.
+          schema:
+            type: string
+            enum: [active, archived, deleted]
+            default: active
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          description: Opaque cursor returned by the previous page.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: A page of Library items
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LibrarySearchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/library/items/{id}:
+    get:
+      tags: [library]
+      operationId: getLibraryItem
+      summary: Get a Library item
+      security:
+        - bearerAuth: []
+      x-required-scope: library:read
+      parameters:
+        - $ref: '#/components/parameters/LibraryItemId'
+      responses:
+        '200':
+          description: Library item detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LibraryDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      tags: [library]
+      operationId: updateLibraryItem
+      summary: Update Library editorial fields
+      security:
+        - bearerAuth: []
+      x-required-scope: library:write
+      parameters:
+        - $ref: '#/components/parameters/LibraryItemId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LibraryItemUpdateRequest'
+      responses:
+        '200':
+          description: Updated Library item detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LibraryDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/library/items/{id}/archive:
+    post:
+      tags: [library]
+      operationId: archiveLibraryItem
+      summary: Archive a Library item
+      security:
+        - bearerAuth: []
+      x-required-scope: library:write
+      parameters:
+        - $ref: '#/components/parameters/LibraryItemId'
+      responses:
+        '200':
+          description: Archived Library item detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LibraryDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/library/items/{id}/tags:
+    post:
+      tags: [library]
+      operationId: addLibraryItemTag
+      summary: Attach a tag to a Library item
+      security:
+        - bearerAuth: []
+      x-required-scope: library:write
+      parameters:
+        - $ref: '#/components/parameters/LibraryItemId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LibraryTagRequest'
+      responses:
+        '200':
+          description: Attached tag
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LibraryTag'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/library/items/{id}/tags/{tag}:
+    delete:
+      tags: [library]
+      operationId: removeLibraryItemTag
+      summary: Detach a tag from a Library item
+      security:
+        - bearerAuth: []
+      x-required-scope: library:write
+      parameters:
+        - $ref: '#/components/parameters/LibraryItemId'
+        - $ref: '#/components/parameters/LibraryTagName'
+      responses:
+        '204':
+          description: Tag detached
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
 components:
   securitySchemes:
     bearerAuth:
@@ -96,6 +301,20 @@ components:
       schema:
         type: string
         format: uuid
+    LibraryItemId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    LibraryTagName:
+      name: tag
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
   responses:
     BadRequest:
       description: Invalid request
@@ -140,6 +359,254 @@ components:
           schema:
             $ref: '#/components/schemas/ApiErrorEnvelope'
   schemas:
+    LibrarySearchResponse:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LibrarySearchItem'
+        next_cursor:
+          type: string
+          nullable: true
+    LibrarySearchItem:
+      allOf:
+        - $ref: '#/components/schemas/LibraryItemFields'
+        - type: object
+          required: [source_count]
+          properties:
+            source_count:
+              type: integer
+              format: int64
+              minimum: 0
+    LibraryDetailResponse:
+      allOf:
+        - $ref: '#/components/schemas/LibraryItemFields'
+        - type: object
+          required: [sources]
+          properties:
+            sources:
+              type: array
+              items:
+                $ref: '#/components/schemas/LibrarySource'
+    LibraryItemFields:
+      type: object
+      required:
+        - id
+        - kind
+        - status
+        - preferred_title
+        - editorial_description
+        - notes
+        - canonical_asset
+        - tags
+        - created_at
+        - updated_at
+        - archived_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          $ref: '#/components/schemas/ContentKind'
+        status:
+          $ref: '#/components/schemas/ContentStatus'
+        preferred_title:
+          type: string
+          nullable: true
+        editorial_description:
+          type: string
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+        canonical_asset:
+          type: object
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/LibraryAsset'
+        tags:
+          type: array
+          items:
+            $ref: '#/components/schemas/LibraryTag'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        archived_at:
+          type: string
+          format: date-time
+          nullable: true
+    LibraryItemUpdateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        preferred_title:
+          type: string
+          nullable: true
+        editorial_description:
+          type: string
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+        expected_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+    LibraryTagRequest:
+      type: object
+      required: [tag]
+      additionalProperties: false
+      properties:
+        tag:
+          type: string
+          minLength: 1
+          maxLength: 100
+    LibraryTag:
+      type: object
+      required: [id, normalized_name, display_name, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        normalized_name:
+          type: string
+        display_name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    LibraryAsset:
+      type: object
+      required:
+        - id
+        - role
+        - media_kind
+        - mime_type
+        - container
+        - width
+        - height
+        - duration_ms
+        - bit_rate
+        - file_size_bytes
+        - storage_state
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        role:
+          $ref: '#/components/schemas/AssetRole'
+        media_kind:
+          $ref: '#/components/schemas/MediaKind'
+        mime_type:
+          type: string
+          nullable: true
+        container:
+          type: string
+          nullable: true
+        width:
+          type: integer
+          format: int32
+          nullable: true
+        height:
+          type: integer
+          format: int32
+          nullable: true
+        duration_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          nullable: true
+        bit_rate:
+          type: integer
+          format: int64
+          minimum: 0
+          nullable: true
+        file_size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          nullable: true
+        storage_state:
+          $ref: '#/components/schemas/StorageState'
+        created_at:
+          type: string
+          format: date-time
+    LibrarySource:
+      type: object
+      required:
+        - id
+        - source_type
+        - original_url
+        - normalized_url
+        - platform
+        - platform_content_id
+        - author_name
+        - source_title
+        - source_description
+        - source_published_at
+        - retrieved_at
+        - metadata_json
+      properties:
+        id:
+          type: string
+          format: uuid
+        source_type:
+          $ref: '#/components/schemas/SourceType'
+        original_url:
+          type: string
+          nullable: true
+        normalized_url:
+          type: string
+          nullable: true
+        platform:
+          type: string
+          nullable: true
+        platform_content_id:
+          type: string
+          nullable: true
+        author_name:
+          type: string
+          nullable: true
+        source_title:
+          type: string
+          nullable: true
+        source_description:
+          type: string
+          nullable: true
+        source_published_at:
+          type: string
+          format: date-time
+          nullable: true
+        retrieved_at:
+          type: string
+          format: date-time
+        metadata_json:
+          type: object
+          additionalProperties: true
+    ContentKind:
+      type: string
+      enum: [video, image, animation, audio]
+    ContentStatus:
+      type: string
+      enum: [active, archived, deleted]
+    AssetRole:
+      type: string
+      enum: [original, canonical, preview, thumbnail]
+    MediaKind:
+      type: string
+      enum: [video, image, audio, animation]
+    StorageState:
+      type: string
+      enum: [local, uploaded, missing]
+    SourceType:
+      type: string
+      enum: [webpage, direct_url, youtube, telegram, upload]
     IngestCreateRequest:
       type: object
       required: [url]

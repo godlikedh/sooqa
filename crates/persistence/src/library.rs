@@ -1,8 +1,9 @@
 use serde_json::Value;
 use sooqa_library::{
-    AssetRole, ContentItem, ExactDuplicateRequest, ExactDuplicateResolution, MediaAsset,
-    NewContentItem, NewMediaAsset, NewSourceRecord, NewSourceRecordDraft, NewStorageObject, NewTag,
-    SourceRecord, StorageObject, Tag,
+    AssetRole, ContentItem, ContentItemUpdate, ExactDuplicateRequest, ExactDuplicateResolution,
+    LibraryCursor, LibraryItemDetail, LibraryItemSummary, LibrarySearchPage, LibrarySearchQuery,
+    MediaAsset, NewContentItem, NewMediaAsset, NewSourceRecord, NewSourceRecordDraft,
+    NewStorageObject, NewTag, SourceRecord, StorageObject, Tag,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
@@ -169,6 +170,259 @@ impl LibraryRepository {
             content_created: true,
             source_created: true,
         })
+    }
+
+    pub async fn find_library_item(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<LibraryItemDetail>, LibraryRepositoryError> {
+        let Some(content_item) = self.find_content_item(id).await? else {
+            return Ok(None);
+        };
+        let canonical_asset = self.load_canonical_asset(&content_item).await?;
+        let tags = self.list_tags(id).await?;
+        let sources = self.list_source_records(id).await?;
+        Ok(Some(LibraryItemDetail { content_item, canonical_asset, tags, sources }))
+    }
+
+    pub async fn search_library(
+        &self,
+        query: LibrarySearchQuery,
+    ) -> Result<LibrarySearchPage, LibraryRepositoryError> {
+        if !(1..=100).contains(&query.limit) {
+            return Err(LibraryRepositoryError::InvalidLimit { value: query.limit });
+        }
+
+        let tags = (!query.tags.is_empty()).then_some(query.tags);
+        let rows = sqlx::query_as::<_, ContentItemRow>(
+            r#"
+            SELECT
+                ci.id, ci.kind, ci.status, ci.canonical_asset_id, ci.preferred_title,
+                ci.editorial_description, ci.notes, ci.created_at, ci.updated_at,
+                ci.archived_at
+            FROM content_items ci
+            WHERE ($1::text IS NULL OR (
+                    ci.preferred_title ILIKE '%' || $1 || '%'
+                    OR ci.editorial_description ILIKE '%' || $1 || '%'
+                    OR ci.notes ILIKE '%' || $1 || '%'
+                    OR EXISTS (
+                        SELECT 1
+                        FROM source_records sr
+                        WHERE sr.content_item_id = ci.id
+                          AND (sr.source_title ILIKE '%' || $1 || '%'
+                               OR sr.source_description ILIKE '%' || $1 || '%')
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM content_item_tags cit_search
+                        INNER JOIN tags t_search ON t_search.id = cit_search.tag_id
+                        WHERE cit_search.content_item_id = ci.id
+                          AND t_search.normalized_name ILIKE '%' || $1 || '%'
+                    )
+                ))
+              AND ($2::text IS NULL OR ci.kind = $2)
+              AND ($3::text IS NULL OR ci.status = $3)
+              AND (
+                    $4::text[] IS NULL
+                    OR ci.id IN (
+                        SELECT cit_filter.content_item_id
+                        FROM content_item_tags cit_filter
+                        INNER JOIN tags t_filter ON t_filter.id = cit_filter.tag_id
+                        WHERE t_filter.normalized_name = ANY($4)
+                        GROUP BY cit_filter.content_item_id
+                        HAVING count(DISTINCT t_filter.normalized_name) = cardinality($4)
+                    )
+                )
+              AND ($5::timestamptz IS NULL OR ci.updated_at < $5
+                   OR (ci.updated_at = $5 AND ci.id < $6))
+            ORDER BY ci.updated_at DESC, ci.id DESC
+            LIMIT $7
+            "#,
+        )
+        .bind(query.text.as_deref())
+        .bind(query.kind.map(|kind| kind.as_str()))
+        .bind(query.status.map(|status| status.as_str()))
+        .bind(tags)
+        .bind(query.cursor.as_ref().map(|cursor| cursor.updated_at))
+        .bind(query.cursor.as_ref().map(|cursor| cursor.id))
+        .bind(i64::from(query.limit) + 1)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let has_more = rows.len() > query.limit as usize;
+        let rows = rows.into_iter().take(query.limit as usize).collect::<Vec<_>>();
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let content_item = row.into_content_item()?;
+            let canonical_asset = self.load_canonical_asset(&content_item).await?;
+            let tags = self.list_tags(content_item.id).await?;
+            let source_count = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM source_records WHERE content_item_id = $1",
+            )
+            .bind(content_item.id)
+            .fetch_one(&self.pool)
+            .await?;
+            let source_count = u64::try_from(source_count)
+                .map_err(|_| LibraryRepositoryError::InvalidNumber { field: "source_count" })?;
+            items.push(LibraryItemSummary { content_item, canonical_asset, tags, source_count });
+        }
+
+        let next_cursor = has_more
+            .then(|| {
+                items.last().map(|item| LibraryCursor {
+                    updated_at: item.content_item.updated_at,
+                    id: item.content_item.id,
+                })
+            })
+            .flatten();
+        Ok(LibrarySearchPage { items, next_cursor })
+    }
+
+    pub async fn update_content_item(
+        &self,
+        id: Uuid,
+        update: ContentItemUpdate,
+    ) -> Result<ContentItem, LibraryRepositoryError> {
+        if update.preferred_title.is_none()
+            && update.editorial_description.is_none()
+            && update.notes.is_none()
+        {
+            return Err(LibraryRepositoryError::EmptyUpdate);
+        }
+
+        let row = sqlx::query_as::<_, ContentItemRow>(
+            r#"
+            UPDATE content_items
+            SET preferred_title = CASE WHEN $2 THEN $3 ELSE preferred_title END,
+                editorial_description = CASE WHEN $4 THEN $5 ELSE editorial_description END,
+                notes = CASE WHEN $6 THEN $7 ELSE notes END,
+                updated_at = now()
+            WHERE id = $1
+              AND ($8::timestamptz IS NULL OR updated_at = $8)
+            RETURNING
+                id, kind, status, canonical_asset_id, preferred_title,
+                editorial_description, notes, created_at, updated_at, archived_at
+            "#,
+        )
+        .bind(id)
+        .bind(update.preferred_title.is_some())
+        .bind(update.preferred_title.as_ref().and_then(|value| value.as_deref()))
+        .bind(update.editorial_description.is_some())
+        .bind(update.editorial_description.as_ref().and_then(|value| value.as_deref()))
+        .bind(update.notes.is_some())
+        .bind(update.notes.as_ref().and_then(|value| value.as_deref()))
+        .bind(update.expected_updated_at)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = row {
+            return row.into_content_item();
+        }
+        if self.find_content_item(id).await?.is_none() {
+            return Err(LibraryRepositoryError::ResourceMissing(id));
+        }
+        Err(LibraryRepositoryError::OptimisticConflict(id))
+    }
+
+    pub async fn archive_content_item(
+        &self,
+        id: Uuid,
+    ) -> Result<ContentItem, LibraryRepositoryError> {
+        let row = sqlx::query_as::<_, ContentItemRow>(
+            r#"
+            UPDATE content_items
+            SET status = 'archived', archived_at = COALESCE(archived_at, now()), updated_at = now()
+            WHERE id = $1 AND status <> 'deleted'
+            RETURNING
+                id, kind, status, canonical_asset_id, preferred_title,
+                editorial_description, notes, created_at, updated_at, archived_at
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = row {
+            return row.into_content_item();
+        }
+        if self.find_content_item(id).await?.is_none() {
+            return Err(LibraryRepositoryError::ResourceMissing(id));
+        }
+        Err(LibraryRepositoryError::InvalidState { id, operation: "archive" })
+    }
+
+    pub async fn add_tag(
+        &self,
+        content_item_id: Uuid,
+        tag: NewTag,
+    ) -> Result<Tag, LibraryRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let content_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_items WHERE id = $1)")
+                .bind(content_item_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        if !content_exists {
+            return Err(LibraryRepositoryError::ResourceMissing(content_item_id));
+        }
+
+        let tag_row = upsert_tag_in_transaction(&mut transaction, tag).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO content_item_tags (content_item_id, tag_id)
+            VALUES ($1, $2)
+            ON CONFLICT (content_item_id, tag_id) DO NOTHING
+            "#,
+        )
+        .bind(content_item_id)
+        .bind(tag_row.id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(tag_row.into_tag())
+    }
+
+    pub async fn remove_tag(
+        &self,
+        content_item_id: Uuid,
+        normalized_name: &str,
+    ) -> Result<(), LibraryRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let content_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_items WHERE id = $1)")
+                .bind(content_item_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        if !content_exists {
+            return Err(LibraryRepositoryError::ResourceMissing(content_item_id));
+        }
+
+        let result = sqlx::query(
+            r#"
+            DELETE FROM content_item_tags
+            WHERE content_item_id = $1
+              AND tag_id = (SELECT id FROM tags WHERE normalized_name = $2)
+            "#,
+        )
+        .bind(content_item_id)
+        .bind(normalized_name)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(LibraryRepositoryError::TagNotAttached);
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn load_canonical_asset(
+        &self,
+        content_item: &ContentItem,
+    ) -> Result<Option<MediaAsset>, LibraryRepositoryError> {
+        match content_item.canonical_asset_id {
+            Some(id) => self.find_media_asset(id).await,
+            None => Ok(None),
+        }
     }
 
     pub async fn create_content_item(
@@ -556,6 +810,25 @@ async fn find_source_by_identity(
     row.map(SourceRecordRow::into_source_record).transpose()
 }
 
+async fn upsert_tag_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    new_tag: NewTag,
+) -> Result<TagRow, LibraryRepositoryError> {
+    Ok(sqlx::query_as::<_, TagRow>(
+        r#"
+        INSERT INTO tags (normalized_name, display_name)
+        VALUES ($1, $2)
+        ON CONFLICT (normalized_name) DO UPDATE
+        SET display_name = EXCLUDED.display_name
+        RETURNING id, normalized_name, display_name, created_at
+        "#,
+    )
+    .bind(new_tag.normalized_name)
+    .bind(new_tag.display_name)
+    .fetch_one(&mut **transaction)
+    .await?)
+}
+
 async fn find_media_asset_by_sha256(
     transaction: &mut Transaction<'_, Postgres>,
     sha256: &[u8],
@@ -773,6 +1046,18 @@ pub enum LibraryRepositoryError {
     InvalidSourceIdentity,
     #[error("database invariant violated: {0}")]
     Invariant(&'static str),
+    #[error("library item {0} was not found")]
+    ResourceMissing(Uuid),
+    #[error("library item {0} was changed by another request")]
+    OptimisticConflict(Uuid),
+    #[error("library update contains no editable fields")]
+    EmptyUpdate,
+    #[error("library item {id} cannot be {operation} in its current state")]
+    InvalidState { id: Uuid, operation: &'static str },
+    #[error("tag is not attached to the library item")]
+    TagNotAttached,
+    #[error("library search limit must be between 1 and 100, got {value}")]
+    InvalidLimit { value: u32 },
 }
 
 #[derive(Debug, FromRow)]

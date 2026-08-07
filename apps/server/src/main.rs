@@ -52,7 +52,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     };
     let app: Router = sooqa_api::router(
         api_settings,
-        sooqa_api::ApiState::new(database.inbox(), database.device_tokens()),
+        sooqa_api::ApiState::new(database.inbox(), database.device_tokens(), database.library()),
     );
 
     tracing::info!(role = %config.role, "sooqa server started");

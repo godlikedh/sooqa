@@ -433,6 +433,52 @@ pub struct ExactDuplicateResolution {
     pub source_created: bool,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LibraryItemDetail {
+    pub content_item: ContentItem,
+    pub canonical_asset: Option<MediaAsset>,
+    pub tags: Vec<Tag>,
+    pub sources: Vec<SourceRecord>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LibraryItemSummary {
+    pub content_item: ContentItem,
+    pub canonical_asset: Option<MediaAsset>,
+    pub tags: Vec<Tag>,
+    pub source_count: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LibraryCursor {
+    pub updated_at: OffsetDateTime,
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LibrarySearchQuery {
+    pub text: Option<String>,
+    pub tags: Vec<String>,
+    pub kind: Option<ContentKind>,
+    pub status: Option<ContentStatus>,
+    pub limit: u32,
+    pub cursor: Option<LibraryCursor>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LibrarySearchPage {
+    pub items: Vec<LibraryItemSummary>,
+    pub next_cursor: Option<LibraryCursor>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ContentItemUpdate {
+    pub preferred_title: Option<Option<String>>,
+    pub editorial_description: Option<Option<String>>,
+    pub notes: Option<Option<String>>,
+    pub expected_updated_at: Option<OffsetDateTime>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Tag {
     pub id: Uuid,
