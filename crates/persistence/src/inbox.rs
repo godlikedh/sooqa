@@ -83,6 +83,22 @@ impl InboxRepository {
         transaction.commit().await?;
         Ok(CreateIngestResult { request, created: true })
     }
+
+    pub async fn find(&self, id: Uuid) -> Result<Option<IngestRequest>, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let request = load_request(&mut transaction, id).await;
+        match request {
+            Ok(request) => {
+                transaction.commit().await?;
+                Ok(Some(request))
+            }
+            Err(InboxRepositoryError::ResourceMissing(_)) => {
+                transaction.rollback().await?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

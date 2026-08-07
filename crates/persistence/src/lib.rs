@@ -1,8 +1,12 @@
 //! Database connection and migration boundaries for sooqa.
 
+mod device_tokens;
 mod inbox;
 mod jobs;
 
+pub use device_tokens::{
+    DeviceToken, DeviceTokenRepository, DeviceTokenRepositoryError, hash_device_token,
+};
 pub use inbox::{CreateIngestResult, InboxRepository, InboxRepositoryError};
 pub use jobs::{JobRepository, JobRepositoryError};
 
@@ -52,6 +56,10 @@ impl Database {
 
     pub fn inbox(&self) -> InboxRepository {
         InboxRepository::new(self.pool.clone())
+    }
+
+    pub fn device_tokens(&self) -> DeviceTokenRepository {
+        DeviceTokenRepository::new(self.pool.clone())
     }
 
     pub fn pool(&self) -> &PgPool {
