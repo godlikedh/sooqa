@@ -1,7 +1,9 @@
 //! Database connection and migration boundaries for sooqa.
 
+mod inbox;
 mod jobs;
 
+pub use inbox::{CreateIngestResult, InboxRepository, InboxRepositoryError};
 pub use jobs::{JobRepository, JobRepositoryError};
 
 use sooqa_config::SecretString;
@@ -46,6 +48,10 @@ impl Database {
 
     pub fn jobs(&self) -> JobRepository {
         JobRepository::new(self.pool.clone())
+    }
+
+    pub fn inbox(&self) -> InboxRepository {
+        InboxRepository::new(self.pool.clone())
     }
 
     pub fn pool(&self) -> &PgPool {
