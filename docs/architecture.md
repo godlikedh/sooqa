@@ -188,6 +188,25 @@ the existing UUID foreign key, so persistence of that mapping is deferred to
 the administration slice. Callback data is versioned as
 `v1:ingest_status:<request-id>`; callback handling is a later UI increment.
 
+H3 adds the Telegram storage provider. `StorageUploadProvider` loads the
+canonical asset metadata and SHA-256 from PostgreSQL, verifies the local file
+before sending it, builds a short diagnostic caption containing the
+asset/content IDs and hash prefix, and uploads the correct Telegram media type
+to the configured private storage chat. The `StorageUploadStore` port reserves
+a deterministic upload intent in the existing `idempotency_records` table
+before the network call; successful completion records the Telegram
+message/file references and marks the asset uploaded in one transaction.
+Existing active objects are reused. Definitively rejected API requests release
+a pending intent, while transport failures and post-send persistence failures
+mark it unknown and block blind retries; the same completion operation is the
+reconciliation seam. Pending or unknown intents are never automatically
+reclaimed, because a long-running or ambiguous Telegram request could still
+be in flight. Recording a canonical asset also enqueues a deterministic typed
+`upload_storage_asset` job. The worker registers the upload handler when
+Telegram storage configuration is present, and startup verifies that the bot
+can post to the configured private channel without holding a database
+transaction.
+
 The E3 Library API adds authenticated read and editorial-write routes over the
 typed Library repository. Search defaults to active items, supports text,
 kind, status, all-tag filtering, and opaque `(updated_at, id)` cursor pages.

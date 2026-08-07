@@ -73,6 +73,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             std::time::Duration::from_secs(config.telegram.poll_timeout_seconds),
             DatabaseUpdateStore { repository: database.telegram() },
             config.telegram.admin_user_ids.clone(),
+            config.telegram.storage_chat_id,
             DatabaseIngestService { repository: database.inbox() },
         )?;
         tracing::info!(api_base_url = %config.telegram.api_base_url, "Telegram bot polling enabled");

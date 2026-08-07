@@ -43,9 +43,9 @@ The equivalent environment overrides are `SOOQA_MEDIA_FFMPEG_PATH`,
 `SOOQA_MEDIA_YTDLP_FORMAT`. On normal startup,
 the worker logs the detected version of each required binary and exits before
 database connection if a binary is unavailable. The server does not require
-these media tools. The current worker still has no production media or
-Telegram media handlers; it polls durably stored jobs, executes registered
-handlers, records outcomes, and stops gracefully on SIGTERM or Ctrl-C.
+these media tools. The worker polls durably stored jobs, executes registered
+handlers including the configured Telegram storage upload handler, records
+outcomes, and stops gracefully on SIGTERM or Ctrl-C.
 
 ## Telegram bot
 
@@ -61,6 +61,7 @@ user ID:
     SOOQA_TELEGRAM_ADMIN_USER_IDS=123456789
     SOOQA_TELEGRAM_API_BASE_URL=https://api.telegram.org
     SOOQA_TELEGRAM_POLL_TIMEOUT_SECONDS=30
+    SOOQA_TELEGRAM_STORAGE_CHAT_ID=-1001234567890
 
 The server starts polling alongside the HTTP API only when the bot token is
 configured. It ignores group messages, rejects non-admin private users with a
@@ -70,5 +71,14 @@ durable Inbox request as the HTTP API; the response includes its request ID
 and status. Update receipts are retained as durable deduplication records. A
 five-minute claim lease allows an abandoned in-progress update to be reclaimed;
 failed API or Inbox calls release their claim immediately. URL source
-inspection, downloading, media processing, uploads, and channel publication
-remain later Telegram slices.
+inspection, downloading, media processing, and channel publication remain
+later Telegram slices.
+
+For H3 storage, make the bot an administrator of a private storage channel and
+set `SOOQA_TELEGRAM_STORAGE_CHAT_ID` to its negative chat ID. The server checks
+that chat during Telegram startup. Upload intents are durable in
+`idempotency_records`; pending or ambiguous intents are retained and must be
+reconciled before retrying. They are not automatically reclaimed because a
+long-running Telegram request could still be in flight. The worker enables the
+upload job only when the Telegram token and storage chat are configured;
+canonical-asset recording creates the durable upload job.
