@@ -338,6 +338,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -352,6 +354,7 @@ paths:
       x-required-scope: library:write
       parameters:
         - $ref: '#/components/parameters/DuplicateCandidateId'
+        - $ref: '#/components/parameters/IdempotencyKey'
       responses:
         '200':
           description: Updated candidate
@@ -363,6 +366,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -379,6 +384,7 @@ paths:
       x-required-scope: library:write
       parameters:
         - $ref: '#/components/parameters/DuplicateCandidateId'
+        - $ref: '#/components/parameters/IdempotencyKey'
       responses:
         '200':
           description: Updated candidate
@@ -390,6 +396,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -406,6 +414,7 @@ paths:
       x-required-scope: library:write
       parameters:
         - $ref: '#/components/parameters/DuplicateCandidateId'
+        - $ref: '#/components/parameters/IdempotencyKey'
       responses:
         '200':
           description: Updated candidate
@@ -417,6 +426,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -434,7 +445,7 @@ components:
       name: Idempotency-Key
       in: header
       required: true
-      description: Replays the original accepted request when the payload is identical.
+      description: Replays the original operation when the key and request scope match.
       schema:
         type: string
         minLength: 1

@@ -303,6 +303,11 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
             "The duplicate candidate has already been resolved",
             headers,
         ),
+        LibraryRepositoryError::DuplicateCandidateIdempotencyConflict(_) => ApiError::conflict(
+            "idempotency_conflict",
+            "The Idempotency-Key conflicts with an earlier decision",
+            headers,
+        ),
         LibraryRepositoryError::TagNotAttached => ApiError::not_found(
             "tag_not_attached",
             "The tag is not attached to the library item",

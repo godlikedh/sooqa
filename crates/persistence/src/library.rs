@@ -160,6 +160,7 @@ impl LibraryRepository {
         candidate_id: Uuid,
         action: DuplicateCandidateAction,
         actor_device_token_id: Uuid,
+        idempotency_key: &str,
     ) -> Result<DuplicateCandidate, LibraryRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let current = sqlx::query_as::<_, DuplicateCandidateRow>(
@@ -178,6 +179,29 @@ impl LibraryRepository {
         .ok_or(LibraryRepositoryError::DuplicateCandidateMissing(candidate_id))?;
         let current_status = DuplicateCandidateStatus::try_from(current.status.as_str())
             .map_err(|_| LibraryRepositoryError::Invariant("unknown duplicate candidate status"))?;
+        if let Some(existing_action) = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT action
+            FROM duplicate_candidate_events
+            WHERE candidate_id = $1
+              AND actor_device_token_id = $2
+              AND idempotency_key = $3
+            "#,
+        )
+        .bind(candidate_id)
+        .bind(actor_device_token_id)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            if existing_action == action.as_str() {
+                transaction.commit().await?;
+                return current.into_duplicate_candidate();
+            }
+            return Err(LibraryRepositoryError::DuplicateCandidateIdempotencyConflict(
+                candidate_id,
+            ));
+        }
         if current_status != DuplicateCandidateStatus::Pending {
             return Err(LibraryRepositoryError::InvalidCandidateState {
                 id: candidate_id,
@@ -200,13 +224,15 @@ impl LibraryRepository {
         .await?;
         sqlx::query(
             r#"
-            INSERT INTO duplicate_candidate_events (candidate_id, action, actor_device_token_id)
-            VALUES ($1, $2, $3)
+            INSERT INTO duplicate_candidate_events
+                (candidate_id, action, actor_device_token_id, idempotency_key)
+            VALUES ($1, $2, $3, $4)
             "#,
         )
         .bind(candidate_id)
         .bind(action.as_str())
         .bind(actor_device_token_id)
+        .bind(idempotency_key)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
@@ -1436,6 +1462,8 @@ pub enum LibraryRepositoryError {
     DuplicateCandidateMissing(Uuid),
     #[error("duplicate candidate {id} is already in status {status:?}")]
     InvalidCandidateState { id: Uuid, status: DuplicateCandidateStatus },
+    #[error("idempotency key conflicts with an earlier decision for duplicate candidate {0}")]
+    DuplicateCandidateIdempotencyConflict(Uuid),
 }
 
 #[derive(Debug, FromRow)]

@@ -61,9 +61,10 @@ async fn list_candidates(
 async fn get_candidate(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Path(raw_id): Path<String>,
 ) -> Result<Json<CandidateDetailResponse>, ApiError> {
     authorize(&state.device_tokens, &headers, "library:read").await?;
+    let id = parse_candidate_id(&raw_id, &headers)?;
     let candidate = state
         .library
         .find_duplicate_candidate_by_id(id)
@@ -90,25 +91,43 @@ async fn get_candidate(
 async fn confirm_variant(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Path(raw_id): Path<String>,
 ) -> Result<Json<CandidateDetailResponse>, ApiError> {
-    decide(&state, &headers, id, DuplicateCandidateAction::ConfirmVariant).await
+    decide(
+        &state,
+        &headers,
+        parse_candidate_id(&raw_id, &headers)?,
+        DuplicateCandidateAction::ConfirmVariant,
+    )
+    .await
 }
 
 async fn keep_separate(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Path(raw_id): Path<String>,
 ) -> Result<Json<CandidateDetailResponse>, ApiError> {
-    decide(&state, &headers, id, DuplicateCandidateAction::KeepSeparate).await
+    decide(
+        &state,
+        &headers,
+        parse_candidate_id(&raw_id, &headers)?,
+        DuplicateCandidateAction::KeepSeparate,
+    )
+    .await
 }
 
 async fn dismiss(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Path(id): Path<Uuid>,
+    Path(raw_id): Path<String>,
 ) -> Result<Json<CandidateDetailResponse>, ApiError> {
-    decide(&state, &headers, id, DuplicateCandidateAction::Dismiss).await
+    decide(
+        &state,
+        &headers,
+        parse_candidate_id(&raw_id, &headers)?,
+        DuplicateCandidateAction::Dismiss,
+    )
+    .await
 }
 
 async fn decide(
@@ -118,9 +137,17 @@ async fn decide(
     action: DuplicateCandidateAction,
 ) -> Result<Json<CandidateDetailResponse>, ApiError> {
     let actor = authorize(&state.device_tokens, headers, "library:write").await?;
+    let idempotency_key = super::required_header(headers, "idempotency-key")?.trim();
+    if idempotency_key.is_empty() || idempotency_key.chars().count() > 255 {
+        return Err(ApiError::bad_request(
+            "invalid_idempotency_key",
+            "The Idempotency-Key header must be between 1 and 255 characters",
+            headers,
+        ));
+    }
     let candidate = state
         .library
-        .decide_duplicate_candidate(id, action, actor.id)
+        .decide_duplicate_candidate(id, action, actor.id, idempotency_key)
         .await
         .map_err(|error| map_library_error(error, headers))?;
     let events = state
@@ -132,6 +159,16 @@ async fn decide(
         candidate: CandidateResponse::from_candidate(&candidate),
         events: events.iter().map(CandidateEventResponse::from_event).collect(),
     }))
+}
+
+fn parse_candidate_id(raw_id: &str, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(raw_id).map_err(|_| {
+        ApiError::bad_request(
+            "invalid_candidate_id",
+            "The duplicate candidate ID must be a UUID",
+            headers,
+        )
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]

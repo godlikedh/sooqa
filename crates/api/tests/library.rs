@@ -2,7 +2,7 @@ use std::env;
 
 use axum::{
     body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    http::{HeaderValue, Request, StatusCode},
 };
 use serde_json::{Value, json};
 use sooqa_api::{ApiSettings, ApiState, router};
@@ -436,6 +436,18 @@ async fn authenticated_duplicate_candidate_api_supports_review_actions() {
     assert_eq!(read_detail_body["candidate"]["status"], "pending");
     assert!(read_detail_body["events"].as_array().expect("events should be an array").is_empty());
 
+    let malformed_detail = app(&fixture)
+        .oneshot(request(
+            "GET",
+            "/api/v1/duplicate-candidates/not-a-uuid".to_owned(),
+            &fixture.read_token,
+            None,
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(malformed_detail.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(malformed_detail).await["error"]["code"], "invalid_candidate_id");
+
     let read_cannot_decide = app(&fixture)
         .oneshot(request(
             "POST",
@@ -448,11 +460,11 @@ async fn authenticated_duplicate_candidate_api_supports_review_actions() {
     assert_eq!(read_cannot_decide.status(), StatusCode::FORBIDDEN);
 
     let confirmed = app(&fixture)
-        .oneshot(request(
+        .oneshot(request_with_idempotency_key(
             "POST",
             format!("/api/v1/duplicate-candidates/{}/confirm-variant", candidate.id),
             &fixture.write_token,
-            None,
+            "candidate-confirm",
         ))
         .await
         .expect("router should respond");
@@ -461,12 +473,26 @@ async fn authenticated_duplicate_candidate_api_supports_review_actions() {
     assert_eq!(confirmed_body["candidate"]["status"], "confirmed_variant");
     assert_eq!(confirmed_body["events"][0]["action"], "confirm_variant");
 
+    let replayed = app(&fixture)
+        .oneshot(request_with_idempotency_key(
+            "POST",
+            format!("/api/v1/duplicate-candidates/{}/confirm-variant", candidate.id),
+            &fixture.write_token,
+            "candidate-confirm",
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(replayed.status(), StatusCode::OK);
+    let replayed_body = response_json(replayed).await;
+    assert_eq!(replayed_body["candidate"]["status"], "confirmed_variant");
+    assert_eq!(replayed_body["events"].as_array().expect("events should be an array").len(), 1);
+
     let second_decision = app(&fixture)
-        .oneshot(request(
+        .oneshot(request_with_idempotency_key(
             "POST",
             format!("/api/v1/duplicate-candidates/{}/dismiss", candidate.id),
             &fixture.write_token,
-            None,
+            "candidate-dismiss",
         ))
         .await
         .expect("router should respond");
@@ -474,4 +500,18 @@ async fn authenticated_duplicate_candidate_api_supports_review_actions() {
     assert_eq!(response_json(second_decision).await["error"]["code"], "invalid_candidate_state");
 
     fixture.clean_up().await;
+}
+
+fn request_with_idempotency_key(
+    method: &str,
+    uri: String,
+    token: &str,
+    idempotency_key: &str,
+) -> Request<Body> {
+    let mut request = request(method, uri, token, None);
+    request.headers_mut().insert(
+        "idempotency-key",
+        HeaderValue::from_str(idempotency_key).expect("idempotency key should be valid"),
+    );
+    request
 }

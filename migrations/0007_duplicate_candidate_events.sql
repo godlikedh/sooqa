@@ -5,11 +5,15 @@ CREATE TABLE duplicate_candidate_events (
     action text NOT NULL
         CHECK (action IN ('confirm_variant', 'keep_separate', 'dismiss')),
     actor_device_token_id uuid REFERENCES device_tokens(id) ON DELETE SET NULL,
+    idempotency_key text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX duplicate_candidate_events_candidate_idx
     ON duplicate_candidate_events (candidate_id, created_at DESC);
+
+CREATE UNIQUE INDEX duplicate_candidate_events_idempotency_idx
+    ON duplicate_candidate_events (candidate_id, actor_device_token_id, idempotency_key);
 
 ALTER TABLE duplicate_candidates
     ADD CONSTRAINT duplicate_candidates_resolution_timestamp_check

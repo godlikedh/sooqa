@@ -100,8 +100,10 @@ The G3 duplicate-resolution API adds authenticated candidate list/detail routes
 and explicit confirm-variant, keep-separate, and dismiss transitions. A
 PostgreSQL row lock allows only a pending candidate to transition, and each
 decision inserts an immutable `duplicate_candidate_events` audit row with the
-authenticated device-token ID. Decisions do not merge or delete content;
-Telegram presentation remains in Stack H.
+authenticated device-token ID and request idempotency key. Retrying the same
+action with the same key replays the resolved candidate; a different key still
+returns a stable conflict. Decisions do not merge or delete content; Telegram
+presentation remains in Stack H.
 
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,

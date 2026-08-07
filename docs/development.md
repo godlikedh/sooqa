@@ -163,9 +163,10 @@ G3 exposes duplicate candidates through the authenticated API. Library readers
 can list candidates by status or inspect one with its audit events. Library
 writers can confirm a variant, keep the pair separate, or dismiss it. Each
 action is a single PostgreSQL transaction that locks the candidate, allows only
-the pending state, updates the status, and records the acting device token.
-Repeated decisions return a stable conflict; the API does not automatically
-merge or delete content.
+the pending state, and records the acting device token and `Idempotency-Key`.
+Retrying the same action with the same key replays the decision; a different
+key returns a stable conflict. The API does not automatically merge or delete
+content.
 
 Run its PostgreSQL API integration test with:
 
