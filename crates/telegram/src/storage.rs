@@ -277,12 +277,13 @@ impl TelegramStorageApi for TeloxideApi {
 
     fn is_ambiguous_error(error: &Self::Error) -> bool {
         match error {
-            StorageUploadApiError::Api(error) => !matches!(
-                error,
-                teloxide::RequestError::Api(_)
-                    | teloxide::RequestError::MigrateToChatId(_)
-                    | teloxide::RequestError::RetryAfter(_)
-            ),
+            StorageUploadApiError::Api(teloxide::RequestError::Api(
+                teloxide::errors::ApiError::Unknown(_),
+            ))
+            | StorageUploadApiError::Api(teloxide::RequestError::Network(_))
+            | StorageUploadApiError::Api(teloxide::RequestError::InvalidJson { .. })
+            | StorageUploadApiError::Api(teloxide::RequestError::Io(_)) => true,
+            StorageUploadApiError::Api(_) => false,
             StorageUploadApiError::MissingFileReference { .. } => true,
             StorageUploadApiError::StorageChatNotPrivateChannel
             | StorageUploadApiError::StorageBotNotAdministrator
@@ -441,6 +442,7 @@ mod tests {
         reserved: Arc<Mutex<bool>>,
         released: Arc<Mutex<bool>>,
         unknown: Arc<Mutex<bool>>,
+        complete_fail: Arc<Mutex<bool>>,
     }
 
     #[async_trait]
@@ -482,6 +484,9 @@ mod tests {
             _intent_id: Uuid,
             object: NewStorageObject,
         ) -> Result<StorageObject, Self::Error> {
+            if *self.complete_fail.lock().expect("mock mutex should not be poisoned") {
+                return Err(MockError { ambiguous: false });
+            }
             let object = StorageObject {
                 id: Uuid::from_u128(4),
                 asset_id: object.asset_id,
@@ -596,6 +601,56 @@ mod tests {
         assert!(*store.unknown.lock().unwrap());
         assert!(!*store.released.lock().unwrap());
         tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn hash_mismatch_is_rejected_before_reserving_an_intent() {
+        let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let api = MockApi::default();
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() = Some(canonical_asset(&path, vec![0; 32]));
+        let provider = StorageUploadProvider::new(api, store.clone(), -100123)
+            .expect("storage chat ID should be valid");
+
+        assert!(matches!(
+            provider.upload(input()).await,
+            Err(StorageUploadError::HashMismatch { .. })
+        ));
+        assert!(!*store.reserved.lock().unwrap());
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_after_upload_keeps_intent_unknown() {
+        let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let digest = sha256_file(&path).await.expect("fixture should hash");
+        let api = MockApi::default();
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
+        *store.complete_fail.lock().unwrap() = true;
+        let provider = StorageUploadProvider::new(api, store.clone(), -100123)
+            .expect("storage chat ID should be valid");
+
+        assert!(matches!(provider.upload(input()).await, Err(StorageUploadError::Persistence(_))));
+        assert!(*store.unknown.lock().unwrap());
+        assert!(!*store.released.lock().unwrap());
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[test]
+    fn unknown_telegram_errors_are_ambiguous_but_known_rejections_are_not() {
+        let unknown = StorageUploadApiError::Api(teloxide::RequestError::Api(
+            teloxide::errors::ApiError::Unknown("Internal Server Error".to_owned()),
+        ));
+        let rejected = StorageUploadApiError::Api(teloxide::RequestError::Api(
+            teloxide::errors::ApiError::BotBlocked,
+        ));
+
+        assert!(<TeloxideApi as TelegramStorageApi>::is_ambiguous_error(&unknown));
+        assert!(!<TeloxideApi as TelegramStorageApi>::is_ambiguous_error(&rejected));
     }
 
     #[test]

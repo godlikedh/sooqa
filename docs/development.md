@@ -78,9 +78,10 @@ The storage provider requires a negative Telegram chat ID, loads the canonical
 asset hash from PostgreSQL, hashes the local file before upload, and persists
 references only after Telegram returns a message. Definitive API rejections
 can release a pending intent; ambiguous failures remain unknown for
-reconciliation. The server and worker verify that the bot is an administrator
+reconciliation; pending intents are not automatically reclaimed. The server and worker verify that the bot is an administrator
 with posting rights in the configured private channel. The worker registers
-`upload_storage_asset` when the Telegram token and storage chat are configured.
+`upload_storage_asset` when the Telegram token and storage chat are configured;
+canonical-asset recording enqueues that job with a deterministic idempotency key.
 
 ## Source inspection
 

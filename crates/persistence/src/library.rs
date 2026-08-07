@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sooqa_jobs::NewJob;
 use sooqa_library::{
     AssetRole, ContentItem, ContentItemUpdate, DuplicateCandidate, DuplicateCandidateAction,
     DuplicateCandidateEvent, DuplicateCandidateStatus, ExactDuplicateRequest,
@@ -819,6 +820,7 @@ impl LibraryRepository {
         if content.canonical_asset_id != Some(asset.id) {
             set_canonical_asset_in_transaction(&mut transaction, content_item_id, asset.id).await?;
         }
+        enqueue_storage_upload_in_transaction(&mut transaction, asset.id).await?;
         transaction.commit().await?;
         Ok(asset)
     }
@@ -1046,12 +1048,11 @@ impl StorageUploadStore for LibraryRepository {
             r#"
             INSERT INTO idempotency_records (
                 scope, idempotency_key, request_hash, resource_type,
-                response_body, expires_at
+                response_body
             )
             VALUES (
                 $1, $2, $3, 'storage_object',
-                '{"state":"pending"}'::jsonb,
-                now() + interval '15 minutes'
+                '{"state":"pending"}'::jsonb
             )
             ON CONFLICT (scope, idempotency_key) DO NOTHING
             RETURNING id
@@ -1070,7 +1071,7 @@ impl StorageUploadStore for LibraryRepository {
 
         let existing = sqlx::query_as::<_, StorageUploadIntentRow>(
             r#"
-            SELECT request_hash, resource_id, id, response_body, expires_at
+            SELECT request_hash, resource_id, response_body
             FROM idempotency_records
             WHERE scope = $1 AND idempotency_key = $2
             FOR UPDATE
@@ -1113,24 +1114,6 @@ impl StorageUploadStore for LibraryRepository {
                 StorageUploadReservation::Reused(object.into_storage_object()?)
             }
             None if existing_state == Some("unknown") => StorageUploadReservation::InProgress,
-            None if existing_state == Some("pending")
-                && existing
-                    .expires_at
-                    .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc()) =>
-            {
-                sqlx::query(
-                    r#"
-                    UPDATE idempotency_records
-                    SET response_body = '{"state":"pending"}'::jsonb,
-                        expires_at = now() + interval '15 minutes'
-                    WHERE id = $1 AND resource_id IS NULL
-                    "#,
-                )
-                .bind(existing.id)
-                .execute(&mut *transaction)
-                .await?;
-                StorageUploadReservation::Reserved { intent_id: existing.id }
-            }
             None => StorageUploadReservation::InProgress,
         };
         transaction.commit().await?;
@@ -1172,8 +1155,7 @@ impl StorageUploadStore for LibraryRepository {
             UPDATE idempotency_records
             SET resource_id = $2,
                 response_status = $4,
-                response_body = $3,
-                expires_at = NULL
+                response_body = $3
             WHERE id = $1
               AND resource_id IS NULL
               AND response_status IS NULL
@@ -1217,8 +1199,7 @@ impl StorageUploadStore for LibraryRepository {
         sqlx::query(
             r#"
             UPDATE idempotency_records
-            SET response_body = '{"state":"unknown"}'::jsonb,
-                expires_at = NULL
+            SET response_body = '{"state":"unknown"}'::jsonb
             WHERE id = $1 AND resource_id IS NULL
             "#,
         )
@@ -1372,6 +1353,27 @@ async fn insert_canonical_media_asset_in_transaction(
     .bind(asset.storage_state.as_str())
     .fetch_optional(&mut **transaction)
     .await?)
+}
+
+async fn enqueue_storage_upload_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    asset_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let job = NewJob::upload_storage_asset(asset_id)
+        .idempotency_key(format!("asset:{asset_id}:upload_storage:v1"));
+    sqlx::query(
+        r#"
+        INSERT INTO jobs (job_type, payload_json, idempotency_key)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+        "#,
+    )
+    .bind(job.job_type().as_str())
+    .bind(job.payload_json())
+    .bind(job.idempotency_key_value())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 async fn set_canonical_asset_in_transaction(
@@ -1713,9 +1715,7 @@ pub enum LibraryRepositoryError {
 struct StorageUploadIntentRow {
     request_hash: Vec<u8>,
     resource_id: Option<Uuid>,
-    id: Uuid,
     response_body: Option<Value>,
-    expires_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, FromRow)]

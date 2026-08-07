@@ -77,7 +77,8 @@ later Telegram slices.
 For H3 storage, make the bot an administrator of a private storage channel and
 set `SOOQA_TELEGRAM_STORAGE_CHAT_ID` to its negative chat ID. The server checks
 that chat during Telegram startup. Upload intents are durable in
-`idempotency_records`; a pending intent has a short pre-send lease, while an
-ambiguous process/API failure is retained as unknown and must be reconciled
-before retrying. The worker enables the upload job only when the Telegram token
-and storage chat are configured.
+`idempotency_records`; pending or ambiguous intents are retained and must be
+reconciled before retrying. They are not automatically reclaimed because a
+long-running Telegram request could still be in flight. The worker enables the
+upload job only when the Telegram token and storage chat are configured;
+canonical-asset recording creates the durable upload job.

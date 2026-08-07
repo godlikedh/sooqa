@@ -44,6 +44,13 @@ async fn clean_up(database: &Database, content_id: Uuid, tag_id: Uuid, normalize
 }
 
 async fn clean_up_content(database: &Database, content_id: Uuid) {
+    sqlx::query(
+        "DELETE FROM jobs WHERE job_type = 'upload_storage_asset' AND payload_json->>'asset_id' IN (SELECT id::text FROM media_assets WHERE content_item_id = $1)",
+    )
+    .bind(content_id)
+    .execute(database.pool())
+    .await
+    .expect("storage upload jobs should clean up");
     sqlx::query("DELETE FROM source_records WHERE content_item_id = $1")
         .bind(content_id)
         .execute(database.pool())
@@ -263,20 +270,6 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
             .expect("duplicate reservation should load"),
         StorageUploadReservation::InProgress
     );
-    sqlx::query(
-        "UPDATE idempotency_records SET expires_at = now() - interval '1 minute' WHERE id = $1",
-    )
-    .bind(intent_id)
-    .execute(database.pool())
-    .await
-    .expect("upload lease should be adjustable in the fixture");
-    assert!(matches!(
-        library
-            .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
-            .await
-            .expect("expired upload lease should be reclaimable"),
-        StorageUploadReservation::Reserved { intent_id: reclaimed } if reclaimed == intent_id
-    ));
     library
         .mark_storage_upload_unknown(intent_id)
         .await
@@ -498,6 +491,14 @@ async fn recording_canonical_asset_is_idempotent_and_hash_unique() {
         .await
         .expect("same canonical asset should be idempotent");
     assert_eq!(replayed.id, recorded.id);
+    let upload_job_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE job_type = 'upload_storage_asset' AND idempotency_key = $1",
+    )
+    .bind(format!("asset:{}:upload_storage:v1", recorded.id))
+    .fetch_one(database.pool())
+    .await
+    .expect("storage upload job should load");
+    assert_eq!(upload_job_count, 1);
     assert_eq!(
         library
             .find_content_item(first.id)

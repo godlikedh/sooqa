@@ -199,8 +199,10 @@ message/file references and marks the asset uploaded in one transaction.
 Existing active objects are reused. Definitively rejected API requests release
 a pending intent, while transport failures and post-send persistence failures
 mark it unknown and block blind retries; the same completion operation is the
-reconciliation seam. A short pre-send lease permits recovery from a process
-crash before the external call. The worker registers the upload handler when
+reconciliation seam. Pending or unknown intents are never automatically
+reclaimed, because a long-running or ambiguous Telegram request could still
+be in flight. Recording a canonical asset also enqueues a deterministic typed
+`upload_storage_asset` job. The worker registers the upload handler when
 Telegram storage configuration is present, and startup verifies that the bot
 can post to the configured private channel without holding a database
 transaction.
