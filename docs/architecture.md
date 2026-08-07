@@ -171,7 +171,8 @@ The polling loop advances its Telegram offset only after a handler succeeds;
 failed handlers retain the offset and retry up to five times with a short
 backoff. A still-failing handler returns an error so the server supervisor can
 restart it without acknowledging the update; transient polling errors are
-also retried, while an invalid bot token is reported as terminal.
+also retried up to five times, while an invalid bot token is reported as
+terminal.
 
 The E3 Library API adds authenticated read and editorial-write routes over the
 typed Library repository. Search defaults to active items, supports text,

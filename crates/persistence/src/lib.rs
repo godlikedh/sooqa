@@ -13,7 +13,8 @@ pub use inbox::{CreateIngestResult, InboxRepository, InboxRepositoryError, Sourc
 pub use jobs::{JobRepository, JobRepositoryError};
 pub use library::{LibraryRepository, LibraryRepositoryError};
 pub use telegram::{
-    TelegramRepository, TelegramRepositoryError, TelegramUpdateClaim, TelegramUpdateReceipt,
+    TelegramRepository, TelegramRepositoryError, TelegramUpdateClaim, TelegramUpdateClaimResult,
+    TelegramUpdateReceipt,
 };
 
 use sooqa_config::SecretString;

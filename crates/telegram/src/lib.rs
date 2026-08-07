@@ -26,6 +26,7 @@ pub const UNAUTHORIZED_RESPONSE: &str = "This bot is restricted to its configure
 const RESPONSE_RATE_LIMIT: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_HANDLER_ATTEMPTS: usize = 5;
+const MAX_POLLING_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct IncomingMessage {
@@ -60,6 +61,13 @@ pub struct UpdateClaim {
     pub claim_token: Uuid,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UpdateClaimResult {
+    Claimed(UpdateClaim),
+    Completed,
+    InProgress,
+}
+
 #[derive(Debug, ThisError)]
 pub enum TelegramError {
     #[error("Telegram API request failed: {0}")]
@@ -74,6 +82,8 @@ pub enum TelegramError {
     HttpClient(#[source] reqwest::Error),
     #[error("Telegram Ctrl-C handler could not be initialized: {0}")]
     Shutdown(#[source] std::io::Error),
+    #[error("Telegram update is still being processed: {0}")]
+    UpdateInProgress(i64),
 }
 
 #[async_trait]
@@ -87,7 +97,7 @@ pub trait TelegramApi: Clone + Send + Sync + 'static {
 pub trait UpdateStore: Clone + Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
-    async fn claim_update(&self, update_id: i64) -> Result<Option<UpdateClaim>, Self::Error>;
+    async fn claim_update(&self, update_id: i64) -> Result<UpdateClaimResult, Self::Error>;
 
     async fn complete_update(&self, claim: UpdateClaim) -> Result<(), Self::Error>;
 
@@ -126,8 +136,12 @@ where
         &self,
         message: IncomingMessage,
     ) -> Result<HandleOutcome, TelegramError> {
-        let Some(claim) = self.claim(message.update_id).await? else {
-            return Ok(HandleOutcome::DuplicateIgnored);
+        let claim = match self.claim(message.update_id).await? {
+            UpdateClaimResult::Claimed(claim) => claim,
+            UpdateClaimResult::Completed => return Ok(HandleOutcome::DuplicateIgnored),
+            UpdateClaimResult::InProgress => {
+                return Err(TelegramError::UpdateInProgress(message.update_id));
+            }
         };
         if !message.is_private {
             self.complete(claim).await?;
@@ -180,8 +194,12 @@ where
     pub async fn handle_update(&self, update: Update) -> Result<HandleOutcome, TelegramError> {
         let update_id = i64::from(update.id.0);
         let UpdateKind::Message(message) = update.kind else {
-            let Some(claim) = self.claim(update_id).await? else {
-                return Ok(HandleOutcome::DuplicateIgnored);
+            let claim = match self.claim(update_id).await? {
+                UpdateClaimResult::Claimed(claim) => claim,
+                UpdateClaimResult::Completed => return Ok(HandleOutcome::DuplicateIgnored),
+                UpdateClaimResult::InProgress => {
+                    return Err(TelegramError::UpdateInProgress(update_id));
+                }
             };
             self.complete(claim).await?;
             return Ok(HandleOutcome::NonMessageIgnored);
@@ -196,7 +214,7 @@ where
         .await
     }
 
-    async fn claim(&self, update_id: i64) -> Result<Option<UpdateClaim>, TelegramError> {
+    async fn claim(&self, update_id: i64) -> Result<UpdateClaimResult, TelegramError> {
         self.update_store
             .claim_update(update_id)
             .await
@@ -351,6 +369,7 @@ where
         let bot = self.api.bot();
         let service = self.service;
         let mut offset = 0_i32;
+        let mut polling_failures = 0_usize;
         let ctrl_c = tokio::signal::ctrl_c();
         tokio::pin!(ctrl_c);
 
@@ -367,6 +386,7 @@ where
                     .send() => {
                     match result {
                         Ok(updates) => {
+                            polling_failures = 0;
                             for update in updates {
                                 offset = handle_update_with_retries(&service, update).await?;
                             }
@@ -374,6 +394,10 @@ where
                         Err(error) => {
                             let error = TelegramError::Api(Box::new(error));
                             if is_terminal_bot_error(&error) {
+                                return Err(error);
+                            }
+                            polling_failures += 1;
+                            if polling_failures >= MAX_POLLING_ATTEMPTS {
                                 return Err(error);
                             }
                             tracing::warn!(?error, offset, "Telegram polling failed; retaining offset for retry");
@@ -482,22 +506,21 @@ mod tests {
     impl UpdateStore for MockStore {
         type Error = MockError;
 
-        async fn claim_update(&self, update_id: i64) -> Result<Option<UpdateClaim>, Self::Error> {
+        async fn claim_update(&self, update_id: i64) -> Result<UpdateClaimResult, Self::Error> {
             if self
                 .completed
                 .lock()
                 .expect("mock mutex should not be poisoned")
                 .contains(&update_id)
-                || self
-                    .claimed
-                    .lock()
-                    .expect("mock mutex should not be poisoned")
-                    .contains(&update_id)
             {
-                return Ok(None);
+                return Ok(UpdateClaimResult::Completed);
+            }
+            if self.claimed.lock().expect("mock mutex should not be poisoned").contains(&update_id)
+            {
+                return Ok(UpdateClaimResult::InProgress);
             }
             self.claimed.lock().expect("mock mutex should not be poisoned").insert(update_id);
-            Ok(Some(UpdateClaim { update_id, claim_token: Uuid::new_v4() }))
+            Ok(UpdateClaimResult::Claimed(UpdateClaim { update_id, claim_token: Uuid::new_v4() }))
         }
 
         async fn complete_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {

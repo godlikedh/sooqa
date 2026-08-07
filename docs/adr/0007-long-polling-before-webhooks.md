@@ -25,7 +25,9 @@ behind the project-owned `sooqa-telegram` boundary.
 The runtime makes five handler attempts. If an update still fails, it returns
 an error without advancing the offset so a process supervisor can restart the
 server and reclaim the update. Transient `getUpdates` errors are retried with
-backoff; an invalid bot token is terminal and is surfaced immediately.
+backoff for five attempts; an invalid bot token is terminal and is surfaced
+immediately. Other persistent polling failures also return an error after the
+bounded attempts so a supervisor can restart or alert on the condition.
 
 The adapter does not expose a public webhook route in H1. A future webhook
 implementation must preserve the same normalized update boundary and durable

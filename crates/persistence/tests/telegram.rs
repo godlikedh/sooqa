@@ -1,6 +1,6 @@
 use std::env;
 
-use sooqa_persistence::Database;
+use sooqa_persistence::{Database, TelegramUpdateClaimResult};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -13,23 +13,25 @@ async fn telegram_update_claim_is_idempotent() {
 
     let update_id = (Uuid::new_v4().as_u128() % 9_000_000_000_000_000_000 + 1) as i64;
     let repository = database.telegram();
-    let claim = repository
-        .claim_update(update_id)
-        .await
-        .expect("first claim should succeed")
-        .expect("first claim should be available");
-    assert!(
-        repository.claim_update(update_id).await.expect("second claim should succeed").is_none()
+    let claim = match repository.claim_update(update_id).await.expect("first claim should succeed")
+    {
+        TelegramUpdateClaimResult::Claimed(claim) => claim,
+        other => panic!("expected an available first claim, got {other:?}"),
+    };
+    assert_eq!(
+        repository.claim_update(update_id).await.expect("second claim should succeed"),
+        TelegramUpdateClaimResult::InProgress
     );
     repository.release_update(claim).await.expect("claim should release");
-    let retry = repository
-        .claim_update(update_id)
-        .await
-        .expect("released claim should succeed")
-        .expect("released claim should be available");
+    let retry =
+        match repository.claim_update(update_id).await.expect("released claim should succeed") {
+            TelegramUpdateClaimResult::Claimed(claim) => claim,
+            other => panic!("expected a released claim to be available, got {other:?}"),
+        };
     repository.complete_update(retry).await.expect("claim should complete");
-    assert!(
-        repository.claim_update(update_id).await.expect("completed claim should succeed").is_none()
+    assert_eq!(
+        repository.claim_update(update_id).await.expect("completed claim should succeed"),
+        TelegramUpdateClaimResult::Completed
     );
     assert_eq!(
         repository

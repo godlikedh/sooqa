@@ -49,6 +49,8 @@ same process. Each handler gets five bounded attempts; a still-failing update
 stops the runtime without advancing the offset, allowing a supervisor restart
 to reclaim it. Transient `getUpdates` failures use the same offset and a short
 backoff.
+After five consecutive polling failures, the runtime returns an error so a
+supervisor can surface or restart it instead of spinning forever.
 The initial authorized commands are `/start`, `/help`, and `/status`; only
 private messages from configured administrator IDs are handled. Responses are
 rate-limited per user/chat, and unauthorized attempts produce structured

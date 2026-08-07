@@ -15,7 +15,7 @@ impl TelegramRepository {
     pub async fn claim_update(
         &self,
         update_id: i64,
-    ) -> Result<Option<TelegramUpdateClaim>, TelegramRepositoryError> {
+    ) -> Result<TelegramUpdateClaimResult, TelegramRepositoryError> {
         if update_id <= 0 {
             return Err(TelegramRepositoryError::InvalidUpdateId(update_id));
         }
@@ -36,7 +36,25 @@ impl TelegramRepository {
         .bind(update_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(claim_token.map(|claim_token| TelegramUpdateClaim { update_id, claim_token }))
+        if let Some(claim_token) = claim_token {
+            return Ok(TelegramUpdateClaimResult::Claimed(TelegramUpdateClaim {
+                update_id,
+                claim_token,
+            }));
+        }
+
+        let state = sqlx::query_as::<_, TelegramUpdateState>(
+            "SELECT completed_at FROM telegram_update_receipts WHERE update_id = $1",
+        )
+        .bind(update_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(TelegramRepositoryError::ClaimLost(update_id))?;
+        if state.completed_at.is_some() {
+            Ok(TelegramUpdateClaimResult::Completed)
+        } else {
+            Ok(TelegramUpdateClaimResult::InProgress)
+        }
     }
 
     pub async fn complete_update(
@@ -95,10 +113,22 @@ pub struct TelegramUpdateReceipt {
     pub completed_at: Option<time::OffsetDateTime>,
 }
 
+#[derive(Debug, FromRow)]
+struct TelegramUpdateState {
+    completed_at: Option<time::OffsetDateTime>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TelegramUpdateClaim {
     pub update_id: i64,
     pub claim_token: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TelegramUpdateClaimResult {
+    Claimed(TelegramUpdateClaim),
+    Completed,
+    InProgress,
 }
 
 #[derive(Debug, Error)]
