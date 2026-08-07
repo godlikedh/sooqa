@@ -233,10 +233,6 @@ where
             message.text.as_deref().map(parse_message_action).unwrap_or(MessageAction::Ignore);
         match action {
             MessageAction::Url(source_url) => {
-                if !self.allow_response(message.user_id, message.chat_id) {
-                    self.complete(claim).await?;
-                    return Ok(HandleOutcome::RateLimited);
-                }
                 let Some(ingest_service) = self.ingest_service.as_ref() else {
                     self.release(claim).await?;
                     return Err(TelegramError::Ingest(Box::new(IngestUnavailable)));
@@ -264,6 +260,10 @@ where
                     "✅ Ingest queued\nID: {}\nStatus: {}",
                     accepted.request_id, accepted.status
                 );
+                if !self.allow_response(message.user_id, message.chat_id) {
+                    self.complete(claim).await?;
+                    return Ok(HandleOutcome::RateLimited);
+                }
                 self.send_and_complete(
                     claim,
                     message.chat_id,
@@ -439,6 +439,11 @@ fn parse_single_url(text: &str) -> Option<String> {
 
 fn parse_http_url(token: &str) -> Option<String> {
     if is_safe_http_url(token) {
+        let without_external_punctuation =
+            token.trim_end_matches(|character: char| ".,;:?".contains(character));
+        if without_external_punctuation != token && is_safe_http_url(without_external_punctuation) {
+            return Some(without_external_punctuation.to_owned());
+        }
         return Some(token.to_owned());
     }
     let unwrapped = token.trim_matches(|character: char| "<>[](){}".contains(character));
@@ -900,6 +905,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limited_url_ack_still_creates_ingest_request() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        let service =
+            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+
+        assert_eq!(
+            service
+                .handle_message(message(9, Some(123), "https://example.test/one"))
+                .await
+                .unwrap(),
+            HandleOutcome::Responded(Command::Add)
+        );
+        assert_eq!(
+            service
+                .handle_message(message(10, Some(123), "https://example.test/two"))
+                .await
+                .unwrap(),
+            HandleOutcome::RateLimited
+        );
+        assert_eq!(ingest.commands.lock().unwrap().len(), 2);
+        assert_eq!(api.messages.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn failed_update_retries_before_offset_advances() {
         let api = MockApi::default();
         *api.failures_remaining.lock().unwrap() = 1;
@@ -997,6 +1027,14 @@ mod tests {
         assert_eq!(
             parse_message_action("https://example.test/a(b)"),
             MessageAction::Url("https://example.test/a(b)".to_owned())
+        );
+        assert_eq!(
+            parse_message_action("https://example.test/path,"),
+            MessageAction::Url("https://example.test/path".to_owned())
+        );
+        assert_eq!(
+            parse_message_action("https://example.test/path."),
+            MessageAction::Url("https://example.test/path".to_owned())
         );
         assert_eq!(
             parse_message_action("<https://example.test/video.webm>"),

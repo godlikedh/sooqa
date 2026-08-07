@@ -180,7 +180,9 @@ small `IngestService` port. The server adapter turns that command into the
 same typed `IngestSubmission` used by the HTTP API and delegates the durable
 request/job transaction to `InboxRepository`. The Telegram update ID becomes
 the idempotency key (`telegram:update:<id>:v1`), so handler retries cannot
-create a second request. The Telegram user ID remains in the adapter command;
+create a second request. Response rate limiting is applied after the Inbox
+submission, so a suppressed acknowledgement never discards the durable
+request. The Telegram user ID remains in the adapter command;
 the current administrator configuration has no user repository to map it to
 the existing UUID foreign key, so persistence of that mapping is deferred to
 the administration slice. Callback data is versioned as

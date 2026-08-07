@@ -56,7 +56,9 @@ only private messages from configured administrator IDs are handled. Send a
 URL as `/add https://example.test/video.webm` or as a bare message containing
 one URL to create a durable Inbox request. The bot replies with the request ID
 and current status. A failed Inbox call releases the Telegram receipt and
-clears its response rate-limit entry so the update can be retried safely.
+clears its response rate-limit entry so the update can be retried safely. If
+the response limiter is active, the request is still created and only the
+acknowledgement is suppressed.
 Callback data uses the versioned `v1:ingest_status:<request-id>` convention,
 but callback buttons and status refreshes are not implemented yet. Responses
 are rate-limited per user/chat, and unauthorized attempts produce structured
