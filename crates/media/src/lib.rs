@@ -11,6 +11,10 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod direct_http;
+
+pub use direct_http::{DirectHttpDownloader, HostResolver, ResolvedAddress};
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceInput {
     pub ingest_request_id: Uuid,
@@ -44,6 +48,16 @@ pub struct DownloadLimits {
     pub max_bytes: u64,
     pub max_redirects: u32,
     pub timeout: Duration,
+}
+
+impl Default for DownloadLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: 2 * 1024 * 1024 * 1024,
+            max_redirects: 5,
+            timeout: Duration::from_secs(300),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
