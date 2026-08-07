@@ -1,5 +1,9 @@
 //! Database connection and migration boundaries for sooqa.
 
+mod jobs;
+
+pub use jobs::{JobRepository, JobRepositoryError};
+
 use sooqa_config::SecretString;
 use sqlx::{
     migrate::MigrateError,
@@ -38,6 +42,10 @@ impl Database {
     pub async fn migrate(&self) -> Result<(), DatabaseError> {
         MIGRATOR.run(&self.pool).await?;
         Ok(())
+    }
+
+    pub fn jobs(&self) -> JobRepository {
+        JobRepository::new(self.pool.clone())
     }
 
     pub fn pool(&self) -> &PgPool {
