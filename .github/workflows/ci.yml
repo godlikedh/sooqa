@@ -37,11 +37,13 @@ jobs:
           toolchain: 1.97.1
           components: rustfmt, clippy
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-1.97.1
+
       - name: Check formatting
         run: cargo fmt --all -- --check
-
-      - name: Check workspace
-        run: cargo check --workspace --all-targets
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -74,6 +76,11 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-1.97.1
 
       - name: Run PostgreSQL integration tests
         env:
