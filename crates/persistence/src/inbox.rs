@@ -1,5 +1,9 @@
 use serde_json::json;
-use sooqa_inbox::{IngestKind, IngestRequest, IngestStatus, IngestSubmission, SubmittedVia};
+use sooqa_inbox::{
+    IngestKind, IngestRequest, IngestStateError, IngestStatus, IngestSubmission, SubmittedVia,
+};
+use sooqa_jobs::NewJob;
+use sooqa_media::SourceInspection;
 use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -99,6 +103,101 @@ impl InboxRepository {
             Err(error) => Err(error),
         }
     }
+
+    pub async fn begin_source_inspection(
+        &self,
+        id: Uuid,
+    ) -> Result<SourceInspectionStart, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        let start = match request.status {
+            IngestStatus::Queued => SourceInspectionStart::Ready(request),
+            IngestStatus::FailedRetryable => {
+                request.transition_to(IngestStatus::Queued)?;
+                request.error_code = None;
+                request.error_message = None;
+                request.completed_at = None;
+                request.updated_at = OffsetDateTime::now_utc();
+                update_ingest_state(&mut transaction, &request).await?;
+                SourceInspectionStart::Ready(request)
+            }
+            _ => SourceInspectionStart::AlreadyAdvanced(request),
+        };
+        transaction.commit().await?;
+        Ok(start)
+    }
+
+    pub async fn complete_source_inspection(
+        &self,
+        id: Uuid,
+        inspection: SourceInspection,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        if request.status != IngestStatus::Queued {
+            transaction.commit().await?;
+            return Ok(request);
+        }
+
+        request.transition_to(IngestStatus::Downloading)?;
+        request.error_code = None;
+        request.error_message = None;
+        request.completed_at = None;
+        request.updated_at = OffsetDateTime::now_utc();
+        update_ingest_state(&mut transaction, &request).await?;
+
+        let job = NewJob::download_source(id, inspection);
+        sqlx::query(
+            r#"
+            INSERT INTO jobs (job_type, payload_json, idempotency_key)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+            "#,
+        )
+        .bind(job.job_type().as_str())
+        .bind(job.payload_json())
+        .bind(format!("ingest:{id}:download_source:v1"))
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
+        Ok(request)
+    }
+
+    pub async fn fail_source_inspection(
+        &self,
+        id: Uuid,
+        status: IngestStatus,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        if !matches!(status, IngestStatus::FailedRetryable | IngestStatus::FailedTerminal) {
+            return Err(InboxRepositoryError::InvalidSourceInspectionFailureStatus(status));
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        if request.status.is_terminal() {
+            transaction.commit().await?;
+            return Ok(request);
+        }
+
+        request.transition_to(status)?;
+        request.error_code = Some(error_code.to_owned());
+        request.error_message = Some(error_message.to_owned());
+        request.completed_at =
+            (status == IngestStatus::FailedTerminal).then(OffsetDateTime::now_utc);
+        request.updated_at = OffsetDateTime::now_utc();
+        update_ingest_state(&mut transaction, &request).await?;
+        transaction.commit().await?;
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum SourceInspectionStart {
+    Ready(IngestRequest),
+    AlreadyAdvanced(IngestRequest),
 }
 
 #[derive(Debug, Clone)]
@@ -143,17 +242,45 @@ async fn insert_request(
     Ok(())
 }
 
-async fn insert_inspect_job(
+async fn update_ingest_state(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request: &IngestRequest,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_type, payload_json, idempotency_key)
-        VALUES ('inspect_source', $1, $2)
+        UPDATE ingest_requests
+        SET status = $2,
+            error_code = $3,
+            error_message = $4,
+            updated_at = $5,
+            completed_at = $6
+        WHERE id = $1
         "#,
     )
-    .bind(json!({ "ingest_request_id": request.id }))
+    .bind(request.id)
+    .bind(request.status.as_str())
+    .bind(&request.error_code)
+    .bind(&request.error_message)
+    .bind(request.updated_at)
+    .bind(request.completed_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn insert_inspect_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &IngestRequest,
+) -> Result<(), sqlx::Error> {
+    let job = NewJob::inspect_source(request.id);
+    sqlx::query(
+        r#"
+        INSERT INTO jobs (job_type, payload_json, idempotency_key)
+        VALUES ($1, $2, $3)
+        "#,
+    )
+    .bind(job.job_type().as_str())
+    .bind(job.payload_json())
     .bind(format!("ingest:{}:inspect_source:v1", request.id))
     .execute(&mut **transaction)
     .await?;
@@ -171,6 +298,7 @@ async fn load_request(
                idempotency_key, error_code, error_message, created_at, updated_at, completed_at
         FROM ingest_requests
         WHERE id = $1
+        FOR UPDATE
         "#,
     )
     .bind(id)
@@ -251,6 +379,10 @@ pub enum InboxRepositoryError {
     UnknownIngestStatus(String),
     #[error("unknown submission source in database: {0}")]
     UnknownSubmittedVia(String),
+    #[error("invalid source inspection failure status: {0:?}")]
+    InvalidSourceInspectionFailureStatus(IngestStatus),
+    #[error("invalid ingest state transition: {0}")]
+    InvalidStateTransition(#[from] IngestStateError),
     #[error("database operation failed: {0}")]
     Database(#[from] sqlx::Error),
 }

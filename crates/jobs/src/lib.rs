@@ -1,8 +1,11 @@
-//! Durable job values and execution boundaries for sooqa.
+//! Durable job envelopes and typed command boundaries for sooqa.
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sooqa_media::SourceInspection;
+use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -119,26 +122,194 @@ impl TryFrom<&str> for JobStatus {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InspectSourcePayload {
+    pub ingest_request_id: Uuid,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadSourcePayload {
+    pub ingest_request_id: Uuid,
+    pub inspection: SourceInspection,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngestJobPayload {
+    pub ingest_request_id: Uuid,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishPostPayload {
+    pub post_id: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssetJobPayload {
+    pub asset_id: Uuid,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyJobPayload {}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum JobCommand {
+    InspectSource(InspectSourcePayload),
+    DownloadSource(DownloadSourcePayload),
+    ProbeAsset(IngestJobPayload),
+    CheckExactDuplicate(IngestJobPayload),
+    NormalizeAsset(IngestJobPayload),
+    ComputeFingerprint(IngestJobPayload),
+    CheckSimilarity(IngestJobPayload),
+    UploadStorageAsset(IngestJobPayload),
+    FinalizeIngest(IngestJobPayload),
+    PublishPost(PublishPostPayload),
+    VerifyStorageObject(AssetJobPayload),
+    CleanupWorkspace(EmptyJobPayload),
+    RecoverStaleJobs(EmptyJobPayload),
+}
+
+impl JobCommand {
+    pub const fn job_type(&self) -> JobType {
+        match self {
+            Self::InspectSource(_) => JobType::InspectSource,
+            Self::DownloadSource(_) => JobType::DownloadSource,
+            Self::ProbeAsset(_) => JobType::ProbeAsset,
+            Self::CheckExactDuplicate(_) => JobType::CheckExactDuplicate,
+            Self::NormalizeAsset(_) => JobType::NormalizeAsset,
+            Self::ComputeFingerprint(_) => JobType::ComputeFingerprint,
+            Self::CheckSimilarity(_) => JobType::CheckSimilarity,
+            Self::UploadStorageAsset(_) => JobType::UploadStorageAsset,
+            Self::FinalizeIngest(_) => JobType::FinalizeIngest,
+            Self::PublishPost(_) => JobType::PublishPost,
+            Self::VerifyStorageObject(_) => JobType::VerifyStorageObject,
+            Self::CleanupWorkspace(_) => JobType::CleanupWorkspace,
+            Self::RecoverStaleJobs(_) => JobType::RecoverStaleJobs,
+        }
+    }
+
+    pub fn from_payload(job_type: JobType, payload: Value) -> Result<Self, JobPayloadError> {
+        macro_rules! decode {
+            ($payload_type:ty, $variant:ident) => {
+                decode_payload::<$payload_type>(job_type, payload).map(Self::$variant)
+            };
+        }
+
+        match job_type {
+            JobType::InspectSource => decode!(InspectSourcePayload, InspectSource),
+            JobType::DownloadSource => decode!(DownloadSourcePayload, DownloadSource),
+            JobType::ProbeAsset => decode!(IngestJobPayload, ProbeAsset),
+            JobType::CheckExactDuplicate => decode!(IngestJobPayload, CheckExactDuplicate),
+            JobType::NormalizeAsset => decode!(IngestJobPayload, NormalizeAsset),
+            JobType::ComputeFingerprint => decode!(IngestJobPayload, ComputeFingerprint),
+            JobType::CheckSimilarity => decode!(IngestJobPayload, CheckSimilarity),
+            JobType::UploadStorageAsset => decode!(IngestJobPayload, UploadStorageAsset),
+            JobType::FinalizeIngest => decode!(IngestJobPayload, FinalizeIngest),
+            JobType::PublishPost => decode!(PublishPostPayload, PublishPost),
+            JobType::VerifyStorageObject => decode!(AssetJobPayload, VerifyStorageObject),
+            JobType::CleanupWorkspace => decode!(EmptyJobPayload, CleanupWorkspace),
+            JobType::RecoverStaleJobs => decode!(EmptyJobPayload, RecoverStaleJobs),
+        }
+    }
+
+    pub fn payload_json(&self) -> Value {
+        match self {
+            Self::InspectSource(payload) => serde_json::to_value(payload),
+            Self::DownloadSource(payload) => serde_json::to_value(payload),
+            Self::ProbeAsset(payload) => serde_json::to_value(payload),
+            Self::CheckExactDuplicate(payload) => serde_json::to_value(payload),
+            Self::NormalizeAsset(payload) => serde_json::to_value(payload),
+            Self::ComputeFingerprint(payload) => serde_json::to_value(payload),
+            Self::CheckSimilarity(payload) => serde_json::to_value(payload),
+            Self::UploadStorageAsset(payload) => serde_json::to_value(payload),
+            Self::FinalizeIngest(payload) => serde_json::to_value(payload),
+            Self::PublishPost(payload) => serde_json::to_value(payload),
+            Self::VerifyStorageObject(payload) => serde_json::to_value(payload),
+            Self::CleanupWorkspace(payload) => serde_json::to_value(payload),
+            Self::RecoverStaleJobs(payload) => serde_json::to_value(payload),
+        }
+        .expect("job payloads must be JSON serializable")
+    }
+}
+
+fn decode_payload<T: DeserializeOwned>(
+    job_type: JobType,
+    payload: Value,
+) -> Result<T, JobPayloadError> {
+    serde_json::from_value(payload)
+        .map_err(|error| JobPayloadError::Invalid { job_type, message: error.to_string() })
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Error)]
+pub enum JobPayloadError {
+    #[error("invalid payload for {job_type}: {message}")]
+    Invalid { job_type: JobType, message: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct NewJob {
-    pub job_type: JobType,
-    pub payload: Value,
-    pub priority: i32,
-    pub available_at: Option<OffsetDateTime>,
-    pub max_attempts: i32,
-    pub idempotency_key: Option<String>,
+    command: JobCommand,
+    priority: i32,
+    available_at: Option<OffsetDateTime>,
+    max_attempts: i32,
+    idempotency_key: Option<String>,
 }
 
 impl NewJob {
-    pub fn new(job_type: JobType, payload: Value) -> Self {
-        Self {
-            job_type,
-            payload,
-            priority: 0,
-            available_at: None,
-            max_attempts: 5,
-            idempotency_key: None,
-        }
+    pub fn new(command: JobCommand) -> Self {
+        Self { command, priority: 0, available_at: None, max_attempts: 5, idempotency_key: None }
+    }
+
+    pub fn inspect_source(ingest_request_id: Uuid) -> Self {
+        Self::new(JobCommand::InspectSource(InspectSourcePayload { ingest_request_id }))
+    }
+
+    pub fn download_source(ingest_request_id: Uuid, inspection: SourceInspection) -> Self {
+        Self::new(JobCommand::DownloadSource(DownloadSourcePayload {
+            ingest_request_id,
+            inspection,
+        }))
+    }
+
+    pub fn publish_post(post_id: impl Into<String>) -> Self {
+        Self::new(JobCommand::PublishPost(PublishPostPayload { post_id: post_id.into() }))
+    }
+
+    pub fn cleanup_workspace() -> Self {
+        Self::new(JobCommand::CleanupWorkspace(EmptyJobPayload {}))
+    }
+
+    pub fn command(&self) -> &JobCommand {
+        &self.command
+    }
+
+    pub fn job_type(&self) -> JobType {
+        self.command.job_type()
+    }
+
+    pub fn payload_json(&self) -> Value {
+        self.command.payload_json()
+    }
+
+    pub fn priority(&self) -> i32 {
+        self.priority
+    }
+
+    pub fn available_at_value(&self) -> Option<OffsetDateTime> {
+        self.available_at
+    }
+
+    pub fn max_attempts_value(&self) -> i32 {
+        self.max_attempts
+    }
+
+    pub fn idempotency_key_value(&self) -> Option<&str> {
+        self.idempotency_key.as_deref()
     }
 
     pub fn with_priority(mut self, priority: i32) -> Self {
@@ -165,8 +336,7 @@ impl NewJob {
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id: JobId,
-    pub job_type: JobType,
-    pub payload: Value,
+    pub command: JobCommand,
     pub status: JobStatus,
     pub priority: i32,
     pub available_at: OffsetDateTime,
@@ -183,6 +353,12 @@ pub struct Job {
     pub completed_at: Option<OffsetDateTime>,
 }
 
+impl Job {
+    pub fn job_type(&self) -> JobType {
+        self.command.job_type()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,13 +372,37 @@ mod tests {
     }
 
     #[test]
-    fn new_job_has_safe_defaults() {
-        let job =
-            NewJob::new(JobType::InspectSource, serde_json::json!({"url": "https://example.com"}));
+    fn typed_job_payload_round_trips_with_its_discriminator() {
+        let id = Uuid::new_v4();
+        let new_job = NewJob::inspect_source(id);
+        let command = JobCommand::from_payload(new_job.job_type(), new_job.payload_json())
+            .expect("typed payload should decode");
 
-        assert_eq!(job.priority, 0);
-        assert_eq!(job.max_attempts, 5);
-        assert!(job.available_at.is_none());
-        assert!(job.idempotency_key.is_none());
+        assert_eq!(command.job_type(), JobType::InspectSource);
+        assert_eq!(
+            command,
+            JobCommand::InspectSource(InspectSourcePayload { ingest_request_id: id })
+        );
+    }
+
+    #[test]
+    fn mismatched_payload_is_rejected() {
+        let error = JobCommand::from_payload(
+            JobType::InspectSource,
+            serde_json::json!({"post_id": "wrong-command"}),
+        )
+        .expect_err("payload should not decode as inspect_source");
+
+        assert!(error.to_string().contains("invalid payload for inspect_source"));
+    }
+
+    #[test]
+    fn new_job_has_safe_defaults() {
+        let job = NewJob::inspect_source(Uuid::new_v4());
+
+        assert_eq!(job.priority(), 0);
+        assert_eq!(job.max_attempts_value(), 5);
+        assert!(job.available_at_value().is_none());
+        assert!(job.idempotency_key_value().is_none());
     }
 }

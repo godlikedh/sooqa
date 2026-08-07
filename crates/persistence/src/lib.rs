@@ -7,7 +7,7 @@ mod jobs;
 pub use device_tokens::{
     DeviceToken, DeviceTokenRepository, DeviceTokenRepositoryError, hash_device_token,
 };
-pub use inbox::{CreateIngestResult, InboxRepository, InboxRepositoryError};
+pub use inbox::{CreateIngestResult, InboxRepository, InboxRepositoryError, SourceInspectionStart};
 pub use jobs::{JobRepository, JobRepositoryError};
 
 use sooqa_config::SecretString;

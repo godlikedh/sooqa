@@ -11,15 +11,19 @@ use std::{
     time::Duration,
 };
 
-use sooqa_jobs::{Job, JobStatus, JobType};
-use sooqa_persistence::{JobRepository, JobRepositoryError};
+use sooqa_inbox::IngestStatus;
+use sooqa_jobs::{Job, JobCommand, JobStatus, JobType};
+use sooqa_media::{SourceDownloader, SourceInput};
+use sooqa_persistence::{
+    InboxRepository, InboxRepositoryError, JobRepository, JobRepositoryError, SourceInspectionStart,
+};
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFailure>> + Send + 'static>>;
-pub type HandlerFn = fn(Job) -> HandlerFuture;
+pub type HandlerFn = Arc<dyn Fn(Job) -> HandlerFuture + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct HandlerFailure {
@@ -48,8 +52,11 @@ impl HandlerRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, job_type: JobType, handler: HandlerFn) {
-        self.handlers.insert(job_type, handler);
+    pub fn register<F>(&mut self, job_type: JobType, handler: F)
+    where
+        F: Fn(Job) -> HandlerFuture + Send + Sync + 'static,
+    {
+        self.handlers.insert(job_type, Arc::new(handler));
     }
 
     pub fn contains(&self, job_type: JobType) -> bool {
@@ -57,7 +64,87 @@ impl HandlerRegistry {
     }
 
     fn handler(&self, job_type: JobType) -> Option<HandlerFn> {
-        self.handlers.get(&job_type).copied()
+        self.handlers.get(&job_type).cloned()
+    }
+}
+
+pub fn inspect_source_handler(
+    inbox: InboxRepository,
+    downloader: Arc<dyn SourceDownloader>,
+) -> HandlerFn {
+    Arc::new(move |job| {
+        let inbox = inbox.clone();
+        let downloader = Arc::clone(&downloader);
+        Box::pin(async move { inspect_source(&inbox, downloader.as_ref(), job).await })
+    })
+}
+
+async fn inspect_source(
+    inbox: &InboxRepository,
+    downloader: &dyn SourceDownloader,
+    job: Job,
+) -> Result<(), HandlerFailure> {
+    let ingest_request_id = match &job.command {
+        JobCommand::InspectSource(payload) => payload.ingest_request_id,
+        _ => {
+            return Err(HandlerFailure::permanent(
+                "invalid_payload",
+                "inspect_source handler received a different job command",
+            ));
+        }
+    };
+
+    let request = match inbox.begin_source_inspection(ingest_request_id).await {
+        Ok(SourceInspectionStart::Ready(request)) => request,
+        Ok(SourceInspectionStart::AlreadyAdvanced(_)) => return Ok(()),
+        Err(error) => return Err(map_inbox_error(error)),
+    };
+
+    let source = SourceInput {
+        ingest_request_id,
+        source_url: request.source_url,
+        page_url: request.page_url,
+    };
+    let inspection = match downloader.inspect(&source).await {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            let terminal = !error.is_retryable() || job.attempt_count >= job.max_attempts;
+            let status =
+                if terminal { IngestStatus::FailedTerminal } else { IngestStatus::FailedRetryable };
+            let class = error.class().to_owned();
+            let message = error.to_string();
+            inbox
+                .fail_source_inspection(ingest_request_id, status, &class, &message)
+                .await
+                .map_err(map_inbox_error)?;
+            return Err(if terminal {
+                HandlerFailure::permanent(class, message)
+            } else {
+                HandlerFailure::retryable(class, message)
+            });
+        }
+    };
+
+    inbox
+        .complete_source_inspection(ingest_request_id, inspection)
+        .await
+        .map_err(map_inbox_error)?;
+    Ok(())
+}
+
+fn map_inbox_error(error: InboxRepositoryError) -> HandlerFailure {
+    let message = error.to_string();
+    match error {
+        InboxRepositoryError::ResourceMissing(_)
+        | InboxRepositoryError::MissingSourceUrl(_)
+        | InboxRepositoryError::InvalidSourceInspectionFailureStatus(_)
+        | InboxRepositoryError::InvalidStateTransition(_)
+        | InboxRepositoryError::UnknownIngestKind(_)
+        | InboxRepositoryError::UnknownIngestStatus(_)
+        | InboxRepositoryError::UnknownSubmittedVia(_) => {
+            HandlerFailure::permanent("invalid_ingest_state", message)
+        }
+        _ => HandlerFailure::retryable("database_error", message),
     }
 }
 
@@ -154,9 +241,9 @@ impl Worker {
             };
 
             self.metrics.claimed.fetch_add(1, Ordering::Relaxed);
-            info!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type, "job claimed");
+            info!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type(), "job claimed");
 
-            let Some(handler) = self.registry.handler(job.job_type) else {
+            let Some(handler) = self.registry.handler(job.job_type()) else {
                 self.repository
                     .fail(
                         job.id,
@@ -166,7 +253,7 @@ impl Worker {
                     )
                     .await?;
                 self.metrics.failed.fetch_add(1, Ordering::Relaxed);
-                warn!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type, "job failed because no handler is registered");
+                warn!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type(), "job failed because no handler is registered");
                 continue;
             };
 

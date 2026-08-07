@@ -9,6 +9,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "async-trait"
+version = "0.1.91"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1350,7 +1361,10 @@ dependencies = [
 name = "sooqa-jobs"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
+ "sooqa-media",
+ "thiserror",
  "time",
  "uuid",
 ]
@@ -1366,6 +1380,13 @@ version = "0.1.0"
 [[package]]
 name = "sooqa-media"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
 
 [[package]]
 name = "sooqa-persistence"
@@ -1376,6 +1397,7 @@ dependencies = [
  "sooqa-config",
  "sooqa-inbox",
  "sooqa-jobs",
+ "sooqa-media",
  "sqlx",
  "thiserror",
  "time",
@@ -1417,6 +1439,10 @@ version = "0.1.0"
 [[package]]
 name = "sooqa-test-support"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "sooqa-media",
+]
 
 [[package]]
 name = "sooqa-worker"
@@ -1424,9 +1450,12 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "sooqa-config",
+ "sooqa-inbox",
  "sooqa-jobs",
+ "sooqa-media",
  "sooqa-persistence",
  "sooqa-runtime",
+ "sooqa-test-support",
  "sqlx",
  "thiserror",
  "time",
