@@ -18,8 +18,15 @@ submissions, models the user-visible ingest state machine, stores
 `ingest_requests`, and atomically creates the first `inspect_source` job.
 Idempotency records bind a request key and payload hash to the original ingest
 request, so a repeated request returns the existing resource while a changed
-payload is rejected. The real source-inspection handler is still a future
-slice.
+payload is rejected.
+
+The C3 source-inspection boundary now lives in `sooqa-media`. A worker handler
+loads the durable ingest request, invokes an injected `SourceDownloader`
+outside any database transaction, then atomically moves the request to
+`downloading` and enqueues the durable `download_source` job. Inspection
+results travel in that job's payload until a source record is introduced. The
+current implementation uses a deterministic fake in integration tests; real
+HTTP and page adapters remain the D1 scope.
 
 The server now connects to PostgreSQL for the authenticated ingest API. Device
 tokens are stored as SHA-256 hashes with scopes and revocation timestamps; the

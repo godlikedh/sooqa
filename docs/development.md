@@ -23,3 +23,13 @@ not committed. The API crate remains the integration boundary: generated
 models can be adopted there when the contract and generator output are stable,
 while authentication, persistence, and request orchestration stay in the
 handwritten server layer.
+
+## Source inspection
+
+The C3 handler is tested with a deterministic fake downloader. Run its
+PostgreSQL-backed integration test with:
+
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-worker --test inspection -- --ignored
+
+Real HTTP resolution, redirect policy, streaming, and `yt-dlp` integration are
+deferred to the D1 downloader slice.
