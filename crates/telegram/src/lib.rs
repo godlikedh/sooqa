@@ -433,21 +433,24 @@ fn parse_single_url(text: &str) -> Option<String> {
         }
     }
 
-    let urls = tokens
-        .map(|token| token.trim_matches(|character: char| "<>[](){}.,!?;".contains(character)))
-        .filter_map(|token| {
-            let url = Url::parse(token).ok()?;
-            if !matches!(url.scheme(), "http" | "https")
-                || url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-            {
-                return None;
-            }
-            Some(token.to_owned())
-        })
-        .collect::<Vec<_>>();
+    let urls = tokens.filter_map(parse_http_url).collect::<Vec<_>>();
     (urls.len() == 1).then(|| urls.into_iter().next().expect("one URL exists"))
+}
+
+fn parse_http_url(token: &str) -> Option<String> {
+    if is_safe_http_url(token) {
+        return Some(token.to_owned());
+    }
+    let unwrapped = token.trim_matches(|character: char| "<>[](){}".contains(character));
+    (unwrapped != token && is_safe_http_url(unwrapped)).then(|| unwrapped.to_owned())
+}
+
+fn is_safe_http_url(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else { return false };
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -985,6 +988,18 @@ mod tests {
         );
         assert_eq!(
             parse_message_action("https://example.test/video.webm"),
+            MessageAction::Url("https://example.test/video.webm".to_owned())
+        );
+        assert_eq!(
+            parse_message_action("https://example.test/path!"),
+            MessageAction::Url("https://example.test/path!".to_owned())
+        );
+        assert_eq!(
+            parse_message_action("https://example.test/a(b)"),
+            MessageAction::Url("https://example.test/a(b)".to_owned())
+        );
+        assert_eq!(
+            parse_message_action("<https://example.test/video.webm>"),
             MessageAction::Url("https://example.test/video.webm".to_owned())
         );
         assert_eq!(parse_message_action("/add"), MessageAction::Command(Command::Add));
