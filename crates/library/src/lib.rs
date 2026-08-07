@@ -12,6 +12,7 @@ pub enum ContentKind {
     Video,
     Image,
     Animation,
+    Audio,
 }
 
 impl ContentKind {
@@ -20,6 +21,7 @@ impl ContentKind {
             Self::Video => "video",
             Self::Image => "image",
             Self::Animation => "animation",
+            Self::Audio => "audio",
         }
     }
 }
@@ -32,6 +34,7 @@ impl TryFrom<&str> for ContentKind {
             "video" => Ok(Self::Video),
             "image" => Ok(Self::Image),
             "animation" => Ok(Self::Animation),
+            "audio" => Ok(Self::Audio),
             unknown => Err(unknown.to_owned()),
         }
     }
@@ -407,6 +410,15 @@ pub struct NewStorageObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_kinds_round_trip_to_database_values() {
+        for kind in
+            [ContentKind::Video, ContentKind::Image, ContentKind::Animation, ContentKind::Audio]
+        {
+            assert_eq!(ContentKind::try_from(kind.as_str()), Ok(kind));
+        }
+    }
 
     #[test]
     fn tags_trim_and_normalize_without_merging_display_text() {

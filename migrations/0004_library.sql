@@ -1,7 +1,7 @@
 -- Owner module: library
 CREATE TABLE content_items (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    kind text NOT NULL CHECK (kind IN ('video', 'image', 'animation')),
+    kind text NOT NULL CHECK (kind IN ('video', 'image', 'animation', 'audio')),
     status text NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'archived', 'deleted')),
     canonical_asset_id uuid,
