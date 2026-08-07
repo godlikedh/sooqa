@@ -30,9 +30,11 @@ The worker's non-secret media executable paths can be configured in TOML:
     ffmpeg_path = "ffmpeg"
     ffprobe_path = "ffprobe"
     ytdlp_path = "yt-dlp"
+    ytdlp_format = "bestvideo*+bestaudio/best"
 
 The equivalent environment overrides are `SOOQA_MEDIA_FFMPEG_PATH`,
-`SOOQA_MEDIA_FFPROBE_PATH`, and `SOOQA_MEDIA_YTDLP_PATH`. On normal startup,
+`SOOQA_MEDIA_FFPROBE_PATH`, `SOOQA_MEDIA_YTDLP_PATH`, and
+`SOOQA_MEDIA_YTDLP_FORMAT`. On normal startup,
 the worker logs the detected version of each required binary and exits before
 database connection if a binary is unavailable. The server does not require
 these media tools. The current worker still has no production media or

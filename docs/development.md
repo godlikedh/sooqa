@@ -67,5 +67,12 @@ Normal worker startup reports each binary version and exits if one is missing;
 `--check-config` only validates and prints configuration, so it remains usable
 on machines without media binaries.
 
-yt-dlp integration, normalization, and production media-job wiring remain
-later slices.
+The D4 yt-dlp adapter uses `--dump-single-json --skip-download --no-playlist`
+for inspection and a controlled output path for downloads. It validates
+HTTP(S) URLs, passes the configured format as one argument, bounds subprocess
+output, classifies transient process failures, and checks the downloaded file
+size. Its Unix fake-executable test verifies that URLs, format strings, and
+paths are not shell-interpolated. Normal CI does not contact live third-party
+sites.
+
+Normalization and production media-job wiring remain later slices.

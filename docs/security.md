@@ -13,3 +13,9 @@ Media workspaces use job IDs rather than user-controlled path components. File
 names cannot contain separators or parent-directory components, symlinked
 workspace paths are rejected, and cleanup verifies the workspace is the
 expected direct child of the configured jobs directory before removing it.
+
+The yt-dlp adapter accepts only HTTP(S) URLs without embedded credentials,
+disables playlist expansion, passes format selections and output paths as
+individual subprocess arguments, and never invokes a shell. Captured process
+output is bounded; source URLs are replaced in yt-dlp process diagnostics
+before they are returned as errors.
