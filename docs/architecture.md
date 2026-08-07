@@ -167,6 +167,8 @@ polling in the server, while the configured administrator IDs decide which
 private users may receive command responses. Responses are bounded by a
 per-user/chat in-process rate limiter, unauthorized attempts are structured
 warnings, and group messages never enter Inbox.
+The polling loop advances its Telegram offset only after a handler succeeds;
+failed handlers retain the offset and retry after a short backoff.
 
 The E3 Library API adds authenticated read and editorial-write routes over the
 typed Library repository. Search defaults to active items, supports text,

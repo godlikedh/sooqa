@@ -43,6 +43,9 @@ a self-hosted Local Bot API Server. Telegram update IDs are claimed in
 `telegram_update_receipts` before command handling, so redelivered updates do
 not send a second response. Claims have lease tokens and are completed only
 after a response succeeds; a failed response releases the claim for retry.
+The polling loop advances Telegram's offset only after the update handler
+succeeds, so a transient response or persistence failure is retried in the
+same process.
 The initial authorized commands are `/start`, `/help`, and `/status`; only
 private messages from configured administrator IDs are handled. Responses are
 rate-limited per user/chat, and unauthorized attempts produce structured

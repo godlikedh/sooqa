@@ -10,12 +10,9 @@ use std::{
 use async_trait::async_trait;
 use teloxide::{
     Bot,
-    dispatching::Dispatcher,
-    dptree,
-    error_handlers::LoggingErrorHandler,
+    payloads::GetUpdatesSetters,
     prelude::{Request, Requester},
     types::{Update, UpdateKind},
-    update_listeners::Polling,
 };
 use thiserror::Error as ThisError;
 use tracing::warn;
@@ -73,6 +70,8 @@ pub enum TelegramError {
     InvalidPollTimeout,
     #[error("Telegram HTTP client could not be configured: {0}")]
     HttpClient(#[source] reqwest::Error),
+    #[error("Telegram Ctrl-C handler could not be initialized: {0}")]
+    Shutdown(#[source] std::io::Error),
 }
 
 #[async_trait]
@@ -280,7 +279,7 @@ impl TeloxideApi {
         api_base_url: &str,
         poll_timeout: Duration,
     ) -> Result<Self, TelegramError> {
-        if poll_timeout.is_zero() {
+        if poll_timeout.is_zero() || poll_timeout.as_secs() > u64::from(u32::MAX) {
             return Err(TelegramError::InvalidPollTimeout);
         }
         let api_base_url = Url::parse(api_base_url)
@@ -341,28 +340,48 @@ where
     }
 
     pub async fn run(self) -> Result<(), TelegramError> {
+        const RETRY_DELAY: Duration = Duration::from_secs(1);
+
         self.api
             .bot()
             .delete_webhook()
             .send()
             .await
             .map_err(|error| TelegramError::Api(Box::new(error)))?;
-        let listener = Polling::builder(self.api.bot()).timeout(self.poll_timeout).build();
+        let bot = self.api.bot();
         let service = self.service;
-        let handler = dptree::entry().endpoint(move |update: Update| {
-            let service = service.clone();
-            async move { service.handle_update(update).await.map(|_| ()) }
-        });
-        Dispatcher::builder(self.api.bot(), handler)
-            .error_handler(LoggingErrorHandler::with_custom_text("Telegram dispatcher error"))
-            .enable_ctrlc_handler()
-            .build()
-            .try_dispatch_with_listener(
-                listener,
-                LoggingErrorHandler::with_custom_text("Telegram polling error"),
-            )
-            .await
-            .map_err(|error| TelegramError::Api(Box::new(error)))
+        let mut offset = 0_i32;
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+
+        loop {
+            tokio::select! {
+                result = &mut ctrl_c => {
+                    result.map_err(TelegramError::Shutdown)?;
+                    return Ok(());
+                }
+                result = bot
+                    .get_updates()
+                    .offset(offset)
+                    .timeout(self.poll_timeout.as_secs() as u32)
+                    .send() => {
+                    let updates = result.map_err(|error| TelegramError::Api(Box::new(error)))?;
+                    let mut retry = false;
+                    for update in updates {
+                        let next_offset = update.id.as_offset();
+                        if let Err(error) = service.handle_update(update).await {
+                            tracing::warn!(?error, offset, "Telegram update handling failed; retaining polling offset for retry");
+                            retry = true;
+                            break;
+                        }
+                        offset = next_offset;
+                    }
+                    if retry {
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
     }
 }
 
