@@ -1,0 +1,467 @@
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use image::{DynamicImage, ImageReader, imageops::FilterType};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::{
+    CommandError, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommand, ExternalCommandRunner, MediaProbe,
+    MediaWorkspace, WorkspaceArea, WorkspaceError,
+};
+
+const FRAME_RATIOS_BPS: [u16; 7] = [500, 1500, 3000, 5000, 7000, 8500, 9500];
+const FRAME_DHASH_WIDTH: u32 = 9;
+const FRAME_DHASH_HEIGHT: u32 = 8;
+
+pub const FRAME_DHASH_V1: &str = "frame_dhash_v1";
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FrameTimestamp {
+    pub timestamp_ms: u64,
+    pub ratio_bps: u16,
+}
+
+/// Select stable relative positions while collapsing duplicate timestamps in
+/// very short videos.
+pub fn select_fingerprint_timestamps(duration_ms: u64) -> Vec<FrameTimestamp> {
+    let mut timestamps = Vec::with_capacity(FRAME_RATIOS_BPS.len());
+    for ratio_bps in FRAME_RATIOS_BPS {
+        let timestamp_ms = (u128::from(duration_ms) * u128::from(ratio_bps) / 10_000) as u64;
+        if timestamps.last().is_none_or(|last: &FrameTimestamp| last.timestamp_ms != timestamp_ms) {
+            timestamps.push(FrameTimestamp { timestamp_ms, ratio_bps });
+        }
+    }
+    timestamps
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FingerprintVersion {
+    #[serde(rename = "frame_dhash_v1")]
+    FrameDHashV1,
+}
+
+impl FingerprintVersion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FrameDHashV1 => FRAME_DHASH_V1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FrameFingerprint {
+    pub timestamp_ms: u64,
+    pub ratio_bps: u16,
+    pub hash: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VideoFingerprint {
+    pub version: FingerprintVersion,
+    pub duration_ms: u64,
+    pub frames: Vec<FrameFingerprint>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FrameExtractionResult {
+    pub fingerprint: VideoFingerprint,
+    pub frame_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone)]
+pub struct FrameExtractor {
+    ffmpeg_executable: PathBuf,
+    runner: Arc<dyn ExternalCommandRunner>,
+    timeout: Duration,
+    max_output_bytes: usize,
+}
+
+impl FrameExtractor {
+    pub fn new(ffmpeg_executable: impl Into<PathBuf>, timeout: Duration) -> Self {
+        Self::with_runner(
+            ffmpeg_executable,
+            timeout,
+            DEFAULT_MAX_OUTPUT_BYTES,
+            Arc::new(crate::ProcessCommandRunner),
+        )
+    }
+
+    pub fn with_runner(
+        ffmpeg_executable: impl Into<PathBuf>,
+        timeout: Duration,
+        max_output_bytes: usize,
+        runner: Arc<dyn ExternalCommandRunner>,
+    ) -> Self {
+        Self { ffmpeg_executable: ffmpeg_executable.into(), runner, timeout, max_output_bytes }
+    }
+
+    pub async fn extract(
+        &self,
+        workspace: &MediaWorkspace,
+        input_name: &str,
+        duration_ms: u64,
+    ) -> Result<FrameExtractionResult, FrameExtractionError> {
+        if duration_ms == 0 {
+            return Err(FrameExtractionError::InvalidDuration);
+        }
+        workspace.validate()?;
+        let input_path = workspace.path(WorkspaceArea::Source, input_name)?;
+        let input_metadata = tokio::fs::symlink_metadata(&input_path).await.map_err(|source| {
+            FrameExtractionError::InputFile { path: input_path.clone(), source }
+        })?;
+        if input_metadata.file_type().is_symlink() || !input_metadata.is_file() {
+            return Err(FrameExtractionError::InputNotFile { path: input_path });
+        }
+        let timestamps = select_fingerprint_timestamps(duration_ms);
+        let mut frame_paths = Vec::with_capacity(timestamps.len());
+
+        for (index, timestamp) in timestamps.iter().enumerate() {
+            let frame_name = format!("frame-dhash-v1-{index:02}.png");
+            let output_path = match workspace.path(WorkspaceArea::Frames, &frame_name) {
+                Ok(path) => path,
+                Err(error) => {
+                    cleanup_frames(&frame_paths).await;
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = self.extract_frame(&input_path, &output_path, *timestamp).await {
+                cleanup_frames(&frame_paths).await;
+                return Err(error);
+            }
+            frame_paths.push(output_path);
+        }
+
+        let paths_for_hashing = frame_paths.clone();
+        let frames = match tokio::task::spawn_blocking(move || {
+            paths_for_hashing
+                .iter()
+                .map(|path| decode_and_hash(path))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        {
+            Ok(result) => match result {
+                Ok(frames) => frames,
+                Err(error) => {
+                    cleanup_frames(&frame_paths).await;
+                    return Err(error);
+                }
+            },
+            Err(error) => {
+                cleanup_frames(&frame_paths).await;
+                return Err(FrameExtractionError::TaskJoin(error));
+            }
+        };
+
+        let frames = timestamps
+            .into_iter()
+            .zip(frames)
+            .map(|(timestamp, hash)| FrameFingerprint {
+                timestamp_ms: timestamp.timestamp_ms,
+                ratio_bps: timestamp.ratio_bps,
+                hash,
+            })
+            .collect();
+        Ok(FrameExtractionResult {
+            fingerprint: VideoFingerprint {
+                version: FingerprintVersion::FrameDHashV1,
+                duration_ms,
+                frames,
+            },
+            frame_paths,
+        })
+    }
+
+    pub async fn extract_for_probe(
+        &self,
+        workspace: &MediaWorkspace,
+        input_name: &str,
+        probe: &MediaProbe,
+    ) -> Result<FrameExtractionResult, FrameExtractionError> {
+        let duration_ms = probe.duration_ms.ok_or(FrameExtractionError::MissingDuration)?;
+        self.extract(workspace, input_name, duration_ms).await
+    }
+
+    async fn extract_frame(
+        &self,
+        input_path: &Path,
+        output_path: &Path,
+        timestamp: FrameTimestamp,
+    ) -> Result<(), FrameExtractionError> {
+        match tokio::fs::symlink_metadata(output_path).await {
+            Ok(_) => {
+                return Err(FrameExtractionError::OutputExists { path: output_path.to_owned() });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(FrameExtractionError::OutputFile {
+                    path: output_path.to_owned(),
+                    source,
+                });
+            }
+        }
+        let file_name =
+            output_path.file_name().ok_or_else(|| FrameExtractionError::OutputFile {
+                path: output_path.to_owned(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "output has no file name",
+                ),
+            })?;
+        let temporary_path = output_path.with_file_name(format!(
+            ".{}-{}.png",
+            file_name.to_string_lossy(),
+            Uuid::new_v4()
+        ));
+        let command = ExternalCommand::new(self.ffmpeg_executable.clone())
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-i")
+            .arg(input_path.as_os_str())
+            .arg("-ss")
+            .arg(format_timestamp(timestamp.timestamp_ms))
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-an")
+            .arg("-f")
+            .arg("image2")
+            .arg(temporary_path.as_os_str())
+            .timeout(self.timeout)
+            .max_output_bytes(self.max_output_bytes);
+        let result = async {
+            let output = self.runner.run(command).await?;
+            if output.stdout_truncated || output.stderr_truncated {
+                return Err(FrameExtractionError::OutputLimitExceeded {
+                    limit: self.max_output_bytes,
+                });
+            }
+            if !output.success {
+                return Err(FrameExtractionError::ProcessFailed {
+                    exit_code: output.exit_code,
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                });
+            }
+            let metadata =
+                tokio::fs::symlink_metadata(&temporary_path).await.map_err(|source| {
+                    FrameExtractionError::OutputFile { path: temporary_path.clone(), source }
+                })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+                return Err(FrameExtractionError::InvalidOutput { path: temporary_path.clone() });
+            }
+            match tokio::fs::hard_link(&temporary_path, output_path).await {
+                Ok(()) => {
+                    let _ = tokio::fs::remove_file(&temporary_path).await;
+                    Ok(())
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err(FrameExtractionError::OutputExists { path: output_path.to_owned() })
+                }
+                Err(source) => {
+                    Err(FrameExtractionError::OutputFile { path: output_path.to_owned(), source })
+                }
+            }
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+        }
+        result
+    }
+}
+
+fn format_timestamp(timestamp_ms: u64) -> String {
+    format!("{}.{:03}", timestamp_ms / 1_000, timestamp_ms % 1_000)
+}
+
+fn decode_and_hash(path: &Path) -> Result<u64, FrameExtractionError> {
+    let reader = ImageReader::open(path)
+        .map_err(|source| FrameExtractionError::InputFile { path: path.to_owned(), source })?
+        .with_guessed_format()
+        .map_err(|source| FrameExtractionError::InputFile { path: path.to_owned(), source })?;
+    let image = reader
+        .decode()
+        .map_err(|source| FrameExtractionError::Decode { path: path.to_owned(), source })?;
+    Ok(frame_dhash_v1(&image))
+}
+
+/// Compute the versioned 64-bit dHash used by G1.
+///
+/// The image is converted to grayscale, resized to 9×8, then each row's eight
+/// adjacent horizontal comparisons are packed in row-major order. A set bit
+/// means the left pixel is darker than the right pixel.
+pub fn frame_dhash_v1(image: &DynamicImage) -> u64 {
+    let grayscale = image.grayscale();
+    let resized = grayscale
+        .resize_exact(FRAME_DHASH_WIDTH, FRAME_DHASH_HEIGHT, FilterType::Triangle)
+        .to_luma8();
+    let mut hash = 0_u64;
+    for y in 0..FRAME_DHASH_HEIGHT {
+        for x in 0..(FRAME_DHASH_WIDTH - 1) {
+            if resized.get_pixel(x, y).0[0] < resized.get_pixel(x + 1, y).0[0] {
+                let bit = u64::from(y * (FRAME_DHASH_WIDTH - 1) + x);
+                hash |= 1 << bit;
+            }
+        }
+    }
+    hash
+}
+
+async fn cleanup_frames(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum FrameExtractionError {
+    #[error("video duration must be greater than zero")]
+    InvalidDuration,
+    #[error("video probe did not contain a duration")]
+    MissingDuration,
+    #[error("workspace path is invalid: {0}")]
+    Workspace(#[from] WorkspaceError),
+    #[error("could not run ffmpeg for frame extraction: {0}")]
+    Command(#[from] CommandError),
+    #[error("ffmpeg frame extraction output exceeded the {limit}-byte capture limit")]
+    OutputLimitExceeded { limit: usize },
+    #[error("ffmpeg frame extraction failed with status {exit_code:?}: {stderr}")]
+    ProcessFailed { exit_code: Option<i32>, stderr: String },
+    #[error("frame output already exists: {path}")]
+    OutputExists { path: PathBuf },
+    #[error("could not inspect frame output {path}: {source}")]
+    OutputFile { path: PathBuf, source: std::io::Error },
+    #[error("frame output is missing, empty, or a symlink: {path}")]
+    InvalidOutput { path: PathBuf },
+    #[error("could not read extracted frame {path}: {source}")]
+    InputFile { path: PathBuf, source: std::io::Error },
+    #[error("video input is not a regular file: {path}")]
+    InputNotFile { path: PathBuf },
+    #[error("could not decode extracted frame {path}: {source}")]
+    Decode { path: PathBuf, source: image::ImageError },
+    #[error("frame hashing task failed: {0}")]
+    TaskJoin(#[source] tokio::task::JoinError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
+    use image::{ImageBuffer, Luma, Rgb};
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct RecordingRunner {
+        commands: Arc<Mutex<VecDeque<ExternalCommand>>>,
+    }
+
+    use crate::ExternalCommandOutput;
+    use async_trait::async_trait;
+
+    #[async_trait]
+    impl ExternalCommandRunner for RecordingRunner {
+        async fn run(
+            &self,
+            command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            let output = PathBuf::from(command.args().last().expect("output argument exists"));
+            let image = ImageBuffer::from_fn(18, 16, |x, y| {
+                Rgb([x.saturating_mul(10) as u8, y.saturating_mul(10) as u8, 80])
+            });
+            DynamicImage::ImageRgb8(image)
+                .save_with_format(&output, image::ImageFormat::Png)
+                .expect("fake ffmpeg should write a frame");
+            self.commands.lock().expect("runner lock should not be poisoned").push_back(command);
+            Ok(ExternalCommandOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            })
+        }
+    }
+
+    fn temp_path(stem: &str) -> PathBuf {
+        let temp_dir =
+            std::fs::canonicalize(std::env::temp_dir()).expect("test temp directory exists");
+        temp_dir.join(format!("sooqa-{stem}-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn timestamps_are_stable_and_short_inputs_collapse_duplicates() {
+        assert_eq!(
+            select_fingerprint_timestamps(1_000),
+            vec![
+                FrameTimestamp { timestamp_ms: 50, ratio_bps: 500 },
+                FrameTimestamp { timestamp_ms: 150, ratio_bps: 1500 },
+                FrameTimestamp { timestamp_ms: 300, ratio_bps: 3000 },
+                FrameTimestamp { timestamp_ms: 500, ratio_bps: 5000 },
+                FrameTimestamp { timestamp_ms: 700, ratio_bps: 7000 },
+                FrameTimestamp { timestamp_ms: 850, ratio_bps: 8500 },
+                FrameTimestamp { timestamp_ms: 950, ratio_bps: 9500 },
+            ]
+        );
+        assert_eq!(select_fingerprint_timestamps(1).len(), 1);
+    }
+
+    #[test]
+    fn dhash_v1_is_stable_for_a_horizontal_gradient() {
+        let image = ImageBuffer::from_fn(9, 8, |x, _| Luma([(x * 20) as u8]));
+        assert_eq!(frame_dhash_v1(&DynamicImage::ImageLuma8(image)), u64::MAX);
+        assert_eq!(FingerprintVersion::FrameDHashV1.as_str(), FRAME_DHASH_V1);
+        let encoded = serde_json::to_string(&FingerprintVersion::FrameDHashV1)
+            .expect("fingerprint version should serialize");
+        assert_eq!(encoded, "\"frame_dhash_v1\"");
+    }
+
+    #[tokio::test]
+    async fn extraction_writes_frames_and_returns_versioned_hashes() {
+        let workspace = MediaWorkspace::create(temp_path("fingerprint-workspace"), Uuid::new_v4())
+            .await
+            .expect("workspace should be created");
+        let input =
+            workspace.path(WorkspaceArea::Source, "input.mp4").expect("input path should be valid");
+        std::fs::write(&input, b"fake video").expect("fake input should be written");
+        let runner = RecordingRunner::default();
+        let extractor = FrameExtractor::with_runner(
+            "/usr/bin/ffmpeg",
+            Duration::from_secs(5),
+            1024,
+            Arc::new(runner.clone()),
+        );
+
+        let result = extractor
+            .extract(&workspace, "input.mp4", 10_000)
+            .await
+            .expect("frames should be extracted");
+        assert_eq!(result.fingerprint.version, FingerprintVersion::FrameDHashV1);
+        assert_eq!(result.fingerprint.duration_ms, 10_000);
+        assert_eq!(result.fingerprint.frames.len(), 7);
+        assert_eq!(result.frame_paths.len(), 7);
+        assert!(result.fingerprint.frames.iter().all(|frame| frame.hash != 0));
+        assert_eq!(runner.commands.lock().expect("runner lock should not be poisoned").len(), 7);
+        for path in &result.frame_paths {
+            assert!(path.is_file());
+        }
+        let error = extractor
+            .extract(&workspace, "input.mp4", 10_000)
+            .await
+            .expect_err("existing frame output should not be overwritten");
+        assert!(matches!(error, FrameExtractionError::OutputExists { .. }));
+
+        workspace.cleanup().await.expect("workspace should be removed");
+    }
+}

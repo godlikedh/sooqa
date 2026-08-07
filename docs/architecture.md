@@ -76,6 +76,15 @@ validation is deliberately path-based and is not a defense against a separate
 same-user process racing directory replacement between validation and I/O; a
 shared hostile work root would need descriptor-relative no-follow operations.
 
+The G1 fingerprinting slice adds a typed `FrameExtractor` to `sooqa-media`.
+Callers pass the duration from the project-owned `MediaProbe` (or a validated
+duration directly); ffmpeg extracts one PNG at each stable 5%, 15%, 30%, 50%,
+70%, 85%, and 95% position. Very short videos collapse duplicate timestamps.
+Frames are decoded on Tokio's blocking pool and converted to the versioned
+`frame_dhash_v1` 64-bit horizontal difference hash. The result stores the
+algorithm version, duration, relative timestamp basis points, and hashes;
+similarity scoring and durable candidate persistence remain G2.
+
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,
 and logs directories plus a diagnostic `manifest.json`. Output names are
