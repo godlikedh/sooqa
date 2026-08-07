@@ -1329,6 +1329,15 @@ dependencies = [
 [[package]]
 name = "sooqa-inbox"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "time",
+ "url",
+ "uuid",
+]
 
 [[package]]
 name = "sooqa-jobs"
@@ -1357,6 +1366,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "sooqa-config",
+ "sooqa-inbox",
  "sooqa-jobs",
  "sqlx",
  "thiserror",

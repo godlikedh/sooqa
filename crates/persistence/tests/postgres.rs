@@ -12,7 +12,7 @@ async fn migrations_are_idempotent_and_create_core_tables() {
     database.migrate().await.expect("first migration should succeed");
     database.migrate().await.expect("second migration should be idempotent");
 
-    for table in ["admins", "jobs", "job_attempts", "idempotency_records"] {
+    for table in ["admins", "jobs", "job_attempts", "idempotency_records", "ingest_requests"] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{}", table))
             .fetch_one(database.pool())
