@@ -57,6 +57,14 @@ locks the content row briefly, idempotently records the canonical asset, and
 updates `content_items.canonical_asset_id` after external work has completed.
 Production media-job wiring remains a later slice.
 
+The F3 image-normalization slice adds `ImageNormalizer` to `sooqa-media`.
+JPEG and PNG inputs are decoded with an allocation limit, metadata is stripped
+by re-encoding, opaque images become bounded JPEGs, and images with meaningful
+transparency remain PNG. Canonical images and same-format thumbnails preserve
+aspect ratio and never upscale smaller inputs. The result exposes dimensions,
+format, output paths, and independent SHA-256 digests; persistence and
+production job composition remain outside the media crate.
+
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,
 and logs directories plus a diagnostic `manifest.json`. Output names are

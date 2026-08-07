@@ -98,6 +98,19 @@ representation and call `LibraryRepository::record_canonical_asset`. That
 method is idempotent for a replay of the same content and digest and rejects a
 canonical digest already attached to another content item.
 
+## Image normalization
+
+F3 adds `ImageNormalizer` for the MVP JPEG/PNG path. It uses the configured
+maximum dimensions without upscaling, strips incidental metadata by decoding
+and re-encoding, keeps meaningful alpha as PNG, converts opaque images to JPEG,
+and emits a same-format thumbnail. Decoding is bounded by a configurable input
+pixel allocation limit and runs on Tokio's blocking pool because image codecs
+are CPU-bound.
+
+Run its focused tests with:
+
+    cargo test -p sooqa-media image_normalize::tests
+
 ## Normalization planner
 
 F1 adds a pure planner for the canonical video profile. It selects a remux for
