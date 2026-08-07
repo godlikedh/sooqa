@@ -439,11 +439,6 @@ fn parse_single_url(text: &str) -> Option<String> {
 
 fn parse_http_url(token: &str) -> Option<String> {
     if is_safe_http_url(token) {
-        let without_external_punctuation =
-            token.trim_end_matches(|character: char| ".,;:?".contains(character));
-        if without_external_punctuation != token && is_safe_http_url(without_external_punctuation) {
-            return Some(without_external_punctuation.to_owned());
-        }
         return Some(token.to_owned());
     }
     let unwrapped = token.trim_matches(|character: char| "<>[](){}".contains(character));
@@ -1030,11 +1025,11 @@ mod tests {
         );
         assert_eq!(
             parse_message_action("https://example.test/path,"),
-            MessageAction::Url("https://example.test/path".to_owned())
+            MessageAction::Url("https://example.test/path,".to_owned())
         );
         assert_eq!(
             parse_message_action("https://example.test/path."),
-            MessageAction::Url("https://example.test/path".to_owned())
+            MessageAction::Url("https://example.test/path.".to_owned())
         );
         assert_eq!(
             parse_message_action("<https://example.test/video.webm>"),
