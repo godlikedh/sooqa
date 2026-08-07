@@ -80,8 +80,9 @@ impl CanonicalImageProfile {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ImageNormalizationPlan {
+    workspace: MediaWorkspace,
     input_path: PathBuf,
     canonical_base_path: PathBuf,
     thumbnail_base_path: PathBuf,
@@ -168,6 +169,7 @@ impl ImageNormalizer {
         thumbnail_name: &str,
     ) -> Result<ImageNormalizationPlan, ImageNormalizationError> {
         Ok(ImageNormalizationPlan {
+            workspace: workspace.clone(),
             input_path: workspace.path(WorkspaceArea::Source, input_name)?,
             canonical_base_path: workspace.path(WorkspaceArea::Normalized, canonical_name)?,
             thumbnail_base_path: workspace.path(WorkspaceArea::Previews, thumbnail_name)?,
@@ -291,6 +293,7 @@ fn encode_image(
     plan: &ImageNormalizationPlan,
     profile: CanonicalImageProfile,
 ) -> Result<EncodedImage, ImageNormalizationError> {
+    plan.workspace.validate()?;
     let image = decode_image(&plan.input_path, profile)?;
     let rgba = image.to_rgba8();
     let has_transparency = rgba.pixels().any(|pixel| pixel.0[3] != u8::MAX);
@@ -346,8 +349,13 @@ fn decode_image(
     validate_input_path(path, profile.max_input_bytes)?;
     let input_path = path.to_owned();
     let mut limits = Limits::default();
-    limits.max_alloc =
-        Some(profile.max_input_pixels.saturating_mul(4).min(profile.max_working_bytes / 2).max(1));
+    limits.max_alloc = Some(
+        profile
+            .max_input_pixels
+            .saturating_mul(4)
+            .min(profile.max_working_bytes.saturating_div(4))
+            .max(1),
+    );
     let reader = ImageReader::open(&input_path)
         .map_err(|source| ImageNormalizationError::InputFile { path: input_path.clone(), source })?
         .with_guessed_format()
@@ -396,11 +404,12 @@ fn decode_image(
             limit: profile.max_input_pixels,
         });
     }
-    let estimated_working_bytes =
-        pixels.checked_mul(16).ok_or(ImageNormalizationError::InputWorkingSetTooLarge {
+    let estimated_working_bytes = estimate_working_bytes(width, height, profile).ok_or(
+        ImageNormalizationError::InputWorkingSetTooLarge {
             path: input_path.clone(),
             limit: profile.max_working_bytes,
-        })?;
+        },
+    )?;
     if estimated_working_bytes > profile.max_working_bytes {
         return Err(ImageNormalizationError::InputWorkingSetTooLarge {
             path: input_path.clone(),
@@ -414,6 +423,27 @@ fn decode_image(
         .map_err(|source| ImageNormalizationError::Decode { path: input_path, source })?;
     image.apply_orientation(orientation);
     Ok(image)
+}
+
+/// Estimate the peak image working set before decoding. The image crate does
+/// not expose a process-wide allocation budget, so the normalizer reserves for
+/// the decoded/oriented source, RGBA inspection, color conversion, resize
+/// scratch space, canonical output, and thumbnail output. This conservative
+/// preflight keeps the transformation bounded even when several intermediate
+/// buffers overlap briefly.
+fn estimate_working_bytes(width: u32, height: u32, profile: CanonicalImageProfile) -> Option<u64> {
+    let input_pixels = u64::from(width).checked_mul(u64::from(height))?;
+    let canonical_width = width.min(profile.max_width);
+    let canonical_height = height.min(profile.max_height);
+    let thumbnail_width = canonical_width.min(profile.thumbnail_max_width);
+    let thumbnail_height = canonical_height.min(profile.thumbnail_max_height);
+    let canonical_pixels = u64::from(canonical_width).checked_mul(u64::from(canonical_height))?;
+    let thumbnail_pixels = u64::from(thumbnail_width).checked_mul(u64::from(thumbnail_height))?;
+
+    input_pixels
+        .checked_mul(32)?
+        .checked_add(canonical_pixels.checked_mul(16)?)?
+        .checked_add(thumbnail_pixels.checked_mul(16)?)
 }
 
 fn with_extension(path: &Path, extension: &str) -> PathBuf {
@@ -463,8 +493,11 @@ fn write_image(
         drop(writer);
         fs::hard_link(&temporary_path, path)
             .map_err(|source| ImageNormalizationError::Output { path: path.to_owned(), source })?;
-        fs::remove_file(&temporary_path)
-            .map_err(|source| ImageNormalizationError::Output { path: path.to_owned(), source })
+        // The hard link is the publication point. If cleanup of the private
+        // temporary name fails after publication, keep the valid destination
+        // and let a later workspace cleanup remove the orphaned temp file.
+        let _ = fs::remove_file(&temporary_path);
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);
@@ -486,6 +519,11 @@ fn validate_input_path(path: &Path, max_input_bytes: u64) -> Result<(), ImageNor
             path: path.to_owned(),
             limit: max_input_bytes,
         });
+    }
+    if let Some(parent) = symlinked_parent(path)
+        .map_err(|source| ImageNormalizationError::InputFile { path: path.to_owned(), source })?
+    {
+        return Err(ImageNormalizationError::InputParentSymlink { path: parent });
     }
     Ok(())
 }
@@ -533,7 +571,8 @@ mod tests {
     use super::*;
 
     fn temp_path(stem: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("sooqa-{stem}-{}.img", Uuid::new_v4()))
+        let temp_dir = fs::canonicalize(std::env::temp_dir()).expect("test temp directory exists");
+        temp_dir.join(format!("sooqa-{stem}-{}.img", Uuid::new_v4()))
     }
 
     fn write_png(path: &Path, pixel: Rgba<u8>, width: u32, height: u32) {
@@ -693,5 +732,63 @@ mod tests {
         .expect_err("byte limit should be enforced before decoding");
         assert!(matches!(error, ImageNormalizationError::InputTooLarge { limit: 1, .. }));
         std::fs::remove_file(large_input).expect("test image should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_inputs_with_symlinked_parents_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let real_parent = temp_path("real-input-parent");
+        std::fs::create_dir(&real_parent).expect("real parent should be created");
+        let input = real_parent.join("input.png");
+        write_png(&input, Rgba([0, 0, 0, u8::MAX]), 2, 2);
+        let symlink_parent = temp_path("symlink-input-parent");
+        symlink(&real_parent, &symlink_parent).expect("parent symlink should be created");
+
+        let error =
+            decode_image(&symlink_parent.join("input.png"), CanonicalImageProfile::default())
+                .expect_err("symlinked input parent should be rejected");
+        assert!(matches!(error, ImageNormalizationError::InputParentSymlink { .. }));
+
+        std::fs::remove_file(input).expect("input should be removed");
+        std::fs::remove_dir(&real_parent).expect("real parent should be removed");
+        std::fs::remove_file(symlink_parent).expect("parent symlink should be removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execution_revalidates_workspace_areas_before_opening_files() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = MediaWorkspace::create(temp_path("revalidation-workspace"), Uuid::new_v4())
+            .await
+            .expect("workspace should be created");
+        let input =
+            workspace.path(WorkspaceArea::Source, "input.png").expect("input path should be valid");
+        write_png(&input, Rgba([40, 80, 120, u8::MAX]), 20, 10);
+        let normalizer = ImageNormalizer::new(CanonicalImageProfile::default())
+            .expect("profile should be valid");
+        let plan = normalizer
+            .plan(&workspace, "input.png", "canonical", "thumbnail")
+            .expect("normalization plan should be valid");
+
+        let source = workspace.root().join("source");
+        let moved_source = workspace.root().join("source-real");
+        let outside_source = temp_path("outside-source");
+        std::fs::create_dir(&outside_source).expect("outside source should be created");
+        std::fs::rename(&source, &moved_source).expect("source should be moved");
+        symlink(&outside_source, &source).expect("source symlink should be created");
+
+        let error = normalizer
+            .execute(&plan)
+            .await
+            .expect_err("execution should revalidate the workspace boundary");
+        assert!(matches!(error, ImageNormalizationError::Workspace(WorkspaceError::Symlink(_))));
+
+        std::fs::remove_file(&source).expect("source symlink should be removed");
+        std::fs::rename(&moved_source, &source).expect("source should be restored");
+        std::fs::remove_dir(outside_source).expect("outside source should be removed");
+        workspace.cleanup().await.expect("workspace should be removed");
     }
 }

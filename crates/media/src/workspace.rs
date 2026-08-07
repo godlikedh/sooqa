@@ -105,6 +105,26 @@ impl MediaWorkspace {
         &self.root
     }
 
+    /// Re-check the fixed workspace boundary immediately before a worker uses it.
+    ///
+    /// Plans may outlive the directory checks performed while they were built. A
+    /// worker therefore validates the root and every fixed area again before it
+    /// opens an input or publishes an output.
+    pub fn validate(&self) -> Result<(), WorkspaceError> {
+        ensure_real_directory_sync(&self.jobs_root)?;
+        ensure_real_directory_sync(&self.root)?;
+        for area in [
+            WorkspaceArea::Source,
+            WorkspaceArea::Normalized,
+            WorkspaceArea::Frames,
+            WorkspaceArea::Previews,
+            WorkspaceArea::Logs,
+        ] {
+            ensure_real_directory_sync(&self.root.join(area.directory_name()))?;
+        }
+        Ok(())
+    }
+
     pub fn path(&self, area: WorkspaceArea, file_name: &str) -> Result<PathBuf, WorkspaceError> {
         validate_file_name(file_name)?;
         ensure_real_directory_sync(&self.jobs_root)?;

@@ -107,8 +107,12 @@ and emits a same-format thumbnail. Decoding is bounded by configurable input
 byte, pixel, decoder-allocation, and estimated working-set limits; EXIF
 orientation is applied before metadata is discarded; APNG is rejected for the
 static path; and output files use same-directory atomic no-clobber publication.
-Callers should obtain paths from
-`MediaWorkspace` so the workspace boundary is established before normalization.
+The worker revalidates the fixed workspace directories immediately before I/O,
+and input parents are checked for symlinks. The working-set setting is a
+conservative preflight budget for decoder, conversion, resize, and output
+buffers; the image crate does not expose a strict process-wide allocator cap.
+Callers should obtain paths from `MediaWorkspace` so the workspace boundary is
+established before normalization.
 Decoding runs on Tokio's blocking pool because image codecs are CPU-bound.
 
 Run its focused tests with:
