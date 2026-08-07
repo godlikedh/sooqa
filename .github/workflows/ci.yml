@@ -63,4 +63,6 @@ jobs:
       - name: Run PostgreSQL integration tests
         env:
           DATABASE_URL: postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa
-        run: cargo test -p sooqa-persistence --tests -- --ignored
+        run: |
+          cargo test -p sooqa-persistence --tests -- --ignored
+          cargo test -p sooqa-worker --test worker -- --ignored

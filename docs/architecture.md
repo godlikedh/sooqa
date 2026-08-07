@@ -8,5 +8,6 @@ This document will grow with the implementation. The bootstrap stage contains
 no Telegram or media integrations yet. Shared configuration and process
 lifecycle plumbing lives in sooqa-config and sooqa-runtime. The server exposes
 the initial liveness API through sooqa-api, and sooqa-persistence now provides
-PostgreSQL migrations plus a durable job repository. The worker loop and job
-handlers remain future slices.
+PostgreSQL migrations plus a durable job repository. sooqa-worker now provides
+the bounded polling loop, handler registry, leases, and graceful shutdown; real
+media and Telegram handlers remain future slices.

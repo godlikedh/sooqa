@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 pub type JobId = Uuid;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum JobType {
     InspectSource,
     DownloadSource,

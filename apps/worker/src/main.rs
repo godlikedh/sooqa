@@ -1,8 +1,12 @@
 //! Durable job worker entry point for sooqa.
 
-use std::error::Error;
+use std::{error::Error, time::Duration};
 
-use sooqa_config::{AppConfig, AppRole, CliOptions};
+use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
+use sooqa_persistence::Database;
+use uuid::Uuid;
+
+use sooqa_worker::{HandlerRegistry, Worker};
 
 #[tokio::main]
 async fn main() {
@@ -22,8 +26,20 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     sooqa_runtime::init_tracing(&config.observability)?;
-    tracing::info!(role = %config.role, "sooqa worker started");
-    sooqa_runtime::shutdown_signal().await;
+    let database_url =
+        config.secrets.database_url.as_ref().ok_or(ConfigError::MissingSecret("database URL"))?;
+    let database = Database::connect_secret(database_url, config.database.max_connections).await?;
+    let worker_id = format!("worker-{}", Uuid::new_v4());
+    let worker = Worker::new(
+        database.jobs(),
+        HandlerRegistry::default(),
+        worker_id,
+        Duration::from_secs(config.worker.poll_interval_seconds),
+        Duration::from_secs(config.worker.lease_duration_seconds),
+    )?;
+
+    tracing::info!(role = %config.role, worker_id = %worker.worker_id(), "sooqa worker starting");
+    worker.run(sooqa_runtime::shutdown_signal()).await?;
     tracing::info!(role = %config.role, "sooqa worker stopped");
 
     Ok(())

@@ -13,6 +13,10 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
     let database =
         Database::connect(&database_url, 10).await.expect("database should be reachable");
     database.migrate().await.expect("migrations should succeed");
+    sqlx::query("DELETE FROM jobs WHERE idempotency_key LIKE 'b2-%'")
+        .execute(database.pool())
+        .await
+        .expect("old B2 test jobs should clean up");
     let jobs = database.jobs();
 
     let first_key = format!("b2-first-{}", Uuid::new_v4());

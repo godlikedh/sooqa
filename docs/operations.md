@@ -19,3 +19,11 @@ Compose commands. Stop the VM with `colima stop` when it is not needed.
 The B1 migration command is:
 
     DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa cargo run -p sooqa-server -- migrate
+
+After migrations are applied, the worker can be started with:
+
+    DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa cargo run -p sooqa-worker
+
+The current worker has no media or Telegram handlers yet. It polls durably
+stored jobs, executes registered handlers, records outcomes, and stops
+gracefully on SIGTERM or Ctrl-C.
