@@ -103,9 +103,12 @@ canonical digest already attached to another content item.
 F3 adds `ImageNormalizer` for the MVP JPEG/PNG path. It uses the configured
 maximum dimensions without upscaling, strips incidental metadata by decoding
 and re-encoding, keeps meaningful alpha as PNG, converts opaque images to JPEG,
-and emits a same-format thumbnail. Decoding is bounded by a configurable input
-pixel allocation limit and runs on Tokio's blocking pool because image codecs
-are CPU-bound.
+and emits a same-format thumbnail. Decoding is bounded by configurable input
+byte, pixel, and decoder-allocation limits; EXIF orientation is applied before
+metadata is discarded; APNG is rejected for the static path; and output files
+use same-directory atomic renames. Callers should obtain paths from
+`MediaWorkspace` so the workspace boundary is established before normalization.
+Decoding runs on Tokio's blocking pool because image codecs are CPU-bound.
 
 Run its focused tests with:
 
