@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use sooqa_jobs::{Job, JobStatus, JobType, NewJob};
+use sooqa_jobs::{Job, JobCommand, JobPayloadError, JobStatus, JobType, NewJob};
 use sqlx::{FromRow, PgPool, postgres::PgQueryResult};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -17,7 +17,7 @@ impl JobRepository {
     }
 
     pub async fn enqueue(&self, new_job: NewJob) -> Result<Job, JobRepositoryError> {
-        if new_job.max_attempts <= 0 {
+        if new_job.max_attempts_value() <= 0 {
             return Err(JobRepositoryError::InvalidMaxAttempts);
         }
 
@@ -34,12 +34,12 @@ impl JobRepository {
                 idempotency_key, created_at, updated_at, completed_at
             "#,
         )
-        .bind(new_job.job_type.as_str())
-        .bind(new_job.payload)
-        .bind(new_job.priority)
-        .bind(new_job.available_at)
-        .bind(new_job.max_attempts)
-        .bind(new_job.idempotency_key)
+        .bind(new_job.job_type().as_str())
+        .bind(new_job.payload_json())
+        .bind(new_job.priority())
+        .bind(new_job.available_at_value())
+        .bind(new_job.max_attempts_value())
+        .bind(new_job.idempotency_key_value())
         .fetch_one(&self.pool)
         .await?;
 
@@ -377,11 +377,14 @@ struct JobRow {
 
 impl JobRow {
     fn into_job(self) -> Result<Job, JobRepositoryError> {
+        let job_type = JobType::try_from(self.job_type.as_str())
+            .map_err(JobRepositoryError::UnknownJobType)?;
+        let command = JobCommand::from_payload(job_type, self.payload_json)
+            .map_err(JobRepositoryError::InvalidPayload)?;
+
         Ok(Job {
             id: self.id,
-            job_type: JobType::try_from(self.job_type.as_str())
-                .map_err(JobRepositoryError::UnknownJobType)?,
-            payload: self.payload_json,
+            command,
             status: JobStatus::try_from(self.status.as_str())
                 .map_err(JobRepositoryError::UnknownJobStatus)?,
             priority: self.priority,
@@ -420,6 +423,8 @@ pub enum JobRepositoryError {
     UnknownJobType(String),
     #[error("unknown job status in database: {0}")]
     UnknownJobStatus(String),
+    #[error("invalid job payload: {0}")]
+    InvalidPayload(#[from] JobPayloadError),
     #[error("database operation failed: {0}")]
     Database(#[from] sqlx::Error),
 }

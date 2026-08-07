@@ -1,6 +1,6 @@
 use std::env;
 
-use sooqa_jobs::{JobStatus, JobType, NewJob};
+use sooqa_jobs::{JobStatus, NewJob};
 use sooqa_persistence::Database;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -21,10 +21,7 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
 
     let first_key = format!("b2-first-{}", Uuid::new_v4());
     let first = jobs
-        .enqueue(
-            NewJob::new(JobType::InspectSource, serde_json::json!({"url": "https://example.com"}))
-                .idempotency_key(first_key),
-        )
+        .enqueue(NewJob::inspect_source(Uuid::new_v4()).idempotency_key(first_key))
         .await
         .expect("job should enqueue");
     assert_eq!(first.status, JobStatus::Queued);
@@ -79,7 +76,7 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
     let second_key = format!("b2-stale-{}", Uuid::new_v4());
     let second = jobs
         .enqueue(
-            NewJob::new(JobType::CleanupWorkspace, serde_json::json!({}))
+            NewJob::cleanup_workspace()
                 .with_priority(100)
                 .max_attempts(2)
                 .idempotency_key(second_key),
@@ -110,11 +107,7 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
 
     let third_key = format!("b2-failed-{}", Uuid::new_v4());
     let third = jobs
-        .enqueue(
-            NewJob::new(JobType::PublishPost, serde_json::json!({"post_id": "example"}))
-                .with_priority(200)
-                .idempotency_key(third_key),
-        )
+        .enqueue(NewJob::publish_post("example").with_priority(200).idempotency_key(third_key))
         .await
         .expect("failed job should enqueue");
     let failed_claim = jobs

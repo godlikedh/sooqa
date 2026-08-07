@@ -31,5 +31,11 @@ PostgreSQL-backed integration test with:
 
     DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-worker --test inspection -- --ignored
 
+Durable jobs are represented in application code by `JobCommand` variants and
+typed payload structs. JSONB decoding is limited to the persistence row
+mapper, where the database `job_type` discriminator is checked against the
+payload before a `Job` enters the worker. New enqueue sites should use a typed
+`NewJob` constructor rather than constructing JSON directly.
+
 Real HTTP resolution, redirect policy, streaming, and `yt-dlp` integration are
 deferred to the D1 downloader slice.

@@ -25,7 +25,7 @@ async fn worker_processes_test_job_and_stops_gracefully() {
     let jobs = database.jobs();
     let job = jobs
         .enqueue(
-            NewJob::new(JobType::CleanupWorkspace, serde_json::json!({}))
+            NewJob::cleanup_workspace()
                 .with_priority(1_000)
                 .idempotency_key(format!("b3-worker-{}", Uuid::new_v4())),
         )

@@ -12,7 +12,7 @@ use std::{
 };
 
 use sooqa_inbox::IngestStatus;
-use sooqa_jobs::{Job, JobStatus, JobType};
+use sooqa_jobs::{Job, JobCommand, JobStatus, JobType};
 use sooqa_media::{SourceDownloader, SourceInput};
 use sooqa_persistence::{
     InboxRepository, InboxRepositoryError, JobRepository, JobRepositoryError, SourceInspectionStart,
@@ -84,23 +84,15 @@ async fn inspect_source(
     downloader: &dyn SourceDownloader,
     job: Job,
 ) -> Result<(), HandlerFailure> {
-    let ingest_request_id = job
-        .payload
-        .get("ingest_request_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            HandlerFailure::permanent(
+    let ingest_request_id = match &job.command {
+        JobCommand::InspectSource(payload) => payload.ingest_request_id,
+        _ => {
+            return Err(HandlerFailure::permanent(
                 "invalid_payload",
-                "inspect_source job payload must include ingest_request_id",
-            )
-        })?
-        .parse()
-        .map_err(|_| {
-            HandlerFailure::permanent(
-                "invalid_payload",
-                "inspect_source job payload contains an invalid ingest_request_id",
-            )
-        })?;
+                "inspect_source handler received a different job command",
+            ));
+        }
+    };
 
     let request = match inbox.begin_source_inspection(ingest_request_id).await {
         Ok(SourceInspectionStart::Ready(request)) => request,
@@ -133,12 +125,6 @@ async fn inspect_source(
         }
     };
 
-    let inspection = serde_json::to_value(inspection).map_err(|error| {
-        HandlerFailure::permanent(
-            "invalid_inspection",
-            format!("source inspection could not be serialized: {error}"),
-        )
-    })?;
     inbox
         .complete_source_inspection(ingest_request_id, inspection)
         .await
@@ -255,9 +241,9 @@ impl Worker {
             };
 
             self.metrics.claimed.fetch_add(1, Ordering::Relaxed);
-            info!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type, "job claimed");
+            info!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type(), "job claimed");
 
-            let Some(handler) = self.registry.handler(job.job_type) else {
+            let Some(handler) = self.registry.handler(job.job_type()) else {
                 self.repository
                     .fail(
                         job.id,
@@ -267,7 +253,7 @@ impl Worker {
                     )
                     .await?;
                 self.metrics.failed.fetch_add(1, Ordering::Relaxed);
-                warn!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type, "job failed because no handler is registered");
+                warn!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type(), "job failed because no handler is registered");
                 continue;
             };
 

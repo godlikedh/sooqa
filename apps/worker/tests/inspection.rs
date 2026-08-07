@@ -73,7 +73,7 @@ async fn inspect_source_uses_fake_adapter_and_advances_durably() {
         .await
         .expect("inspect job should be claimable")
         .expect("inspect job should exist");
-    assert_eq!(job.job_type.as_str(), "inspect_source");
+    assert_eq!(job.job_type().as_str(), "inspect_source");
 
     let fake = FakeSourceDownloader::successful(SourceInspection {
         adapter: "fake".to_owned(),

@@ -1,8 +1,9 @@
-use serde_json::Value;
 use serde_json::json;
 use sooqa_inbox::{
     IngestKind, IngestRequest, IngestStateError, IngestStatus, IngestSubmission, SubmittedVia,
 };
+use sooqa_jobs::NewJob;
+use sooqa_media::SourceInspection;
 use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -129,7 +130,7 @@ impl InboxRepository {
     pub async fn complete_source_inspection(
         &self,
         id: Uuid,
-        inspection: Value,
+        inspection: SourceInspection,
     ) -> Result<IngestRequest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
@@ -145,18 +146,16 @@ impl InboxRepository {
         request.updated_at = OffsetDateTime::now_utc();
         update_ingest_state(&mut transaction, &request).await?;
 
-        let payload = json!({
-            "ingest_request_id": id,
-            "inspection": inspection,
-        });
+        let job = NewJob::download_source(id, inspection);
         sqlx::query(
             r#"
             INSERT INTO jobs (job_type, payload_json, idempotency_key)
-            VALUES ('download_source', $1, $2)
+            VALUES ($1, $2, $3)
             ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
             "#,
         )
-        .bind(payload)
+        .bind(job.job_type().as_str())
+        .bind(job.payload_json())
         .bind(format!("ingest:{id}:download_source:v1"))
         .execute(&mut *transaction)
         .await?;
@@ -273,13 +272,15 @@ async fn insert_inspect_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request: &IngestRequest,
 ) -> Result<(), sqlx::Error> {
+    let job = NewJob::inspect_source(request.id);
     sqlx::query(
         r#"
         INSERT INTO jobs (job_type, payload_json, idempotency_key)
-        VALUES ('inspect_source', $1, $2)
+        VALUES ($1, $2, $3)
         "#,
     )
-    .bind(json!({ "ingest_request_id": request.id }))
+    .bind(job.job_type().as_str())
+    .bind(job.payload_json())
     .bind(format!("ingest:{}:inspect_source:v1", request.id))
     .execute(&mut **transaction)
     .await?;

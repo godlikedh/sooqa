@@ -6,7 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
+sooqa-media = { path = "../media" }
+thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
 
