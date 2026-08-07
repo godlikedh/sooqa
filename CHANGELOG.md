@@ -18,3 +18,6 @@ All notable changes to sooqa will be documented here.
   claiming, leases, retries, attempt history, and stale-lease recovery.
 - Added the bounded worker loop, worker identity, handler registry, graceful
   shutdown, structured job logs, and in-process worker metrics.
+- Added the first Telegram adapter with configurable long polling, private
+  administrator authorization, `/start`, `/help`, and `/status`, plus durable
+  update-id deduplication receipts.

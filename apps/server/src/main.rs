@@ -4,6 +4,8 @@ use std::error::Error;
 
 use axum::Router;
 use sooqa_config::{AppConfig, AppRole, CliCommand, CliOptions, ConfigError};
+use sooqa_persistence::{TelegramRepository, TelegramRepositoryError};
+use sooqa_telegram::{TelegramRuntime, UpdateStore};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -56,8 +58,40 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
 
     tracing::info!(role = %config.role, "sooqa server started");
-    sooqa_server::serve(listener, app, sooqa_runtime::shutdown_signal()).await?;
+    let server = sooqa_server::serve(listener, app, sooqa_runtime::shutdown_signal());
+    if let Some(token) =
+        config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured())
+    {
+        let telegram = TelegramRuntime::new(
+            token.expose_secret(),
+            &config.telegram.api_base_url,
+            std::time::Duration::from_secs(config.telegram.poll_timeout_seconds),
+            DatabaseUpdateStore { repository: database.telegram() },
+            config.telegram.admin_user_ids.clone(),
+        )?;
+        tracing::info!(api_base_url = %config.telegram.api_base_url, "Telegram bot polling enabled");
+        tokio::select! {
+            result = server => result?,
+            result = telegram.run() => result?,
+        }
+    } else {
+        server.await?;
+    }
     tracing::info!(role = %config.role, "sooqa server stopped");
 
     Ok(())
+}
+
+#[derive(Clone)]
+struct DatabaseUpdateStore {
+    repository: TelegramRepository,
+}
+
+#[async_trait::async_trait]
+impl UpdateStore for DatabaseUpdateStore {
+    type Error = TelegramRepositoryError;
+
+    async fn claim_update(&self, update_id: i64) -> Result<bool, Self::Error> {
+        self.repository.claim_update(update_id).await
+    }
 }

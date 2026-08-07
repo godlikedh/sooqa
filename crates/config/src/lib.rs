@@ -18,6 +18,8 @@ const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
 const DEFAULT_FFPROBE_PATH: &str = "ffprobe";
 const DEFAULT_YTDLP_PATH: &str = "yt-dlp";
 const DEFAULT_YTDLP_FORMAT: &str = "bestvideo*+bestaudio/best";
+const DEFAULT_TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
+const DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_LEVEL: &str = "info";
 
@@ -158,6 +160,13 @@ pub struct CompanionConfig {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TelegramConfig {
+    pub api_base_url: String,
+    pub admin_user_ids: Vec<i64>,
+    pub poll_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ObservabilityConfig {
     pub log_format: LogFormat,
     pub log_level: String,
@@ -188,6 +197,7 @@ pub struct AppConfig {
     pub media: MediaConfig,
     pub companion: CompanionConfig,
     pub database: DatabaseConfig,
+    pub telegram: TelegramConfig,
     pub observability: ObservabilityConfig,
     pub secrets: SecretConfig,
 }
@@ -274,6 +284,17 @@ impl AppConfig {
                 url_env: raw.database.url_env.unwrap_or_else(|| "DATABASE_URL".to_owned()),
                 max_connections: raw.database.max_connections.unwrap_or(20),
             },
+            telegram: TelegramConfig {
+                api_base_url: raw
+                    .telegram
+                    .api_base_url
+                    .unwrap_or_else(|| DEFAULT_TELEGRAM_API_BASE_URL.to_owned()),
+                admin_user_ids: raw.telegram.admin_user_ids,
+                poll_timeout_seconds: raw
+                    .telegram
+                    .poll_timeout_seconds
+                    .unwrap_or(DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS),
+            },
             observability: ObservabilityConfig { log_format, log_level },
             secrets: SecretConfig {
                 database_url: raw.secrets.database_url.map(SecretString::new),
@@ -284,7 +305,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -299,6 +320,9 @@ impl AppConfig {
             self.companion.listen_address,
             self.database.url_env,
             self.database.max_connections,
+            self.telegram.api_base_url,
+            self.telegram.admin_user_ids.len(),
+            self.telegram.poll_timeout_seconds,
             self.observability.log_format,
             self.observability.log_level,
             configured_state(self.secrets.database_url.as_ref()),
@@ -360,6 +384,20 @@ impl AppConfig {
         if let Some(value) = optional_env_string("SOOQA_TELEGRAM_BOT_TOKEN")? {
             self.secrets.telegram_bot_token = Some(SecretString::new(value));
         }
+        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_API_BASE_URL")? {
+            self.telegram.api_base_url = value;
+        }
+        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_ADMIN_USER_IDS")? {
+            self.telegram.admin_user_ids =
+                parse_admin_user_ids("SOOQA_TELEGRAM_ADMIN_USER_IDS", &value)?;
+        }
+        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_POLL_TIMEOUT_SECONDS")? {
+            self.telegram.poll_timeout_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_TELEGRAM_POLL_TIMEOUT_SECONDS".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
+        }
         Ok(())
     }
 
@@ -403,6 +441,42 @@ impl AppConfig {
                 reason: "must be greater than zero",
             });
         }
+        let api_base_url = url::Url::parse(&self.telegram.api_base_url).map_err(|_| {
+            ConfigError::InvalidValue {
+                name: "telegram.api_base_url".to_owned(),
+                reason: "must be a valid HTTP(S) URL",
+            }
+        })?;
+        if !matches!(api_base_url.scheme(), "http" | "https")
+            || api_base_url.host_str().is_none()
+            || !api_base_url.username().is_empty()
+            || api_base_url.password().is_some()
+        {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.api_base_url".to_owned(),
+                reason: "must be an HTTP(S) URL without credentials",
+            });
+        }
+        if self.telegram.poll_timeout_seconds == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.poll_timeout_seconds".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.secrets.telegram_bot_token.as_ref().is_some_and(SecretString::is_configured)
+            && self.telegram.admin_user_ids.is_empty()
+        {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.admin_user_ids".to_owned(),
+                reason: "must configure at least one administrator when a bot token is set",
+            });
+        }
+        if self.telegram.admin_user_ids.iter().any(|id| *id <= 0) {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.admin_user_ids".to_owned(),
+                reason: "must contain positive Telegram user IDs",
+            });
+        }
         for (name, path) in [
             ("media.ffmpeg_path", &self.media.ffmpeg_path),
             ("media.ffprobe_path", &self.media.ffprobe_path),
@@ -441,8 +515,17 @@ struct RawConfig {
     media: RawMediaConfig,
     companion: RawCompanionConfig,
     database: RawDatabaseConfig,
+    telegram: RawTelegramConfig,
     observability: RawObservabilityConfig,
     secrets: RawSecretConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawTelegramConfig {
+    api_base_url: Option<String>,
+    admin_user_ids: Vec<i64>,
+    poll_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -528,6 +611,19 @@ fn optional_env_string(name: &str) -> Result<Option<String>, ConfigError> {
             .map_err(|_| ConfigError::InvalidEnvironmentEncoding { name: name.to_owned() }),
         None => Ok(None),
     }
+}
+
+fn parse_admin_user_ids(name: &str, value: &str) -> Result<Vec<i64>, ConfigError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|value| {
+            value.parse::<i64>().map_err(|_| ConfigError::InvalidValue {
+                name: name.to_owned(),
+                reason: "expected comma-separated positive Telegram user IDs",
+            })
+        })
+        .collect()
 }
 
 fn parse_socket_address(name: &str, value: &str) -> Result<SocketAddr, ConfigError> {
@@ -660,6 +756,34 @@ mod tests {
         assert_eq!(config.media.ffprobe_path, PathBuf::from("/opt/bin/ffprobe"));
         assert_eq!(config.media.ytdlp_path, PathBuf::from("yt-dlp"));
         assert_eq!(config.media.ytdlp_format, "bestvideo*+bestaudio/best");
+    }
+
+    #[test]
+    fn telegram_settings_parse_and_validate() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Server,
+            None,
+            "[telegram]\napi_base_url = \"http://telegram-bot-api:8081\"\nadmin_user_ids = [123456789]\npoll_timeout_seconds = 45\n",
+        )
+        .expect("TOML should parse");
+
+        assert!(config.validate().is_ok());
+        assert_eq!(config.telegram.api_base_url, "http://telegram-bot-api:8081");
+        assert_eq!(config.telegram.admin_user_ids, vec![123456789]);
+        assert_eq!(config.telegram.poll_timeout_seconds, 45);
+    }
+
+    #[test]
+    fn telegram_api_url_rejects_credentials() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Server,
+            None,
+            "[telegram]\napi_base_url = \"https://user:password@example.test\"\n",
+        )
+        .expect("TOML should parse");
+
+        let error = config.validate().expect_err("Telegram API credentials must fail");
+        assert!(error.to_string().contains("without credentials"));
     }
 
     #[test]
