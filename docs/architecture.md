@@ -62,11 +62,12 @@ JPEG and PNG inputs are decoded with an allocation limit, metadata is stripped
 by re-encoding, opaque images become bounded JPEGs, and images with meaningful
 transparency remain PNG. Canonical images and same-format thumbnails preserve
 aspect ratio and never upscale smaller inputs. The result exposes dimensions,
-format, output paths, and independent SHA-256 digests. Input paths must be
-regular files; parent paths are resolved once, output files are created through
-same-directory atomic renames, EXIF orientation is applied before metadata is
-discarded, and animated PNGs are rejected by the static image path. Persistence
-and production job composition remain outside the media crate.
+format, output paths, and independent SHA-256 digests. Image plans are built
+from `MediaWorkspace` paths, input paths must be regular files, output files
+are published with same-directory atomic no-clobber links, EXIF orientation is
+applied before metadata is discarded, and animated PNGs are rejected by the
+static image path. Persistence and production job composition remain outside
+the media crate.
 
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,

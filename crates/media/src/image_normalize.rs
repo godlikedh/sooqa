@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{FileDigest, HashError, sha256_file};
+use crate::{FileDigest, HashError, MediaWorkspace, WorkspaceArea, WorkspaceError, sha256_file};
 
 const DEFAULT_MAX_WIDTH: u32 = 1920;
 const DEFAULT_MAX_HEIGHT: u32 = 1080;
@@ -156,15 +156,16 @@ impl ImageNormalizer {
 
     pub fn plan(
         &self,
-        input: impl AsRef<Path>,
-        canonical_base: impl AsRef<Path>,
-        thumbnail_base: impl AsRef<Path>,
-    ) -> ImageNormalizationPlan {
-        ImageNormalizationPlan {
-            input_path: input.as_ref().to_owned(),
-            canonical_base_path: canonical_base.as_ref().to_owned(),
-            thumbnail_base_path: thumbnail_base.as_ref().to_owned(),
-        }
+        workspace: &MediaWorkspace,
+        input_name: &str,
+        canonical_name: &str,
+        thumbnail_name: &str,
+    ) -> Result<ImageNormalizationPlan, ImageNormalizationError> {
+        Ok(ImageNormalizationPlan {
+            input_path: workspace.path(WorkspaceArea::Source, input_name)?,
+            canonical_base_path: workspace.path(WorkspaceArea::Normalized, canonical_name)?,
+            thumbnail_base_path: workspace.path(WorkspaceArea::Previews, thumbnail_name)?,
+        })
     }
 
     pub async fn execute(
@@ -243,6 +244,8 @@ pub enum ImageNormalizationError {
     TaskJoin(#[source] tokio::task::JoinError),
     #[error("could not hash normalized image: {0}")]
     Hash(#[from] HashError),
+    #[error("workspace path is invalid: {0}")]
+    Workspace(#[from] WorkspaceError),
 }
 
 #[derive(Debug)]
@@ -261,10 +264,7 @@ fn encode_image(
     plan: &ImageNormalizationPlan,
     profile: CanonicalImageProfile,
 ) -> Result<EncodedImage, ImageNormalizationError> {
-    let input_path = resolve_input_path(&plan.input_path, profile.max_input_bytes)?;
-    let canonical_base_path = resolve_output_base_path(&plan.canonical_base_path)?;
-    let thumbnail_base_path = resolve_output_base_path(&plan.thumbnail_base_path)?;
-    let image = decode_image(&input_path, profile)?;
+    let image = decode_image(&plan.input_path, profile)?;
     let rgba = image.to_rgba8();
     let has_transparency = rgba.pixels().any(|pixel| pixel.0[3] != u8::MAX);
     let format =
@@ -276,18 +276,21 @@ fn encode_image(
     };
     let thumbnail =
         fit_image(&canonical, profile.thumbnail_max_width, profile.thumbnail_max_height);
-    let canonical_path = with_extension(&canonical_base_path, format.extension());
-    let thumbnail_path = with_extension(&thumbnail_base_path, format.extension());
-    if canonical_path == input_path {
+    let canonical_path = with_extension(&plan.canonical_base_path, format.extension());
+    let thumbnail_path = with_extension(&plan.thumbnail_base_path, format.extension());
+    if canonical_path == plan.input_path {
         return Err(ImageNormalizationError::OutputPathCollision { path: canonical_path });
     }
-    if thumbnail_path == input_path || thumbnail_path == canonical_path {
+    if thumbnail_path == plan.input_path || thumbnail_path == canonical_path {
         return Err(ImageNormalizationError::OutputPathCollision { path: thumbnail_path });
     }
     validate_output_path(&canonical_path)?;
     validate_output_path(&thumbnail_path)?;
     write_image(&canonical_path, &canonical, format, profile.jpeg_quality)?;
-    write_image(&thumbnail_path, &thumbnail, format, profile.jpeg_quality)?;
+    if let Err(error) = write_image(&thumbnail_path, &thumbnail, format, profile.jpeg_quality) {
+        let _ = fs::remove_file(&canonical_path);
+        return Err(error);
+    }
 
     Ok(EncodedImage {
         canonical_path,
@@ -313,7 +316,8 @@ fn decode_image(
     path: &Path,
     profile: CanonicalImageProfile,
 ) -> Result<DynamicImage, ImageNormalizationError> {
-    let input_path = resolve_input_path(path, profile.max_input_bytes)?;
+    validate_input_path(path, profile.max_input_bytes)?;
+    let input_path = path.to_owned();
     let mut limits = Limits::default();
     limits.max_alloc = Some(profile.max_input_pixels.saturating_mul(4));
     let reader = ImageReader::open(&input_path)
@@ -418,7 +422,9 @@ fn write_image(
             .sync_all()
             .map_err(|source| ImageNormalizationError::Output { path: path.to_owned(), source })?;
         drop(writer);
-        fs::rename(&temporary_path, path)
+        fs::hard_link(&temporary_path, path)
+            .map_err(|source| ImageNormalizationError::Output { path: path.to_owned(), source })?;
+        fs::remove_file(&temporary_path)
             .map_err(|source| ImageNormalizationError::Output { path: path.to_owned(), source })
     })();
     if result.is_err() {
@@ -443,32 +449,6 @@ fn validate_input_path(path: &Path, max_input_bytes: u64) -> Result<(), ImageNor
         });
     }
     Ok(())
-}
-
-fn resolve_input_path(
-    path: &Path,
-    max_input_bytes: u64,
-) -> Result<PathBuf, ImageNormalizationError> {
-    validate_input_path(path, max_input_bytes)?;
-    let resolved = fs::canonicalize(path)
-        .map_err(|source| ImageNormalizationError::InputFile { path: path.to_owned(), source })?;
-    if let Some(path) = symlinked_parent(&resolved)
-        .map_err(|source| ImageNormalizationError::InputFile { path: resolved.clone(), source })?
-    {
-        return Err(ImageNormalizationError::InputParentSymlink { path });
-    }
-    Ok(resolved)
-}
-
-fn resolve_output_base_path(path: &Path) -> Result<PathBuf, ImageNormalizationError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let parent = fs::canonicalize(parent)
-        .map_err(|source| ImageNormalizationError::Output { path: parent.to_owned(), source })?;
-    let file_name = path.file_name().ok_or_else(|| ImageNormalizationError::Output {
-        path: path.to_owned(),
-        source: io::Error::new(io::ErrorKind::InvalidInput, "output path has no file name"),
-    })?;
-    Ok(parent.join(file_name))
 }
 
 fn validate_output_path(path: &Path) -> Result<(), ImageNormalizationError> {
@@ -526,9 +506,11 @@ mod tests {
 
     #[tokio::test]
     async fn opaque_images_become_aspect_preserving_jpeg_with_thumbnail() {
-        let input = temp_path("opaque-input");
-        let canonical_base = temp_path("opaque-canonical");
-        let thumbnail_base = temp_path("opaque-thumbnail");
+        let workspace = MediaWorkspace::create(temp_path("opaque-workspace"), Uuid::new_v4())
+            .await
+            .expect("workspace should be created");
+        let input =
+            workspace.path(WorkspaceArea::Source, "input.png").expect("input path should be valid");
         write_png(&input, Rgba([40, 80, 120, u8::MAX]), 400, 200);
         let normalizer = ImageNormalizer::new(CanonicalImageProfile {
             max_width: 100,
@@ -540,7 +522,11 @@ mod tests {
         .expect("profile should be valid");
 
         let result = normalizer
-            .execute(&normalizer.plan(&input, &canonical_base, &thumbnail_base))
+            .execute(
+                &normalizer
+                    .plan(&workspace, "input.png", "canonical", "thumbnail")
+                    .expect("normalization plan should be valid"),
+            )
             .await
             .expect("image should normalize");
 
@@ -557,16 +543,16 @@ mod tests {
             .expect("canonical image should decode");
         assert_eq!((decoded.width(), decoded.height()), (100, 50));
 
-        for path in [input, result.canonical_path, result.thumbnail_path] {
-            std::fs::remove_file(path).expect("test image should be removed");
-        }
+        workspace.cleanup().await.expect("workspace should be removed");
     }
 
     #[tokio::test]
     async fn transparent_images_remain_png_and_keep_alpha() {
-        let input = temp_path("transparent-input");
-        let canonical_base = temp_path("transparent-canonical");
-        let thumbnail_base = temp_path("transparent-thumbnail");
+        let workspace = MediaWorkspace::create(temp_path("transparent-workspace"), Uuid::new_v4())
+            .await
+            .expect("workspace should be created");
+        let input =
+            workspace.path(WorkspaceArea::Source, "input.png").expect("input path should be valid");
         write_png(&input, Rgba([255, 0, 0, 100]), 40, 30);
         let normalizer = ImageNormalizer::new(CanonicalImageProfile {
             max_width: 100,
@@ -578,7 +564,11 @@ mod tests {
         .expect("profile should be valid");
 
         let result = normalizer
-            .execute(&normalizer.plan(&input, &canonical_base, &thumbnail_base))
+            .execute(
+                &normalizer
+                    .plan(&workspace, "input.png", "canonical", "thumbnail")
+                    .expect("normalization plan should be valid"),
+            )
             .await
             .expect("image should normalize");
 
@@ -593,9 +583,36 @@ mod tests {
             .to_rgba8();
         assert_eq!(decoded.get_pixel(0, 0).0[3], 100);
 
-        for path in [input, result.canonical_path, result.thumbnail_path] {
-            std::fs::remove_file(path).expect("test image should be removed");
-        }
+        workspace.cleanup().await.expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn existing_output_is_not_overwritten() {
+        let workspace =
+            MediaWorkspace::create(temp_path("existing-output-workspace"), Uuid::new_v4())
+                .await
+                .expect("workspace should be created");
+        let input =
+            workspace.path(WorkspaceArea::Source, "input.png").expect("input path should be valid");
+        let canonical = workspace
+            .path(WorkspaceArea::Normalized, "canonical.jpg")
+            .expect("canonical path should be valid");
+        write_png(&input, Rgba([40, 80, 120, u8::MAX]), 20, 10);
+        std::fs::write(&canonical, b"existing output").expect("existing output should be written");
+        let normalizer = ImageNormalizer::new(CanonicalImageProfile::default())
+            .expect("profile should be valid");
+        let plan = normalizer
+            .plan(&workspace, "input.png", "canonical", "thumbnail")
+            .expect("normalization plan should be valid");
+
+        let error =
+            normalizer.execute(&plan).await.expect_err("existing output should not be overwritten");
+        assert!(matches!(error, ImageNormalizationError::OutputExists { .. }));
+        assert_eq!(
+            std::fs::read(&canonical).expect("existing output should load"),
+            b"existing output"
+        );
+        workspace.cleanup().await.expect("workspace should be removed");
     }
 
     #[test]
@@ -608,8 +625,7 @@ mod tests {
         std::fs::write(&input, b"not an image").expect("test input should be written");
         let normalizer = ImageNormalizer::new(CanonicalImageProfile::default())
             .expect("profile should be valid");
-        let plan = normalizer.plan(&input, temp_path("canonical"), temp_path("thumbnail"));
-        let error = decode_image(plan.input_path(), normalizer.profile())
+        let error = decode_image(&input, normalizer.profile())
             .expect_err("invalid image should be rejected");
         assert!(matches!(error, ImageNormalizationError::UnsupportedInputFormat { .. }));
         std::fs::remove_file(input).expect("test input should be removed");
@@ -622,6 +638,12 @@ mod tests {
         )
         .expect_err("pixel limit should be enforced before decoding");
         assert!(matches!(error, ImageNormalizationError::InputTooManyPixels { limit: 50, .. }));
+        let error = decode_image(
+            &large_input,
+            CanonicalImageProfile { max_input_bytes: 1, ..Default::default() },
+        )
+        .expect_err("byte limit should be enforced before decoding");
+        assert!(matches!(error, ImageNormalizationError::InputTooLarge { limit: 1, .. }));
         std::fs::remove_file(large_input).expect("test image should be removed");
     }
 }
