@@ -708,7 +708,7 @@ The state should describe user-visible progress, while technical job states rema
 
 ```text
 id
-kind                         # video | image | animation
+kind                         # video | image | animation | audio
 status                       # active | archived | deleted
 canonical_asset_id
 preferred_title

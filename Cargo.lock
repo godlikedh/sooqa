@@ -1586,6 +1586,13 @@ version = "0.1.0"
 [[package]]
 name = "sooqa-library"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "uuid",
+]
 
 [[package]]
 name = "sooqa-media"
@@ -1613,6 +1620,7 @@ dependencies = [
  "sooqa-config",
  "sooqa-inbox",
  "sooqa-jobs",
+ "sooqa-library",
  "sooqa-media",
  "sqlx",
  "thiserror",

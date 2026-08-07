@@ -54,6 +54,14 @@ cleanup is restricted to the workspace's expected jobs root, and
 The manifest is diagnostic convenience only; PostgreSQL remains the source of
 truth for durable workflow state.
 
+The E1 Library slice adds relational PostgreSQL records for content items, media
+assets, source records, tags, and provider storage objects. The `sooqa-library`
+crate owns typed enums and records, while `sooqa-persistence::LibraryRepository`
+converts database discriminators and signed PostgreSQL integer fields at the
+adapter boundary. Tags are normalized and attached through an explicit join
+table; duplicate resolution, canonical-asset decisions, and search remain
+later slices.
+
 Worker startup now checks the configured `ffmpeg`, `ffprobe`, and `yt-dlp`
 executables and logs their detected versions. A worker exits before connecting
 to PostgreSQL when a required media binary is missing or cannot report a

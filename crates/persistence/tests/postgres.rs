@@ -19,6 +19,12 @@ async fn migrations_are_idempotent_and_create_core_tables() {
         "idempotency_records",
         "ingest_requests",
         "device_tokens",
+        "content_items",
+        "media_assets",
+        "source_records",
+        "tags",
+        "content_item_tags",
+        "storage_objects",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{}", table))

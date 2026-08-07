@@ -20,6 +20,10 @@ The B1 migration command is:
 
     DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa cargo run -p sooqa-server -- migrate
 
+The migration set now includes the initial Library tables for content items,
+media assets, source records, tags, and storage objects. Apply migrations with
+the same command after upgrading the application; migrations are forward-only.
+
 After migrations are applied, the worker can be started with:
 
     DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa cargo run -p sooqa-worker
