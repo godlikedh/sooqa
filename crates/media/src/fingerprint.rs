@@ -158,21 +158,31 @@ impl FrameExtractor {
                 Ok(path) => path,
                 Err(error) => return Err(error.into()),
             };
-            match tokio::fs::symlink_metadata(&output_path).await {
+            let needs_extraction = match tokio::fs::symlink_metadata(&output_path).await {
                 Ok(metadata) => {
-                    if metadata.file_type().is_symlink()
-                        || !metadata.is_file()
-                        || metadata.len() == 0
-                    {
+                    if metadata.file_type().is_symlink() || !metadata.is_file() {
                         return Err(FrameExtractionError::InvalidOutput { path: output_path });
                     }
+                    if metadata.len() == 0 {
+                        tokio::fs::remove_file(&output_path).await.map_err(|source| {
+                            FrameExtractionError::OutputFile { path: output_path.clone(), source }
+                        })?;
+                        true
+                    } else {
+                        if existing_frame_hash(&output_path, self.decode_limits).await?.is_some() {
+                            frame_paths.push(output_path);
+                            continue;
+                        }
+                        true
+                    }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    self.extract_frame(&input_path, &output_path, *timestamp).await?;
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                 Err(source) => {
                     return Err(FrameExtractionError::OutputFile { path: output_path, source });
                 }
+            };
+            if needs_extraction {
+                self.extract_frame(&input_path, &output_path, *timestamp).await?;
             }
             frame_paths.push(output_path);
         }
@@ -256,6 +266,7 @@ impl FrameExtractor {
             file_name.to_string_lossy(),
             Uuid::new_v4()
         ));
+        let _temporary_path_guard = TemporaryPath(temporary_path.clone());
         let command = ExternalCommand::new(self.ffmpeg_executable.clone())
             .arg("-hide_banner")
             .arg("-loglevel")
@@ -316,8 +327,36 @@ impl FrameExtractor {
     }
 }
 
+struct TemporaryPath(PathBuf);
+
+impl Drop for TemporaryPath {
+    fn drop(&mut self) {
+        // This also runs when the async extraction future is dropped while
+        // ffmpeg is still running. The operation is one unlink, not media I/O.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn format_timestamp(timestamp_ms: u64) -> String {
     format!("{}.{:03}", timestamp_ms / 1_000, timestamp_ms % 1_000)
+}
+
+async fn existing_frame_hash(
+    path: &Path,
+    limits: FrameDecodeLimits,
+) -> Result<Option<u64>, FrameExtractionError> {
+    let path = path.to_owned();
+    let decode_path = path.clone();
+    match tokio::task::spawn_blocking(move || decode_and_hash(&decode_path, limits)).await {
+        Ok(Ok(hash)) => Ok(Some(hash)),
+        Ok(Err(_)) => {
+            tokio::fs::remove_file(&path).await.map_err(|source| {
+                FrameExtractionError::OutputFile { path: path.clone(), source }
+            })?;
+            Ok(None)
+        }
+        Err(error) => Err(FrameExtractionError::TaskJoin(error)),
+    }
 }
 
 fn decode_and_hash(path: &Path, limits: FrameDecodeLimits) -> Result<u64, FrameExtractionError> {
@@ -556,6 +595,15 @@ mod tests {
             .expect("existing valid frames should be reused");
         assert_eq!(rerun.fingerprint, result.fingerprint);
         assert_eq!(runner.commands.lock().expect("runner lock should not be poisoned").len(), 7);
+
+        std::fs::write(&result.frame_paths[0], b"corrupt frame")
+            .expect("corrupt frame should be written");
+        let repaired = extractor
+            .extract(&workspace, "input.mp4", 10_000)
+            .await
+            .expect("corrupt frame should be replaced");
+        assert_eq!(repaired.fingerprint, result.fingerprint);
+        assert_eq!(runner.commands.lock().expect("runner lock should not be poisoned").len(), 8);
 
         let bounded_extractor = extractor
             .with_decode_limits(FrameDecodeLimits { max_bytes: 1, ..FrameDecodeLimits::default() });
