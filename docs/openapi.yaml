@@ -1,0 +1,276 @@
+openapi: 3.0.3
+info:
+  title: sooqa API
+  version: 0.1.0
+  description: Authenticated HTTP API for the sooqa media inbox.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+servers:
+  - url: /
+tags:
+  - name: ingest
+    description: Durable content submissions
+paths:
+  /api/v1/ingest-requests:
+    post:
+      tags: [ingest]
+      operationId: createIngestRequest
+      summary: Submit a URL for ingestion
+      description: Creates a durable ingest request and its first inspect_source job.
+      security:
+        - bearerAuth: []
+      x-required-scope: ingest:create
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestCreateRequest'
+      responses:
+        '202':
+          description: Ingest request accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestAcceptedResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/ingest-requests/{id}:
+    get:
+      tags: [ingest]
+      operationId: getIngestRequest
+      summary: Get an ingest request
+      security:
+        - bearerAuth: []
+      x-required-scope: ingest:read
+      parameters:
+        - $ref: '#/components/parameters/IngestRequestId'
+      responses:
+        '200':
+          description: Ingest request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: sooqa-device-token
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Replays the original accepted request when the payload is identical.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+    IngestRequestId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorEnvelope'
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorEnvelope'
+    Forbidden:
+      description: Token lacks the required scope
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorEnvelope'
+    Conflict:
+      description: Idempotency key conflicts with a different payload
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorEnvelope'
+    PayloadTooLarge:
+      description: Request body exceeds the configured limit
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorEnvelope'
+    NotFound:
+      description: Resource was not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorEnvelope'
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiErrorEnvelope'
+  schemas:
+    IngestCreateRequest:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          format: uri
+          pattern: '^https?://.+'
+          description: HTTP or HTTPS source URL.
+        page_url:
+          type: string
+          format: uri
+          pattern: '^https?://.+'
+        page_title:
+          type: string
+        selected_text:
+          type: string
+          description: Optional text selected by the administrator as a caption hint.
+        tags:
+          type: array
+          items:
+            type: string
+          default: []
+    IngestAcceptedResponse:
+      type: object
+      required: [id, status, links]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/IngestStatus'
+        links:
+          $ref: '#/components/schemas/IngestLinks'
+    IngestResponse:
+      type: object
+      required:
+        - id
+        - kind
+        - status
+        - source_url
+        - supplied_tags
+        - created_at
+        - updated_at
+        - links
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          $ref: '#/components/schemas/IngestKind'
+        status:
+          $ref: '#/components/schemas/IngestStatus'
+        source_url:
+          type: string
+          format: uri
+          pattern: '^https?://.+'
+        page_url:
+          type: string
+          format: uri
+          nullable: true
+        page_title:
+          type: string
+          nullable: true
+        supplied_caption:
+          type: string
+          nullable: true
+        supplied_tags:
+          type: array
+          items:
+            type: string
+        error_code:
+          type: string
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        links:
+          $ref: '#/components/schemas/IngestLinks'
+    IngestLinks:
+      type: object
+      required: [self]
+      properties:
+        self:
+          type: string
+    IngestKind:
+      type: string
+      enum: [url, telegram_message, upload]
+    IngestStatus:
+      type: string
+      enum:
+        - received
+        - queued
+        - downloading
+        - probing
+        - exact_dedup_check
+        - normalizing
+        - fingerprinting
+        - similarity_check
+        - storing
+        - completed
+        - failed_retryable
+        - failed_terminal
+        - cancelled
+    ApiErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ApiError'
+    ApiError:
+      type: object
+      required: [code, message, request_id, details]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: string
+        details:
+          type: object
+          additionalProperties: true

@@ -26,5 +26,8 @@ tokens are stored as SHA-256 hashes with scopes and revocation timestamps; the
 API requires `ingest:create` for submission and `ingest:read` for status reads.
 `POST /api/v1/ingest-requests` accepts a generic URL and returns a durable
 request ID, while `GET /api/v1/ingest-requests/{id}` exposes its current
-user-visible state. Token provisioning and revocation commands remain a later
-administration slice.
+user-visible state. The request and response shapes are declared in
+[`openapi.yaml`](openapi.yaml); CI validates the contract, and a pinned
+OpenAPI Generator recipe can emit Rust model previews without replacing the
+handwritten authentication and orchestration boundary. Token provisioning and
+revocation commands remain a later administration slice.
