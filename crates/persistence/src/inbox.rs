@@ -132,6 +132,59 @@ impl InboxRepository {
         Ok(start)
     }
 
+    pub async fn begin_asset_probe(
+        &self,
+        id: Uuid,
+    ) -> Result<AssetProbeStart, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        let start = match request.status {
+            IngestStatus::Queued => {
+                request.transition_to(IngestStatus::Downloading)?;
+                request.transition_to(IngestStatus::Probing)?;
+                request.error_code = None;
+                request.error_message = None;
+                request.completed_at = None;
+                request.updated_at = OffsetDateTime::now_utc();
+                update_ingest_state(&mut transaction, &request).await?;
+                AssetProbeStart::Ready(request)
+            }
+            IngestStatus::Probing => AssetProbeStart::Ready(request),
+            _ => AssetProbeStart::AlreadyAdvanced(request),
+        };
+        transaction.commit().await?;
+        Ok(start)
+    }
+
+    pub async fn complete_asset_probe(
+        &self,
+        id: Uuid,
+        probe: serde_json::Value,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        if request.status != IngestStatus::Probing {
+            transaction.commit().await?;
+            return Ok(request);
+        }
+        if let Some(object) = request.original_input.as_object_mut() {
+            object.insert("probe".to_owned(), probe);
+        } else {
+            request.original_input = json!({ "source": request.original_input, "probe": probe });
+        }
+        request.updated_at = OffsetDateTime::now_utc();
+        sqlx::query(
+            "UPDATE ingest_requests SET original_input = $2, updated_at = $3 WHERE id = $1",
+        )
+        .bind(request.id)
+        .bind(&request.original_input)
+        .bind(request.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(request)
+    }
+
     pub async fn complete_source_inspection(
         &self,
         id: Uuid,
@@ -180,6 +233,20 @@ impl InboxRepository {
             return Err(InboxRepositoryError::InvalidSourceInspectionFailureStatus(status));
         }
 
+        self.fail_asset_probe(id, status, error_code, error_message).await
+    }
+
+    pub async fn fail_asset_probe(
+        &self,
+        id: Uuid,
+        status: IngestStatus,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        if !matches!(status, IngestStatus::FailedRetryable | IngestStatus::FailedTerminal) {
+            return Err(InboxRepositoryError::InvalidSourceInspectionFailureStatus(status));
+        }
+
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
         if request.status.is_terminal() {
@@ -201,6 +268,12 @@ impl InboxRepository {
 
 #[derive(Debug, Clone)]
 pub enum SourceInspectionStart {
+    Ready(IngestRequest),
+    AlreadyAdvanced(IngestRequest),
+}
+
+#[derive(Debug, Clone)]
+pub enum AssetProbeStart {
     Ready(IngestRequest),
     AlreadyAdvanced(IngestRequest),
 }

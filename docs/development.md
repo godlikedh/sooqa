@@ -67,12 +67,14 @@ warnings without message contents or secrets.
 
 H4 also accepts photo, video, animation, audio, and recognizable document
 messages from the same administrators. The adapter downloads them through the
-configured Bot API, preserves Telegram message/file metadata and captions in
-the Inbox request, and enqueues a typed `probe_asset` job. Telegram's cloud
-Bot API limit of 20 MiB is rejected before download; a Local Bot API Server is
-used when configured through `api_base_url` and is not subject to that
-cloud-only check. Unsupported document types receive a warning and do not
-create an ingest request.
+configured Bot API into the shared media workspace, preserves Telegram
+message/file metadata and captions in the Inbox request, and enqueues a typed
+`probe_asset` job. The worker validates the same workspace boundary and probes
+the downloaded file with ffprobe before recording probe metadata in the Inbox.
+Telegram's cloud Bot API limit of 20 MiB is rejected before download; a Local
+Bot API Server is used when configured through `api_base_url` and is not
+subject to that cloud-only check. Unsupported document types receive a
+warning and do not create an ingest request.
 
 The adapter tests use a mocked API and receipt store, so they do not contact
 Telegram:
@@ -93,6 +95,12 @@ The PostgreSQL-backed H4 persistence test verifies that a Telegram submission
 creates one `telegram_message` request and one idempotent `probe_asset` job:
 
     DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --test ingest creates_telegram_ingest_and_probe_job_atomically -- --ignored
+
+The worker integration test uses a fake ffprobe runner against the shared
+workspace and verifies that a claimed Telegram probe job records probe
+metadata:
+
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-worker --test worker probe_handler_consumes_telegram_media_from_the_shared_workspace -- --ignored
 
 The storage provider requires a negative Telegram chat ID, loads the canonical
 asset hash from PostgreSQL, hashes the local file before upload, and persists
@@ -140,8 +148,10 @@ the system temporary directory and requires a locally installed `ffprobe`:
 
     cargo test -p sooqa-media ffprobe::tests::probes_generated_wav_fixture_with_real_ffprobe -- --ignored
 
-The worker reads `media.ffmpeg_path`, `media.ffprobe_path`, and
-`media.ytdlp_path` from TOML, with `SOOQA_MEDIA_*_PATH` environment overrides.
+The worker reads `media.work_root`, `media.ffmpeg_path`, `media.ffprobe_path`,
+and `media.ytdlp_path` from TOML, with `SOOQA_MEDIA_*` environment overrides.
+The server and worker must mount the same `media.work_root` (default
+`/var/lib/sooqa/work`) for Telegram downloads and probe jobs to share files.
 Normal worker startup reports each binary version and exits if one is missing;
 `--check-config` only validates and prints configuration, so it remains usable
 on machines without media binaries.

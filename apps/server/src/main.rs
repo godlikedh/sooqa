@@ -78,7 +78,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             config.telegram.admin_user_ids.clone(),
             config.telegram.storage_chat_id,
             DatabaseIngestService { repository: database.inbox() },
-        )?;
+        )?
+        .with_media_work_root(config.media.work_root.clone());
         tracing::info!(api_base_url = %config.telegram.api_base_url, "Telegram bot polling enabled");
         tokio::select! {
             result = server => result?,
@@ -136,6 +137,7 @@ impl IngestService for DatabaseIngestService {
             "telegram_chat_id": command.chat_id,
             "telegram_message_id": command.message_id,
             "telegram_user_id": command.submitted_by_user_id,
+            "telegram_workspace_id": command.workspace_id,
             "telegram_file_id": command.file_id,
             "telegram_file_unique_id": command.file_unique_id,
             "file_size": command.file_size,

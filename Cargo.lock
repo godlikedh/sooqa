@@ -2209,6 +2209,7 @@ dependencies = [
 name = "sooqa-worker"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "serde_json",
  "sooqa-config",
  "sooqa-inbox",
