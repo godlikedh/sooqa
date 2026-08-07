@@ -96,6 +96,13 @@ scores, and final score. `sooqa-library` owns the typed duplicate-candidate
 record, while `sooqa-persistence` upserts ordered content-item pairs in
 `duplicate_candidates`; G3 owns review actions and API exposure.
 
+The G3 duplicate-resolution API adds authenticated candidate list/detail routes
+and explicit confirm-variant, keep-separate, and dismiss transitions. A
+PostgreSQL row lock allows only a pending candidate to transition, and each
+decision inserts an immutable `duplicate_candidate_events` audit row with the
+authenticated device-token ID. Decisions do not merge or delete content;
+Telegram presentation remains in Stack H.
+
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,
 and logs directories plus a diagnostic `manifest.json`. Output names are

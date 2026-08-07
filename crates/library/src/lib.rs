@@ -442,6 +442,32 @@ pub enum DuplicateCandidateStatus {
     Dismissed,
 }
 
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateCandidateAction {
+    ConfirmVariant,
+    KeepSeparate,
+    Dismiss,
+}
+
+impl DuplicateCandidateAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfirmVariant => "confirm_variant",
+            Self::KeepSeparate => "keep_separate",
+            Self::Dismiss => "dismiss",
+        }
+    }
+
+    pub const fn resulting_status(self) -> DuplicateCandidateStatus {
+        match self {
+            Self::ConfirmVariant => DuplicateCandidateStatus::ConfirmedVariant,
+            Self::KeepSeparate => DuplicateCandidateStatus::KeptSeparate,
+            Self::Dismiss => DuplicateCandidateStatus::Dismissed,
+        }
+    }
+}
+
 impl DuplicateCandidateStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -479,6 +505,15 @@ pub struct DuplicateCandidate {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub resolved_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DuplicateCandidateEvent {
+    pub id: Uuid,
+    pub candidate_id: Uuid,
+    pub action: DuplicateCandidateAction,
+    pub actor_device_token_id: Option<Uuid>,
+    pub created_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

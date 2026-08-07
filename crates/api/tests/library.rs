@@ -7,8 +7,8 @@ use axum::{
 use serde_json::{Value, json};
 use sooqa_api::{ApiSettings, ApiState, router};
 use sooqa_library::{
-    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem, NewMediaAssetDraft,
-    NewSourceRecordDraft, SourceType, StorageState,
+    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem,
+    NewDuplicateCandidate, NewMediaAssetDraft, NewSourceRecordDraft, SourceType, StorageState,
 };
 use sooqa_persistence::{Database, hash_device_token};
 use tower::util::ServiceExt;
@@ -378,6 +378,101 @@ async fn authenticated_library_api_supports_search_edit_tags_and_archive() {
         .expect("router should respond");
     assert_eq!(archived_search.status(), StatusCode::OK);
     assert_eq!(response_json(archived_search).await["items"][0]["id"], cat_id.to_string());
+
+    fixture.clean_up().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn authenticated_duplicate_candidate_api_supports_review_actions() {
+    let mut fixture = Fixture::create().await;
+    let left_id = fixture.seed_item("Candidate left", "candidate-left", 41).await;
+    let right_id = fixture.seed_item("Candidate right", "candidate-right", 42).await;
+    let candidate = fixture
+        .database
+        .library()
+        .upsert_duplicate_candidate(
+            NewDuplicateCandidate::try_new(
+                right_id,
+                left_id,
+                "frame_dhash_v1",
+                9_100,
+                json!({"final_score": 0.91, "frame_distances": []}),
+            )
+            .expect("candidate should be valid"),
+        )
+        .await
+        .expect("candidate should be stored");
+
+    let listed = app(&fixture)
+        .oneshot(request(
+            "GET",
+            "/api/v1/duplicate-candidates?status=pending".to_owned(),
+            &fixture.read_token,
+            None,
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed_body = response_json(listed).await;
+    assert!(
+        listed_body["items"]
+            .as_array()
+            .expect("items should be an array")
+            .iter()
+            .any(|item| item["id"] == candidate.id.to_string())
+    );
+
+    let read_detail = app(&fixture)
+        .oneshot(request(
+            "GET",
+            format!("/api/v1/duplicate-candidates/{}", candidate.id),
+            &fixture.read_token,
+            None,
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(read_detail.status(), StatusCode::OK);
+    let read_detail_body = response_json(read_detail).await;
+    assert_eq!(read_detail_body["candidate"]["status"], "pending");
+    assert!(read_detail_body["events"].as_array().expect("events should be an array").is_empty());
+
+    let read_cannot_decide = app(&fixture)
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/duplicate-candidates/{}/confirm-variant", candidate.id),
+            &fixture.read_token,
+            None,
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(read_cannot_decide.status(), StatusCode::FORBIDDEN);
+
+    let confirmed = app(&fixture)
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/duplicate-candidates/{}/confirm-variant", candidate.id),
+            &fixture.write_token,
+            None,
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(confirmed.status(), StatusCode::OK);
+    let confirmed_body = response_json(confirmed).await;
+    assert_eq!(confirmed_body["candidate"]["status"], "confirmed_variant");
+    assert_eq!(confirmed_body["events"][0]["action"], "confirm_variant");
+
+    let second_decision = app(&fixture)
+        .oneshot(request(
+            "POST",
+            format!("/api/v1/duplicate-candidates/{}/dismiss", candidate.id),
+            &fixture.write_token,
+            None,
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(second_decision.status(), StatusCode::CONFLICT);
+    assert_eq!(response_json(second_decision).await["error"]["code"], "invalid_candidate_state");
 
     fixture.clean_up().await;
 }

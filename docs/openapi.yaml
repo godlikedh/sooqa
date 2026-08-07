@@ -13,6 +13,8 @@ tags:
     description: Durable content submissions
   - name: library
     description: Search and editorial Library operations
+  - name: duplicate-candidates
+    description: Review perceptual duplicate candidates
 paths:
   /api/v1/ingest-requests:
     post:
@@ -278,6 +280,149 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalError'
+  /api/v1/duplicate-candidates:
+    get:
+      tags: [duplicate-candidates]
+      operationId: listDuplicateCandidates
+      summary: List perceptual duplicate candidates
+      security:
+        - bearerAuth: []
+      x-required-scope: library:read
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, confirmed_variant, kept_separate, dismissed]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Duplicate candidates ordered by score
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DuplicateCandidateListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/duplicate-candidates/{id}:
+    get:
+      tags: [duplicate-candidates]
+      operationId: getDuplicateCandidate
+      summary: Get a duplicate candidate and audit events
+      security:
+        - bearerAuth: []
+      x-required-scope: library:read
+      parameters:
+        - $ref: '#/components/parameters/DuplicateCandidateId'
+      responses:
+        '200':
+          description: Duplicate candidate detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DuplicateCandidateDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/duplicate-candidates/{id}/confirm-variant:
+    post:
+      tags: [duplicate-candidates]
+      operationId: confirmDuplicateVariant
+      summary: Confirm a candidate as a variant
+      security:
+        - bearerAuth: []
+      x-required-scope: library:write
+      parameters:
+        - $ref: '#/components/parameters/DuplicateCandidateId'
+      responses:
+        '200':
+          description: Updated candidate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DuplicateCandidateDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/duplicate-candidates/{id}/keep-separate:
+    post:
+      tags: [duplicate-candidates]
+      operationId: keepDuplicateCandidatesSeparate
+      summary: Keep candidate items separate
+      security:
+        - bearerAuth: []
+      x-required-scope: library:write
+      parameters:
+        - $ref: '#/components/parameters/DuplicateCandidateId'
+      responses:
+        '200':
+          description: Updated candidate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DuplicateCandidateDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/duplicate-candidates/{id}/dismiss:
+    post:
+      tags: [duplicate-candidates]
+      operationId: dismissDuplicateCandidate
+      summary: Dismiss a duplicate candidate
+      security:
+        - bearerAuth: []
+      x-required-scope: library:write
+      parameters:
+        - $ref: '#/components/parameters/DuplicateCandidateId'
+      responses:
+        '200':
+          description: Updated candidate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DuplicateCandidateDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
 components:
   securitySchemes:
     bearerAuth:
@@ -315,6 +460,13 @@ components:
       schema:
         type: string
         minLength: 1
+    DuplicateCandidateId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
   responses:
     BadRequest:
       description: Invalid request
@@ -359,6 +511,90 @@ components:
           schema:
             $ref: '#/components/schemas/ApiErrorEnvelope'
   schemas:
+    DuplicateCandidateListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DuplicateCandidate'
+    DuplicateCandidateDetailResponse:
+      type: object
+      required: [candidate, events]
+      properties:
+        candidate:
+          $ref: '#/components/schemas/DuplicateCandidate'
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/DuplicateCandidateEvent'
+    DuplicateCandidate:
+      type: object
+      required:
+        - id
+        - left_content_item_id
+        - right_content_item_id
+        - algorithm_version
+        - score_basis_points
+        - evidence_json
+        - status
+        - created_at
+        - updated_at
+        - resolved_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        left_content_item_id:
+          type: string
+          format: uuid
+        right_content_item_id:
+          type: string
+          format: uuid
+        algorithm_version:
+          type: string
+        score_basis_points:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 10000
+        evidence_json:
+          type: object
+          additionalProperties: true
+        status:
+          type: string
+          enum: [pending, confirmed_variant, kept_separate, dismissed]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+    DuplicateCandidateEvent:
+      type: object
+      required: [id, candidate_id, action, actor_device_token_id, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        candidate_id:
+          type: string
+          format: uuid
+        action:
+          type: string
+          enum: [confirm_variant, keep_separate, dismiss]
+        actor_device_token_id:
+          type: string
+          format: uuid
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
     LibrarySearchResponse:
       type: object
       required: [items, next_cursor]
