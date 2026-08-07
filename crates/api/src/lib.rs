@@ -1,5 +1,7 @@
 //! HTTP API boundary for sooqa.
 
+mod library;
+
 use std::time::Duration;
 
 use axum::{
@@ -16,7 +18,7 @@ use sooqa_inbox::{
 };
 use sooqa_persistence::{
     DeviceToken, DeviceTokenRepository, DeviceTokenRepositoryError, InboxRepository,
-    InboxRepositoryError,
+    InboxRepositoryError, LibraryRepository, LibraryRepositoryError,
 };
 use time::OffsetDateTime;
 use tower_http::{
@@ -44,11 +46,16 @@ impl Default for ApiSettings {
 pub struct ApiState {
     inbox: InboxRepository,
     device_tokens: DeviceTokenRepository,
+    library: LibraryRepository,
 }
 
 impl ApiState {
-    pub fn new(inbox: InboxRepository, device_tokens: DeviceTokenRepository) -> Self {
-        Self { inbox, device_tokens }
+    pub fn new(
+        inbox: InboxRepository,
+        device_tokens: DeviceTokenRepository,
+        library: LibraryRepository,
+    ) -> Self {
+        Self { inbox, device_tokens, library }
     }
 }
 
@@ -57,6 +64,7 @@ pub fn router(settings: ApiSettings, state: ApiState) -> Router {
         .route("/health/live", get(health_live))
         .route("/api/v1/ingest-requests", post(create_ingest))
         .route("/api/v1/ingest-requests/{id}", get(get_ingest))
+        .merge(library::routes())
         .with_state(state);
 
     add_layers(router, settings)
@@ -260,6 +268,44 @@ fn map_token_error(error: DeviceTokenRepositoryError, headers: &HeaderMap) -> Ap
     ApiError::internal(headers)
 }
 
+fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiError {
+    match error {
+        LibraryRepositoryError::ResourceMissing(_) => {
+            ApiError::not_found("library_item_not_found", "The library item was not found", headers)
+        }
+        LibraryRepositoryError::OptimisticConflict(_) => ApiError::conflict(
+            "library_item_changed",
+            "The library item changed since it was read",
+            headers,
+        ),
+        LibraryRepositoryError::EmptyUpdate => ApiError::bad_request(
+            "empty_update",
+            "The request must contain at least one editable field",
+            headers,
+        ),
+        LibraryRepositoryError::InvalidState { operation, .. } => ApiError::conflict(
+            "invalid_library_state",
+            match operation {
+                "archive" => "The library item cannot be archived in its current state",
+                _ => "The library item cannot be changed in its current state",
+            },
+            headers,
+        ),
+        LibraryRepositoryError::TagNotAttached => ApiError::not_found(
+            "tag_not_attached",
+            "The tag is not attached to the library item",
+            headers,
+        ),
+        LibraryRepositoryError::InvalidLimit { .. } => {
+            ApiError::bad_request("invalid_limit", "The limit must be between 1 and 100", headers)
+        }
+        error => {
+            error!(error = %error, "library API repository operation failed");
+            ApiError::internal(headers)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct IngestCreateRequest {
     url: String,
@@ -292,8 +338,11 @@ struct IngestResponse {
     supplied_tags: Vec<String>,
     error_code: Option<String>,
     error_message: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     updated_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
     completed_at: Option<OffsetDateTime>,
     links: IngestLinks,
 }

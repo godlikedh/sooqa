@@ -102,7 +102,14 @@ impl Fixture {
 }
 
 fn app_with_settings(fixture: &Fixture, settings: ApiSettings) -> axum::Router {
-    router(settings, ApiState::new(fixture.database.inbox(), fixture.database.device_tokens()))
+    router(
+        settings,
+        ApiState::new(
+            fixture.database.inbox(),
+            fixture.database.device_tokens(),
+            fixture.database.library(),
+        ),
+    )
 }
 
 fn app(fixture: &Fixture) -> axum::Router {

@@ -86,7 +86,8 @@ ignored unless PostgreSQL is available:
 
     DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --test library -- --ignored
 
-Library search remains a later slice.
+The E3 API layer now exposes this repository through authenticated search and
+detail routes; its PostgreSQL-backed test is described below.
 
 ## Exact duplicate resolution
 
@@ -103,3 +104,15 @@ Run the focused PostgreSQL tests with:
 
 The concurrency test submits two different source URLs for the same SHA-256
 and verifies one content item, one canonical asset, and two source records.
+
+## Library API
+
+The E3 HTTP slice exposes authenticated Library search and item operations. It
+uses `library:read` for reads and `library:write` for edits, tag mutations, and
+archive. Search returns an opaque cursor ordered by `(updated_at, id)` and
+defaults to active items; pass `status=archived` when reviewing archived
+content.
+
+Run the PostgreSQL-backed API test with:
+
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-api --test library -- --ignored

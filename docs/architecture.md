@@ -92,3 +92,12 @@ user-visible state. The request and response shapes are declared in
 OpenAPI Generator recipe can emit Rust model previews without replacing the
 handwritten authentication and orchestration boundary. Token provisioning and
 revocation commands remain a later administration slice.
+
+The E3 Library API adds authenticated read and editorial-write routes over the
+typed Library repository. Search defaults to active items, supports text,
+kind, status, all-tag filtering, and opaque `(updated_at, id)` cursor pages.
+Detail responses include the canonical asset, tags, and source records. Title,
+description, and notes edits use optional optimistic timestamp checks; tags can
+be attached or detached; archive is a reversible state transition for the MVP.
+The API boundary owns bearer-token scope checks and JSON serialization, while
+the repository remains responsible for PostgreSQL mapping and transactions.
