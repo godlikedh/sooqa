@@ -43,9 +43,9 @@ The equivalent environment overrides are `SOOQA_MEDIA_FFMPEG_PATH`,
 `SOOQA_MEDIA_YTDLP_FORMAT`. On normal startup,
 the worker logs the detected version of each required binary and exits before
 database connection if a binary is unavailable. The server does not require
-these media tools. The current worker still has no production media or
-Telegram media handlers; it polls durably stored jobs, executes registered
-handlers, records outcomes, and stops gracefully on SIGTERM or Ctrl-C.
+these media tools. The worker polls durably stored jobs, executes registered
+handlers including the configured Telegram storage upload handler, records
+outcomes, and stops gracefully on SIGTERM or Ctrl-C.
 
 ## Telegram bot
 
