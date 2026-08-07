@@ -46,4 +46,10 @@ redirect handling, validates each redirect target, and streams downloads with
 byte and timeout limits. The worker binary still uses explicit handler
 composition; D1 does not yet register this adapter in production.
 
-yt-dlp integration, ffprobe, and isolated media workspaces remain later slices.
+The D2 workspace and hashing tests are included in the same command. A
+workspace is created under `<work-root>/jobs/<job-id>/`, exposes only fixed
+output areas, writes a diagnostic manifest, and cleans up only its own
+directory. `sha256_file` reads fixed-size chunks and returns both byte count and
+lowercase SHA-256.
+
+yt-dlp integration, ffprobe, and worker production wiring remain later slices.
