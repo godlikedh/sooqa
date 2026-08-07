@@ -1,9 +1,10 @@
 use serde_json::Value;
 use sooqa_library::{
-    AssetRole, ContentItem, ContentItemUpdate, ExactDuplicateRequest, ExactDuplicateResolution,
-    LibraryCursor, LibraryItemDetail, LibraryItemSummary, LibrarySearchPage, LibrarySearchQuery,
-    MediaAsset, NewContentItem, NewMediaAsset, NewSourceRecord, NewSourceRecordDraft,
-    NewStorageObject, NewTag, SourceRecord, StorageObject, Tag,
+    AssetRole, ContentItem, ContentItemUpdate, DuplicateCandidate, ExactDuplicateRequest,
+    ExactDuplicateResolution, LibraryCursor, LibraryItemDetail, LibraryItemSummary,
+    LibrarySearchPage, LibrarySearchQuery, MediaAsset, NewContentItem, NewDuplicateCandidate,
+    NewMediaAsset, NewSourceRecord, NewSourceRecordDraft, NewStorageObject, NewTag, SourceRecord,
+    StorageObject, Tag,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
@@ -18,6 +19,78 @@ pub struct LibraryRepository {
 impl LibraryRepository {
     pub(crate) fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn upsert_duplicate_candidate(
+        &self,
+        candidate: NewDuplicateCandidate,
+    ) -> Result<DuplicateCandidate, LibraryRepositoryError> {
+        let candidate = NewDuplicateCandidate::try_new(
+            candidate.left_content_item_id,
+            candidate.right_content_item_id,
+            candidate.algorithm_version,
+            candidate.score_basis_points,
+            candidate.evidence_json,
+        )?;
+        let row = sqlx::query_as::<_, DuplicateCandidateRow>(
+            r#"
+            INSERT INTO duplicate_candidates (
+                left_content_item_id, right_content_item_id, algorithm_version,
+                score_basis_points, evidence_json
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (left_content_item_id, right_content_item_id, algorithm_version)
+            DO UPDATE SET
+                score_basis_points = EXCLUDED.score_basis_points,
+                evidence_json = EXCLUDED.evidence_json,
+                updated_at = now()
+            RETURNING
+                id, left_content_item_id, right_content_item_id, algorithm_version,
+                score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
+            "#,
+        )
+        .bind(candidate.left_content_item_id)
+        .bind(candidate.right_content_item_id)
+        .bind(&candidate.algorithm_version)
+        .bind(i16::try_from(candidate.score_basis_points).map_err(|_| {
+            LibraryRepositoryError::Invariant("duplicate candidate score did not fit smallint")
+        })?)
+        .bind(candidate.evidence_json)
+        .fetch_one(&self.pool)
+        .await?;
+        row.into_duplicate_candidate()
+    }
+
+    pub async fn find_duplicate_candidate(
+        &self,
+        left_content_item_id: Uuid,
+        right_content_item_id: Uuid,
+        algorithm_version: &str,
+    ) -> Result<Option<DuplicateCandidate>, LibraryRepositoryError> {
+        let candidate = NewDuplicateCandidate::try_new(
+            left_content_item_id,
+            right_content_item_id,
+            algorithm_version,
+            0,
+            Value::Null,
+        )?;
+        let row = sqlx::query_as::<_, DuplicateCandidateRow>(
+            r#"
+            SELECT
+                id, left_content_item_id, right_content_item_id, algorithm_version,
+                score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
+            FROM duplicate_candidates
+            WHERE left_content_item_id = $1
+              AND right_content_item_id = $2
+              AND algorithm_version = $3
+            "#,
+        )
+        .bind(candidate.left_content_item_id)
+        .bind(candidate.right_content_item_id)
+        .bind(candidate.algorithm_version)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(DuplicateCandidateRow::into_duplicate_candidate).transpose()
     }
 
     pub async fn resolve_exact_duplicate(
@@ -1219,6 +1292,41 @@ pub enum LibraryRepositoryError {
     TagNotAttached,
     #[error("library search limit must be between 1 and 100, got {value}")]
     InvalidLimit { value: u32 },
+    #[error("duplicate candidate validation failed: {0}")]
+    InvalidDuplicateCandidate(#[from] sooqa_library::DuplicateCandidateValidationError),
+}
+
+#[derive(Debug, FromRow)]
+struct DuplicateCandidateRow {
+    id: Uuid,
+    left_content_item_id: Uuid,
+    right_content_item_id: Uuid,
+    algorithm_version: String,
+    score_basis_points: i16,
+    evidence_json: Value,
+    status: String,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+    resolved_at: Option<OffsetDateTime>,
+}
+
+impl DuplicateCandidateRow {
+    fn into_duplicate_candidate(self) -> Result<DuplicateCandidate, LibraryRepositoryError> {
+        Ok(DuplicateCandidate {
+            id: self.id,
+            left_content_item_id: self.left_content_item_id,
+            right_content_item_id: self.right_content_item_id,
+            algorithm_version: self.algorithm_version,
+            score_basis_points: u16::try_from(self.score_basis_points).map_err(|_| {
+                LibraryRepositoryError::Invariant("duplicate candidate score was negative")
+            })?,
+            evidence_json: self.evidence_json,
+            status: parse_enum("duplicate_candidates.status", &self.status)?,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            resolved_at: self.resolved_at,
+        })
+    }
 }
 
 #[derive(Debug, FromRow)]

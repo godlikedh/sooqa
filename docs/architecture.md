@@ -87,6 +87,15 @@ extracted frame decoding has byte, pixel, and conservative working-set caps;
 valid frames are reused on retry so partial extraction can resume. Similarity
 scoring and durable candidate persistence remain G2.
 
+The G2 similarity boundary keeps comparison pure in `sooqa-media`. It
+prefilters by duration and aspect ratio, compares relative frame positions with
+Hamming distance, aggregates the median visual distance, and combines visual,
+duration, and structure signals into configurable candidate thresholds. The
+evidence includes the algorithm version, per-frame distances, component
+scores, and final score. `sooqa-library` owns the typed duplicate-candidate
+record, while `sooqa-persistence` upserts ordered content-item pairs in
+`duplicate_candidates`; G3 owns review actions and API exposure.
+
 The D2 media primitives now provide an isolated workspace at
 `<work-root>/jobs/<job-id>/` with fixed source, normalized, frames, previews,
 and logs directories plus a diagnostic `manifest.json`. Output names are

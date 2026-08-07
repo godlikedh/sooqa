@@ -2,9 +2,9 @@ use std::env;
 
 use serde_json::json;
 use sooqa_library::{
-    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem, NewMediaAsset,
-    NewMediaAssetDraft, NewSourceRecord, NewSourceRecordDraft, NewStorageObject, NewTag,
-    SourceType, StorageState,
+    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem,
+    NewDuplicateCandidate, NewMediaAsset, NewMediaAssetDraft, NewSourceRecord,
+    NewSourceRecordDraft, NewStorageObject, NewTag, SourceType, StorageState,
 };
 use sooqa_persistence::Database;
 use uuid::Uuid;
@@ -414,4 +414,71 @@ async fn recording_canonical_asset_is_idempotent_and_hash_unique() {
 
     clean_up_content(&database, first.id).await;
     clean_up_content(&database, second.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn duplicate_candidates_upsert_ordered_pairs_and_evidence() {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let library = database.library();
+    let left = library
+        .resolve_exact_duplicate(exact_duplicate_request(
+            vec![31; 32],
+            &format!("https://library.test/candidate-left/{}", Uuid::new_v4()),
+        ))
+        .await
+        .expect("left content should be created");
+    let right = library
+        .resolve_exact_duplicate(exact_duplicate_request(
+            vec![32; 32],
+            &format!("https://library.test/candidate-right/{}", Uuid::new_v4()),
+        ))
+        .await
+        .expect("right content should be created");
+
+    let candidate = NewDuplicateCandidate::try_new(
+        right.content_item.id,
+        left.content_item.id,
+        "frame_dhash_v1",
+        9_250,
+        json!({"duration_score": 0.98, "frame_distances": []}),
+    )
+    .expect("candidate should be valid");
+    let recorded =
+        library.upsert_duplicate_candidate(candidate).await.expect("candidate should be recorded");
+    assert_eq!(recorded.score_basis_points, 9_250);
+    assert!(recorded.left_content_item_id < recorded.right_content_item_id);
+    assert_eq!(recorded.status.as_str(), "pending");
+
+    let updated = library
+        .upsert_duplicate_candidate(
+            NewDuplicateCandidate::try_new(
+                left.content_item.id,
+                right.content_item.id,
+                "frame_dhash_v1",
+                8_750,
+                json!({"duration_score": 0.9}),
+            )
+            .expect("updated candidate should be valid"),
+        )
+        .await
+        .expect("candidate should update idempotently");
+    assert_eq!(updated.id, recorded.id);
+    assert_eq!(updated.score_basis_points, 8_750);
+
+    let found = library
+        .find_duplicate_candidate(left.content_item.id, right.content_item.id, "frame_dhash_v1")
+        .await
+        .expect("candidate lookup should succeed")
+        .expect("candidate should be found");
+    assert_eq!(found.id, recorded.id);
+    assert_eq!(found.evidence_json, json!({"duration_score": 0.9}));
+
+    clean_up_content(&database, left.content_item.id).await;
+    clean_up_content(&database, right.content_item.id).await;
 }
