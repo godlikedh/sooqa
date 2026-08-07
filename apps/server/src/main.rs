@@ -3,7 +3,7 @@
 use std::error::Error;
 
 use axum::Router;
-use sooqa_config::{AppConfig, AppRole, CliOptions};
+use sooqa_config::{AppConfig, AppRole, CliCommand, CliOptions, ConfigError};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -20,6 +20,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     if options.check_config {
         println!("{}", config.summary());
+        return Ok(());
+    }
+
+    if options.command == Some(CliCommand::Migrate) {
+        let database_url = config
+            .secrets
+            .database_url
+            .as_ref()
+            .ok_or(ConfigError::MissingSecret("database URL"))?;
+        let database = sooqa_persistence::Database::connect_secret(
+            database_url,
+            config.database.max_connections,
+        )
+        .await?;
+        database.migrate().await?;
+        println!("sooqa-server: database migrations applied");
         return Ok(());
     }
 

@@ -14,4 +14,16 @@ lint:
 test:
     cargo test --workspace --all-targets
 
+db-up:
+    docker compose up -d postgres
+
+db-down:
+    docker compose down
+
+db-migrate:
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo run -p sooqa-server -- migrate
+
+test-integration:
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --test postgres -- --ignored
+
 check: fmt-check lint test

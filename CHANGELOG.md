@@ -12,3 +12,5 @@ All notable changes to sooqa will be documented here.
   tracing, and graceful shutdown scaffolding.
 - Added the server liveness endpoint, request IDs, limits, build metadata, and
   a Dockerfile skeleton.
+- Added the PostgreSQL Compose service, SQLx connection layer, initial schema
+  migration, and migration integration test harness.

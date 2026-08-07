@@ -27,6 +27,12 @@ rust-version = "1.97.1"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 axum = "0.8"
+sqlx = { version = "0.8", default-features = false, features = [
+    "macros",
+    "migrate",
+    "postgres",
+    "runtime-tokio-rustls",
+] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 thiserror = "2"
 toml = "0.9"

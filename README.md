@@ -58,3 +58,35 @@ environment-variable overrides. Start from config.example.toml.
 Use SOOQA_CONFIG_FILE when you do not want to repeat --config. Environment
 variables take precedence over TOML values. Configuration summaries redact
 secret values.
+
+## PostgreSQL
+
+On macOS, Docker Desktop is not required. Colima provides the Docker-compatible
+engine used by the commands below:
+
+    brew install colima
+    colima start --runtime docker --cpu 2 --memory 4 --disk 30
+    docker context use colima
+
+If the `colima` context does not exist, register its socket once:
+
+    docker context create colima --docker host=unix://$HOME/.colima/default/docker.sock
+    docker context use colima
+
+Confirm the active runtime with `docker context show`; it should print
+`colima`. Stop it when finished with `colima stop`.
+
+Start the development database with Docker Compose:
+
+    docker compose up -d postgres
+
+Apply the forward-only migrations:
+
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo run -p sooqa-server -- migrate
+
+Run the PostgreSQL integration test after the database is healthy:
+
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --test postgres -- --ignored
+
+The development password is intentionally simple and must not be reused in
+production.

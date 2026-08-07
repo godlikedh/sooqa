@@ -23,6 +23,11 @@ pub enum AppRole {
     Companion,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CliCommand {
+    Migrate,
+}
+
 impl fmt::Display for AppRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
@@ -37,6 +42,7 @@ impl fmt::Display for AppRole {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CliOptions {
     pub check_config: bool,
+    pub command: Option<CliCommand>,
     pub config_path: Option<PathBuf>,
 }
 
@@ -47,6 +53,7 @@ impl CliOptions {
         S: Into<String>,
     {
         let mut check_config = false;
+        let mut command = None;
         let mut config_path = None;
         let mut arguments = arguments.into_iter();
 
@@ -54,6 +61,7 @@ impl CliOptions {
             let argument = argument.into();
             match argument.as_str() {
                 "--check-config" => check_config = true,
+                "migrate" => command = Some(CliCommand::Migrate),
                 "--config" => {
                     let path =
                         arguments.next().ok_or(ConfigError::MissingArgument("--config"))?.into();
@@ -64,7 +72,7 @@ impl CliOptions {
             }
         }
 
-        Ok(Self { check_config, config_path })
+        Ok(Self { check_config, command, config_path })
     }
 }
 
@@ -120,6 +128,12 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DatabaseConfig {
+    pub url_env: String,
+    pub max_connections: u32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WorkerConfig {
     pub poll_interval_seconds: u64,
 }
@@ -158,6 +172,7 @@ pub struct AppConfig {
     pub server: ServerConfig,
     pub worker: WorkerConfig,
     pub companion: CompanionConfig,
+    pub database: DatabaseConfig,
     pub observability: ObservabilityConfig,
     pub secrets: SecretConfig,
 }
@@ -215,6 +230,10 @@ impl AppConfig {
                     .listen_address
                     .unwrap_or_else(|| DEFAULT_COMPANION_LISTEN_ADDRESS.to_owned()),
             },
+            database: DatabaseConfig {
+                url_env: raw.database.url_env.unwrap_or_else(|| "DATABASE_URL".to_owned()),
+                max_connections: raw.database.max_connections.unwrap_or(20),
+            },
             observability: ObservabilityConfig { log_format, log_level },
             secrets: SecretConfig {
                 database_url: raw.secrets.database_url.map(SecretString::new),
@@ -225,7 +244,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} companion.listen_address={} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} companion.listen_address={} database.url_env={} database.max_connections={} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -233,6 +252,8 @@ impl AppConfig {
             self.server.listen_address,
             self.worker.poll_interval_seconds,
             self.companion.listen_address,
+            self.database.url_env,
+            self.database.max_connections,
             self.observability.log_format,
             self.observability.log_level,
             configured_state(self.secrets.database_url.as_ref()),
@@ -247,7 +268,7 @@ impl AppConfig {
         if let Some(value) = optional_env_string("SOOQA_WORKER_POLL_INTERVAL_SECONDS")? {
             self.worker.poll_interval_seconds =
                 value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_WORKER_POLL_INTERVAL_SECONDS",
+                    name: "SOOQA_WORKER_POLL_INTERVAL_SECONDS".to_owned(),
                     reason: "expected a positive integer",
                 })?;
         }
@@ -262,6 +283,15 @@ impl AppConfig {
         }
         if let Some(value) = optional_env_string("SOOQA_DATABASE_URL")? {
             self.secrets.database_url = Some(SecretString::new(value));
+        } else if let Some(value) = optional_env_string(&self.database.url_env)? {
+            self.secrets.database_url = Some(SecretString::new(value));
+        }
+        if let Some(value) = optional_env_string("SOOQA_DATABASE_MAX_CONNECTIONS")? {
+            self.database.max_connections =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_DATABASE_MAX_CONNECTIONS".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
         }
         if let Some(value) = optional_env_string("SOOQA_TELEGRAM_BOT_TOKEN")? {
             self.secrets.telegram_bot_token = Some(SecretString::new(value));
@@ -275,25 +305,31 @@ impl AppConfig {
             parse_socket_address("companion.listen_address", &self.companion.listen_address)?;
         if !companion_address.ip().is_loopback() {
             return Err(ConfigError::InvalidValue {
-                name: "companion.listen_address",
+                name: "companion.listen_address".to_owned(),
                 reason: "must use a loopback address",
             });
         }
         if self.worker.poll_interval_seconds == 0 {
             return Err(ConfigError::InvalidValue {
-                name: "worker.poll_interval_seconds",
+                name: "worker.poll_interval_seconds".to_owned(),
                 reason: "must be greater than zero",
             });
         }
         if self.server.request_body_limit_bytes == 0 {
             return Err(ConfigError::InvalidValue {
-                name: "server.request_body_limit_bytes",
+                name: "server.request_body_limit_bytes".to_owned(),
                 reason: "must be greater than zero",
             });
         }
         if self.server.request_timeout_seconds == 0 {
             return Err(ConfigError::InvalidValue {
-                name: "server.request_timeout_seconds",
+                name: "server.request_timeout_seconds".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.database.max_connections == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "database.max_connections".to_owned(),
                 reason: "must be greater than zero",
             });
         }
@@ -307,8 +343,16 @@ struct RawConfig {
     server: RawServerConfig,
     worker: RawWorkerConfig,
     companion: RawCompanionConfig,
+    database: RawDatabaseConfig,
     observability: RawObservabilityConfig,
     secrets: RawSecretConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawDatabaseConfig {
+    url_env: Option<String>,
+    max_connections: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -352,34 +396,36 @@ pub enum ConfigError {
     #[error("could not parse TOML config: {0}")]
     ParseToml(#[from] toml::de::Error),
     #[error("environment variable {name} contains invalid UTF-8")]
-    InvalidEnvironmentEncoding { name: &'static str },
+    InvalidEnvironmentEncoding { name: String },
     #[error("invalid value for {name}: {reason}")]
-    InvalidValue { name: &'static str, reason: &'static str },
+    InvalidValue { name: String, reason: &'static str },
     #[error("missing argument after {0}")]
     MissingArgument(&'static str),
     #[error("unknown argument: {0}")]
     UnknownArgument(String),
     #[error("help requested")]
     HelpRequested,
+    #[error("required secret is not configured: {0}")]
+    MissingSecret(&'static str),
 }
 
-fn optional_env_path(name: &'static str) -> Result<Option<PathBuf>, ConfigError> {
+fn optional_env_path(name: &str) -> Result<Option<PathBuf>, ConfigError> {
     Ok(optional_env_string(name)?.map(PathBuf::from))
 }
 
-fn optional_env_string(name: &'static str) -> Result<Option<String>, ConfigError> {
+fn optional_env_string(name: &str) -> Result<Option<String>, ConfigError> {
     match env::var_os(name) {
         Some(value) => value
             .into_string()
             .map(Some)
-            .map_err(|_| ConfigError::InvalidEnvironmentEncoding { name }),
+            .map_err(|_| ConfigError::InvalidEnvironmentEncoding { name: name.to_owned() }),
         None => Ok(None),
     }
 }
 
-fn parse_socket_address(name: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {
+fn parse_socket_address(name: &str, value: &str) -> Result<SocketAddr, ConfigError> {
     SocketAddr::from_str(value).map_err(|_| ConfigError::InvalidValue {
-        name,
+        name: name.to_owned(),
         reason: "expected an IP address and port such as 127.0.0.1:8080",
     })
 }
@@ -389,7 +435,7 @@ fn parse_log_format(value: &str) -> Result<LogFormat, ConfigError> {
         "json" => Ok(LogFormat::Json),
         "pretty" => Ok(LogFormat::Pretty),
         _ => Err(ConfigError::InvalidValue {
-            name: "observability.log_format",
+            name: "observability.log_format".to_owned(),
             reason: "expected json or pretty",
         }),
     }
@@ -400,7 +446,7 @@ fn normalize_log_level(value: &str) -> Result<String, ConfigError> {
     match normalized.as_str() {
         "trace" | "debug" | "info" | "warn" | "error" => Ok(normalized),
         _ => Err(ConfigError::InvalidValue {
-            name: "observability.log_level",
+            name: "observability.log_level".to_owned(),
             reason: "expected trace, debug, info, warn, or error",
         }),
     }

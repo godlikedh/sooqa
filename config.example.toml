@@ -9,6 +9,10 @@ poll_interval_seconds = 5
 [companion]
 listen_address = "127.0.0.1:47831"
 
+[database]
+url_env = "DATABASE_URL"
+max_connections = 20
+
 [observability]
 log_format = "json"
 log_level = "info"
