@@ -1,0 +1,926 @@
+use serde_json::Value;
+use sooqa_publisher::{
+    ChannelPolicy, NewChannelPolicy, NewPostDraft, NewPublicationSchedule, NewTargetChannel,
+    PostDraft, PostDraftStatus, PostDraftUpdate, PublicationAttempt, PublicationAttemptStatus,
+    PublicationSchedule, PublicationScheduleStatus, PublishedPost, PublisherValidationError,
+    TargetChannel, transition_post_draft_status, transition_publication_schedule_status,
+};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use thiserror::Error;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub struct PublisherRepository {
+    pool: PgPool,
+}
+
+impl PublisherRepository {
+    pub(crate) fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn create_target_channel(
+        &self,
+        new_channel: NewTargetChannel,
+    ) -> Result<TargetChannel, PublisherRepositoryError> {
+        let row = sqlx::query_as::<_, TargetChannelRow>(
+            r#"
+            INSERT INTO target_channels (
+                name, telegram_chat_id, default_parse_mode, default_disable_notification
+            )
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, name, telegram_chat_id, is_enabled, default_parse_mode,
+                      default_disable_notification, created_at, updated_at
+            "#,
+        )
+        .bind(new_channel.name)
+        .bind(new_channel.telegram_chat_id)
+        .bind(new_channel.default_parse_mode)
+        .bind(new_channel.default_disable_notification)
+        .fetch_one(&self.pool)
+        .await?;
+        row.into_target_channel()
+    }
+
+    pub async fn find_target_channel(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<TargetChannel>, PublisherRepositoryError> {
+        let row = sqlx::query_as::<_, TargetChannelRow>(
+            r#"
+            SELECT id, name, telegram_chat_id, is_enabled, default_parse_mode,
+                   default_disable_notification, created_at, updated_at
+            FROM target_channels
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(TargetChannelRow::into_target_channel).transpose()
+    }
+
+    pub async fn list_target_channels(
+        &self,
+        enabled_only: bool,
+    ) -> Result<Vec<TargetChannel>, PublisherRepositoryError> {
+        let rows = if enabled_only {
+            sqlx::query_as::<_, TargetChannelRow>(
+                r#"
+                SELECT id, name, telegram_chat_id, is_enabled, default_parse_mode,
+                       default_disable_notification, created_at, updated_at
+                FROM target_channels
+                WHERE is_enabled
+                ORDER BY name, id
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, TargetChannelRow>(
+                r#"
+                SELECT id, name, telegram_chat_id, is_enabled, default_parse_mode,
+                       default_disable_notification, created_at, updated_at
+                FROM target_channels
+                ORDER BY name, id
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+        rows.into_iter().map(TargetChannelRow::into_target_channel).collect()
+    }
+
+    pub async fn set_target_channel_enabled(
+        &self,
+        id: Uuid,
+        is_enabled: bool,
+    ) -> Result<TargetChannel, PublisherRepositoryError> {
+        let row = sqlx::query_as::<_, TargetChannelRow>(
+            r#"
+            UPDATE target_channels
+            SET is_enabled = $2, updated_at = now()
+            WHERE id = $1
+            RETURNING id, name, telegram_chat_id, is_enabled, default_parse_mode,
+                      default_disable_notification, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(is_enabled)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(PublisherRepositoryError::TargetChannelMissing(id))?;
+        row.into_target_channel()
+    }
+
+    pub async fn upsert_channel_policy(
+        &self,
+        policy: NewChannelPolicy,
+    ) -> Result<ChannelPolicy, PublisherRepositoryError> {
+        policy.validate()?;
+        let row = sqlx::query_as::<_, ChannelPolicyRow>(
+            r#"
+            INSERT INTO channel_policies (
+                target_channel_id, minimum_post_interval_seconds,
+                same_content_cooldown_seconds, similar_content_cooldown_seconds,
+                similarity_threshold, on_cooldown_violation, allowed_windows_json,
+                max_posts_per_day, jitter_seconds
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (target_channel_id) DO UPDATE SET
+                minimum_post_interval_seconds = EXCLUDED.minimum_post_interval_seconds,
+                same_content_cooldown_seconds = EXCLUDED.same_content_cooldown_seconds,
+                similar_content_cooldown_seconds = EXCLUDED.similar_content_cooldown_seconds,
+                similarity_threshold = EXCLUDED.similarity_threshold,
+                on_cooldown_violation = EXCLUDED.on_cooldown_violation,
+                allowed_windows_json = EXCLUDED.allowed_windows_json,
+                max_posts_per_day = EXCLUDED.max_posts_per_day,
+                jitter_seconds = EXCLUDED.jitter_seconds,
+                updated_at = now()
+            RETURNING target_channel_id, minimum_post_interval_seconds,
+                      same_content_cooldown_seconds, similar_content_cooldown_seconds,
+                      similarity_threshold, on_cooldown_violation, allowed_windows_json,
+                      max_posts_per_day, jitter_seconds, updated_at
+            "#,
+        )
+        .bind(policy.target_channel_id)
+        .bind(to_i64(policy.minimum_post_interval_seconds, "minimum_post_interval_seconds")?)
+        .bind(to_i64(policy.same_content_cooldown_seconds, "same_content_cooldown_seconds")?)
+        .bind(to_i64(policy.similar_content_cooldown_seconds, "similar_content_cooldown_seconds")?)
+        .bind(policy.similarity_threshold)
+        .bind(policy.on_cooldown_violation.as_str())
+        .bind(policy.allowed_windows_json)
+        .bind(
+            policy.max_posts_per_day.map(i32::try_from).transpose().map_err(|_| {
+                PublisherRepositoryError::NumberOverflow { field: "max_posts_per_day" }
+            })?,
+        )
+        .bind(to_i64(policy.jitter_seconds, "jitter_seconds")?)
+        .fetch_one(&self.pool)
+        .await?;
+        row.into_channel_policy()
+    }
+
+    pub async fn find_channel_policy(
+        &self,
+        target_channel_id: Uuid,
+    ) -> Result<Option<ChannelPolicy>, PublisherRepositoryError> {
+        let row = sqlx::query_as::<_, ChannelPolicyRow>(
+            r#"
+            SELECT target_channel_id, minimum_post_interval_seconds,
+                   same_content_cooldown_seconds, similar_content_cooldown_seconds,
+                   similarity_threshold, on_cooldown_violation, allowed_windows_json,
+                   max_posts_per_day, jitter_seconds, updated_at
+            FROM channel_policies
+            WHERE target_channel_id = $1
+            "#,
+        )
+        .bind(target_channel_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(ChannelPolicyRow::into_channel_policy).transpose()
+    }
+
+    pub async fn create_post_draft(
+        &self,
+        new_draft: NewPostDraft,
+    ) -> Result<PostDraft, PublisherRepositoryError> {
+        ensure_asset_belongs_to_content(&self.pool, new_draft.content_item_id, new_draft.asset_id)
+            .await?;
+        let row = sqlx::query_as::<_, PostDraftRow>(
+            r#"
+            INSERT INTO post_drafts (
+                content_item_id, asset_id, target_channel_id, caption, parse_mode
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, content_item_id, asset_id, target_channel_id, caption,
+                      parse_mode, status, created_at, updated_at
+            "#,
+        )
+        .bind(new_draft.content_item_id)
+        .bind(new_draft.asset_id)
+        .bind(new_draft.target_channel_id)
+        .bind(new_draft.caption)
+        .bind(new_draft.parse_mode)
+        .fetch_one(&self.pool)
+        .await?;
+        row.into_post_draft()
+    }
+
+    pub async fn find_post_draft(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<PostDraft>, PublisherRepositoryError> {
+        let row = sqlx::query_as::<_, PostDraftRow>(
+            r#"
+            SELECT id, content_item_id, asset_id, target_channel_id, caption,
+                   parse_mode, status, created_at, updated_at
+            FROM post_drafts
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(PostDraftRow::into_post_draft).transpose()
+    }
+
+    pub async fn update_post_draft(
+        &self,
+        id: Uuid,
+        update: PostDraftUpdate,
+    ) -> Result<PostDraft, PublisherRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut draft = load_post_draft(&mut transaction, id).await?;
+        if let Some(expected_updated_at) = update.expected_updated_at
+            && draft.updated_at != expected_updated_at
+        {
+            return Err(PublisherRepositoryError::OptimisticConflict(id));
+        }
+        if let Some(caption) = update.caption {
+            draft.caption = caption;
+        }
+        if let Some(parse_mode) = update.parse_mode {
+            draft.parse_mode = parse_mode;
+        }
+        if let Some(status) = update.status {
+            draft.status = transition_post_draft_status(draft.status, status)?;
+        }
+        draft.updated_at = OffsetDateTime::now_utc();
+        let row = sqlx::query_as::<_, PostDraftRow>(
+            r#"
+            UPDATE post_drafts
+            SET caption = $2, parse_mode = $3, status = $4, updated_at = $5
+            WHERE id = $1
+            RETURNING id, content_item_id, asset_id, target_channel_id, caption,
+                      parse_mode, status, created_at, updated_at
+            "#,
+        )
+        .bind(draft.id)
+        .bind(&draft.caption)
+        .bind(&draft.parse_mode)
+        .bind(draft.status.as_str())
+        .bind(draft.updated_at)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        row.into_post_draft()
+    }
+
+    pub async fn create_publication_schedule(
+        &self,
+        schedule: NewPublicationSchedule,
+    ) -> Result<PublicationSchedule, PublisherRepositoryError> {
+        schedule.validate()?;
+        let mut transaction = self.pool.begin().await?;
+        if let Some(existing) = sqlx::query_as::<_, PublicationScheduleRow>(
+            r#"
+            SELECT id, post_draft_id, status, publish_at, not_before, not_after,
+                   priority, cooldown_override, idempotency_key, created_at, updated_at
+            FROM publication_schedules
+            WHERE idempotency_key = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(&schedule.idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            if existing.post_draft_id != schedule.post_draft_id
+                || existing.publish_at != schedule.publish_at
+                || existing.not_before != schedule.not_before
+                || existing.not_after != schedule.not_after
+                || existing.priority != schedule.priority
+                || existing.cooldown_override != schedule.cooldown_override
+            {
+                return Err(PublisherRepositoryError::ScheduleIdempotencyConflict(
+                    schedule.idempotency_key,
+                ));
+            }
+            transaction.commit().await?;
+            return existing.into_publication_schedule();
+        }
+        let draft = load_post_draft(&mut transaction, schedule.post_draft_id).await?;
+        if draft.status != PostDraftStatus::Ready {
+            return Err(PublisherRepositoryError::DraftNotReady {
+                id: draft.id,
+                status: draft.status,
+            });
+        }
+        let inserted = sqlx::query_as::<_, PublicationScheduleRow>(
+            r#"
+            INSERT INTO publication_schedules (
+                post_draft_id, publish_at, not_before, not_after, priority,
+                cooldown_override, idempotency_key
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING id, post_draft_id, status, publish_at, not_before, not_after,
+                      priority, cooldown_override, idempotency_key, created_at, updated_at
+            "#,
+        )
+        .bind(schedule.post_draft_id)
+        .bind(schedule.publish_at)
+        .bind(schedule.not_before)
+        .bind(schedule.not_after)
+        .bind(schedule.priority)
+        .bind(schedule.cooldown_override)
+        .bind(&schedule.idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let row = if let Some(inserted) = inserted {
+            let updated = sqlx::query_as::<_, PostDraftRow>(
+                r#"
+                UPDATE post_drafts
+                SET status = 'scheduled', updated_at = now()
+                WHERE id = $1 AND status = 'ready'
+                RETURNING id, content_item_id, asset_id, target_channel_id, caption,
+                          parse_mode, status, created_at, updated_at
+                "#,
+            )
+            .bind(schedule.post_draft_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if updated.is_none() {
+                return Err(PublisherRepositoryError::DraftNotReady {
+                    id: draft.id,
+                    status: draft.status,
+                });
+            }
+            inserted
+        } else {
+            let existing = sqlx::query_as::<_, PublicationScheduleRow>(
+                r#"
+                SELECT id, post_draft_id, status, publish_at, not_before, not_after,
+                       priority, cooldown_override, idempotency_key, created_at, updated_at
+                FROM publication_schedules
+                WHERE idempotency_key = $1
+                FOR UPDATE
+                "#,
+            )
+            .bind(&schedule.idempotency_key)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if existing.post_draft_id != schedule.post_draft_id
+                || existing.publish_at != schedule.publish_at
+                || existing.not_before != schedule.not_before
+                || existing.not_after != schedule.not_after
+                || existing.priority != schedule.priority
+                || existing.cooldown_override != schedule.cooldown_override
+            {
+                return Err(PublisherRepositoryError::ScheduleIdempotencyConflict(
+                    schedule.idempotency_key,
+                ));
+            }
+            existing
+        };
+        transaction.commit().await?;
+        row.into_publication_schedule()
+    }
+
+    pub async fn find_publication_schedule(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<PublicationSchedule>, PublisherRepositoryError> {
+        let row = sqlx::query_as::<_, PublicationScheduleRow>(
+            r#"
+            SELECT id, post_draft_id, status, publish_at, not_before, not_after,
+                   priority, cooldown_override, idempotency_key, created_at, updated_at
+            FROM publication_schedules
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(PublicationScheduleRow::into_publication_schedule).transpose()
+    }
+
+    pub async fn list_due_publication_schedules(
+        &self,
+        now: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<PublicationSchedule>, PublisherRepositoryError> {
+        if !(1..=100).contains(&limit) {
+            return Err(PublisherRepositoryError::InvalidLimit(limit));
+        }
+        let rows = sqlx::query_as::<_, PublicationScheduleRow>(
+            r#"
+            SELECT id, post_draft_id, status, publish_at, not_before, not_after,
+                   priority, cooldown_override, idempotency_key, created_at, updated_at
+            FROM publication_schedules
+            WHERE status IN ('pending', 'queued', 'failed')
+              AND publish_at <= $1
+              AND (not_before IS NULL OR not_before <= $1)
+              AND (not_after IS NULL OR not_after >= $1)
+            ORDER BY priority DESC, publish_at ASC, created_at ASC, id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(now)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(PublicationScheduleRow::into_publication_schedule).collect()
+    }
+
+    pub async fn transition_publication_schedule(
+        &self,
+        id: Uuid,
+        target: PublicationScheduleStatus,
+    ) -> Result<PublicationSchedule, PublisherRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut schedule = load_publication_schedule(&mut transaction, id).await?;
+        schedule.status = transition_publication_schedule_status(schedule.status, target)?;
+        schedule.updated_at = OffsetDateTime::now_utc();
+        let row = sqlx::query_as::<_, PublicationScheduleRow>(
+            r#"
+            UPDATE publication_schedules
+            SET status = $2, updated_at = $3
+            WHERE id = $1
+            RETURNING id, post_draft_id, status, publish_at, not_before, not_after,
+                      priority, cooldown_override, idempotency_key, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(schedule.status.as_str())
+        .bind(schedule.updated_at)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        row.into_publication_schedule()
+    }
+
+    pub async fn start_publication_attempt(
+        &self,
+        schedule_id: Uuid,
+        telegram_request_key: Option<String>,
+    ) -> Result<PublicationAttempt, PublisherRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut schedule = load_publication_schedule(&mut transaction, schedule_id).await?;
+        if schedule.status == PublicationScheduleStatus::Pending
+            || schedule.status == PublicationScheduleStatus::Queued
+            || schedule.status == PublicationScheduleStatus::Failed
+        {
+            schedule.status = transition_publication_schedule_status(
+                schedule.status,
+                PublicationScheduleStatus::Queued,
+            )?;
+            schedule.status = transition_publication_schedule_status(
+                schedule.status,
+                PublicationScheduleStatus::Publishing,
+            )?;
+            sqlx::query(
+                "UPDATE publication_schedules SET status = 'publishing', updated_at = now() WHERE id = $1",
+            )
+            .bind(schedule_id)
+            .execute(&mut *transaction)
+            .await?;
+        } else if schedule.status != PublicationScheduleStatus::Publishing {
+            return Err(PublisherRepositoryError::InvalidScheduleState {
+                id: schedule_id,
+                status: schedule.status,
+            });
+        }
+        let attempt_number: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(max(attempt_number), 0) + 1 FROM publication_attempts WHERE publication_schedule_id = $1",
+        )
+        .bind(schedule_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let row = sqlx::query_as::<_, PublicationAttemptRow>(
+            r#"
+            INSERT INTO publication_attempts (
+                publication_schedule_id, attempt_number, telegram_request_key
+            )
+            VALUES ($1, $2, $3)
+            RETURNING id, publication_schedule_id, attempt_number, status, started_at,
+                      finished_at, telegram_request_key, error_class, error_message, response_json
+            "#,
+        )
+        .bind(schedule_id)
+        .bind(attempt_number)
+        .bind(telegram_request_key)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        row.into_publication_attempt()
+    }
+
+    pub async fn finish_publication_attempt(
+        &self,
+        schedule_id: Uuid,
+        attempt_number: i32,
+        status: PublicationAttemptStatus,
+        error_class: Option<&str>,
+        error_message: Option<&str>,
+        response_json: Option<Value>,
+    ) -> Result<PublicationAttempt, PublisherRepositoryError> {
+        if status == PublicationAttemptStatus::Running {
+            return Err(PublisherRepositoryError::AttemptMustFinish);
+        }
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, PublicationAttemptRow>(
+            r#"
+            UPDATE publication_attempts
+            SET status = $3, finished_at = now(), error_class = $4,
+                error_message = $5, response_json = $6
+            WHERE publication_schedule_id = $1
+              AND attempt_number = $2
+              AND status = 'running'
+            RETURNING id, publication_schedule_id, attempt_number, status, started_at,
+                      finished_at, telegram_request_key, error_class, error_message, response_json
+            "#,
+        )
+        .bind(schedule_id)
+        .bind(attempt_number)
+        .bind(status.as_str())
+        .bind(error_class)
+        .bind(error_message)
+        .bind(response_json)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(PublisherRepositoryError::AttemptMissing { schedule_id, attempt_number })?;
+        let schedule_status = if status == PublicationAttemptStatus::Succeeded {
+            PublicationScheduleStatus::Published
+        } else {
+            PublicationScheduleStatus::Failed
+        };
+        sqlx::query(
+            "UPDATE publication_schedules SET status = $2, updated_at = now() WHERE id = $1",
+        )
+        .bind(schedule_id)
+        .bind(schedule_status.as_str())
+        .execute(&mut *transaction)
+        .await?;
+        if status == PublicationAttemptStatus::Succeeded {
+            let schedule_draft_id: Uuid =
+                sqlx::query_scalar("SELECT post_draft_id FROM publication_schedules WHERE id = $1")
+                    .bind(schedule_id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+            sqlx::query(
+                "UPDATE post_drafts SET status = 'published', updated_at = now() WHERE id = $1 AND status = 'scheduled'",
+            )
+            .bind(schedule_draft_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        row.into_publication_attempt()
+    }
+
+    pub async fn record_published_post(
+        &self,
+        schedule_id: Uuid,
+        telegram_message_id: i64,
+        caption_snapshot: Option<String>,
+    ) -> Result<PublishedPost, PublisherRepositoryError> {
+        if telegram_message_id <= 0 {
+            return Err(PublisherRepositoryError::InvalidTelegramMessageId(telegram_message_id));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, PublishedPostRow>(
+            r#"
+            INSERT INTO published_posts (
+                publication_schedule_id, content_item_id, asset_id, target_channel_id,
+                telegram_chat_id, telegram_message_id, caption_snapshot
+            )
+            SELECT ps.id, pd.content_item_id, pd.asset_id, pd.target_channel_id,
+                   tc.telegram_chat_id, $2, $3
+            FROM publication_schedules ps
+            JOIN post_drafts pd ON pd.id = ps.post_draft_id
+            JOIN target_channels tc ON tc.id = pd.target_channel_id
+            WHERE ps.id = $1
+            ON CONFLICT (publication_schedule_id) DO UPDATE SET
+                telegram_chat_id = EXCLUDED.telegram_chat_id,
+                telegram_message_id = EXCLUDED.telegram_message_id,
+                caption_snapshot = EXCLUDED.caption_snapshot,
+                published_at = now(),
+                status = 'active'
+            RETURNING id, publication_schedule_id, content_item_id, asset_id,
+                      target_channel_id, telegram_chat_id, telegram_message_id,
+                      caption_snapshot, published_at, status
+            "#,
+        )
+        .bind(schedule_id)
+        .bind(telegram_message_id)
+        .bind(caption_snapshot)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(PublisherRepositoryError::ScheduleMissing(schedule_id))?;
+        transaction.commit().await?;
+        row.into_published_post()
+    }
+}
+
+async fn ensure_asset_belongs_to_content(
+    pool: &PgPool,
+    content_item_id: Uuid,
+    asset_id: Uuid,
+) -> Result<(), PublisherRepositoryError> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM media_assets WHERE id = $2 AND content_item_id = $1)",
+    )
+    .bind(content_item_id)
+    .bind(asset_id)
+    .fetch_one(pool)
+    .await?;
+    if !exists {
+        return Err(PublisherRepositoryError::AssetContentMismatch { content_item_id, asset_id });
+    }
+    Ok(())
+}
+
+async fn load_post_draft(
+    transaction: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+) -> Result<PostDraft, PublisherRepositoryError> {
+    let row = sqlx::query_as::<_, PostDraftRow>(
+        r#"
+        SELECT id, content_item_id, asset_id, target_channel_id, caption,
+               parse_mode, status, created_at, updated_at
+        FROM post_drafts
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(PublisherRepositoryError::PostDraftMissing(id))?;
+    row.into_post_draft()
+}
+
+async fn load_publication_schedule(
+    transaction: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+) -> Result<PublicationSchedule, PublisherRepositoryError> {
+    let row = sqlx::query_as::<_, PublicationScheduleRow>(
+        r#"
+        SELECT id, post_draft_id, status, publish_at, not_before, not_after,
+               priority, cooldown_override, idempotency_key, created_at, updated_at
+        FROM publication_schedules
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(PublisherRepositoryError::ScheduleMissing(id))?;
+    row.into_publication_schedule()
+}
+
+fn to_i64(value: u64, field: &'static str) -> Result<i64, PublisherRepositoryError> {
+    i64::try_from(value).map_err(|_| PublisherRepositoryError::NumberOverflow { field })
+}
+
+#[derive(Debug, Error)]
+pub enum PublisherRepositoryError {
+    #[error("publisher validation failed: {0}")]
+    Validation(#[from] PublisherValidationError),
+    #[error("database returned an unknown {field} value: {value}")]
+    InvalidEnum { field: &'static str, value: String },
+    #[error("publisher number {field} does not fit the database type")]
+    NumberOverflow { field: &'static str },
+    #[error("target channel {0} was not found")]
+    TargetChannelMissing(Uuid),
+    #[error("post draft {0} was not found")]
+    PostDraftMissing(Uuid),
+    #[error("publication schedule {0} was not found")]
+    ScheduleMissing(Uuid),
+    #[error("publication attempt {schedule_id}/{attempt_number} was not found or already finished")]
+    AttemptMissing { schedule_id: Uuid, attempt_number: i32 },
+    #[error("post draft {id} is not ready for scheduling; current status is {status:?}")]
+    DraftNotReady { id: Uuid, status: PostDraftStatus },
+    #[error("publication schedule idempotency key conflicts with another request: {0}")]
+    ScheduleIdempotencyConflict(String),
+    #[error("post draft {0} was updated by another request")]
+    OptimisticConflict(Uuid),
+    #[error("asset {asset_id} does not belong to content item {content_item_id}")]
+    AssetContentMismatch { content_item_id: Uuid, asset_id: Uuid },
+    #[error("publication schedule {id} cannot transition from status {status:?}")]
+    InvalidScheduleState { id: Uuid, status: PublicationScheduleStatus },
+    #[error("publication attempt must finish with a terminal status")]
+    AttemptMustFinish,
+    #[error("publication limit must be between 1 and 100, got {0}")]
+    InvalidLimit(u32),
+    #[error("Telegram message ID must be positive, got {0}")]
+    InvalidTelegramMessageId(i64),
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+#[derive(Debug, FromRow)]
+struct TargetChannelRow {
+    id: Uuid,
+    name: String,
+    telegram_chat_id: i64,
+    is_enabled: bool,
+    default_parse_mode: Option<String>,
+    default_disable_notification: bool,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+impl TargetChannelRow {
+    fn into_target_channel(self) -> Result<TargetChannel, PublisherRepositoryError> {
+        Ok(TargetChannel {
+            id: self.id,
+            name: self.name,
+            telegram_chat_id: self.telegram_chat_id,
+            is_enabled: self.is_enabled,
+            default_parse_mode: self.default_parse_mode,
+            default_disable_notification: self.default_disable_notification,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct ChannelPolicyRow {
+    target_channel_id: Uuid,
+    minimum_post_interval_seconds: i64,
+    same_content_cooldown_seconds: i64,
+    similar_content_cooldown_seconds: i64,
+    similarity_threshold: f64,
+    on_cooldown_violation: String,
+    allowed_windows_json: Value,
+    max_posts_per_day: Option<i32>,
+    jitter_seconds: i64,
+    updated_at: OffsetDateTime,
+}
+
+impl ChannelPolicyRow {
+    fn into_channel_policy(self) -> Result<ChannelPolicy, PublisherRepositoryError> {
+        Ok(ChannelPolicy {
+            target_channel_id: self.target_channel_id,
+            minimum_post_interval_seconds: from_i64(
+                self.minimum_post_interval_seconds,
+                "minimum_post_interval_seconds",
+            )?,
+            same_content_cooldown_seconds: from_i64(
+                self.same_content_cooldown_seconds,
+                "same_content_cooldown_seconds",
+            )?,
+            similar_content_cooldown_seconds: from_i64(
+                self.similar_content_cooldown_seconds,
+                "similar_content_cooldown_seconds",
+            )?,
+            similarity_threshold: self.similarity_threshold,
+            on_cooldown_violation: parse_enum(
+                "channel_policies.on_cooldown_violation",
+                &self.on_cooldown_violation,
+            )?,
+            allowed_windows_json: self.allowed_windows_json,
+            max_posts_per_day: self
+                .max_posts_per_day
+                .map(|value| {
+                    u32::try_from(value).map_err(|_| PublisherRepositoryError::NumberOverflow {
+                        field: "max_posts_per_day",
+                    })
+                })
+                .transpose()?,
+            jitter_seconds: from_i64(self.jitter_seconds, "jitter_seconds")?,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct PostDraftRow {
+    id: Uuid,
+    content_item_id: Uuid,
+    asset_id: Uuid,
+    target_channel_id: Uuid,
+    caption: Option<String>,
+    parse_mode: Option<String>,
+    status: String,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+impl PostDraftRow {
+    fn into_post_draft(self) -> Result<PostDraft, PublisherRepositoryError> {
+        Ok(PostDraft {
+            id: self.id,
+            content_item_id: self.content_item_id,
+            asset_id: self.asset_id,
+            target_channel_id: self.target_channel_id,
+            caption: self.caption,
+            parse_mode: self.parse_mode,
+            status: parse_enum("post_drafts.status", &self.status)?,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct PublicationScheduleRow {
+    id: Uuid,
+    post_draft_id: Uuid,
+    status: String,
+    publish_at: OffsetDateTime,
+    not_before: Option<OffsetDateTime>,
+    not_after: Option<OffsetDateTime>,
+    priority: i32,
+    cooldown_override: Option<bool>,
+    idempotency_key: String,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+impl PublicationScheduleRow {
+    fn into_publication_schedule(self) -> Result<PublicationSchedule, PublisherRepositoryError> {
+        Ok(PublicationSchedule {
+            id: self.id,
+            post_draft_id: self.post_draft_id,
+            status: parse_enum("publication_schedules.status", &self.status)?,
+            publish_at: self.publish_at,
+            not_before: self.not_before,
+            not_after: self.not_after,
+            priority: self.priority,
+            cooldown_override: self.cooldown_override,
+            idempotency_key: self.idempotency_key,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct PublicationAttemptRow {
+    id: Uuid,
+    publication_schedule_id: Uuid,
+    attempt_number: i32,
+    status: String,
+    started_at: OffsetDateTime,
+    finished_at: Option<OffsetDateTime>,
+    telegram_request_key: Option<String>,
+    error_class: Option<String>,
+    error_message: Option<String>,
+    response_json: Option<Value>,
+}
+
+impl PublicationAttemptRow {
+    fn into_publication_attempt(self) -> Result<PublicationAttempt, PublisherRepositoryError> {
+        Ok(PublicationAttempt {
+            id: self.id,
+            publication_schedule_id: self.publication_schedule_id,
+            attempt_number: self.attempt_number,
+            status: parse_enum("publication_attempts.status", &self.status)?,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            telegram_request_key: self.telegram_request_key,
+            error_class: self.error_class,
+            error_message: self.error_message,
+            response_json: self.response_json,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct PublishedPostRow {
+    id: Uuid,
+    publication_schedule_id: Uuid,
+    content_item_id: Uuid,
+    asset_id: Uuid,
+    target_channel_id: Uuid,
+    telegram_chat_id: i64,
+    telegram_message_id: i64,
+    caption_snapshot: Option<String>,
+    published_at: OffsetDateTime,
+    status: String,
+}
+
+impl PublishedPostRow {
+    fn into_published_post(self) -> Result<PublishedPost, PublisherRepositoryError> {
+        Ok(PublishedPost {
+            id: self.id,
+            publication_schedule_id: self.publication_schedule_id,
+            content_item_id: self.content_item_id,
+            asset_id: self.asset_id,
+            target_channel_id: self.target_channel_id,
+            telegram_chat_id: self.telegram_chat_id,
+            telegram_message_id: self.telegram_message_id,
+            caption_snapshot: self.caption_snapshot,
+            published_at: self.published_at,
+            status: parse_enum("published_posts.status", &self.status)?,
+        })
+    }
+}
+
+fn parse_enum<T>(field: &'static str, value: &str) -> Result<T, PublisherRepositoryError>
+where
+    T: for<'value> TryFrom<&'value str, Error = String>,
+{
+    T::try_from(value).map_err(|value| PublisherRepositoryError::InvalidEnum { field, value })
+}
+
+fn from_i64(value: i64, field: &'static str) -> Result<u64, PublisherRepositoryError> {
+    u64::try_from(value).map_err(|_| PublisherRepositoryError::NumberOverflow { field })
+}

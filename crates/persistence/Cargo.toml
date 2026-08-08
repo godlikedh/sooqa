@@ -11,6 +11,7 @@ sooqa-inbox = { path = "../inbox" }
 sooqa-jobs = { path = "../jobs" }
 sooqa-library = { path = "../library" }
 sooqa-media = { path = "../media" }
+sooqa-publisher = { path = "../publisher" }
 sooqa-config = { path = "../config" }
 serde_json.workspace = true
 sha2.workspace = true

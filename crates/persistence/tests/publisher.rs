@@ -1,0 +1,252 @@
+use std::env;
+
+use sooqa_library::{
+    AssetRole, ContentKind, MediaKind, NewContentItem, NewMediaAsset, StorageState,
+};
+use sooqa_persistence::Database;
+use sooqa_publisher::{
+    CooldownViolation, NewChannelPolicy, NewPostDraft, NewPublicationSchedule, NewTargetChannel,
+    PostDraftStatus, PostDraftUpdate, PublicationAttemptStatus,
+};
+use time::Duration;
+use uuid::Uuid;
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let key_prefix = format!("i1-publisher-{}", Uuid::new_v4());
+    let telegram_chat_id = -1_000_000_000_000_i64
+        - i64::try_from(Uuid::new_v4().as_u128() % 1_000_000)
+            .expect("bounded UUID fragment should fit in i64");
+    let target = database
+        .publisher()
+        .create_target_channel(
+            NewTargetChannel::try_new(format!("{key_prefix}-channel"), telegram_chat_id)
+                .expect("target channel should be valid"),
+        )
+        .await
+        .expect("target channel should be created");
+    assert!(target.is_enabled);
+    let policy = database
+        .publisher()
+        .upsert_channel_policy(NewChannelPolicy {
+            on_cooldown_violation: CooldownViolation::Block,
+            ..NewChannelPolicy::default_for(target.id)
+        })
+        .await
+        .expect("channel policy should be created");
+    assert_eq!(policy.on_cooldown_violation, CooldownViolation::Block);
+    assert_eq!(
+        database
+            .publisher()
+            .find_channel_policy(target.id)
+            .await
+            .expect("channel policy should load")
+            .expect("channel policy should exist")
+            .target_channel_id,
+        target.id
+    );
+
+    let content = database
+        .library()
+        .create_content_item(NewContentItem::new(ContentKind::Video))
+        .await
+        .expect("content item should be created");
+    let asset = database
+        .library()
+        .create_media_asset(NewMediaAsset {
+            content_item_id: content.id,
+            role: AssetRole::Canonical,
+            media_kind: MediaKind::Video,
+            mime_type: Some("video/mp4".to_owned()),
+            container: Some("mp4".to_owned()),
+            video_codec: Some("h264".to_owned()),
+            audio_codec: Some("aac".to_owned()),
+            width: Some(320),
+            height: Some(240),
+            duration_ms: Some(1_000),
+            bit_rate: Some(100_000),
+            file_size_bytes: Some(8),
+            sha256: Some(vec![41; 32]),
+            local_work_path: Some(format!("/tmp/{key_prefix}.mp4")),
+            storage_state: StorageState::Local,
+        })
+        .await
+        .expect("canonical asset should be created");
+    sqlx::query("UPDATE content_items SET canonical_asset_id = $2 WHERE id = $1")
+        .bind(content.id)
+        .bind(asset.id)
+        .execute(database.pool())
+        .await
+        .expect("canonical asset pointer should be set");
+
+    let draft = database
+        .publisher()
+        .create_post_draft(NewPostDraft {
+            content_item_id: content.id,
+            asset_id: asset.id,
+            target_channel_id: target.id,
+            caption: Some("caption".to_owned()),
+            parse_mode: Some("HTML".to_owned()),
+        })
+        .await
+        .expect("post draft should be created");
+    let draft = database
+        .publisher()
+        .update_post_draft(
+            draft.id,
+            PostDraftUpdate {
+                caption: None,
+                parse_mode: None,
+                status: Some(PostDraftStatus::Ready),
+                expected_updated_at: Some(draft.updated_at),
+            },
+        )
+        .await
+        .expect("draft should become ready");
+
+    let publish_at = time::OffsetDateTime::now_utc() - Duration::minutes(1);
+    let schedule =
+        NewPublicationSchedule::try_new(draft.id, publish_at, format!("{key_prefix}-schedule"))
+            .expect("schedule should be valid");
+    let schedule = database
+        .publisher()
+        .create_publication_schedule(schedule.clone())
+        .await
+        .expect("publication schedule should be created");
+    let replay = database
+        .publisher()
+        .create_publication_schedule(schedule_request(&schedule, &key_prefix))
+        .await
+        .expect("same schedule request should replay");
+    assert_eq!(replay.id, schedule.id);
+    assert_eq!(
+        database
+            .publisher()
+            .list_due_publication_schedules(time::OffsetDateTime::now_utc(), 10)
+            .await
+            .expect("due schedules should load")
+            .len(),
+        1
+    );
+
+    let attempt = database
+        .publisher()
+        .start_publication_attempt(schedule.id, Some(format!("{key_prefix}-telegram")))
+        .await
+        .expect("publication attempt should start");
+    assert_eq!(attempt.attempt_number, 1);
+    let finished = database
+        .publisher()
+        .finish_publication_attempt(
+            schedule.id,
+            attempt.attempt_number,
+            PublicationAttemptStatus::Succeeded,
+            None,
+            None,
+            Some(serde_json::json!({"message_id": 77})),
+        )
+        .await
+        .expect("publication attempt should finish");
+    assert_eq!(finished.status, PublicationAttemptStatus::Succeeded);
+    let published = database
+        .publisher()
+        .record_published_post(schedule.id, 77, Some("caption".to_owned()))
+        .await
+        .expect("published post should be recorded");
+    assert_eq!(published.telegram_chat_id, target.telegram_chat_id);
+    assert_eq!(published.telegram_message_id, 77);
+    assert_eq!(
+        database
+            .publisher()
+            .record_published_post(schedule.id, 77, Some("caption".to_owned()))
+            .await
+            .expect("published post replay should be idempotent")
+            .id,
+        published.id
+    );
+
+    assert_eq!(
+        database
+            .publisher()
+            .find_publication_schedule(schedule.id)
+            .await
+            .expect("schedule should load")
+            .expect("schedule should exist")
+            .status
+            .as_str(),
+        "published"
+    );
+    assert_eq!(
+        database
+            .publisher()
+            .find_post_draft(draft.id)
+            .await
+            .expect("draft should load")
+            .expect("draft should exist")
+            .status,
+        PostDraftStatus::Published
+    );
+
+    sqlx::query("DELETE FROM published_posts WHERE publication_schedule_id = $1")
+        .bind(schedule.id)
+        .execute(database.pool())
+        .await
+        .expect("published post should clean up");
+    sqlx::query("DELETE FROM publication_schedules WHERE id = $1")
+        .bind(schedule.id)
+        .execute(database.pool())
+        .await
+        .expect("schedule should clean up");
+    sqlx::query("DELETE FROM post_drafts WHERE id = $1")
+        .bind(draft.id)
+        .execute(database.pool())
+        .await
+        .expect("draft should clean up");
+    sqlx::query("UPDATE content_items SET canonical_asset_id = NULL WHERE id = $1")
+        .bind(content.id)
+        .execute(database.pool())
+        .await
+        .expect("canonical pointer should clear");
+    sqlx::query("DELETE FROM media_assets WHERE id = $1")
+        .bind(asset.id)
+        .execute(database.pool())
+        .await
+        .expect("asset should clean up");
+    sqlx::query("DELETE FROM content_items WHERE id = $1")
+        .bind(content.id)
+        .execute(database.pool())
+        .await
+        .expect("content item should clean up");
+    sqlx::query("DELETE FROM channel_policies WHERE target_channel_id = $1")
+        .bind(target.id)
+        .execute(database.pool())
+        .await
+        .expect("channel policy should clean up");
+    sqlx::query("DELETE FROM target_channels WHERE id = $1")
+        .bind(target.id)
+        .execute(database.pool())
+        .await
+        .expect("target channel should clean up");
+}
+
+fn schedule_request(
+    schedule: &sooqa_publisher::PublicationSchedule,
+    key_prefix: &str,
+) -> NewPublicationSchedule {
+    NewPublicationSchedule {
+        post_draft_id: schedule.post_draft_id,
+        publish_at: schedule.publish_at,
+        not_before: schedule.not_before,
+        not_after: schedule.not_after,
+        priority: schedule.priority,
+        cooldown_override: schedule.cooldown_override,
+        idempotency_key: format!("{key_prefix}-schedule"),
+    }
+}

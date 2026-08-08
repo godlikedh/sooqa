@@ -28,6 +28,12 @@ async fn migrations_are_idempotent_and_create_core_tables() {
         "duplicate_candidates",
         "duplicate_candidate_events",
         "telegram_update_receipts",
+        "target_channels",
+        "channel_policies",
+        "post_drafts",
+        "publication_schedules",
+        "publication_attempts",
+        "published_posts",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{}", table))
@@ -46,6 +52,9 @@ async fn migrations_are_idempotent_and_create_core_tables() {
         "duplicate_candidate_events_idempotency_idx",
         "idempotency_records_storage_reservation_idx",
         "idempotency_records_storage_asset_idx",
+        "publication_schedules_due_idx",
+        "publication_attempts_schedule_idx",
+        "published_posts_content_channel_idx",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
             .bind(format!("public.{}", index))

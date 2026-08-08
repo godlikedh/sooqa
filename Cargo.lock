@@ -2150,6 +2150,7 @@ dependencies = [
  "sooqa-jobs",
  "sooqa-library",
  "sooqa-media",
+ "sooqa-publisher",
  "sqlx",
  "thiserror",
  "time",
@@ -2160,6 +2161,13 @@ dependencies = [
 [[package]]
 name = "sooqa-publisher"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "uuid",
+]
 
 [[package]]
 name = "sooqa-runtime"
