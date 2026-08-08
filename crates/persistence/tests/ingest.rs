@@ -26,6 +26,14 @@ fn telegram_submission(key: &str) -> IngestSubmission {
 }
 
 fn telegram_submission_with_kind(key: &str, media_kind: &str) -> IngestSubmission {
+    telegram_submission_with_kind_and_mime(key, media_kind, None)
+}
+
+fn telegram_submission_with_kind_and_mime(
+    key: &str,
+    media_kind: &str,
+    mime_type: Option<&str>,
+) -> IngestSubmission {
     IngestSubmission::try_new_telegram(TelegramSubmissionInput {
         source_reference: "telegram://42/99".to_owned(),
         submitted_via: SubmittedVia::TelegramBot,
@@ -35,6 +43,7 @@ fn telegram_submission_with_kind(key: &str, media_kind: &str) -> IngestSubmissio
             "telegram_message_id": 99,
             "telegram_file_unique_id": "unique-file",
             "media_kind": media_kind,
+            "mime_type": mime_type,
             "local_work_path": "/tmp/sooqa-telegram-11.bin",
         }),
         supplied_caption: Some("caption".to_owned()),
@@ -143,6 +152,73 @@ async fn creates_ingest_and_inspect_job_atomically_with_idempotency() {
         Err(InboxRepositoryError::IdempotencyConflict { key: conflict_key })
             if conflict_key == key
     ));
+
+    clean_up(&database, &key_prefix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn unsupported_image_mime_does_not_enqueue_static_normalization() {
+    let _test_guard = integration_test_lock().await;
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let key_prefix = format!("h6-image-format-{}-", Uuid::new_v4());
+    clean_up(&database, &key_prefix).await;
+    let created = database
+        .inbox()
+        .create_ingest(telegram_submission_with_kind_and_mime(
+            &format!("{key_prefix}webp"),
+            "image",
+            Some("image/webp"),
+        ))
+        .await
+        .expect("unsupported image ingest should be created");
+    sqlx::query("UPDATE jobs SET priority = 200000 WHERE idempotency_key = $1")
+        .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
+        .execute(database.pool())
+        .await
+        .expect("image probe job should be prioritized");
+    let job = database
+        .jobs()
+        .claim_next("worker-h6-image-format", Duration::from_secs(30), &[JobType::ProbeAsset])
+        .await
+        .expect("image probe job should be claimable")
+        .expect("image probe job should exist");
+    let attempt = job.attempt().expect("claimed job should have an attempt");
+    database
+        .inbox()
+        .begin_asset_probe(created.request.id, &attempt)
+        .await
+        .expect("probe should begin");
+    database
+        .inbox()
+        .complete_asset_probe(
+            created.request.id,
+            &attempt,
+            serde_json::json!({"container_format": "webp", "size_bytes": 10}),
+        )
+        .await
+        .expect("unsupported image probe should be recorded");
+
+    let (status, error_code): (String, String) =
+        sqlx::query_as("SELECT status, error_code FROM ingest_requests WHERE id = $1")
+            .bind(created.request.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("unsupported image state should be queryable");
+    assert_eq!(status, "failed_terminal");
+    assert_eq!(error_code, "unsupported_image_format");
+    let normalize_job_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
+            .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
+            .fetch_one(database.pool())
+            .await
+            .expect("normalize job count should be queryable");
+    assert_eq!(normalize_job_count, 0);
 
     clean_up(&database, &key_prefix).await;
 }

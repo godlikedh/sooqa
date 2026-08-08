@@ -933,29 +933,62 @@ async fn normalize_handler_composes_image_canonical_and_thumbnail_assets() {
         .await
         .expect("image probe job should complete");
 
-    let normalize_job = database
+    let first_normalize_job = database
         .jobs()
         .claim_next(
-            "worker-h6-image-normalize",
-            Duration::from_secs(30),
+            "worker-h6-image-normalize-stale",
+            Duration::from_secs(1),
             &[JobType::NormalizeAsset],
         )
         .await
         .expect("image normalize job should be claimable")
         .expect("image normalize job should exist");
+    let first_normalize_attempt =
+        first_normalize_job.attempt().expect("first normalize job should have an attempt");
+    database
+        .inbox()
+        .begin_asset_normalization(created.request.id, &first_normalize_attempt)
+        .await
+        .expect("first image normalization should begin");
+    let image_normalizer = ImageNormalizer::new(CanonicalImageProfile::default())
+        .expect("canonical image profile should be valid");
+    let replay_plan = image_normalizer
+        .plan(&workspace, "telegram-input.bin", "canonical", "thumbnail")
+        .expect("image replay plan should be valid");
+    image_normalizer
+        .execute(&replay_plan)
+        .await
+        .expect("stale image attempt should publish valid outputs");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    database
+        .jobs()
+        .recover_stale_leases()
+        .await
+        .expect("stale image normalization lease should recover");
+    let normalize_job = database
+        .jobs()
+        .claim_next(
+            "worker-h6-image-normalize-retry",
+            Duration::from_secs(30),
+            &[JobType::NormalizeAsset],
+        )
+        .await
+        .expect("recovered image normalize job should be claimable")
+        .expect("recovered image normalize job should exist");
+    assert_eq!(normalize_job.id, first_normalize_job.id);
+    assert_eq!(normalize_job.attempt_count, 2);
     let normalize_handler = normalize_asset_handler(
         database.inbox(),
         work_root.clone(),
         NormalizationPlanner::new("ffmpeg", CanonicalVideoProfile::default())
             .expect("canonical video profile should be valid"),
         FfmpegExecutor::new(Arc::new(FakeNormalizeRunner), "ffprobe", Duration::from_secs(1)),
-        ImageNormalizer::new(CanonicalImageProfile::default())
-            .expect("canonical image profile should be valid"),
+        image_normalizer,
     );
     normalize_handler(normalize_job.clone()).await.expect("image normalization should succeed");
     database
         .jobs()
-        .complete(normalize_job.id, "worker-h6-image-normalize")
+        .complete(normalize_job.id, "worker-h6-image-normalize-retry")
         .await
         .expect("image normalize job should complete");
 

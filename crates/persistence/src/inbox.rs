@@ -245,14 +245,24 @@ impl InboxRepository {
         .await?;
 
         let media_kind = request_media_kind(&request);
-        if !matches!(media_kind, Some(SourceMediaKind::Video | SourceMediaKind::Image)) {
+        let unsupported_image_format = media_kind == Some(SourceMediaKind::Image)
+            && !request_image_format_is_supported(&request);
+        if !matches!(media_kind, Some(SourceMediaKind::Video | SourceMediaKind::Image))
+            || unsupported_image_format
+        {
             request.transition_to(IngestStatus::FailedTerminal)?;
-            request.error_code = Some(if media_kind.is_some() {
-                "unsupported_media_kind".to_owned()
-            } else {
-                "invalid_ingest_state".to_owned()
+            request.error_code = Some(match media_kind {
+                Some(SourceMediaKind::Image) if unsupported_image_format => {
+                    "unsupported_image_format".to_owned()
+                }
+                Some(_) => "unsupported_media_kind".to_owned(),
+                None => "invalid_ingest_state".to_owned(),
             });
             request.error_message = Some(match media_kind {
+                Some(SourceMediaKind::Image) if unsupported_image_format => format!(
+                    "image MIME type {:?} is not supported by the JPEG/PNG normalizer",
+                    request_mime_type(&request)
+                ),
                 Some(media_kind) => format!(
                     "asset media kind {media_kind:?} is not supported by the composed normalizers"
                 ),
@@ -847,6 +857,23 @@ fn request_media_kind(request: &IngestRequest) -> Option<SourceMediaKind> {
         request.original_input.get("media_kind")?
     };
     serde_json::from_value(value.clone()).ok()
+}
+
+fn request_mime_type(request: &IngestRequest) -> Option<&str> {
+    let value = if request.kind == IngestKind::Url {
+        request.original_input.get("download")?.get("mime_type")?
+    } else {
+        request.original_input.get("mime_type")?
+    };
+    value.as_str()
+}
+
+fn request_image_format_is_supported(request: &IngestRequest) -> bool {
+    let Some(mime_type) = request_mime_type(request) else {
+        return true;
+    };
+    let mime_type = mime_type.split(';').next().map(str::trim).unwrap_or_default();
+    mime_type.eq_ignore_ascii_case("image/jpeg") || mime_type.eq_ignore_ascii_case("image/png")
 }
 
 async fn load_request(
