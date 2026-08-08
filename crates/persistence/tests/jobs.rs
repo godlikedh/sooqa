@@ -1,5 +1,6 @@
 use std::env;
 
+use sooqa_inbox::{IngestSubmission, SubmittedVia, TelegramSubmissionInput};
 use sooqa_jobs::{JobStatus, JobType, NewJob};
 use sooqa_persistence::Database;
 use time::OffsetDateTime;
@@ -189,4 +190,106 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
         .execute(database.pool())
         .await
         .expect("test jobs should clean up");
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn exhausted_fingerprint_lease_marks_ingest_terminal() {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+    let key = format!("b2-fingerprint-exhausted-{}", Uuid::new_v4());
+    let request = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new_telegram(TelegramSubmissionInput {
+                source_reference: "telegram://42/1999".to_owned(),
+                submitted_via: SubmittedVia::TelegramBot,
+                submitted_by_admin_id: None,
+                original_input: serde_json::json!({"media_kind": "video"}),
+                supplied_caption: None,
+                idempotency_key: Some(key.clone()),
+            })
+            .expect("Telegram submission should be valid"),
+        )
+        .await
+        .expect("ingest should be created");
+    sqlx::query("DELETE FROM jobs WHERE payload_json->>'ingest_request_id' = $1")
+        .bind(request.request.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("initial ingest job should be removed");
+    sqlx::query(
+        "UPDATE ingest_requests SET status = 'fingerprinting', original_input = $2, completed_at = NULL WHERE id = $1",
+    )
+    .bind(request.request.id)
+    .bind(serde_json::json!({"normalization": {"media_kind": "video"}}))
+    .execute(database.pool())
+    .await
+    .expect("fingerprinting fixture should be prepared");
+
+    let job = database
+        .jobs()
+        .enqueue(
+            NewJob::compute_fingerprint(request.request.id)
+                .max_attempts(1)
+                .idempotency_key(format!("{key}-job")),
+        )
+        .await
+        .expect("fingerprint job should be enqueued");
+    database
+        .jobs()
+        .claim_next(
+            "worker-fingerprint-exhausted",
+            std::time::Duration::from_secs(30),
+            &[JobType::ComputeFingerprint],
+        )
+        .await
+        .expect("fingerprint job should be claimable")
+        .expect("fingerprint job should be present");
+    sqlx::query("UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(job.id)
+        .execute(database.pool())
+        .await
+        .expect("fingerprint lease should expire");
+
+    database
+        .jobs()
+        .recover_stale_leases()
+        .await
+        .expect("exhausted fingerprint lease should recover");
+    let job_status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+        .bind(job.id)
+        .fetch_one(database.pool())
+        .await
+        .expect("failed fingerprint job should remain queryable");
+    assert_eq!(job_status, "failed");
+    let (request_status, error_code): (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_code FROM ingest_requests WHERE id = $1")
+            .bind(request.request.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("exhausted fingerprint request should remain queryable");
+    assert_eq!(request_status, "failed_terminal");
+    assert_eq!(error_code.as_deref(), Some("fingerprint_job_exhausted"));
+
+    sqlx::query("DELETE FROM jobs WHERE id = $1")
+        .bind(job.id)
+        .execute(database.pool())
+        .await
+        .expect("fingerprint job should clean up");
+    sqlx::query(
+        "DELETE FROM idempotency_records WHERE scope = 'ingest:create' AND idempotency_key = $1",
+    )
+    .bind(&key)
+    .execute(database.pool())
+    .await
+    .expect("ingest idempotency record should clean up");
+    sqlx::query("DELETE FROM ingest_requests WHERE id = $1")
+        .bind(request.request.id)
+        .execute(database.pool())
+        .await
+        .expect("ingest request should clean up");
 }

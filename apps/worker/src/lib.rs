@@ -24,14 +24,14 @@ use sooqa_library::{
 };
 use sooqa_media::{
     ArtifactPublicationError, DownloadError, DownloadLimits, DownloadedSource, FfmpegExecutor,
-    FfprobeAdapter, ImageNormalizer, MediaProbe, MediaStreamKind, MediaWorkspace,
-    NormalizationExecutionError, NormalizationPlanner, SourceDownloader, SourceInput,
-    WorkspaceArea, WorkspaceError, publish_artifact,
+    FfprobeAdapter, FrameExtractionError, FrameExtractor, ImageNormalizer, MediaProbe,
+    MediaStreamKind, MediaWorkspace, NormalizationExecutionError, NormalizationPlanner,
+    SourceDownloader, SourceInput, WorkspaceArea, WorkspaceError, publish_artifact,
 };
 use sooqa_persistence::{
     AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
-    IngestFinalizationStart, JobRepository, JobRepositoryError, LibraryRepository,
-    LibraryRepositoryError, SourceDownloadStart, SourceInspectionStart,
+    IngestFinalizationStart, IngestFingerprintStart, JobRepository, JobRepositoryError,
+    LibraryRepository, LibraryRepositoryError, SourceDownloadStart, SourceInspectionStart,
 };
 use sooqa_telegram::StorageUploadError;
 use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramStorageApi};
@@ -208,6 +208,20 @@ pub fn finalize_ingest_handler(inbox: InboxRepository, library: LibraryRepositor
         let inbox = inbox.clone();
         let library = library.clone();
         Box::pin(async move { finalize_ingest(&inbox, &library, job).await })
+    })
+}
+
+pub fn compute_fingerprint_handler(
+    inbox: InboxRepository,
+    work_root: impl Into<PathBuf>,
+    extractor: FrameExtractor,
+) -> HandlerFn {
+    let work_root = work_root.into();
+    Arc::new(move |job| {
+        let inbox = inbox.clone();
+        let work_root = work_root.clone();
+        let extractor = extractor.clone();
+        Box::pin(async move { compute_fingerprint(&inbox, &work_root, &extractor, job).await })
     })
 }
 
@@ -885,6 +899,177 @@ async fn finalize_ingest(
         .await
         .map_err(map_inbox_error)?;
     Ok(())
+}
+
+async fn compute_fingerprint(
+    inbox: &InboxRepository,
+    work_root: &Path,
+    extractor: &FrameExtractor,
+    job: Job,
+) -> Result<(), HandlerFailure> {
+    let ingest_request_id = match &job.command {
+        JobCommand::ComputeFingerprint(payload) => payload.ingest_request_id,
+        _ => {
+            return Err(HandlerFailure::permanent(
+                "invalid_payload",
+                "compute_fingerprint handler received a different job command",
+            ));
+        }
+    };
+    let job_attempt = job.attempt().ok_or_else(|| {
+        HandlerFailure::permanent(
+            "invalid_job_state",
+            "compute_fingerprint handler requires a running job lease",
+        )
+    })?;
+    let request = match inbox.begin_ingest_fingerprinting(ingest_request_id, &job_attempt).await {
+        Ok(IngestFingerprintStart::Ready(request)) => request,
+        Ok(IngestFingerprintStart::AlreadyAdvanced(_)) => return Ok(()),
+        Err(error) => return Err(map_inbox_error(error)),
+    };
+    let normalization = match request.original_input.get("normalization").cloned() {
+        Some(value) => match serde_json::from_value::<AssetNormalization>(value) {
+            Ok(normalization) => normalization,
+            Err(error) => {
+                return fail_fingerprint(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    HandlerFailure::permanent(
+                        "invalid_ingest_state",
+                        format!("stored normalization metadata could not be decoded: {error}"),
+                    ),
+                )
+                .await;
+            }
+        },
+        None => {
+            return fail_fingerprint(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent(
+                    "invalid_ingest_state",
+                    "ingest request has no stored normalization metadata",
+                ),
+            )
+            .await;
+        }
+    };
+
+    if normalization.media_kind != SourceMediaKind::Video {
+        inbox
+            .complete_ingest_fingerprint(ingest_request_id, &job_attempt, None)
+            .await
+            .map_err(map_inbox_error)?;
+        return Ok(());
+    }
+
+    let duration_ms = match normalization.duration_ms {
+        Some(duration_ms) if duration_ms > 0 => duration_ms,
+        _ => {
+            return fail_fingerprint(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent(
+                    "invalid_ingest_state",
+                    "video normalization has no valid canonical duration",
+                ),
+            )
+            .await;
+        }
+    };
+    let workspace_id = match workspace_input(&request) {
+        Ok((workspace_id, _)) => workspace_id,
+        Err(failure) => {
+            return fail_fingerprint(inbox, ingest_request_id, &job_attempt, failure).await;
+        }
+    };
+    let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return fail_fingerprint(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_workspace_error(error),
+            )
+            .await;
+        }
+    };
+    if let Err(error) = workspace.validate() {
+        return fail_fingerprint(
+            inbox,
+            ingest_request_id,
+            &job_attempt,
+            map_workspace_error(error),
+        )
+        .await;
+    }
+    let result = match extractor
+        .extract_from_area_with_cache_key(
+            &workspace,
+            WorkspaceArea::Normalized,
+            "canonical.mp4",
+            &normalization.sha256,
+            duration_ms,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return fail_fingerprint(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_fingerprint_error(&job, error),
+            )
+            .await;
+        }
+    };
+    let fingerprint =
+        serde_json::to_value(result.fingerprint).expect("video fingerprints are serializable");
+    inbox
+        .complete_ingest_fingerprint(ingest_request_id, &job_attempt, Some(fingerprint))
+        .await
+        .map_err(map_inbox_error)?;
+    Ok(())
+}
+
+fn map_fingerprint_error(job: &Job, error: FrameExtractionError) -> HandlerFailure {
+    let message = error.to_string();
+    let retryable = matches!(&error, FrameExtractionError::Command(error) if error.is_timeout())
+        && job.attempt_count < job.max_attempts;
+    if retryable {
+        HandlerFailure::retryable("fingerprint_timeout", message)
+    } else {
+        HandlerFailure::permanent("fingerprint_failed", message)
+    }
+}
+
+async fn fail_fingerprint(
+    inbox: &InboxRepository,
+    ingest_request_id: uuid::Uuid,
+    job_attempt: &sooqa_jobs::JobAttempt,
+    failure: HandlerFailure,
+) -> Result<(), HandlerFailure> {
+    let status = if failure.retryable {
+        IngestStatus::FailedRetryable
+    } else {
+        IngestStatus::FailedTerminal
+    };
+    inbox
+        .fail_ingest_fingerprint(
+            ingest_request_id,
+            job_attempt,
+            status,
+            &failure.class,
+            &failure.message,
+        )
+        .await
+        .map_err(map_inbox_error)?;
+    Err(failure)
 }
 
 fn normalization_to_library_asset(
@@ -1835,7 +2020,35 @@ fn validate_timing(poll_interval: Duration, lease_duration: Duration) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use sooqa_media::CommandError;
+
     use super::*;
+
+    fn running_compute_job(attempt_count: i32, max_attempts: i32) -> Job {
+        let now = OffsetDateTime::now_utc();
+        Job {
+            id: Uuid::new_v4(),
+            command: JobCommand::ComputeFingerprint(sooqa_jobs::IngestJobPayload {
+                ingest_request_id: Uuid::new_v4(),
+            }),
+            status: JobStatus::Running,
+            priority: 0,
+            available_at: now,
+            attempt_count,
+            max_attempts,
+            lease_owner: Some("test-worker".to_owned()),
+            lease_expires_at: None,
+            last_heartbeat_at: None,
+            last_error_class: None,
+            last_error_message: None,
+            idempotency_key: None,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        }
+    }
 
     fn test_handler(_job: Job) -> HandlerFuture {
         Box::pin(async { Ok(()) })
@@ -1874,5 +2087,22 @@ mod tests {
         let error = decode_sha256(&format!("{}g", "0".repeat(63)))
             .expect_err("non-hex digest should be rejected");
         assert_eq!(error.class, "invalid_normalization");
+    }
+
+    #[test]
+    fn fingerprint_timeout_becomes_terminal_on_the_last_attempt() {
+        let timeout_error = || {
+            FrameExtractionError::Command(CommandError::TimedOut {
+                program: PathBuf::from("ffmpeg"),
+                timeout: Duration::from_secs(1),
+            })
+        };
+        let retry = map_fingerprint_error(&running_compute_job(1, 5), timeout_error());
+        assert!(retry.retryable);
+        assert_eq!(retry.class, "fingerprint_timeout");
+
+        let exhausted = map_fingerprint_error(&running_compute_job(5, 5), timeout_error());
+        assert!(!exhausted.retryable);
+        assert_eq!(exhausted.class, "fingerprint_failed");
     }
 }

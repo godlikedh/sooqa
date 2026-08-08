@@ -89,10 +89,16 @@ bounded JPEG/PNG normalizer, which also creates a thumbnail. Both paths record
 typed normalization metadata and atomically enqueue `finalize_ingest`.
 Finalization uses the existing exact-dedup/library repository to create or
 reuse the canonical content item, asset, source record, and (for images)
-thumbnail asset, then marks the ingest completed and leaves the existing
-storage-upload job queued for a capable Telegram worker. Audio, animation, and
-unknown media remain terminal `unsupported_media_kind` cases until their
-dedicated normalization paths are implemented.
+thumbnail asset, then enters `fingerprinting` and queues the typed
+`compute_fingerprint` job. The video handler extracts the versioned
+`frame_dhash_v1` fingerprint from the canonical normalized video in the
+isolated workspace and stores it in the existing ingest JSON metadata before
+completing the request; images skip the video-only stage and complete normally.
+This metadata placement is an interim schema-compatible composition until the
+planned fingerprint repository slice. The existing storage-upload job remains
+queued for a capable Telegram worker. Audio, animation, and unknown media
+remain terminal `unsupported_media_kind` cases until their dedicated
+normalization paths are implemented.
 
 Storage uploads use an idempotency record as a durable intent bound to the
 asset, job, provider, storage chat, and upload generation. A reservation has
@@ -132,7 +138,7 @@ includes all three tools and creates a writable `/var/lib/sooqa/work`.
 ## State of the pipeline
 
 Implemented primitives and boundaries do not imply an end-to-end publisher.
-The remaining composition work is fingerprinting/near-duplicate review,
-review-facing library actions, and Telegram publication. The historical roadmap in
+The remaining composition work is similarity candidate generation, review-facing
+library actions, and Telegram publication. The historical roadmap in
 `docs/reference/PROJECT_SPEC.md` is useful context but is not the authority for
 those claims.
