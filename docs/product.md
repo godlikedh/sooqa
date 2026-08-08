@@ -1,0 +1,117 @@
+# sooqa product authority
+
+This document is the active product authority for the architecture reset
+recorded in [ADR 0009](adr/0009-five-table-persistence-reset.md) and GitHub
+issue #43. It supersedes the old persistence model and the historical roadmap
+when they conflict. Until the implementation stack lands, the checked-out
+code and `docs/architecture.md` describe the pre-reset baseline; they are not
+permission to preserve the discarded model during the reset.
+
+## Product
+
+sooqa is a self-hosted, single-admin Telegram media pipeline. The backend
+accepts media through the private HTTP API or the administrator's Telegram
+interaction, processes it durably, exact-deduplicates normalized media, stores
+new media in one private Telegram storage channel, and lets the administrator
+publish stored media to configured target channels.
+
+The first release is intentionally narrow:
+
+- one administrator and one self-hosted installation;
+- PostgreSQL as the source of truth;
+- direct HTTP media plus the already-supported Telegram ingest paths;
+- durable download, probe, normalization, fingerprint, duplicate-check, and
+  storage workflow;
+- searchable stored media with captions/descriptions and normalized tags;
+- immediate publication or a simple per-channel cadence queue.
+
+## Target persistence model
+
+The durable application model has four product tables and one technical queue
+table:
+
+```text
+queue.jobs
+
+ingests --------> media <-------- posts --------> channels
+```
+
+The SQLx migration table remains infrastructure-owned. The target application
+tables are:
+
+- `queue.jobs`: one durable job queue with `run_at`, retry count, lease/fencing
+  token, lifecycle state, error fields, and an optional unique dedupe key;
+- `ingests`: one durable import process with a unique `input_key`, bounded
+  input data, workflow state, optional resulting/matched `media_id`, and
+  current error/timestamps;
+- `media`: one normalized stored media item with canonical SHA-256, compact
+  versioned fingerprint, searchable text/tags, common media properties,
+  source metadata, Telegram storage identifiers, and storage ambiguity state;
+- `channels`: one target Telegram channel with enablement, IANA time zone,
+  posting window, and cadence interval;
+- `posts`: one intended Telegram post and its eventual result, including
+  caption snapshot, scheduled time, state, Telegram message ID, and current
+  send fencing/ambiguity fields.
+
+One normalized media item is one row. The target model does not retain separate
+content, asset, source, tag-join, storage-object, draft, schedule, attempt,
+publication-history, or duplicate-candidate aggregates.
+
+## Durable workflow rules
+
+The ingest process is the product state machine. Prefer one durable
+`process_ingest` orchestration job that advances and resumes it idempotently;
+retain separate jobs only for independently scheduled work such as
+`publish_post` or maintenance.
+
+Post cadence slots are assigned when a post is queued. A `publish_post` job
+references the `posts` row, and one post row becomes the durable publication
+record after success. Telegram calls, HTTP downloads, ffmpeg, and ffprobe run
+outside database transactions. External effects use state plus generation or
+fencing tokens, and ambiguous effects are retained for explicit reconciliation
+instead of being blindly retried.
+
+## Idempotency ownership
+
+Idempotency remains required, but it belongs to the row or effect it protects:
+
+| Effect | Durable protection |
+| --- | --- |
+| Receive the same input | `ingests.input_key UNIQUE` |
+| Enqueue the same work | `queue.jobs.dedupe_key UNIQUE` |
+| Store identical normalized bytes | `media.canonical_sha256 UNIQUE` |
+| Upload to Telegram storage | media storage state plus generation/token |
+| Create the same requested post | `posts.request_key UNIQUE` |
+| Send a post | post state plus generation/token; ambiguous sends do not auto-retry |
+
+There is no generic idempotency table and no permanent Telegram update-receipt
+table. Repeated creates may return the existing resource; updates should be
+naturally idempotent setters where possible.
+
+## Single-admin security
+
+The bot token, API secret, administrator Telegram user ID, and storage chat ID
+come from configuration/environment secrets and never from PostgreSQL or Git.
+Target publication channels remain database rows because they are editable
+product destinations. The API remains private and authenticated; the reset
+does not broaden exposure or add multi-user behavior.
+
+## Explicit non-goals
+
+This reset does not add:
+
+- compatibility with old databases, API snapshots, repository interfaces, or
+  local data;
+- data-copy SQL, compatibility views, old-name aliases, or dual writes;
+- multiple administrators, users, tenants, storage providers, albums, media
+  variants, derivative assets, or a generalized content taxonomy;
+- richer duplicate-interaction UX or automatic perceptual duplicate decisions;
+- a new perceptual-dedup algorithm;
+- Grafana/Prometheus deployment;
+- Telegram publication functionality beyond behavior already present at the
+  selected implementation base.
+
+Existing local databases may be discarded explicitly by the owner. No tool or
+test may reset a Docker volume automatically. The implementation must provide
+documented, explicit reset instructions and must verify the new model from an
+empty database.
