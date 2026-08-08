@@ -221,6 +221,68 @@ impl JobRepository {
         Ok(job)
     }
 
+    /// Return a claimed job to the queue without counting the claim as an
+    /// attempt. This is used when a durable sub-resource is owned by another
+    /// live worker and the job should wait for that lease rather than burn its
+    /// retry budget.
+    pub async fn defer(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        available_at: OffsetDateTime,
+        error_class: &str,
+        error_message: &str,
+    ) -> Result<Job, JobRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let attempt_number: i32 = sqlx::query_scalar(
+            "SELECT attempt_count FROM jobs WHERE id = $1 AND status = 'running' AND lease_owner = $2 FOR UPDATE",
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(JobRepositoryError::LeaseLost)?;
+        if attempt_number <= 0 {
+            return Err(JobRepositoryError::LeaseLost);
+        }
+        let row = sqlx::query_as::<_, JobRow>(
+            r#"
+            UPDATE jobs
+            SET status = 'retry_wait',
+                available_at = $3,
+                attempt_count = attempt_count - 1,
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                last_heartbeat_at = NULL,
+                last_error_class = $4,
+                last_error_message = $5,
+                completed_at = NULL,
+                updated_at = now()
+            WHERE id = $1 AND status = 'running' AND lease_owner = $2
+            RETURNING
+                id, job_type, payload_json, status, priority, available_at,
+                attempt_count, max_attempts, lease_owner, lease_expires_at,
+                last_heartbeat_at, last_error_class, last_error_message,
+                idempotency_key, created_at, updated_at, completed_at
+            "#,
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .bind(available_at)
+        .bind(error_class)
+        .bind(error_message)
+        .fetch_one(&mut *transaction)
+        .await?;
+        sqlx::query("DELETE FROM job_attempts WHERE job_id = $1 AND attempt_number = $2")
+            .bind(job_id)
+            .bind(attempt_number)
+            .execute(&mut *transaction)
+            .await?;
+        let job = row.into_job()?;
+        transaction.commit().await?;
+        Ok(job)
+    }
+
     pub async fn fail(
         &self,
         job_id: Uuid,
@@ -322,6 +384,14 @@ impl JobRepository {
 
         transaction.commit().await?;
         Ok(stale_jobs.len() as u64)
+    }
+
+    pub async fn live_job_ids(&self) -> Result<Vec<Uuid>, JobRepositoryError> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM jobs WHERE status = 'running' AND lease_expires_at > now()",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 }
 

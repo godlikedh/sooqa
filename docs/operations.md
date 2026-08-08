@@ -11,8 +11,10 @@ DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa \
 ```
 
 Migration 0009 adds storage reservation ownership/expiry, media digest checks,
-canonical-asset triggers, and job lease/attempt invariants. Deploy the
-migration before deploying code that relies on those columns.
+canonical-asset triggers, and job lease/attempt invariants. Migration 0010
+binds storage intents to their asset, job, provider, chat, and upload
+generation. Deploy both migrations before deploying code that relies on those
+columns.
 
 ## Worker
 
@@ -58,24 +60,29 @@ on errors.
 
 ## Storage intent recovery
 
-An upload intent is `pending` while the worker owns a short reservation. If the
-external Telegram result is uncertain, the intent becomes `unknown` and is
-kept durable. An expired pending reservation is also converted to `unknown`
-before another attempt can observe it. The normal upload path will not guess
-whether Telegram created a message.
+An upload intent is `pending` while the worker owns a renewable reservation.
+The job and intent leases are coordinated: when another live owner holds the
+intent, the job is deferred without consuming an attempt. If the external
+Telegram result is uncertain, the intent becomes `unknown` and is kept
+durable. An expired pending reservation is also converted to `unknown` before
+another attempt can observe it. The normal upload path will not guess whether
+Telegram created a message.
 
 Inspect and reconcile intents with:
 
 ```bash
 cargo run -p sooqa-server -- storage-intents list
 cargo run -p sooqa-server -- storage-intents mark-unknown <intent-id>
+cargo run -p sooqa-server -- storage-intents mark-unknown <intent-id> --force --confirm
 cargo run -p sooqa-server -- storage-intents reset <intent-id> --confirm
-cargo run -p sooqa-server -- storage-intents attach <intent-id> <asset-id> <chat-id> <message-id> <media-kind> <file-id> <file-unique-id>
+cargo run -p sooqa-server -- storage-intents attach <intent-id> <chat-id> <message-id> <file-id> <file-unique-id>
 ```
 
-Use `attach` when the Telegram message exists. Use `reset --confirm` only when
-the operator has verified that the external upload did not create an object;
-the reset deletes the idempotency record so a fresh attempt can be reserved.
+Use `attach` when the Telegram message exists. It derives the asset, provider,
+and media kind from the intent and rejects chat or digest mismatches. Use
+`reset --confirm` only when the operator has verified that the external upload
+did not create an object; reset retains the old job for history and creates a
+new upload generation with a fresh idempotency key.
 
 ## Logs and secrets
 

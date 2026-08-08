@@ -8,12 +8,12 @@ use sooqa_inbox::{
     IngestSubmission, IngestSubmissionInput, IngestValidationError, SubmittedVia,
     TelegramSubmissionInput,
 };
-use sooqa_library::{MediaKind, NewStorageObject};
+use sooqa_library::StorageUploadAttachment;
 use sooqa_persistence::InboxRepository;
 use sooqa_persistence::{TelegramRepository, TelegramRepositoryError};
 use sooqa_telegram::{
-    IngestAccepted, IngestService, MediaIngestCommand, TELEGRAM_STORAGE_PROVIDER, TelegramRuntime,
-    UpdateClaim, UpdateClaimResult, UpdateStore, UrlIngestCommand,
+    IngestAccepted, IngestService, MediaIngestCommand, TelegramRuntime, UpdateClaim,
+    UpdateClaimResult, UpdateStore, UrlIngestCommand,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -109,12 +109,19 @@ async fn run_storage_intent_command(
 ) -> Result<(), Box<dyn Error>> {
     match command {
         StorageIntentCommand::List => {
-            println!("id\tstate\tidempotency_key\tresource_id\tcreated_at\treservation_expires_at");
+            println!(
+                "id\tstate\tasset_id\tjob_id\tgeneration\tprovider\tstorage_chat_id\tidempotency_key\tresource_id\tcreated_at\treservation_expires_at"
+            );
             for intent in database.library().list_storage_upload_intents().await? {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     intent.id,
                     intent.state,
+                    intent.asset_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
+                    intent.job_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
+                    intent.generation,
+                    intent.provider.as_deref().unwrap_or("-"),
+                    intent.storage_chat_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
                     intent.idempotency_key,
                     intent.resource_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
                     intent.created_at,
@@ -124,9 +131,9 @@ async fn run_storage_intent_command(
                 );
             }
         }
-        StorageIntentCommand::MarkUnknown { intent_id } => {
+        StorageIntentCommand::MarkUnknown { intent_id, force } => {
             let intent_id = parse_uuid("intent-id", &intent_id)?;
-            database.library().mark_storage_upload_intent_unknown(intent_id).await?;
+            database.library().mark_storage_upload_intent_unknown(intent_id, force).await?;
             println!("sooqa-server: storage upload intent {intent_id} marked unknown");
         }
         StorageIntentCommand::Reset { intent_id } => {
@@ -136,31 +143,23 @@ async fn run_storage_intent_command(
         }
         StorageIntentCommand::Attach {
             intent_id,
-            asset_id,
             storage_chat_id,
             storage_message_id,
-            media_kind,
             telegram_file_id,
             telegram_file_unique_id,
         } => {
             let intent_id = parse_uuid("intent-id", &intent_id)?;
-            let asset_id = parse_uuid("asset-id", &asset_id)?;
             let storage_chat_id = parse_i64("storage-chat-id", &storage_chat_id)?;
             let storage_message_id = parse_i64("storage-message-id", &storage_message_id)?;
-            let media_kind = MediaKind::try_from(media_kind.as_str())
-                .map_err(|value| format!("invalid media-kind {value:?}"))?;
             let object = database
                 .library()
                 .attach_storage_upload(
                     intent_id,
-                    NewStorageObject {
-                        asset_id,
-                        provider: TELEGRAM_STORAGE_PROVIDER.to_owned(),
+                    StorageUploadAttachment {
                         storage_chat_id,
                         storage_message_id,
                         telegram_file_id: Some(telegram_file_id),
                         telegram_file_unique_id: Some(telegram_file_unique_id),
-                        media_kind,
                     },
                 )
                 .await?;

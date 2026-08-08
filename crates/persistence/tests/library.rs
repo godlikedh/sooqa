@@ -1,16 +1,25 @@
 use std::env;
 
 use serde_json::json;
+use sooqa_jobs::NewJob;
 use sooqa_library::{
     AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem,
     NewDuplicateCandidate, NewMediaAsset, NewMediaAssetDraft, NewSourceRecord,
     NewSourceRecordDraft, NewStorageObject, NewTag, SourceType, StorageState,
-    StorageUploadReservation, StorageUploadStore,
+    StorageUploadAttachment, StorageUploadReservation, StorageUploadReservationRequest,
+    StorageUploadStore,
 };
 use sooqa_persistence::Database;
 use uuid::Uuid;
 
 async fn clean_up(database: &Database, content_id: Uuid, tag_id: Uuid, normalized_url: &str) {
+    sqlx::query(
+        "DELETE FROM idempotency_records WHERE scope = 'storage:upload' AND storage_asset_id IN (SELECT id FROM media_assets WHERE content_item_id = $1)",
+    )
+    .bind(content_id)
+    .execute(database.pool())
+    .await
+    .expect("storage upload intents should clean up");
     sqlx::query("DELETE FROM storage_objects WHERE asset_id IN (SELECT id FROM media_assets WHERE content_item_id = $1)")
         .bind(content_id)
         .execute(database.pool())
@@ -45,12 +54,26 @@ async fn clean_up(database: &Database, content_id: Uuid, tag_id: Uuid, normalize
 
 async fn clean_up_content(database: &Database, content_id: Uuid) {
     sqlx::query(
+        "DELETE FROM idempotency_records WHERE scope = 'storage:upload' AND storage_asset_id IN (SELECT id FROM media_assets WHERE content_item_id = $1)",
+    )
+    .bind(content_id)
+    .execute(database.pool())
+    .await
+    .expect("storage upload intents should clean up");
+    sqlx::query(
         "DELETE FROM jobs WHERE job_type = 'upload_storage_asset' AND payload_json->>'asset_id' IN (SELECT id::text FROM media_assets WHERE content_item_id = $1)",
     )
     .bind(content_id)
     .execute(database.pool())
     .await
     .expect("storage upload jobs should clean up");
+    sqlx::query(
+        "DELETE FROM storage_objects WHERE asset_id IN (SELECT id FROM media_assets WHERE content_item_id = $1)",
+    )
+    .bind(content_id)
+    .execute(database.pool())
+    .await
+    .expect("storage objects should clean up");
     sqlx::query("DELETE FROM source_records WHERE content_item_id = $1")
         .bind(content_id)
         .execute(database.pool())
@@ -92,6 +115,24 @@ fn canonical_asset(content_item_id: Uuid, sha256: Vec<u8>) -> NewMediaAsset {
             "/var/lib/sooqa/work/jobs/test/{content_item_id}/normalized.mp4"
         )),
         storage_state: StorageState::Local,
+    }
+}
+
+fn storage_reservation_request(
+    asset_id: Uuid,
+    idempotency_key: &str,
+    request_hash: &[u8],
+    job_id: Uuid,
+    generation: i32,
+) -> StorageUploadReservationRequest {
+    StorageUploadReservationRequest {
+        asset_id,
+        provider: "telegram".to_owned(),
+        idempotency_key: idempotency_key.to_owned(),
+        request_hash: request_hash.to_owned(),
+        job_id,
+        generation,
+        storage_chat_id: -100123,
     }
 }
 
@@ -254,21 +295,51 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
         .create_media_asset(canonical_asset(content.id, sha256.clone()))
         .await
         .expect("asset should be created");
-    let idempotency_key = format!("telegram:storage:{}:v1", asset.id);
+    let other_content = library
+        .create_content_item(NewContentItem::new(ContentKind::Video))
+        .await
+        .expect("second content item should be created");
+    let other_asset = library
+        .create_media_asset(canonical_asset(other_content.id, vec![15; 32]))
+        .await
+        .expect("second asset should be created");
+    let idempotency_key = format!("asset:{}:upload_storage:v1:0", asset.id);
+    let job_id = database
+        .jobs()
+        .enqueue(NewJob::upload_storage_asset(asset.id).idempotency_key(idempotency_key.clone()))
+        .await
+        .expect("storage upload job should exist")
+        .id;
 
     let reservation = library
-        .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+        .reserve_storage_upload(storage_reservation_request(
+            asset.id,
+            &idempotency_key,
+            &sha256,
+            job_id,
+            0,
+        ))
         .await
         .expect("upload intent should be reserved");
     let StorageUploadReservation::Reserved { intent_id, owner_token } = reservation else {
         panic!("first upload should reserve an intent");
     };
-    assert_eq!(
+    assert!(matches!(
         library
-            .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+            .reserve_storage_upload(storage_reservation_request(
+                asset.id,
+                &idempotency_key,
+                &sha256,
+                job_id,
+                0,
+            ))
             .await
             .expect("duplicate reservation should load"),
-        StorageUploadReservation::InProgress
+        StorageUploadReservation::InProgress { retry_at: Some(_) }
+    ));
+    assert!(
+        library.mark_storage_upload_intent_unknown(intent_id, false).await.is_err(),
+        "an active reservation must not be marked unknown without force"
     );
     library
         .mark_storage_upload_unknown(intent_id, owner_token)
@@ -276,25 +347,47 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
         .expect("upload intent should be markable as unknown");
     assert_eq!(
         library
-            .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+            .reserve_storage_upload(storage_reservation_request(
+                asset.id,
+                &idempotency_key,
+                &sha256,
+                job_id,
+                0,
+            ))
             .await
             .expect("unknown upload should load"),
-        StorageUploadReservation::InProgress
+        StorageUploadReservation::InProgress { retry_at: None }
     );
 
+    let attachment = StorageUploadAttachment {
+        storage_chat_id: -100123,
+        storage_message_id: 789,
+        telegram_file_id: Some("file-id".to_owned()),
+        telegram_file_unique_id: Some("unique-id".to_owned()),
+    };
+    sqlx::query("UPDATE idempotency_records SET storage_asset_id = $2 WHERE id = $1")
+        .bind(intent_id)
+        .bind(other_asset.id)
+        .execute(database.pool())
+        .await
+        .expect("test should be able to create a cross-asset mismatch");
+    let error = library
+        .attach_storage_upload(intent_id, attachment.clone())
+        .await
+        .expect_err("cross-asset attachment must be rejected");
+    assert!(
+        error.to_string().contains("does not match the intent digest"),
+        "unexpected cross-asset error: {error}"
+    );
+    sqlx::query("UPDATE idempotency_records SET storage_asset_id = $2 WHERE id = $1")
+        .bind(intent_id)
+        .bind(asset.id)
+        .execute(database.pool())
+        .await
+        .expect("test intent binding should be restored");
+
     let stored = library
-        .attach_storage_upload(
-            intent_id,
-            NewStorageObject {
-                asset_id: asset.id,
-                provider: "telegram".to_owned(),
-                storage_chat_id: -100123,
-                storage_message_id: 789,
-                telegram_file_id: Some("file-id".to_owned()),
-                telegram_file_unique_id: Some("unique-id".to_owned()),
-                media_kind: MediaKind::Video,
-            },
-        )
+        .attach_storage_upload(intent_id, attachment)
         .await
         .expect("upload intent should complete");
     assert_eq!(stored.asset_id, asset.id);
@@ -309,7 +402,13 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
     );
     assert_eq!(
         library
-            .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+            .reserve_storage_upload(storage_reservation_request(
+                asset.id,
+                &idempotency_key,
+                &sha256,
+                job_id,
+                0,
+            ))
             .await
             .expect("completed reservation should replay"),
         StorageUploadReservation::Reused(stored.clone())
@@ -325,6 +424,7 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
         .execute(database.pool())
         .await
         .expect("storage object should clean up");
+    clean_up_content(&database, other_content.id).await;
     clean_up_content(&database, content.id).await;
 }
 
@@ -347,14 +447,46 @@ async fn storage_upload_intent_expiry_is_reconcilable_and_operator_reset_is_expl
         .create_media_asset(canonical_asset(content.id, sha256.clone()))
         .await
         .expect("asset should be created");
-    let idempotency_key = format!("telegram:storage:{}:expiry:v1", asset.id);
+    let idempotency_key = format!("asset:{}:upload_storage:v1:0", asset.id);
+    let job_id = database
+        .jobs()
+        .enqueue(NewJob::upload_storage_asset(asset.id).idempotency_key(idempotency_key.clone()))
+        .await
+        .expect("storage upload job should exist")
+        .id;
     let reservation = library
-        .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+        .reserve_storage_upload(storage_reservation_request(
+            asset.id,
+            &idempotency_key,
+            &sha256,
+            job_id,
+            0,
+        ))
         .await
         .expect("upload intent should be reserved");
     let StorageUploadReservation::Reserved { intent_id, .. } = reservation else {
         panic!("first upload should reserve an intent");
     };
+    sqlx::query(
+        r#"
+        UPDATE jobs
+        SET status = 'running', attempt_count = 1, lease_owner = 'crashed-worker',
+            lease_expires_at = now() - interval '1 second',
+            last_heartbeat_at = now() - interval '1 second'
+        WHERE id = $1
+        "#,
+    )
+    .bind(job_id)
+    .execute(database.pool())
+    .await
+    .expect("test should simulate a crashed running job");
+    sqlx::query(
+        "INSERT INTO job_attempts (job_id, attempt_number, status) VALUES ($1, 1, 'running')",
+    )
+    .bind(job_id)
+    .execute(database.pool())
+    .await
+    .expect("test should record the crashed attempt");
     sqlx::query(
         "UPDATE idempotency_records SET reservation_expires_at = now() - interval '1 second' WHERE id = $1",
     )
@@ -365,10 +497,16 @@ async fn storage_upload_intent_expiry_is_reconcilable_and_operator_reset_is_expl
 
     assert_eq!(
         library
-            .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+            .reserve_storage_upload(storage_reservation_request(
+                asset.id,
+                &idempotency_key,
+                &sha256,
+                job_id,
+                0,
+            ))
             .await
             .expect("expired reservation should remain visible"),
-        StorageUploadReservation::InProgress
+        StorageUploadReservation::InProgress { retry_at: None }
     );
     let state: String =
         sqlx::query_scalar("SELECT response_body->>'state' FROM idempotency_records WHERE id = $1")
@@ -378,13 +516,72 @@ async fn storage_upload_intent_expiry_is_reconcilable_and_operator_reset_is_expl
             .expect("intent state should be queryable");
     assert_eq!(state, "unknown");
     library
-        .mark_storage_upload_intent_unknown(intent_id)
+        .mark_storage_upload_intent_unknown(intent_id, false)
         .await
         .expect("operator should be able to acknowledge the ambiguity");
     library
         .reset_storage_upload_intent(intent_id)
         .await
         .expect("operator reset should require an explicit action");
+
+    let (reset_key, reset_job_id, reset_generation, reset_state): (String, Uuid, i32, String) =
+        sqlx::query_as(
+            "SELECT idempotency_key, storage_job_id, storage_generation, response_body->>'state' FROM idempotency_records WHERE id = $1",
+        )
+        .bind(intent_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("reset intent should remain durable");
+    assert_eq!(reset_generation, 1);
+    assert_eq!(reset_key, format!("asset:{}:upload_storage:v1:1", asset.id));
+    assert_ne!(reset_job_id, job_id);
+    assert_eq!(reset_state, "queued");
+    let old_job_status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("old job should remain in history");
+    assert_eq!(old_job_status, "cancelled");
+    let old_attempt_status: String = sqlx::query_scalar(
+        "SELECT status FROM job_attempts WHERE job_id = $1 AND attempt_number = 1",
+    )
+    .bind(job_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("old attempt should remain in history");
+    assert_eq!(old_attempt_status, "cancelled");
+
+    let StorageUploadReservation::Reserved { intent_id: reset_intent_id, owner_token } = library
+        .reserve_storage_upload(storage_reservation_request(
+            asset.id,
+            &reset_key,
+            &sha256,
+            reset_job_id,
+            reset_generation,
+        ))
+        .await
+        .expect("reset generation should reserve")
+    else {
+        panic!("reset generation should reserve a new owner");
+    };
+    assert_eq!(reset_intent_id, intent_id);
+    let completed = library
+        .complete_storage_upload(
+            intent_id,
+            owner_token,
+            NewStorageObject {
+                asset_id: asset.id,
+                provider: "telegram".to_owned(),
+                storage_chat_id: -100123,
+                storage_message_id: 900,
+                telegram_file_id: Some("reset-file".to_owned()),
+                telegram_file_unique_id: Some("reset-unique".to_owned()),
+                media_kind: MediaKind::Video,
+            },
+        )
+        .await
+        .expect("new upload generation should complete");
+    assert_eq!(completed.asset_id, asset.id);
     clean_up_content(&database, content.id).await;
 }
 
@@ -554,7 +751,7 @@ async fn recording_canonical_asset_is_idempotent_and_hash_unique() {
     let upload_job_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM jobs WHERE job_type = 'upload_storage_asset' AND idempotency_key = $1",
     )
-    .bind(format!("asset:{}:upload_storage:v1", recorded.id))
+    .bind(format!("asset:{}:upload_storage:v1:0", recorded.id))
     .fetch_one(database.pool())
     .await
     .expect("storage upload job should load");

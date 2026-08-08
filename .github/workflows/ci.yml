@@ -45,6 +45,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Report future-incompatible dependencies
+        run: cargo check --workspace --all-targets --future-incompat-report
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

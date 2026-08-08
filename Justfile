@@ -11,6 +11,9 @@ fmt-check:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
+future-incompat:
+    cargo check --workspace --all-targets --future-incompat-report
+
 test:
     cargo test --workspace --all-targets
 
@@ -39,4 +42,4 @@ openapi-validate:
 openapi-generate:
     sh tools/openapi-generate.sh
 
-check: fmt-check lint test
+check: fmt-check future-incompat lint test

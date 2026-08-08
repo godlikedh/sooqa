@@ -2,7 +2,7 @@ use std::{
     env,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -18,13 +18,36 @@ use sooqa_media::{
 use sooqa_persistence::Database;
 use sooqa_worker::{HandlerFuture, HandlerRegistry, Worker, probe_asset_handler};
 use tokio::{
-    sync::{Notify, oneshot},
+    sync::{Mutex, Notify, oneshot},
     time::timeout,
 };
 use uuid::Uuid;
 
 fn test_handler(_job: Job) -> HandlerFuture {
     Box::pin(async { Ok(()) })
+}
+
+static WORKER_INTEGRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+async fn integration_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    WORKER_INTEGRATION_LOCK.get_or_init(|| Mutex::new(())).lock().await
+}
+
+async fn clean_probe_fixtures(database: &Database) {
+    sqlx::query(
+        r#"
+        DELETE FROM jobs
+        WHERE job_type = 'probe_asset'
+          AND payload_json->>'ingest_request_id' IN (
+              SELECT id::text
+              FROM ingest_requests
+              WHERE source_url IN ('telegram://42/99', 'telegram://42/100')
+          )
+        "#,
+    )
+    .execute(database.pool())
+    .await
+    .expect("old probe fixtures should clean up");
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +88,7 @@ impl ExternalCommandRunner for RetryProbeRunner {
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL instance"]
 async fn worker_processes_test_job_and_stops_gracefully() {
+    let _test_guard = integration_test_lock().await;
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
     let database =
@@ -145,6 +169,7 @@ async fn worker_processes_test_job_and_stops_gracefully() {
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL instance"]
 async fn worker_heartbeats_long_jobs_and_keeps_them_owned() {
+    let _test_guard = integration_test_lock().await;
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
     let database =
@@ -287,11 +312,13 @@ async fn worker_heartbeats_long_jobs_and_keeps_them_owned() {
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL instance"]
 async fn probe_handler_consumes_telegram_media_from_the_shared_workspace() {
+    let _test_guard = integration_test_lock().await;
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
     let database =
         Database::connect(&database_url, 10).await.expect("database should be reachable");
     database.migrate().await.expect("migrations should succeed");
+    clean_probe_fixtures(&database).await;
 
     let key_prefix = format!("h4-worker-{}-", Uuid::new_v4());
     let work_root = std::env::temp_dir().join(format!("sooqa-h4-worker-{}", Uuid::new_v4()));
@@ -378,11 +405,13 @@ async fn probe_handler_consumes_telegram_media_from_the_shared_workspace() {
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL instance"]
 async fn probe_handler_retries_after_a_retryable_probe_failure() {
+    let _test_guard = integration_test_lock().await;
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
     let database =
         Database::connect(&database_url, 10).await.expect("database should be reachable");
     database.migrate().await.expect("migrations should succeed");
+    clean_probe_fixtures(&database).await;
 
     let key_prefix = format!("h4-retry-{}-", Uuid::new_v4());
     let work_root = std::env::temp_dir().join(format!("sooqa-h4-retry-{}", Uuid::new_v4()));

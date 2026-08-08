@@ -43,16 +43,15 @@ pub enum StorageIntentCommand {
     List,
     MarkUnknown {
         intent_id: String,
+        force: bool,
     },
     Reset {
         intent_id: String,
     },
     Attach {
         intent_id: String,
-        asset_id: String,
         storage_chat_id: String,
         storage_message_id: String,
-        media_kind: String,
         telegram_file_id: String,
         telegram_file_unique_id: String,
     },
@@ -116,9 +115,21 @@ fn parse_storage_intent_command(
         arguments.next().ok_or(ConfigError::MissingArgument("storage-intents command"))?;
     match subcommand.as_str() {
         "list" => Ok(StorageIntentCommand::List),
-        "mark-unknown" => Ok(StorageIntentCommand::MarkUnknown {
-            intent_id: next_storage_argument(arguments, "storage-intents mark-unknown intent-id")?,
-        }),
+        "mark-unknown" => {
+            let intent_id =
+                next_storage_argument(arguments, "storage-intents mark-unknown intent-id")?;
+            let force = match arguments.next() {
+                None => false,
+                Some(option) if option == "--force" => {
+                    if arguments.next().as_deref() != Some("--confirm") {
+                        return Err(ConfigError::MissingArgument("--confirm"));
+                    }
+                    true
+                }
+                Some(unknown) => return Err(ConfigError::UnknownArgument(unknown)),
+            };
+            Ok(StorageIntentCommand::MarkUnknown { intent_id, force })
+        }
         "reset" => {
             let intent_id = next_storage_argument(arguments, "storage-intents reset intent-id")?;
             match arguments.next().as_deref() {
@@ -129,13 +140,11 @@ fn parse_storage_intent_command(
         }
         "attach" => Ok(StorageIntentCommand::Attach {
             intent_id: next_storage_argument(arguments, "storage-intents attach intent-id")?,
-            asset_id: next_storage_argument(arguments, "storage-intents attach asset-id")?,
             storage_chat_id: next_storage_argument(arguments, "storage-intents attach chat-id")?,
             storage_message_id: next_storage_argument(
                 arguments,
                 "storage-intents attach message-id",
             )?,
-            media_kind: next_storage_argument(arguments, "storage-intents attach media-kind")?,
             telegram_file_id: next_storage_argument(arguments, "storage-intents attach file-id")?,
             telegram_file_unique_id: next_storage_argument(
                 arguments,
@@ -879,6 +888,48 @@ mod tests {
             }))
         );
         assert!(CliOptions::parse(["storage-intents", "reset", "intent-id"]).is_err());
+    }
+
+    #[test]
+    fn storage_intent_commands_parse_force_and_typed_attach_arguments() {
+        assert_eq!(
+            CliOptions::parse([
+                "storage-intents",
+                "mark-unknown",
+                "intent-id",
+                "--force",
+                "--confirm",
+            ])
+            .expect("forced mark-unknown should parse")
+            .command,
+            Some(CliCommand::StorageIntents(StorageIntentCommand::MarkUnknown {
+                intent_id: "intent-id".to_owned(),
+                force: true,
+            }))
+        );
+        assert_eq!(
+            CliOptions::parse([
+                "storage-intents",
+                "attach",
+                "intent-id",
+                "-100123",
+                "789",
+                "file-id",
+                "unique-id",
+            ])
+            .expect("typed attach should parse")
+            .command,
+            Some(CliCommand::StorageIntents(StorageIntentCommand::Attach {
+                intent_id: "intent-id".to_owned(),
+                storage_chat_id: "-100123".to_owned(),
+                storage_message_id: "789".to_owned(),
+                telegram_file_id: "file-id".to_owned(),
+                telegram_file_unique_id: "unique-id".to_owned(),
+            }))
+        );
+        assert!(
+            CliOptions::parse(["storage-intents", "mark-unknown", "intent-id", "--force"]).is_err()
+        );
     }
 
     #[test]

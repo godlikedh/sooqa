@@ -70,22 +70,36 @@ downloaded into a per-update workspace, then create a Telegram ingest request
 and `probe_asset` job. The probe handler validates the shared workspace and
 uses ffprobe before recording typed probe metadata.
 
-Storage uploads use an idempotency record as a durable intent. A reservation
-has an owner token and expiry. A successful upload completes the intent in the
-same short transaction as the storage object; an API/persistence uncertainty
-marks it `unknown`. Expired pending reservations become `unknown` before a
-new attempt can observe them. Unknown intents are never silently reset: an
-operator uses the storage-intent CLI to inspect, acknowledge, reset, or attach
-the externally created object.
+Storage uploads use an idempotency record as a durable intent bound to the
+asset, job, provider, storage chat, and upload generation. A reservation has
+an owner token and a renewable expiry. A worker defers when another live owner
+holds the intent, so that coordination does not consume job attempts. A
+successful upload completes the intent in the same short transaction as the
+storage object; an API/persistence uncertainty marks it `unknown`. Expired
+pending reservations become `unknown` before another attempt can observe them.
+Unknown intents are never silently reset: an operator uses the storage-intent
+CLI to inspect, acknowledge, reset, or attach the externally created object.
+Reset locks the intent and old job, preserves the old job as history, and
+creates a new upload generation with a new idempotency key. Attach accepts only
+Telegram result fields and derives the asset, provider, and media kind from
+the locked durable intent and canonical asset.
 
 ## Filesystem and subprocess safety
 
-Every media job gets a workspace under `media.work_root`; workspace helpers
-allow only fixed areas and safe file names. Direct HTTP, yt-dlp, and Telegram
-downloads write to same-directory temporary files and publish only after size
-and type checks. ffmpeg normalization follows the same pattern and publishes
-with a no-clobber hard link. Failed or cancelled work removes its temporary
-artifact.
+Every media job gets a restrictive workspace under `media.work_root`; workspace
+helpers allow only fixed areas and safe file names. Direct HTTP, yt-dlp, and
+Telegram downloads write to same-directory temporary files and publish only
+after validation. ffmpeg normalization follows the same pattern. The shared
+publication helper never overwrites a destination: a retry reuses it only when
+the existing regular file has identical validated content. Temporary paths
+are guarded for drop/cancellation cleanup, and worker startup scavenges old
+known temporary names only in non-live job workspaces after checking active
+database leases.
+
+Unix external commands run in an owned process group; timeout and cancellation
+terminate the group with a short TERM grace period followed by KILL and reap
+the direct child. Non-Unix builds use the direct-child fallback until a native
+Job Object implementation is added.
 
 The current worker composition requires ffprobe. It does not preflight ffmpeg
 or yt-dlp until a handler requiring either tool is enabled. The container

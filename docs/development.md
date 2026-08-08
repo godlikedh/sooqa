@@ -40,7 +40,15 @@ API ingest and library routes, worker behavior and source inspection.
 The current `teloxide` dependency graph also emits a known Rust
 future-incompatibility warning for the transitive `proc-macro-error2` crate
 through `aquamarine`. There is no compatible local upgrade in this slice;
-revisit it during the next Telegram dependency refresh.
+revisit it during the next Telegram dependency refresh. CI runs
+`cargo check --workspace --all-targets --future-incompat-report`, and the
+current dependency path is:
+
+```text
+proc-macro-error2 v2.0.1
+└── aquamarine v0.6.0
+    └── teloxide v0.17.0
+```
 
 Media integration tests that need locally installed binaries are separate:
 
@@ -70,19 +78,25 @@ These commands run through `sooqa-server` and require `DATABASE_URL`:
 ```bash
 cargo run -p sooqa-server -- storage-intents list
 cargo run -p sooqa-server -- storage-intents mark-unknown <intent-id>
+cargo run -p sooqa-server -- storage-intents mark-unknown <intent-id> --force --confirm
 cargo run -p sooqa-server -- storage-intents reset <intent-id> --confirm
-cargo run -p sooqa-server -- storage-intents attach <intent-id> <asset-id> <chat-id> <message-id> <media-kind> <file-id> <file-unique-id>
+cargo run -p sooqa-server -- storage-intents attach <intent-id> <chat-id> <message-id> <file-id> <file-unique-id>
 ```
 
-`reset` is deliberately explicit because an unknown intent may represent a
-Telegram message that was created successfully. Prefer `attach` when the
-external object can be identified.
+`mark-unknown` rejects active, unexpired reservations unless the operator
+supplies both `--force` and `--confirm`. `reset` is deliberately explicit
+because an unknown intent may represent a Telegram message that was created
+successfully. It keeps the old job for history and creates a new upload
+generation. Prefer `attach` when the external object can be identified; it
+derives the asset, provider, and media kind from the locked intent.
 
 ## Repository conventions
 
 Keep state-machine transitions and idempotency in Inbox/Persistence, keep
 external calls outside database transactions, and pass subprocess arguments as
-arrays. Add a focused test and update the active documentation whenever
+arrays. Unix media commands run in an owned process group so timeout and
+cancellation cleanup reaches yt-dlp descendants; non-Unix builds retain the
+direct-child fallback until a platform Job Object implementation is added. Add a focused test and update the active documentation whenever
 behavior changes. The historical specification under `docs/reference/` is
 roadmap context; code, tests, README, active docs, and ADRs describe the
 current system.

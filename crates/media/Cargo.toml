@@ -9,6 +9,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 image.workspace = true
+nix.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

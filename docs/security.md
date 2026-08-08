@@ -20,13 +20,16 @@ Direct HTTP source handling validates HTTP(S) URLs, rejects credentials and
 private/special IP ranges, resolves and pins destinations, and revalidates
 manual redirects. yt-dlp, ffmpeg, and ffprobe are invoked with argument arrays,
 bounded output, timeouts, and no shell. yt-dlp and ffmpeg write unique
-same-directory temporary files and publish only after validation.
+same-directory temporary files and publish only after validation. Publication
+never overwrites an existing file; retries reuse only identical validated
+output.
 
 Workspaces use job/update IDs rather than user-controlled path components.
 File names cannot contain separators or parent-directory components, workspace
-paths reject symlinked parents, and cleanup removes only the expected direct
-child of the configured jobs directory. A shared hostile work root would need
-descriptor-relative no-follow filesystem operations beyond this MVP.
+paths reject symlinked parents, and cleanup/scavenging removes only known
+temporary names below real, fixed job-workspace directories. A shared hostile
+work root would need descriptor-relative no-follow filesystem operations beyond
+this MVP.
 
 Database constraints enforce SHA-256 length, canonical ownership/role, job
 lease state, and job-attempt states in addition to repository validation.

@@ -19,6 +19,7 @@ mod fingerprint;
 mod hashing;
 mod image_normalize;
 mod normalize;
+mod publication;
 mod similarity;
 mod workspace;
 mod ytdlp;

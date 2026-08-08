@@ -4,7 +4,9 @@ use std::{error::Error, sync::Arc, time::Duration};
 
 use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
 use sooqa_jobs::JobType;
-use sooqa_media::{BinaryCheck, FfprobeAdapter, ProcessCommandRunner, diagnose_binaries};
+use sooqa_media::{
+    BinaryCheck, FfprobeAdapter, MediaWorkspace, ProcessCommandRunner, diagnose_binaries,
+};
 use sooqa_persistence::Database;
 use uuid::Uuid;
 
@@ -66,6 +68,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
     let capabilities = handlers.job_types();
     ensure_work_root(&config.media.work_root).await?;
+    let live_job_ids = database.jobs().live_job_ids().await?;
+    let stale_artifact_age =
+        Duration::from_secs(config.worker.lease_duration_seconds.saturating_add(5 * 60));
+    let removed_artifacts = MediaWorkspace::scavenge_stale_artifacts(
+        &config.media.work_root,
+        stale_artifact_age,
+        &live_job_ids,
+    )
+    .await?;
+    if removed_artifacts > 0 {
+        tracing::info!(removed_artifacts, "removed stale media workspace artifacts");
+    }
     let mut binary_checks = Vec::new();
     if capabilities.contains(&JobType::ProbeAsset) {
         binary_checks.push(BinaryCheck::new(

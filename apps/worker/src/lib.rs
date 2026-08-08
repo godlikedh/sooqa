@@ -20,6 +20,7 @@ use sooqa_persistence::{
     AssetProbeStart, InboxRepository, InboxRepositoryError, JobRepository, JobRepositoryError,
     SourceInspectionStart,
 };
+use sooqa_telegram::StorageUploadError;
 use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramStorageApi};
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -38,15 +39,29 @@ pub struct HandlerFailure {
     pub retryable: bool,
     pub class: String,
     pub message: String,
+    pub defer_until: Option<OffsetDateTime>,
 }
 
 impl HandlerFailure {
     pub fn retryable(class: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { retryable: true, class: class.into(), message: message.into() }
+        Self { retryable: true, class: class.into(), message: message.into(), defer_until: None }
     }
 
     pub fn permanent(class: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { retryable: false, class: class.into(), message: message.into() }
+        Self { retryable: false, class: class.into(), message: message.into(), defer_until: None }
+    }
+
+    pub fn defer(
+        class: impl Into<String>,
+        message: impl Into<String>,
+        available_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            retryable: true,
+            class: class.into(),
+            message: message.into(),
+            defer_until: Some(available_at),
+        }
     }
 }
 
@@ -238,8 +253,8 @@ where
     A: TelegramStorageApi,
     S: StorageUploadStore,
 {
-    let asset_id = match &job.command {
-        JobCommand::UploadStorageAsset(payload) => payload.asset_id,
+    let (asset_id, generation) = match &job.command {
+        JobCommand::UploadStorageAsset(payload) => (payload.asset_id, payload.generation),
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -248,14 +263,24 @@ where
         }
     };
 
-    provider.upload(StorageUploadInput { asset_id }).await.map(|_| ()).map_err(|error| {
-        let message = error.to_string();
-        if error.is_retryable() && job.attempt_count < job.max_attempts {
-            HandlerFailure::retryable("storage_upload", message)
-        } else {
-            HandlerFailure::permanent("storage_upload", message)
-        }
-    })
+    provider
+        .upload(StorageUploadInput { asset_id, job_id: job.id, generation })
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            let message = error.to_string();
+            if let StorageUploadError::InProgress { retry_at: Some(retry_at) } = &error {
+                return HandlerFailure::defer("storage_upload_in_progress", message, *retry_at);
+            }
+            if matches!(error, StorageUploadError::InProgress { retry_at: None }) {
+                return HandlerFailure::permanent("storage_upload_unknown", message);
+            }
+            if error.is_retryable() && job.attempt_count < job.max_attempts {
+                HandlerFailure::retryable("storage_upload", message)
+            } else {
+                HandlerFailure::permanent("storage_upload", message)
+            }
+        })
 }
 
 async fn inspect_source(
@@ -559,6 +584,18 @@ impl Worker {
                 self.repository.complete(job.id, &self.worker_id).await?;
                 self.metrics.succeeded.fetch_add(1, Ordering::Relaxed);
                 info!(worker_id = %self.worker_id, job_id = %job.id, "job completed");
+            }
+            Err(failure) if failure.defer_until.is_some() => {
+                self.repository
+                    .defer(
+                        job.id,
+                        &self.worker_id,
+                        failure.defer_until.expect("defer timestamp was checked"),
+                        &failure.class,
+                        &failure.message,
+                    )
+                    .await?;
+                info!(worker_id = %self.worker_id, job_id = %job.id, "job deferred until dependent lease expires");
             }
             Err(failure) if failure.retryable => {
                 let updated = self
