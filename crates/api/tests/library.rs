@@ -71,6 +71,8 @@ impl Fixture {
 
     async fn seed_item(&mut self, title: &str, url_suffix: &str, sha_byte: u8) -> Uuid {
         let url = format!("https://library-api.test/{url_suffix}/{}", Uuid::new_v4());
+        let mut sha256 = Vec::from(Uuid::new_v4().as_bytes());
+        sha256.extend_from_slice(Uuid::new_v4().as_bytes());
         let resolution = self
             .database
             .library()
@@ -93,7 +95,7 @@ impl Fixture {
                     duration_ms: Some(3500),
                     bit_rate: Some(500_000),
                     file_size_bytes: Some(42),
-                    sha256: Some(vec![sha_byte; 32]),
+                    sha256: Some(sha256),
                     local_work_path: Some(format!("/tmp/sooqa-e3-{sha_byte}.webm")),
                     storage_state: StorageState::Local,
                 },

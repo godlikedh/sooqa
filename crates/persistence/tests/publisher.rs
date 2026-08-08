@@ -1,5 +1,6 @@
 use std::env;
 
+use sha2::{Digest, Sha256};
 use sooqa_library::{
     AssetRole, ContentKind, MediaKind, NewContentItem, NewMediaAsset, StorageState,
 };
@@ -73,7 +74,7 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
             duration_ms: Some(1_000),
             bit_rate: Some(100_000),
             file_size_bytes: Some(8),
-            sha256: Some(vec![41; 32]),
+            sha256: Some(Sha256::digest(key_prefix.as_bytes()).to_vec()),
             local_work_path: Some(format!("/tmp/{key_prefix}.mp4")),
             storage_state: StorageState::Uploaded,
         })
@@ -186,7 +187,13 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
         "#,
     )
     .bind(&legacy_draft_key)
-    .bind(vec![99_u8; 32])
+    .bind(legacy_create_request_hash(
+        content.id,
+        asset.id,
+        target.id,
+        Some("caption"),
+        Some("HTML"),
+    ))
     .bind(draft.id)
     .bind(serde_json::to_value(&draft).expect("legacy draft snapshot should serialize"))
     .execute(database.pool())
@@ -344,15 +351,12 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
         .await
         .expect("ambiguous publication should be preserved");
     assert_eq!(ambiguous.status, PublicationAttemptStatus::Unknown);
-    assert_eq!(
-        database
-            .publisher()
-            .list_due_publication_schedules(time::OffsetDateTime::now_utc(), 10)
-            .await
-            .expect("due schedules should load")
-            .len(),
-        0
-    );
+    let due = database
+        .publisher()
+        .list_due_publication_schedules(time::OffsetDateTime::now_utc(), 10)
+        .await
+        .expect("due schedules should load");
+    assert!(due.iter().all(|item| item.id != schedule.id));
     database
         .publisher()
         .transition_publication_schedule(
@@ -506,4 +510,28 @@ fn schedule_request(
         cooldown_override: schedule.cooldown_override,
         idempotency_key: format!("{key_prefix}-schedule"),
     }
+}
+
+fn legacy_create_request_hash(
+    content_item_id: Uuid,
+    asset_id: Uuid,
+    target_channel_id: Uuid,
+    caption: Option<&str>,
+    parse_mode: Option<&str>,
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(content_item_id.as_bytes());
+    hasher.update(asset_id.as_bytes());
+    hasher.update(target_channel_id.as_bytes());
+    for value in [caption, parse_mode] {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update((value.len() as u64).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    hasher.finalize().to_vec()
 }

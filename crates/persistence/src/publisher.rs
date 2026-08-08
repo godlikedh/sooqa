@@ -341,6 +341,11 @@ impl PublisherRepository {
         };
         if existing.request_hash.as_slice() != request_hash {
             let draft = idempotency_draft_snapshot(&existing)?;
+            if existing.request_hash.as_slice()
+                != post_draft_legacy_snapshot_hash(&draft).as_slice()
+            {
+                return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
+            }
             if !legacy_create_request_matches(
                 &draft,
                 content_item_id,
@@ -1162,12 +1167,38 @@ fn hash_uuid(hasher: &mut Sha256, value: Uuid) {
 }
 
 fn post_draft_legacy_request_hash(draft: &NewPostDraft) -> Vec<u8> {
+    post_draft_legacy_hash(
+        draft.content_item_id,
+        draft.asset_id,
+        draft.target_channel_id,
+        draft.caption.as_deref(),
+        draft.parse_mode.as_deref(),
+    )
+}
+
+fn post_draft_legacy_snapshot_hash(draft: &PostDraft) -> Vec<u8> {
+    post_draft_legacy_hash(
+        draft.content_item_id,
+        draft.asset_id,
+        draft.target_channel_id,
+        draft.caption.as_deref(),
+        draft.parse_mode.as_deref(),
+    )
+}
+
+fn post_draft_legacy_hash(
+    content_item_id: Uuid,
+    asset_id: Uuid,
+    target_channel_id: Uuid,
+    caption: Option<&str>,
+    parse_mode: Option<&str>,
+) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    hash_uuid(&mut hasher, draft.content_item_id);
-    hash_uuid(&mut hasher, draft.asset_id);
-    hash_uuid(&mut hasher, draft.target_channel_id);
-    hash_optional_string(&mut hasher, draft.caption.as_deref());
-    hash_optional_string(&mut hasher, draft.parse_mode.as_deref());
+    hash_uuid(&mut hasher, content_item_id);
+    hash_uuid(&mut hasher, asset_id);
+    hash_uuid(&mut hasher, target_channel_id);
+    hash_optional_string(&mut hasher, caption);
+    hash_optional_string(&mut hasher, parse_mode);
     hasher.finalize().to_vec()
 }
 

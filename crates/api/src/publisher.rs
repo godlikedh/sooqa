@@ -523,12 +523,15 @@ fn valid_html_entities(value: &str) -> bool {
         let numeric = &entity[1..relative_end];
         let digits = numeric.strip_prefix("#x").or_else(|| numeric.strip_prefix("#X"));
         let valid_numeric = match digits {
-            Some(digits) => {
-                !digits.is_empty() && digits.chars().all(|character| character.is_ascii_hexdigit())
-            }
-            None => numeric.strip_prefix('#').is_some_and(|digits| {
-                !digits.is_empty() && digits.chars().all(|character| character.is_ascii_digit())
-            }),
+            Some(digits) => u32::from_str_radix(digits, 16)
+                .ok()
+                .and_then(char::from_u32)
+                .is_some_and(|character| character != '\0'),
+            None => numeric
+                .strip_prefix('#')
+                .and_then(|digits| digits.parse::<u32>().ok())
+                .and_then(char::from_u32)
+                .is_some_and(|character| character != '\0'),
         };
         if !valid_numeric {
             return false;
@@ -844,6 +847,7 @@ mod tests {
         assert!(!valid_html_markup("<b>mismatched</i>"));
         assert!(!valid_html_markup("<script>unsafe</script>"));
         assert!(!valid_html_markup("unknown &entity;"));
+        assert!(!valid_html_markup("invalid &#xD800; &#x110000;"));
         assert!(!valid_html_markup("raw > text"));
         assert!(!valid_html_markup("<code class=\"language-rust\">standalone</code>"));
     }
