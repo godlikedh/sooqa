@@ -77,7 +77,9 @@ behind the media boundary but is not enabled in the production worker until
 its subprocess egress has an equivalent SSRF boundary.
 Media messages are downloaded into a per-update workspace, then create a
 Telegram ingest request and `probe_asset` job. The probe handler validates the
-shared workspace and uses ffprobe before recording typed probe metadata.
+shared workspace and uses ffprobe before recording typed probe metadata and
+atomically enqueuing the existing `normalize_asset` job. Normalization remains
+the next worker composition slice.
 
 Storage uploads use an idempotency record as a durable intent bound to the
 asset, job, provider, storage chat, and upload generation. A reservation has

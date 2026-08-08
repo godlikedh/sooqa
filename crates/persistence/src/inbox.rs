@@ -135,42 +135,47 @@ impl InboxRepository {
     pub async fn begin_asset_probe(
         &self,
         id: Uuid,
+        attempt: &JobAttempt,
     ) -> Result<AssetProbeStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
-        let start = match request.status {
-            IngestStatus::Queued => {
-                request.transition_to(IngestStatus::Downloading)?;
-                request.transition_to(IngestStatus::Probing)?;
-                request.error_code = None;
-                request.error_message = None;
-                request.completed_at = None;
-                request.updated_at = OffsetDateTime::now_utc();
-                update_ingest_state(&mut transaction, &request).await?;
-                AssetProbeStart::Ready(request)
+        let start = if !lock_current_job_attempt(&mut transaction, attempt).await? {
+            AssetProbeStart::AlreadyAdvanced(request)
+        } else {
+            match request.status {
+                IngestStatus::Queued => {
+                    request.transition_to(IngestStatus::Downloading)?;
+                    request.transition_to(IngestStatus::Probing)?;
+                    request.error_code = None;
+                    request.error_message = None;
+                    request.completed_at = None;
+                    request.updated_at = OffsetDateTime::now_utc();
+                    update_ingest_state(&mut transaction, &request).await?;
+                    AssetProbeStart::Ready(request)
+                }
+                IngestStatus::Downloading => {
+                    request.transition_to(IngestStatus::Probing)?;
+                    request.error_code = None;
+                    request.error_message = None;
+                    request.completed_at = None;
+                    request.updated_at = OffsetDateTime::now_utc();
+                    update_ingest_state(&mut transaction, &request).await?;
+                    AssetProbeStart::Ready(request)
+                }
+                IngestStatus::Probing => AssetProbeStart::Ready(request),
+                IngestStatus::FailedRetryable => {
+                    request.transition_to(IngestStatus::Queued)?;
+                    request.transition_to(IngestStatus::Downloading)?;
+                    request.transition_to(IngestStatus::Probing)?;
+                    request.error_code = None;
+                    request.error_message = None;
+                    request.completed_at = None;
+                    request.updated_at = OffsetDateTime::now_utc();
+                    update_ingest_state(&mut transaction, &request).await?;
+                    AssetProbeStart::Ready(request)
+                }
+                _ => AssetProbeStart::AlreadyAdvanced(request),
             }
-            IngestStatus::Downloading => {
-                request.transition_to(IngestStatus::Probing)?;
-                request.error_code = None;
-                request.error_message = None;
-                request.completed_at = None;
-                request.updated_at = OffsetDateTime::now_utc();
-                update_ingest_state(&mut transaction, &request).await?;
-                AssetProbeStart::Ready(request)
-            }
-            IngestStatus::Probing => AssetProbeStart::Ready(request),
-            IngestStatus::FailedRetryable => {
-                request.transition_to(IngestStatus::Queued)?;
-                request.transition_to(IngestStatus::Downloading)?;
-                request.transition_to(IngestStatus::Probing)?;
-                request.error_code = None;
-                request.error_message = None;
-                request.completed_at = None;
-                request.updated_at = OffsetDateTime::now_utc();
-                update_ingest_state(&mut transaction, &request).await?;
-                AssetProbeStart::Ready(request)
-            }
-            _ => AssetProbeStart::AlreadyAdvanced(request),
         };
         transaction.commit().await?;
         Ok(start)
@@ -210,11 +215,16 @@ impl InboxRepository {
     pub async fn complete_asset_probe(
         &self,
         id: Uuid,
+        attempt: &JobAttempt,
         probe: serde_json::Value,
     ) -> Result<IngestRequest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
         if request.status != IngestStatus::Probing {
+            transaction.commit().await?;
+            return Ok(request);
+        }
+        if !lock_current_job_attempt(&mut transaction, attempt).await? {
             transaction.commit().await?;
             return Ok(request);
         }
@@ -232,6 +242,14 @@ impl InboxRepository {
         .bind(request.updated_at)
         .execute(&mut *transaction)
         .await?;
+
+        request.transition_to(IngestStatus::Normalizing)?;
+        request.error_code = None;
+        request.error_message = None;
+        request.completed_at = None;
+        request.updated_at = OffsetDateTime::now_utc();
+        update_ingest_state(&mut transaction, &request).await?;
+        insert_normalize_job(&mut transaction, &request).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -324,7 +342,18 @@ impl InboxRepository {
         error_code: &str,
         error_message: &str,
     ) -> Result<IngestRequest, InboxRepositoryError> {
-        self.fail_ingest_step(id, status, error_code, error_message, true, Some(attempt)).await
+        self.fail_ingest_step(
+            id,
+            status,
+            error_code,
+            error_message,
+            IngestFailureGuard {
+                ignore_completed_download: true,
+                attempt: Some(attempt),
+                expected_status: Some(IngestStatus::Downloading),
+            },
+        )
+        .await
     }
 
     pub async fn fail_source_inspection(
@@ -334,17 +363,40 @@ impl InboxRepository {
         error_code: &str,
         error_message: &str,
     ) -> Result<IngestRequest, InboxRepositoryError> {
-        self.fail_ingest_step(id, status, error_code, error_message, false, None).await
+        self.fail_ingest_step(
+            id,
+            status,
+            error_code,
+            error_message,
+            IngestFailureGuard {
+                ignore_completed_download: false,
+                attempt: None,
+                expected_status: Some(IngestStatus::Queued),
+            },
+        )
+        .await
     }
 
     pub async fn fail_asset_probe(
         &self,
         id: Uuid,
+        attempt: &JobAttempt,
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
     ) -> Result<IngestRequest, InboxRepositoryError> {
-        self.fail_ingest_step(id, status, error_code, error_message, false, None).await
+        self.fail_ingest_step(
+            id,
+            status,
+            error_code,
+            error_message,
+            IngestFailureGuard {
+                ignore_completed_download: false,
+                attempt: Some(attempt),
+                expected_status: Some(IngestStatus::Probing),
+            },
+        )
+        .await
     }
 
     async fn fail_ingest_step(
@@ -353,8 +405,7 @@ impl InboxRepository {
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
-        ignore_completed_download: bool,
-        attempt: Option<&JobAttempt>,
+        guard: IngestFailureGuard<'_>,
     ) -> Result<IngestRequest, InboxRepositoryError> {
         if !matches!(status, IngestStatus::FailedRetryable | IngestStatus::FailedTerminal) {
             return Err(InboxRepositoryError::InvalidFailureStatus(status));
@@ -362,11 +413,15 @@ impl InboxRepository {
 
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
-        if ignore_completed_download && request.original_input.get("download").is_some() {
+        if guard.ignore_completed_download && request.original_input.get("download").is_some() {
             transaction.commit().await?;
             return Ok(request);
         }
-        if let Some(attempt) = attempt
+        if guard.expected_status.is_some_and(|expected| request.status != expected) {
+            transaction.commit().await?;
+            return Ok(request);
+        }
+        if let Some(attempt) = guard.attempt
             && !lock_current_job_attempt(&mut transaction, attempt).await?
         {
             transaction.commit().await?;
@@ -405,6 +460,12 @@ pub enum SourceDownloadStart {
 pub enum AssetProbeStart {
     Ready(IngestRequest),
     AlreadyAdvanced(IngestRequest),
+}
+
+struct IngestFailureGuard<'a> {
+    ignore_completed_download: bool,
+    attempt: Option<&'a JobAttempt>,
+    expected_status: Option<IngestStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -509,6 +570,26 @@ async fn insert_probe_job(
     .bind(job.job_type().as_str())
     .bind(job.payload_json())
     .bind(format!("ingest:{}:probe_asset:v1", request.id))
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn insert_normalize_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &IngestRequest,
+) -> Result<(), sqlx::Error> {
+    let job = NewJob::normalize_asset(request.id);
+    sqlx::query(
+        r#"
+        INSERT INTO jobs (job_type, payload_json, idempotency_key)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+        "#,
+    )
+    .bind(job.job_type().as_str())
+    .bind(job.payload_json())
+    .bind(format!("ingest:{}:normalize_asset:v1", request.id))
     .execute(&mut **transaction)
     .await?;
     Ok(())

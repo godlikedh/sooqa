@@ -190,8 +190,14 @@ async fn probe_asset(
             ));
         }
     };
+    let job_attempt = job.attempt().ok_or_else(|| {
+        HandlerFailure::permanent(
+            "invalid_job_state",
+            "probe_asset handler requires a running job lease",
+        )
+    })?;
 
-    let request = match inbox.begin_asset_probe(ingest_request_id).await {
+    let request = match inbox.begin_asset_probe(ingest_request_id, &job_attempt).await {
         Ok(AssetProbeStart::Ready(request)) => request,
         Ok(AssetProbeStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
@@ -208,6 +214,7 @@ async fn probe_asset(
                 return fail_probe(
                     inbox,
                     ingest_request_id,
+                    &job_attempt,
                     HandlerFailure::permanent(
                         "invalid_ingest_state",
                         "Telegram ingest request has no valid workspace ID",
@@ -221,16 +228,19 @@ async fn probe_asset(
     let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
         Ok(workspace) => workspace,
         Err(error) => {
-            return fail_probe(inbox, ingest_request_id, map_workspace_error(error)).await;
+            return fail_probe(inbox, ingest_request_id, &job_attempt, map_workspace_error(error))
+                .await;
         }
     };
     if let Err(error) = workspace.validate() {
-        return fail_probe(inbox, ingest_request_id, map_workspace_error(error)).await;
+        return fail_probe(inbox, ingest_request_id, &job_attempt, map_workspace_error(error))
+            .await;
     }
     let input_path = match workspace.path(WorkspaceArea::Source, input_name) {
         Ok(path) => path,
         Err(error) => {
-            return fail_probe(inbox, ingest_request_id, map_workspace_error(error)).await;
+            return fail_probe(inbox, ingest_request_id, &job_attempt, map_workspace_error(error))
+                .await;
         }
     };
 
@@ -243,6 +253,7 @@ async fn probe_asset(
             inbox
                 .fail_asset_probe(
                     ingest_request_id,
+                    &job_attempt,
                     if terminal {
                         IngestStatus::FailedTerminal
                     } else {
@@ -264,6 +275,7 @@ async fn probe_asset(
     inbox
         .complete_asset_probe(
             ingest_request_id,
+            &job_attempt,
             serde_json::to_value(probe).expect("probe is serializable"),
         )
         .await
@@ -278,6 +290,7 @@ fn map_workspace_error(error: WorkspaceError) -> HandlerFailure {
 async fn fail_probe(
     inbox: &InboxRepository,
     ingest_request_id: uuid::Uuid,
+    job_attempt: &sooqa_jobs::JobAttempt,
     failure: HandlerFailure,
 ) -> Result<(), HandlerFailure> {
     let status = if failure.retryable {
@@ -286,7 +299,7 @@ async fn fail_probe(
         IngestStatus::FailedTerminal
     };
     inbox
-        .fail_asset_probe(ingest_request_id, status, &failure.class, &failure.message)
+        .fail_asset_probe(ingest_request_id, job_attempt, status, &failure.class, &failure.message)
         .await
         .map_err(map_inbox_error)?;
     Err(failure)

@@ -36,7 +36,7 @@ The `-- --ignored` part is intentional: Cargo uses the first `--` to stop
 parsing Cargo test options and passes `--ignored` to the test harness, which
 then runs tests marked `#[ignore]`. The integration recipe covers persistence,
 API ingest and library routes, worker behavior, source inspection, and source
-download handoff.
+download handoff, and the probe-to-normalize durable handoff.
 
 The current `teloxide` dependency graph also emits a known Rust
 future-incompatibility warning for the transitive `proc-macro-error2` crate
