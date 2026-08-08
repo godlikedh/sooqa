@@ -57,6 +57,18 @@ pub struct AssetNormalization {
     pub height: Option<u32>,
     pub duration_ms: Option<u64>,
     pub bit_rate: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<AssetThumbnailNormalization>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssetThumbnailNormalization {
+    pub local_work_path: String,
+    pub file_size_bytes: u64,
+    pub sha256: String,
+    pub mime_type: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

@@ -5,9 +5,10 @@ use std::{error::Error, sync::Arc, time::Duration};
 use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
 use sooqa_jobs::JobType;
 use sooqa_media::{
-    BinaryCheck, CanonicalVideoProfile, DirectHttpDownloader, DownloadLimits, FfmpegExecutor,
-    FfprobeAdapter, MediaWorkspace, NormalizationPlanner, ProcessCommandRunner, SourceDownloader,
-    SourceDownloaderRouter, diagnose_binaries,
+    BinaryCheck, CanonicalImageProfile, CanonicalVideoProfile, DirectHttpDownloader,
+    DownloadLimits, FfmpegExecutor, FfprobeAdapter, ImageNormalizer, MediaWorkspace,
+    NormalizationPlanner, ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter,
+    diagnose_binaries,
 };
 use sooqa_persistence::Database;
 use uuid::Uuid;
@@ -80,6 +81,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         config.media.work_root.clone(),
         normalization_planner,
         normalization_executor,
+        ImageNormalizer::new(CanonicalImageProfile::default())?,
     );
     handlers.register(JobType::NormalizeAsset, move |job| normalize_handler(job));
     tracing::info!("asset normalization handler enabled");

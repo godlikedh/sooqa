@@ -245,7 +245,7 @@ impl InboxRepository {
         .await?;
 
         let media_kind = request_media_kind(&request);
-        if media_kind != Some(SourceMediaKind::Video) {
+        if !matches!(media_kind, Some(SourceMediaKind::Video | SourceMediaKind::Image)) {
             request.transition_to(IngestStatus::FailedTerminal)?;
             request.error_code = Some(if media_kind.is_some() {
                 "unsupported_media_kind".to_owned()
@@ -254,7 +254,7 @@ impl InboxRepository {
             });
             request.error_message = Some(match media_kind {
                 Some(media_kind) => format!(
-                    "asset media kind {media_kind:?} is not supported by the video normalizer"
+                    "asset media kind {media_kind:?} is not supported by the composed normalizers"
                 ),
                 None => "ingest request has no stored source media kind".to_owned(),
             });

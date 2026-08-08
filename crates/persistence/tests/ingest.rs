@@ -149,7 +149,7 @@ async fn creates_ingest_and_inspect_job_atomically_with_idempotency() {
 
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL instance"]
-async fn unsupported_probe_kind_does_not_enqueue_video_normalization() {
+async fn probe_kind_routes_to_the_composed_normalizer_or_terminal_failure() {
     let _test_guard = integration_test_lock().await;
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
@@ -201,21 +201,26 @@ async fn unsupported_probe_kind_does_not_enqueue_video_normalization() {
             .await
             .expect("unsupported probe job should complete");
 
-        let (status, error_code): (String, String) =
+        let (status, error_code): (String, Option<String>) =
             sqlx::query_as("SELECT status, error_code FROM ingest_requests WHERE id = $1")
                 .bind(created.request.id)
                 .fetch_one(database.pool())
                 .await
                 .expect("unsupported ingest state should be queryable");
-        assert_eq!(status, "failed_terminal");
-        assert_eq!(error_code, "unsupported_media_kind");
+        if media_kind == "image" {
+            assert_eq!(status, "normalizing");
+            assert!(error_code.is_none(), "image normalization should not have an error");
+        } else {
+            assert_eq!(status, "failed_terminal");
+            assert_eq!(error_code.as_deref(), Some("unsupported_media_kind"));
+        }
         let normalize_job_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
                 .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
                 .fetch_one(database.pool())
                 .await
                 .expect("normalize job count should be queryable");
-        assert_eq!(normalize_job_count, 0);
+        assert_eq!(normalize_job_count, i64::from(media_kind == "image"));
     }
 
     clean_up(&database, &key_prefix).await;
@@ -488,6 +493,7 @@ async fn stale_normalization_failure_cannot_poison_a_newer_finalize_handoff() {
                 height: Some(16),
                 duration_ms: Some(1_000),
                 bit_rate: Some(1_000),
+                thumbnail: None,
             },
         )
         .await

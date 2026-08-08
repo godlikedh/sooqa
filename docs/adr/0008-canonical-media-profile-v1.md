@@ -34,8 +34,8 @@ a later normalization slice.
 - Remuxes avoid unnecessary quality loss and CPU work.
 - Portrait and landscape inputs share one aspect-preserving scale expression.
 - Profile and command decisions can be unit-tested with synthetic probes.
-- The profile is intentionally video-only; image normalization is a later
-  slice.
+- The profile is intentionally video-only; image normalization is a separate
+  JPEG/PNG profile and does not alter this video contract.
 - Changing the profile or algorithm requires explicit versioning/documentation
   before existing canonical assets are reprocessed.
 
@@ -54,6 +54,7 @@ F2 executes the plan, parses progress, validates the output against this
 profile with ffprobe, hashes it, and hands the typed result to the durable
 `finalize_ingest` boundary. That boundary records or reuses the canonical
 library asset and its SHA-256 without holding a database transaction across
-ffmpeg or ffprobe. Image normalization remains a later slice.
-The composed ingest path records image and audio probes but rejects them with
-`unsupported_media_kind`; they do not enter this video-only profile.
+ffmpeg or ffprobe. The composed worker also dispatches static JPEG/PNG inputs
+to the separate image normalizer and records its thumbnail asset. Audio,
+animation, and unknown inputs remain terminal `unsupported_media_kind` cases;
+they do not enter either current normalizer.

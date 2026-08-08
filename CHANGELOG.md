@@ -6,6 +6,9 @@ All notable changes to sooqa will be documented here.
 
 ### Added
 
+- Composed static JPEG/PNG image normalization into the durable ingest path,
+  including typed canonical/thumbnail metadata, image content kinds, and
+  idempotent thumbnail library persistence without a schema change.
 - Composed the durable `normalize_asset` worker with the canonical ffmpeg
   profile, shared workspace publication, output validation, SHA-256 metadata,
   lease-fenced retry handling, and an idempotent `finalize_ingest` handoff.

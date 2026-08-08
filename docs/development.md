@@ -65,9 +65,11 @@ just test-media
 CI installs ffmpeg for those tests. Normal unit tests use fake command runners
 and do not contact Telegram or third-party media sites.
 
-The current composed normalizer accepts video only. Image and audio ingests
-are intentionally recorded by probing and then fail terminally with
-`unsupported_media_kind` until their normalization paths are added.
+The current composed normalizer accepts video and static JPEG/PNG images.
+Image finalization records both canonical and thumbnail assets. Audio,
+animation, and unknown media are intentionally recorded by probing and then
+fail terminally with `unsupported_media_kind` until their normalization paths
+are added.
 
 ## Telegram adapter
 

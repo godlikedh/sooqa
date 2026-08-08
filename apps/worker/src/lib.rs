@@ -14,8 +14,8 @@ use std::{
 };
 
 use sooqa_inbox::{
-    AssetNormalization, IngestFinalization, IngestKind, IngestStatus, SourceDownload,
-    SourceMediaKind,
+    AssetNormalization, AssetThumbnailNormalization, IngestFinalization, IngestKind, IngestStatus,
+    SourceDownload, SourceMediaKind,
 };
 use sooqa_jobs::{Job, JobCommand, JobStatus, JobType};
 use sooqa_library::{
@@ -24,9 +24,9 @@ use sooqa_library::{
 };
 use sooqa_media::{
     ArtifactPublicationError, DownloadError, DownloadLimits, DownloadedSource, FfmpegExecutor,
-    FfprobeAdapter, MediaProbe, MediaStreamKind, MediaWorkspace, NormalizationExecutionError,
-    NormalizationPlanner, SourceDownloader, SourceInput, WorkspaceArea, WorkspaceError,
-    publish_artifact,
+    FfprobeAdapter, ImageNormalizer, MediaProbe, MediaStreamKind, MediaWorkspace,
+    NormalizationExecutionError, NormalizationPlanner, SourceDownloader, SourceInput,
+    WorkspaceArea, WorkspaceError, publish_artifact,
 };
 use sooqa_persistence::{
     AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
@@ -189,6 +189,7 @@ pub fn normalize_asset_handler(
     work_root: impl Into<std::path::PathBuf>,
     planner: NormalizationPlanner,
     executor: FfmpegExecutor,
+    image_normalizer: ImageNormalizer,
 ) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
@@ -196,7 +197,9 @@ pub fn normalize_asset_handler(
         let work_root = work_root.clone();
         let planner = planner.clone();
         let executor = executor.clone();
-        Box::pin(async move { normalize_asset(&inbox, &work_root, &planner, &executor, job).await })
+        Box::pin(async move {
+            normalize_asset(&inbox, &work_root, &planner, &executor, image_normalizer, job).await
+        })
     })
 }
 
@@ -343,6 +346,7 @@ async fn normalize_asset(
     work_root: &std::path::Path,
     planner: &NormalizationPlanner,
     executor: &FfmpegExecutor,
+    image_normalizer: ImageNormalizer,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
@@ -380,6 +384,17 @@ async fn normalize_asset(
             .await;
         }
     };
+    if media_kind == SourceMediaKind::Image {
+        return normalize_image_asset(
+            inbox,
+            work_root,
+            image_normalizer,
+            &request,
+            ingest_request_id,
+            &job_attempt,
+        )
+        .await;
+    }
     if media_kind != SourceMediaKind::Video {
         return fail_normalization(
             inbox,
@@ -421,28 +436,11 @@ async fn normalize_asset(
             .await;
         }
     };
-    let (workspace_id, input_name) = if request.kind == IngestKind::Url {
-        (request.id, "source.bin")
-    } else {
-        let workspace_id = match request.original_input["telegram_workspace_id"]
-            .as_str()
-            .and_then(|value| value.parse().ok())
-        {
-            Some(workspace_id) => workspace_id,
-            None => {
-                return fail_normalization(
-                    inbox,
-                    ingest_request_id,
-                    &job_attempt,
-                    HandlerFailure::permanent(
-                        "invalid_ingest_state",
-                        "Telegram ingest request has no valid workspace ID",
-                    ),
-                )
-                .await;
-            }
-        };
-        (workspace_id, "telegram-input.bin")
+    let (workspace_id, input_name) = match workspace_input(&request) {
+        Ok(value) => value,
+        Err(failure) => {
+            return fail_normalization(inbox, ingest_request_id, &job_attempt, failure).await;
+        }
     };
     let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
         Ok(workspace) => workspace,
@@ -522,6 +520,76 @@ async fn normalize_asset(
     Ok(())
 }
 
+async fn normalize_image_asset(
+    inbox: &InboxRepository,
+    work_root: &std::path::Path,
+    image_normalizer: ImageNormalizer,
+    request: &sooqa_inbox::IngestRequest,
+    ingest_request_id: Uuid,
+    job_attempt: &sooqa_jobs::JobAttempt,
+) -> Result<(), HandlerFailure> {
+    let (workspace_id, input_name) = match workspace_input(request) {
+        Ok(value) => value,
+        Err(failure) => {
+            return fail_normalization(inbox, ingest_request_id, job_attempt, failure).await;
+        }
+    };
+    let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                job_attempt,
+                map_workspace_error(error),
+            )
+            .await;
+        }
+    };
+    if let Err(error) = workspace.validate() {
+        return fail_normalization(
+            inbox,
+            ingest_request_id,
+            job_attempt,
+            map_workspace_error(error),
+        )
+        .await;
+    }
+    let plan = match image_normalizer.plan(&workspace, input_name, "canonical", "thumbnail") {
+        Ok(plan) => plan,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                job_attempt,
+                HandlerFailure::permanent("normalize_plan", error.to_string()),
+            )
+            .await;
+        }
+    };
+    let result = match image_normalizer.execute(&plan).await {
+        Ok(result) => result,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                job_attempt,
+                HandlerFailure::permanent("normalize_image", error.to_string()),
+            )
+            .await;
+        }
+    };
+    inbox
+        .complete_asset_normalization(
+            ingest_request_id,
+            job_attempt,
+            image_normalization_metadata(result),
+        )
+        .await
+        .map_err(map_inbox_error)?;
+    Ok(())
+}
+
 fn normalization_error_is_retryable(error: &NormalizationExecutionError) -> bool {
     match error {
         NormalizationExecutionError::Command(error) => error.is_timeout(),
@@ -537,6 +605,24 @@ fn request_media_kind(request: &sooqa_inbox::IngestRequest) -> Option<SourceMedi
         request.original_input.get("media_kind")?
     };
     serde_json::from_value(value.clone()).ok()
+}
+
+fn workspace_input(
+    request: &sooqa_inbox::IngestRequest,
+) -> Result<(Uuid, &'static str), HandlerFailure> {
+    if request.kind == IngestKind::Url {
+        return Ok((request.id, "source.bin"));
+    }
+    request.original_input["telegram_workspace_id"]
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .map(|workspace_id| (workspace_id, "telegram-input.bin"))
+        .ok_or_else(|| {
+            HandlerFailure::permanent(
+                "invalid_ingest_state",
+                "Telegram ingest request has no valid workspace ID",
+            )
+        })
 }
 
 fn normalization_metadata(result: sooqa_media::NormalizationResult) -> AssetNormalization {
@@ -557,6 +643,34 @@ fn normalization_metadata(result: sooqa_media::NormalizationResult) -> AssetNorm
         height: video.and_then(|stream| stream.height),
         duration_ms: result.probe.duration_ms,
         bit_rate: result.probe.bit_rate,
+        thumbnail: None,
+    }
+}
+
+fn image_normalization_metadata(
+    result: sooqa_media::ImageNormalizationResult,
+) -> AssetNormalization {
+    AssetNormalization {
+        local_work_path: result.canonical_path.to_string_lossy().into_owned(),
+        file_size_bytes: result.canonical_digest.bytes,
+        sha256: result.canonical_digest.sha256,
+        media_kind: SourceMediaKind::Image,
+        mime_type: Some(result.format.mime_type().to_owned()),
+        container: Some(result.format.extension().to_owned()),
+        video_codec: None,
+        audio_codec: None,
+        width: Some(result.width),
+        height: Some(result.height),
+        duration_ms: None,
+        bit_rate: None,
+        thumbnail: Some(AssetThumbnailNormalization {
+            local_work_path: result.thumbnail_path.to_string_lossy().into_owned(),
+            file_size_bytes: result.thumbnail_digest.bytes,
+            sha256: result.thumbnail_digest.sha256,
+            mime_type: Some(result.format.mime_type().to_owned()),
+            width: Some(result.thumbnail_width),
+            height: Some(result.thumbnail_height),
+        }),
     }
 }
 
@@ -645,10 +759,16 @@ async fn finalize_ingest(
         }
     };
     let source = source_record_for_request(&request);
+    let content_kind = match content_kind_for_normalization(&normalization) {
+        Ok(content_kind) => content_kind,
+        Err(failure) => {
+            return fail_finalization(inbox, ingest_request_id, &job_attempt, failure).await;
+        }
+    };
     let resolution = match library
         .resolve_exact_duplicate(ExactDuplicateRequest {
             content_item: NewContentItem {
-                kind: ContentKind::Video,
+                kind: content_kind,
                 preferred_title: request
                     .page_title
                     .clone()
@@ -690,6 +810,28 @@ async fn finalize_ingest(
             .await;
         }
     };
+    if let Some(thumbnail) = normalization.thumbnail.as_ref() {
+        let thumbnail_asset =
+            match thumbnail_to_library_asset(&normalization, thumbnail, resolution.content_item.id)
+            {
+                Ok(asset) => asset,
+                Err(failure) => {
+                    return fail_finalization(inbox, ingest_request_id, &job_attempt, failure)
+                        .await;
+                }
+            };
+        if let Err(error) =
+            library.record_thumbnail_asset(resolution.content_item.id, thumbnail_asset).await
+        {
+            return fail_finalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_library_error(error),
+            )
+            .await;
+        }
+    }
     inbox
         .complete_ingest_finalization(
             ingest_request_id,
@@ -709,7 +851,7 @@ fn normalization_to_library_asset(
 ) -> Result<NewMediaAssetDraft, HandlerFailure> {
     Ok(NewMediaAssetDraft {
         role: AssetRole::Canonical,
-        media_kind: MediaKind::Video,
+        media_kind: media_kind_for_normalization(normalization.media_kind)?,
         mime_type: normalization.mime_type.clone(),
         container: normalization.container.clone(),
         video_codec: normalization.video_codec.clone(),
@@ -721,6 +863,64 @@ fn normalization_to_library_asset(
         file_size_bytes: Some(normalization.file_size_bytes),
         sha256: Some(decode_sha256(&normalization.sha256)?),
         local_work_path: Some(normalization.local_work_path.clone()),
+        storage_state: StorageState::Local,
+    })
+}
+
+fn content_kind_for_normalization(
+    normalization: &AssetNormalization,
+) -> Result<ContentKind, HandlerFailure> {
+    match normalization.media_kind {
+        SourceMediaKind::Video => Ok(ContentKind::Video),
+        SourceMediaKind::Image => Ok(ContentKind::Image),
+        SourceMediaKind::Audio => Ok(ContentKind::Audio),
+        SourceMediaKind::Animation => Ok(ContentKind::Animation),
+        SourceMediaKind::Unknown => Err(HandlerFailure::permanent(
+            "invalid_normalization",
+            "normalized media kind is unknown",
+        )),
+    }
+}
+
+fn media_kind_for_normalization(media_kind: SourceMediaKind) -> Result<MediaKind, HandlerFailure> {
+    match media_kind {
+        SourceMediaKind::Video => Ok(MediaKind::Video),
+        SourceMediaKind::Image => Ok(MediaKind::Image),
+        SourceMediaKind::Audio => Ok(MediaKind::Audio),
+        SourceMediaKind::Animation => Ok(MediaKind::Animation),
+        SourceMediaKind::Unknown => Err(HandlerFailure::permanent(
+            "invalid_normalization",
+            "normalized media kind is unknown",
+        )),
+    }
+}
+
+fn thumbnail_to_library_asset(
+    normalization: &AssetNormalization,
+    thumbnail: &AssetThumbnailNormalization,
+    content_item_id: Uuid,
+) -> Result<sooqa_library::NewMediaAsset, HandlerFailure> {
+    if normalization.media_kind != SourceMediaKind::Image {
+        return Err(HandlerFailure::permanent(
+            "invalid_normalization",
+            "only image normalization may contain a thumbnail",
+        ));
+    }
+    Ok(sooqa_library::NewMediaAsset {
+        content_item_id,
+        role: AssetRole::Thumbnail,
+        media_kind: MediaKind::Image,
+        mime_type: thumbnail.mime_type.clone(),
+        container: None,
+        video_codec: None,
+        audio_codec: None,
+        width: to_database_dimension(thumbnail.width, "thumbnail width")?,
+        height: to_database_dimension(thumbnail.height, "thumbnail height")?,
+        duration_ms: None,
+        bit_rate: None,
+        file_size_bytes: Some(thumbnail.file_size_bytes),
+        sha256: Some(decode_sha256(&thumbnail.sha256)?),
+        local_work_path: Some(thumbnail.local_work_path.clone()),
         storage_state: StorageState::Local,
     })
 }
