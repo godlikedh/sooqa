@@ -6,6 +6,12 @@ All notable changes to sooqa will be documented here.
 
 ### Added
 
+- Composed the durable `normalize_asset` worker with the canonical ffmpeg
+  profile, shared workspace publication, output validation, SHA-256 metadata,
+  lease-fenced retry handling, and an idempotent `finalize_ingest` handoff.
+- Composed `finalize_ingest` with exact-dedup/library persistence so successful
+  video normalization creates or reuses canonical content, asset, and source
+  rows before the ingest becomes completed.
 - Made successful `probe_asset` completion advance the ingest to
   `normalizing` and enqueue the existing `normalize_asset` job atomically.
 - Composed the durable `download_source` worker handler with the existing

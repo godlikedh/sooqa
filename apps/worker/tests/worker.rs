@@ -12,11 +12,15 @@ use async_trait::async_trait;
 use sooqa_inbox::{IngestSubmission, SubmittedVia, TelegramSubmissionInput};
 use sooqa_jobs::{Job, JobType, NewJob};
 use sooqa_media::{
-    CommandError, ExternalCommand, ExternalCommandOutput, ExternalCommandRunner, FfprobeAdapter,
-    MediaWorkspace, WorkspaceArea,
+    CanonicalVideoProfile, CommandError, ExternalCommand, ExternalCommandOutput,
+    ExternalCommandRunner, FfmpegExecutor, FfprobeAdapter, MediaWorkspace, NormalizationPlanner,
+    WorkspaceArea,
 };
 use sooqa_persistence::Database;
-use sooqa_worker::{HandlerFuture, HandlerRegistry, Worker, probe_asset_handler};
+use sooqa_worker::{
+    HandlerFuture, HandlerRegistry, Worker, finalize_ingest_handler, normalize_asset_handler,
+    probe_asset_handler,
+};
 use tokio::{
     sync::{Mutex, Notify, oneshot},
     time::timeout,
@@ -41,7 +45,7 @@ async fn clean_probe_fixtures(database: &Database) {
           AND payload_json->>'ingest_request_id' IN (
               SELECT id::text
               FROM ingest_requests
-              WHERE source_url IN ('telegram://42/99', 'telegram://42/100')
+              WHERE source_url IN ('telegram://42/99', 'telegram://42/100', 'telegram://42/101')
           )
         "#,
     )
@@ -82,6 +86,40 @@ impl ExternalCommandRunner for RetryProbeRunner {
             });
         }
         FakeProbeRunner.run(ExternalCommand::new("ffprobe")).await
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FakeNormalizeRunner;
+
+#[async_trait]
+impl ExternalCommandRunner for FakeNormalizeRunner {
+    async fn run(&self, command: ExternalCommand) -> Result<ExternalCommandOutput, CommandError> {
+        if command.args().iter().any(|argument| argument == "-progress") {
+            let output = PathBuf::from(
+                command.args().last().expect("ffmpeg output argument should be present"),
+            );
+            tokio::fs::write(output, b"normalized-media")
+                .await
+                .expect("fake ffmpeg should write output");
+            return Ok(ExternalCommandOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: b"frame=1\nout_time_ms=1000\nprogress=end\n".to_vec(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            });
+        }
+
+        Ok(ExternalCommandOutput {
+            success: true,
+            exit_code: Some(0),
+            stdout: br#"{"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"1.0","size":"16","bit_rate":"1000"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","width":16,"height":16,"avg_frame_rate":"25/1"},{"index":1,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2}]}"#.to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        })
     }
 }
 
@@ -349,7 +387,7 @@ async fn probe_handler_consumes_telegram_media_from_the_shared_workspace() {
         .create_ingest(submission)
         .await
         .expect("Telegram ingest should be created");
-    sqlx::query("UPDATE jobs SET priority = 100000 WHERE idempotency_key = $1")
+    sqlx::query("UPDATE jobs SET priority = 300000 WHERE idempotency_key = $1")
         .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
         .execute(database.pool())
         .await
@@ -456,6 +494,11 @@ async fn probe_handler_retries_after_a_retryable_probe_failure() {
         .create_ingest(submission)
         .await
         .expect("Telegram ingest should be created");
+    sqlx::query("UPDATE jobs SET priority = 200000 WHERE idempotency_key = $1")
+        .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
+        .execute(database.pool())
+        .await
+        .expect("retry probe job should be prioritized");
     let job = database
         .jobs()
         .claim_next("worker-h4-retry", Duration::from_secs(30), &[JobType::ProbeAsset])
@@ -520,6 +563,277 @@ async fn probe_handler_retries_after_a_retryable_probe_failure() {
         .execute(database.pool())
         .await
         .expect("probe jobs should be cleaned up");
+    sqlx::query(
+        "DELETE FROM idempotency_records WHERE scope = 'ingest:create' AND idempotency_key LIKE $1",
+    )
+    .bind(format!("{}%", key_prefix))
+    .execute(database.pool())
+    .await
+    .expect("ingest idempotency record should be cleaned up");
+    sqlx::query("DELETE FROM ingest_requests WHERE id = $1")
+        .bind(created.request.id)
+        .execute(database.pool())
+        .await
+        .expect("Telegram ingest should be cleaned up");
+    workspace.cleanup().await.expect("workspace should be cleaned");
+    tokio::fs::remove_dir_all(work_root).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn normalize_handler_executes_ffmpeg_and_enqueues_finalize() {
+    let _test_guard = integration_test_lock().await;
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let key_prefix = format!("h5-normalize-{}-", Uuid::new_v4());
+    let work_root = std::env::temp_dir().join(format!("sooqa-h5-worker-{}", Uuid::new_v4()));
+    let workspace_id = Uuid::new_v4();
+    let workspace = MediaWorkspace::create(&work_root, workspace_id)
+        .await
+        .expect("workspace should be created");
+    let input_path = workspace
+        .path(WorkspaceArea::Source, "telegram-input.bin")
+        .expect("workspace source path should be valid");
+    tokio::fs::write(&input_path, b"test media").await.expect("test media should be written");
+
+    let submission = IngestSubmission::try_new_telegram(TelegramSubmissionInput {
+        source_reference: "telegram://42/101".to_owned(),
+        submitted_via: SubmittedVia::TelegramBot,
+        submitted_by_admin_id: None,
+        original_input: serde_json::json!({
+            "telegram_workspace_id": workspace_id,
+            "telegram_update_id": 101,
+            "telegram_chat_id": 42,
+            "telegram_message_id": 101,
+            "telegram_file_unique_id": "worker-test-file",
+            "file_size": 10,
+            "mime_type": "video/webm",
+            "local_work_path": input_path,
+            "media_kind": "video",
+        }),
+        supplied_caption: None,
+        idempotency_key: Some(format!("{}request", key_prefix)),
+    })
+    .expect("Telegram submission should be valid");
+    let created = database
+        .inbox()
+        .create_ingest(submission)
+        .await
+        .expect("Telegram ingest should be created");
+    sqlx::query("UPDATE jobs SET priority = 400000 WHERE idempotency_key = $1")
+        .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
+        .execute(database.pool())
+        .await
+        .expect("normalization probe job should be prioritized");
+
+    let probe_job = database
+        .jobs()
+        .claim_next("worker-h5-probe", Duration::from_secs(30), &[JobType::ProbeAsset])
+        .await
+        .expect("probe job should be claimable")
+        .expect("probe job should exist");
+    let ffprobe = FfprobeAdapter::with_runner(
+        "ffprobe",
+        Duration::from_secs(1),
+        4096,
+        Arc::new(FakeProbeRunner),
+    );
+    let probe_handler = probe_asset_handler(database.inbox(), work_root.clone(), ffprobe);
+    probe_handler(probe_job.clone()).await.expect("probe job should succeed");
+    database
+        .jobs()
+        .complete(probe_job.id, "worker-h5-probe")
+        .await
+        .expect("probe job should complete");
+    sqlx::query("UPDATE jobs SET priority = 400000 WHERE idempotency_key = $1")
+        .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
+        .execute(database.pool())
+        .await
+        .expect("normalize job should be prioritized");
+
+    let normalize_job = database
+        .jobs()
+        .claim_next("worker-h5-normalize", Duration::from_secs(30), &[JobType::NormalizeAsset])
+        .await
+        .expect("normalize job should be claimable")
+        .expect("normalize job should exist");
+    let runner: Arc<dyn ExternalCommandRunner> = Arc::new(FakeNormalizeRunner);
+    let ffprobe =
+        FfprobeAdapter::with_runner("ffprobe", Duration::from_secs(1), 4096, Arc::clone(&runner));
+    let executor = FfmpegExecutor::with_runner(runner, ffprobe, Duration::from_secs(1), 4096);
+    let planner = NormalizationPlanner::new("ffmpeg", CanonicalVideoProfile::default())
+        .expect("canonical profile should be valid");
+    let normalize_handler =
+        normalize_asset_handler(database.inbox(), work_root.clone(), planner, executor);
+    normalize_handler(normalize_job.clone()).await.expect("normalize job should succeed");
+    database
+        .jobs()
+        .complete(normalize_job.id, "worker-h5-normalize")
+        .await
+        .expect("normalize job should complete");
+    sqlx::query("UPDATE jobs SET priority = 400000 WHERE idempotency_key = $1")
+        .bind(format!("ingest:{}:finalize_ingest:v1", created.request.id))
+        .execute(database.pool())
+        .await
+        .expect("finalize job should be prioritized");
+
+    let finalize_job = database
+        .jobs()
+        .claim_next("worker-h5-finalize", Duration::from_secs(30), &[JobType::FinalizeIngest])
+        .await
+        .expect("finalize job should be claimable")
+        .expect("finalize job should exist");
+    let finalize_handler = finalize_ingest_handler(database.inbox(), database.library());
+    finalize_handler(finalize_job.clone()).await.expect("finalize job should succeed");
+    finalize_handler(finalize_job.clone()).await.expect("finalization replay should be idempotent");
+    database
+        .jobs()
+        .complete(finalize_job.id, "worker-h5-finalize")
+        .await
+        .expect("finalize job should complete");
+
+    let (status, original_input): (String, serde_json::Value) =
+        sqlx::query_as("SELECT status, original_input FROM ingest_requests WHERE id = $1")
+            .bind(created.request.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("Telegram ingest should remain queryable");
+    assert_eq!(status, "completed");
+    assert_eq!(original_input["normalization"]["media_kind"], "video");
+    assert_eq!(original_input["normalization"]["file_size_bytes"], 16);
+    assert!(!original_input["normalization"]["sha256"].as_str().unwrap_or_default().is_empty());
+    assert!(
+        original_input["normalization"]["local_work_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("normalized/canonical.mp4"))
+    );
+    let content_item_id = original_input["finalization"]["content_item_id"]
+        .as_str()
+        .expect("content item ID should be stored");
+    let canonical_asset_id = original_input["finalization"]["canonical_asset_id"]
+        .as_str()
+        .expect("canonical asset ID should be stored");
+    let (content_kind, stored_asset_id, asset_kind, asset_sha256): (String, Uuid, String, Vec<u8>) =
+        sqlx::query_as(
+            "SELECT ci.kind, ma.id, ma.media_kind, ma.sha256 FROM content_items ci JOIN media_assets ma ON ma.id = ci.canonical_asset_id WHERE ci.id = $1",
+        )
+        .bind(content_item_id.parse::<Uuid>().expect("content item ID should be a UUID"))
+        .fetch_one(database.pool())
+        .await
+        .expect("canonical library row should be queryable");
+    assert_eq!(content_kind, "video");
+    assert_eq!(
+        stored_asset_id,
+        canonical_asset_id.parse::<Uuid>().expect("asset ID should be a UUID")
+    );
+    assert_eq!(asset_kind, "video");
+    assert_eq!(asset_sha256.len(), 32);
+
+    let (source_type, platform, platform_content_id, source_metadata): (
+        String,
+        Option<String>,
+        Option<String>,
+        serde_json::Value,
+    ) = sqlx::query_as(
+        "SELECT source_type, platform, platform_content_id, metadata_json FROM source_records WHERE content_item_id = $1",
+    )
+    .bind(content_item_id.parse::<Uuid>().expect("content item ID should be a UUID"))
+    .fetch_one(database.pool())
+    .await
+    .expect("source record should be queryable");
+    assert_eq!(source_type, "telegram");
+    assert_eq!(platform.as_deref(), Some("telegram"));
+    assert_eq!(platform_content_id.as_deref(), Some("telegram://42/101"));
+    assert_eq!(source_metadata["media_kind"], "video");
+    assert_eq!(source_metadata["telegram_file_unique_id"], "worker-test-file");
+    assert!(source_metadata.get("local_work_path").is_none());
+    assert!(source_metadata.get("telegram_workspace_id").is_none());
+    assert!(source_metadata.get("normalization").is_none());
+
+    let canonical_asset_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM media_assets WHERE content_item_id = $1 AND role = 'canonical'",
+    )
+    .bind(content_item_id.parse::<Uuid>().expect("content item ID should be a UUID"))
+    .fetch_one(database.pool())
+    .await
+    .expect("canonical asset count should be queryable");
+    assert_eq!(canonical_asset_count, 1);
+
+    let (finalize_job_type, finalize_payload): (String, serde_json::Value) =
+        sqlx::query_as("SELECT job_type, payload_json FROM jobs WHERE idempotency_key = $1")
+            .bind(format!("ingest:{}:finalize_ingest:v1", created.request.id))
+            .fetch_one(database.pool())
+            .await
+            .expect("finalize job should be durable");
+    assert_eq!(finalize_job_type, "finalize_ingest");
+    assert_eq!(finalize_payload["ingest_request_id"], created.request.id.to_string());
+
+    let (storage_job_type, storage_payload): (String, serde_json::Value) =
+        sqlx::query_as("SELECT job_type, payload_json FROM jobs WHERE idempotency_key = $1")
+            .bind(format!("asset:{canonical_asset_id}:upload_storage:v1:0"))
+            .fetch_one(database.pool())
+            .await
+            .expect("storage upload job should be durable");
+    assert_eq!(storage_job_type, "upload_storage_asset");
+    assert_eq!(storage_payload["asset_id"], canonical_asset_id);
+
+    let storage_job_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE job_type = 'upload_storage_asset' AND payload_json->>'asset_id' = $1",
+    )
+    .bind(canonical_asset_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("storage upload job count should be queryable");
+    assert_eq!(storage_job_count, 1);
+
+    let normalized_path = original_input["normalization"]["local_work_path"]
+        .as_str()
+        .expect("normalized path should be stored");
+    assert_eq!(
+        tokio::fs::read(normalized_path).await.expect("normalized output should exist"),
+        b"normalized-media"
+    );
+
+    sqlx::query("DELETE FROM jobs WHERE payload_json->>'ingest_request_id' = $1 OR payload_json->>'asset_id' = $2")
+        .bind(created.request.id.to_string())
+        .bind(canonical_asset_id)
+        .execute(database.pool())
+        .await
+        .expect("ingest jobs should be cleaned up");
+    sqlx::query("DELETE FROM idempotency_records WHERE storage_asset_id = $1")
+        .bind(canonical_asset_id.parse::<Uuid>().expect("asset ID should be a UUID"))
+        .execute(database.pool())
+        .await
+        .expect("storage idempotency records should be cleaned up");
+    sqlx::query("DELETE FROM storage_objects WHERE asset_id = $1")
+        .bind(canonical_asset_id.parse::<Uuid>().expect("asset ID should be a UUID"))
+        .execute(database.pool())
+        .await
+        .expect("storage objects should be cleaned up");
+    sqlx::query("DELETE FROM source_records WHERE content_item_id = $1")
+        .bind(content_item_id.parse::<Uuid>().expect("content item ID should be a UUID"))
+        .execute(database.pool())
+        .await
+        .expect("source record should be cleaned up");
+    sqlx::query("UPDATE content_items SET canonical_asset_id = NULL WHERE id = $1")
+        .bind(content_item_id.parse::<Uuid>().expect("content item ID should be a UUID"))
+        .execute(database.pool())
+        .await
+        .expect("canonical asset pointer should be cleared");
+    sqlx::query("DELETE FROM media_assets WHERE id = $1")
+        .bind(canonical_asset_id.parse::<Uuid>().expect("asset ID should be a UUID"))
+        .execute(database.pool())
+        .await
+        .expect("canonical asset should be cleaned up");
+    sqlx::query("DELETE FROM content_items WHERE id = $1")
+        .bind(content_item_id.parse::<Uuid>().expect("content item ID should be a UUID"))
+        .execute(database.pool())
+        .await
+        .expect("content item should be cleaned up");
     sqlx::query(
         "DELETE FROM idempotency_records WHERE scope = 'ingest:create' AND idempotency_key LIKE $1",
     )

@@ -20,6 +20,7 @@ pub enum SourceMediaKind {
     Video,
     Image,
     Audio,
+    Animation,
     Unknown,
 }
 
@@ -39,6 +40,29 @@ pub struct SourceInspection {
 pub struct SourceDownload {
     pub bytes: u64,
     pub mime_type: Option<String>,
+    pub media_kind: SourceMediaKind,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssetNormalization {
+    pub local_work_path: String,
+    pub file_size_bytes: u64,
+    pub sha256: String,
+    pub media_kind: SourceMediaKind,
+    pub mime_type: Option<String>,
+    pub container: Option<String>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub bit_rate: Option<u64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IngestFinalization {
+    pub content_item_id: Uuid,
+    pub canonical_asset_id: Uuid,
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize)]
@@ -170,8 +194,10 @@ impl IngestStatus {
                 | (Self::Probing, Self::ExactDedupCheck)
                 | (Self::ExactDedupCheck, Self::Normalizing)
                 | (Self::Normalizing, Self::Fingerprinting)
+                | (Self::Normalizing, Self::Storing)
                 | (Self::Fingerprinting, Self::SimilarityCheck)
                 | (Self::SimilarityCheck, Self::Storing)
+                | (Self::FailedRetryable, Self::Storing)
                 | (Self::Storing, Self::Completed)
         )
     }
@@ -588,6 +614,18 @@ mod tests {
             IngestStatus::Completed,
         ] {
             request.transition_to(status).expect("pipeline transition should be valid");
+        }
+
+        let mut storing =
+            IngestRequest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
+        for status in [
+            IngestStatus::Queued,
+            IngestStatus::Downloading,
+            IngestStatus::Probing,
+            IngestStatus::Normalizing,
+            IngestStatus::Storing,
+        ] {
+            storing.transition_to(status).expect("normalization handoff should be valid");
         }
 
         assert!(request.transition_to(IngestStatus::Queued).is_err());

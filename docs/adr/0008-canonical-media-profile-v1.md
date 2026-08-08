@@ -25,8 +25,9 @@ aspect-preserving scale filter. Missing video streams and invalid profile
 values are rejected before command construction.
 
 The planner returns an `ExternalCommand` containing an argument vector. It
-does not execute the command or persist assets; execution, progress,
-validation, and size adaptation belong to later normalization slices.
+does not execute the command or persist assets; F2 owns execution, progress,
+output validation, hashing, and durable finalization. Size adaptation remains
+a later normalization slice.
 
 ## Consequences
 
@@ -47,7 +48,12 @@ validation, and size adaptation belong to later normalization slices.
 - Let worker handlers build arguments: rejected because it would spread media
   policy across orchestration code.
 
-## Follow-up
+## Implementation status
 
-F2 will execute the plan, parse progress, validate output with ffprobe, and
-record the canonical asset and its SHA-256.
+F2 executes the plan, parses progress, validates the output against this
+profile with ffprobe, hashes it, and hands the typed result to the durable
+`finalize_ingest` boundary. That boundary records or reuses the canonical
+library asset and its SHA-256 without holding a database transaction across
+ffmpeg or ffprobe. Image normalization remains a later slice.
+The composed ingest path records image and audio probes but rejects them with
+`unsupported_media_kind`; they do not enter this video-only profile.

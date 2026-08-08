@@ -10,8 +10,8 @@ pub use device_tokens::{
     DeviceToken, DeviceTokenRepository, DeviceTokenRepositoryError, hash_device_token,
 };
 pub use inbox::{
-    AssetProbeStart, CreateIngestResult, InboxRepository, InboxRepositoryError,
-    SourceDownloadStart, SourceInspectionStart,
+    AssetNormalizationStart, AssetProbeStart, CreateIngestResult, InboxRepository,
+    InboxRepositoryError, IngestFinalizationStart, SourceDownloadStart, SourceInspectionStart,
 };
 pub use jobs::{JobRepository, JobRepositoryError};
 pub use library::{LibraryRepository, LibraryRepositoryError};

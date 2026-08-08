@@ -308,6 +308,10 @@ impl NewJob {
         Self::new(JobCommand::NormalizeAsset(IngestJobPayload { ingest_request_id }))
     }
 
+    pub fn finalize_ingest(ingest_request_id: Uuid) -> Self {
+        Self::new(JobCommand::FinalizeIngest(IngestJobPayload { ingest_request_id }))
+    }
+
     pub fn cleanup_workspace() -> Self {
         Self::new(JobCommand::CleanupWorkspace(EmptyJobPayload {}))
     }

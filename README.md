@@ -22,12 +22,12 @@ The repository currently provides:
 
 The composed worker registers `inspect_source` with the SSRF-hardened direct
 HTTP adapter, `download_source` into the shared media workspace, `probe_asset`,
-and, when configured, `upload_storage_asset`.
+`normalize_asset`, and, when configured, `upload_storage_asset`.
 The yt-dlp adapter remains available behind the media boundary but is not yet
 enabled in the production worker because its subprocess egress needs an
-equivalent SSRF boundary. Normalization, library finalization, and publishing
-remain separate boundaries until their handlers are composed into the
-production workflow.
+equivalent SSRF boundary. Normalization records a canonical video artifact and
+queues `finalize_ingest`; finalization creates or reuses the canonical library
+rows and leaves storage upload/publishing as separate boundaries.
 
 Active documentation is the authority for current behavior:
 
@@ -106,8 +106,8 @@ cargo run -p sooqa-worker -- --config config.toml --check-config
 
 The server and worker must share `media.work_root`. The current production
 worker preflights only binaries required by its registered handlers; the
-default probe handler requires `ffprobe`. The image in `Dockerfile` also
-contains `ffmpeg` and `yt-dlp` for handlers added later.
+composed probe and normalization handlers require `ffprobe` and `ffmpeg`. The
+image in `Dockerfile` also contains `yt-dlp` for handlers added later.
 
 The project is licensed under Apache-2.0. See [LICENSE](LICENSE) and
 [ADR 0006](docs/adr/0006-license.md).

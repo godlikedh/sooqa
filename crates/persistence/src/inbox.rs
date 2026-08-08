@@ -1,7 +1,8 @@
 use serde_json::json;
 use sooqa_inbox::{
-    IngestKind, IngestRequest, IngestStateError, IngestStatus, IngestSubmission, SourceDownload,
-    SourceInspection, SubmittedVia,
+    AssetNormalization, IngestFinalization, IngestKind, IngestRequest, IngestStateError,
+    IngestStatus, IngestSubmission, SourceDownload, SourceInspection, SourceMediaKind,
+    SubmittedVia,
 };
 use sooqa_jobs::{JobAttempt, NewJob};
 use sqlx::{FromRow, PgPool};
@@ -243,6 +244,27 @@ impl InboxRepository {
         .execute(&mut *transaction)
         .await?;
 
+        let media_kind = request_media_kind(&request);
+        if media_kind != Some(SourceMediaKind::Video) {
+            request.transition_to(IngestStatus::FailedTerminal)?;
+            request.error_code = Some(if media_kind.is_some() {
+                "unsupported_media_kind".to_owned()
+            } else {
+                "invalid_ingest_state".to_owned()
+            });
+            request.error_message = Some(match media_kind {
+                Some(media_kind) => format!(
+                    "asset media kind {media_kind:?} is not supported by the video normalizer"
+                ),
+                None => "ingest request has no stored source media kind".to_owned(),
+            });
+            request.completed_at = Some(OffsetDateTime::now_utc());
+            request.updated_at = OffsetDateTime::now_utc();
+            update_ingest_state(&mut transaction, &request).await?;
+            transaction.commit().await?;
+            return Ok(request);
+        }
+
         request.transition_to(IngestStatus::Normalizing)?;
         request.error_code = None;
         request.error_message = None;
@@ -252,6 +274,197 @@ impl InboxRepository {
         insert_normalize_job(&mut transaction, &request).await?;
         transaction.commit().await?;
         Ok(request)
+    }
+
+    pub async fn begin_asset_normalization(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+    ) -> Result<AssetNormalizationStart, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        let start = if request.original_input.get("normalization").is_some()
+            || !lock_current_job_attempt(&mut transaction, attempt).await?
+        {
+            AssetNormalizationStart::AlreadyAdvanced(request)
+        } else {
+            match request.status {
+                IngestStatus::Normalizing => AssetNormalizationStart::Ready(request),
+                IngestStatus::FailedRetryable => {
+                    request.transition_to(IngestStatus::Queued)?;
+                    request.transition_to(IngestStatus::Downloading)?;
+                    request.transition_to(IngestStatus::Probing)?;
+                    request.transition_to(IngestStatus::Normalizing)?;
+                    request.error_code = None;
+                    request.error_message = None;
+                    request.completed_at = None;
+                    request.updated_at = OffsetDateTime::now_utc();
+                    update_ingest_state(&mut transaction, &request).await?;
+                    AssetNormalizationStart::Ready(request)
+                }
+                _ => AssetNormalizationStart::AlreadyAdvanced(request),
+            }
+        };
+        transaction.commit().await?;
+        Ok(start)
+    }
+
+    pub async fn complete_asset_normalization(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+        normalization: AssetNormalization,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        if request.status != IngestStatus::Normalizing
+            || request.original_input.get("normalization").is_some()
+            || !lock_current_job_attempt(&mut transaction, attempt).await?
+        {
+            transaction.commit().await?;
+            return Ok(request);
+        }
+
+        let normalization =
+            serde_json::to_value(normalization).expect("asset normalization is serializable");
+        if let Some(object) = request.original_input.as_object_mut() {
+            object.insert("normalization".to_owned(), normalization);
+        } else {
+            request.original_input =
+                json!({ "source": request.original_input, "normalization": normalization });
+        }
+        sqlx::query(
+            "UPDATE ingest_requests SET original_input = $2, updated_at = $3 WHERE id = $1",
+        )
+        .bind(request.id)
+        .bind(&request.original_input)
+        .bind(OffsetDateTime::now_utc())
+        .execute(&mut *transaction)
+        .await?;
+
+        request.transition_to(IngestStatus::Storing)?;
+        request.error_code = None;
+        request.error_message = None;
+        request.completed_at = None;
+        request.updated_at = OffsetDateTime::now_utc();
+        update_ingest_state(&mut transaction, &request).await?;
+        insert_finalize_job(&mut transaction, &request).await?;
+        transaction.commit().await?;
+        Ok(request)
+    }
+
+    pub async fn fail_asset_normalization(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+        status: IngestStatus,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        self.fail_ingest_step(
+            id,
+            status,
+            error_code,
+            error_message,
+            IngestFailureGuard {
+                ignore_completed_download: false,
+                attempt: Some(attempt),
+                expected_status: Some(IngestStatus::Normalizing),
+            },
+        )
+        .await
+    }
+
+    pub async fn begin_ingest_finalization(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+    ) -> Result<IngestFinalizationStart, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        let start = if !lock_current_job_attempt(&mut transaction, attempt).await? {
+            IngestFinalizationStart::AlreadyAdvanced(request)
+        } else {
+            match request.status {
+                IngestStatus::Storing => IngestFinalizationStart::Ready(request),
+                IngestStatus::FailedRetryable => {
+                    request.transition_to(IngestStatus::Storing)?;
+                    request.error_code = None;
+                    request.error_message = None;
+                    request.completed_at = None;
+                    request.updated_at = OffsetDateTime::now_utc();
+                    update_ingest_state(&mut transaction, &request).await?;
+                    IngestFinalizationStart::Ready(request)
+                }
+                _ => IngestFinalizationStart::AlreadyAdvanced(request),
+            }
+        };
+        transaction.commit().await?;
+        Ok(start)
+    }
+
+    pub async fn complete_ingest_finalization(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+        finalization: IngestFinalization,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        if request.status != IngestStatus::Storing
+            || request.original_input.get("finalization").is_some()
+            || !lock_current_job_attempt(&mut transaction, attempt).await?
+        {
+            transaction.commit().await?;
+            return Ok(request);
+        }
+
+        let finalization =
+            serde_json::to_value(finalization).expect("ingest finalization is serializable");
+        if let Some(object) = request.original_input.as_object_mut() {
+            object.insert("finalization".to_owned(), finalization);
+        } else {
+            request.original_input =
+                json!({ "source": request.original_input, "finalization": finalization });
+        }
+        request.transition_to(IngestStatus::Completed)?;
+        request.error_code = None;
+        request.error_message = None;
+        request.completed_at = Some(OffsetDateTime::now_utc());
+        request.updated_at = OffsetDateTime::now_utc();
+        sqlx::query(
+            "UPDATE ingest_requests SET original_input = $2, updated_at = $3 WHERE id = $1",
+        )
+        .bind(request.id)
+        .bind(&request.original_input)
+        .bind(request.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        update_ingest_state(&mut transaction, &request).await?;
+        transaction.commit().await?;
+        Ok(request)
+    }
+
+    pub async fn fail_ingest_finalization(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+        status: IngestStatus,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        self.fail_ingest_step(
+            id,
+            status,
+            error_code,
+            error_message,
+            IngestFailureGuard {
+                ignore_completed_download: false,
+                attempt: Some(attempt),
+                expected_status: Some(IngestStatus::Storing),
+            },
+        )
+        .await
     }
 
     pub async fn complete_source_inspection(
@@ -462,6 +675,18 @@ pub enum AssetProbeStart {
     AlreadyAdvanced(IngestRequest),
 }
 
+#[derive(Debug, Clone)]
+pub enum AssetNormalizationStart {
+    Ready(IngestRequest),
+    AlreadyAdvanced(IngestRequest),
+}
+
+#[derive(Debug, Clone)]
+pub enum IngestFinalizationStart {
+    Ready(IngestRequest),
+    AlreadyAdvanced(IngestRequest),
+}
+
 struct IngestFailureGuard<'a> {
     ignore_completed_download: bool,
     attempt: Option<&'a JobAttempt>,
@@ -593,6 +818,35 @@ async fn insert_normalize_job(
     .execute(&mut **transaction)
     .await?;
     Ok(())
+}
+
+async fn insert_finalize_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &IngestRequest,
+) -> Result<(), sqlx::Error> {
+    let job = NewJob::finalize_ingest(request.id);
+    sqlx::query(
+        r#"
+        INSERT INTO jobs (job_type, payload_json, idempotency_key)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+        "#,
+    )
+    .bind(job.job_type().as_str())
+    .bind(job.payload_json())
+    .bind(format!("ingest:{}:finalize_ingest:v1", request.id))
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+fn request_media_kind(request: &IngestRequest) -> Option<SourceMediaKind> {
+    let value = if request.kind == IngestKind::Url {
+        request.original_input.get("download")?.get("media_kind")?
+    } else {
+        request.original_input.get("media_kind")?
+    };
+    serde_json::from_value(value.clone()).ok()
 }
 
 async fn load_request(

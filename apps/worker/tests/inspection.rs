@@ -316,6 +316,7 @@ async fn download_source_uses_the_shared_workspace_and_enqueues_probe() {
         original_input["download"]["bytes"].as_u64().expect("download bytes should be recorded");
     assert!(matches!(recorded_bytes, 5 | 6));
     assert_eq!(original_input["download"]["mime_type"], "video/mp4");
+    assert_eq!(original_input["download"]["media_kind"], "video");
 
     let probe_job_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")

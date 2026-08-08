@@ -24,7 +24,7 @@ impl VideoCodec {
         }
     }
 
-    fn probe_name(self) -> &'static str {
+    pub(crate) fn probe_name(self) -> &'static str {
         match self {
             Self::H264 => "h264",
         }
@@ -38,7 +38,7 @@ pub enum PixelFormat {
 }
 
 impl PixelFormat {
-    fn ffmpeg_name(self) -> &'static str {
+    pub(crate) fn ffmpeg_name(self) -> &'static str {
         match self {
             Self::Yuv420p => "yuv420p",
         }
@@ -58,7 +58,7 @@ impl AudioCodec {
         }
     }
 
-    fn probe_name(self) -> &'static str {
+    pub(crate) fn probe_name(self) -> &'static str {
         match self {
             Self::Aac => "aac",
         }
@@ -146,6 +146,7 @@ pub struct NormalizationPlan {
     mode: NormalizationMode,
     command: ExternalCommand,
     output: PathBuf,
+    profile: CanonicalVideoProfile,
 }
 
 impl NormalizationPlan {
@@ -177,6 +178,10 @@ impl NormalizationPlan {
 
     pub fn output(&self) -> &Path {
         &self.output
+    }
+
+    pub(crate) fn profile(&self) -> CanonicalVideoProfile {
+        self.profile
     }
 }
 
@@ -217,7 +222,12 @@ impl NormalizationPlanner {
                 self.transcode_command(input.as_ref(), output.as_ref(), video)
             }
         };
-        Ok(NormalizationPlan { mode, command, output: output.as_ref().to_owned() })
+        Ok(NormalizationPlan {
+            mode,
+            command,
+            output: output.as_ref().to_owned(),
+            profile: self.profile,
+        })
     }
 
     fn remux_command(&self, input: &Path, output: &Path) -> ExternalCommand {
@@ -339,7 +349,7 @@ fn dimensions_within_profile(video: &MediaStream, profile: CanonicalVideoProfile
         .is_some_and(|(width, height)| width <= profile.max_width && height <= profile.max_height)
 }
 
-fn requires_frame_rate_cap(video: &MediaStream, maximum: FrameRate) -> bool {
+pub(crate) fn requires_frame_rate_cap(video: &MediaStream, maximum: FrameRate) -> bool {
     let Some(rate) = video.frame_rate else {
         return true;
     };

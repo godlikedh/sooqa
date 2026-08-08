@@ -5,15 +5,17 @@ use std::{error::Error, sync::Arc, time::Duration};
 use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
 use sooqa_jobs::JobType;
 use sooqa_media::{
-    BinaryCheck, DirectHttpDownloader, DownloadLimits, FfprobeAdapter, MediaWorkspace,
-    ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter, diagnose_binaries,
+    BinaryCheck, CanonicalVideoProfile, DirectHttpDownloader, DownloadLimits, FfmpegExecutor,
+    FfprobeAdapter, MediaWorkspace, NormalizationPlanner, ProcessCommandRunner, SourceDownloader,
+    SourceDownloaderRouter, diagnose_binaries,
 };
 use sooqa_persistence::Database;
 use uuid::Uuid;
 
 use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
 use sooqa_worker::{
-    HandlerRegistry, Worker, download_source_handler, inspect_source_handler, probe_asset_handler,
+    HandlerRegistry, Worker, download_source_handler, finalize_ingest_handler,
+    inspect_source_handler, normalize_asset_handler, probe_asset_handler,
     upload_storage_asset_handler,
 };
 
@@ -64,6 +66,26 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     handlers.register(JobType::ProbeAsset, move |job| probe_handler(job));
     tracing::info!("Telegram and upload ingest probe job handler enabled");
+    let normalization_planner = NormalizationPlanner::new(
+        config.media.ffmpeg_path.clone(),
+        CanonicalVideoProfile::default(),
+    )?;
+    let normalization_executor = FfmpegExecutor::new(
+        Arc::new(ProcessCommandRunner),
+        config.media.ffprobe_path.clone(),
+        Duration::from_secs(300),
+    );
+    let normalize_handler = normalize_asset_handler(
+        database.inbox(),
+        config.media.work_root.clone(),
+        normalization_planner,
+        normalization_executor,
+    );
+    handlers.register(JobType::NormalizeAsset, move |job| normalize_handler(job));
+    tracing::info!("asset normalization handler enabled");
+    let finalize_handler = finalize_ingest_handler(database.inbox(), database.library());
+    handlers.register(JobType::FinalizeIngest, move |job| finalize_handler(job));
+    tracing::info!("ingest finalization handler enabled");
     match (
         config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured()),
         config.telegram.storage_chat_id,
@@ -107,6 +129,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
         binary_checks.push(BinaryCheck::new(
             "ffprobe",
             config.media.ffprobe_path.clone(),
+            ["-version"],
+        ));
+    }
+    if capabilities.contains(&JobType::NormalizeAsset) {
+        binary_checks.push(BinaryCheck::new(
+            "ffmpeg",
+            config.media.ffmpeg_path.clone(),
             ["-version"],
         ));
     }

@@ -1,11 +1,19 @@
-use std::{env, time::Duration};
+use std::{env, sync::OnceLock, time::Duration};
 
 use sooqa_inbox::{
-    IngestStatus, IngestSubmission, IngestSubmissionInput, SubmittedVia, TelegramSubmissionInput,
+    AssetNormalization, IngestStatus, IngestSubmission, IngestSubmissionInput, SourceMediaKind,
+    SubmittedVia, TelegramSubmissionInput,
 };
 use sooqa_jobs::JobType;
 use sooqa_persistence::{Database, InboxRepositoryError};
+use tokio::sync::Mutex;
 use uuid::Uuid;
+
+static INTEGRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+async fn integration_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    INTEGRATION_LOCK.get_or_init(|| Mutex::new(())).lock().await
+}
 
 fn submission(url: &str, key: &str) -> IngestSubmission {
     let mut input = IngestSubmissionInput::new(url, SubmittedVia::Api);
@@ -14,6 +22,10 @@ fn submission(url: &str, key: &str) -> IngestSubmission {
 }
 
 fn telegram_submission(key: &str) -> IngestSubmission {
+    telegram_submission_with_kind(key, "video")
+}
+
+fn telegram_submission_with_kind(key: &str, media_kind: &str) -> IngestSubmission {
     IngestSubmission::try_new_telegram(TelegramSubmissionInput {
         source_reference: "telegram://42/99".to_owned(),
         submitted_via: SubmittedVia::TelegramBot,
@@ -22,7 +34,7 @@ fn telegram_submission(key: &str) -> IngestSubmission {
             "telegram_chat_id": 42,
             "telegram_message_id": 99,
             "telegram_file_unique_id": "unique-file",
-            "media_kind": "video",
+            "media_kind": media_kind,
             "local_work_path": "/tmp/sooqa-telegram-11.bin",
         }),
         supplied_caption: Some("caption".to_owned()),
@@ -63,6 +75,7 @@ async fn clean_up(database: &Database, key_prefix: &str) {
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL instance"]
 async fn creates_ingest_and_inspect_job_atomically_with_idempotency() {
+    let _test_guard = integration_test_lock().await;
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
     let database =
@@ -136,7 +149,82 @@ async fn creates_ingest_and_inspect_job_atomically_with_idempotency() {
 
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL instance"]
+async fn unsupported_probe_kind_does_not_enqueue_video_normalization() {
+    let _test_guard = integration_test_lock().await;
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let key_prefix = format!("h5-kind-{}-", Uuid::new_v4());
+    clean_up(&database, &key_prefix).await;
+    for (index, media_kind) in ["image", "audio", "animation"].into_iter().enumerate() {
+        let created = database
+            .inbox()
+            .create_ingest(telegram_submission_with_kind(
+                &format!("{key_prefix}{media_kind}"),
+                media_kind,
+            ))
+            .await
+            .expect("unsupported ingest should be created");
+        sqlx::query("UPDATE jobs SET priority = $2 WHERE idempotency_key = $1")
+            .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
+            .bind(200000 + index as i32)
+            .execute(database.pool())
+            .await
+            .expect("probe job should be prioritized");
+        let job = database
+            .jobs()
+            .claim_next("worker-h5-kind", Duration::from_secs(30), &[JobType::ProbeAsset])
+            .await
+            .expect("probe job should be claimable")
+            .expect("probe job should exist");
+        let attempt = job.attempt().expect("claimed job should have an attempt");
+        database
+            .inbox()
+            .begin_asset_probe(created.request.id, &attempt)
+            .await
+            .expect("probe should begin");
+        database
+            .inbox()
+            .complete_asset_probe(
+                created.request.id,
+                &attempt,
+                serde_json::json!({"container_format": "unsupported", "size_bytes": 10}),
+            )
+            .await
+            .expect("unsupported probe should be recorded");
+        database
+            .jobs()
+            .complete(job.id, "worker-h5-kind")
+            .await
+            .expect("unsupported probe job should complete");
+
+        let (status, error_code): (String, String) =
+            sqlx::query_as("SELECT status, error_code FROM ingest_requests WHERE id = $1")
+                .bind(created.request.id)
+                .fetch_one(database.pool())
+                .await
+                .expect("unsupported ingest state should be queryable");
+        assert_eq!(status, "failed_terminal");
+        assert_eq!(error_code, "unsupported_media_kind");
+        let normalize_job_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
+                .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
+                .fetch_one(database.pool())
+                .await
+                .expect("normalize job count should be queryable");
+        assert_eq!(normalize_job_count, 0);
+    }
+
+    clean_up(&database, &key_prefix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
 async fn creates_telegram_ingest_and_probe_job_atomically() {
+    let _test_guard = integration_test_lock().await;
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
     let database =
@@ -184,6 +272,7 @@ async fn creates_telegram_ingest_and_probe_job_atomically() {
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL instance"]
 async fn stale_probe_failure_cannot_poison_a_newer_normalize_handoff() {
+    let _test_guard = integration_test_lock().await;
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
     let database =
@@ -191,6 +280,7 @@ async fn stale_probe_failure_cannot_poison_a_newer_normalize_handoff() {
     database.migrate().await.expect("migrations should succeed");
 
     let key_prefix = format!("h5-probe-fence-{}-", Uuid::new_v4());
+    clean_up(&database, "h5-probe-fence-").await;
     clean_up(&database, &key_prefix).await;
     let key = format!("{key_prefix}telegram");
     let created = database
@@ -198,7 +288,7 @@ async fn stale_probe_failure_cannot_poison_a_newer_normalize_handoff() {
         .create_ingest(telegram_submission(&key))
         .await
         .expect("Telegram ingest should be created");
-    sqlx::query("UPDATE jobs SET priority = 100000 WHERE idempotency_key = $1")
+    sqlx::query("UPDATE jobs SET priority = 300000 WHERE idempotency_key = $1")
         .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
         .execute(database.pool())
         .await
@@ -274,6 +364,159 @@ async fn stale_probe_failure_cannot_poison_a_newer_normalize_handoff() {
             .await
             .expect("normalize job count should be queryable");
     assert_eq!(normalize_job_count, 1);
+
+    clean_up(&database, &key_prefix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn stale_normalization_failure_cannot_poison_a_newer_finalize_handoff() {
+    let _test_guard = integration_test_lock().await;
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let key_prefix = format!("h5-normalize-fence-{}-", Uuid::new_v4());
+    clean_up(&database, "h5-normalize-fence-").await;
+    clean_up(&database, &key_prefix).await;
+    let created = database
+        .inbox()
+        .create_ingest(telegram_submission(&format!("{key_prefix}telegram")))
+        .await
+        .expect("Telegram ingest should be created");
+    sqlx::query("UPDATE jobs SET priority = 500000 WHERE idempotency_key = $1")
+        .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
+        .execute(database.pool())
+        .await
+        .expect("probe job should be prioritized");
+    let probe_job = database
+        .jobs()
+        .claim_next(
+            "worker-h5-normalize-fence-probe",
+            Duration::from_secs(30),
+            &[JobType::ProbeAsset],
+        )
+        .await
+        .expect("probe job should be claimable")
+        .expect("probe job should exist");
+    let probe_attempt = probe_job.attempt().expect("probe job should have an attempt");
+    database
+        .inbox()
+        .begin_asset_probe(created.request.id, &probe_attempt)
+        .await
+        .expect("probe should begin");
+    database
+        .inbox()
+        .complete_asset_probe(
+            created.request.id,
+            &probe_attempt,
+            serde_json::json!({"container_format": "webm", "size_bytes": 10}),
+        )
+        .await
+        .expect("probe should enqueue normalization");
+    database
+        .jobs()
+        .complete(probe_job.id, "worker-h5-normalize-fence-probe")
+        .await
+        .expect("probe job should complete");
+
+    sqlx::query("UPDATE jobs SET priority = 500000 WHERE idempotency_key = $1")
+        .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
+        .execute(database.pool())
+        .await
+        .expect("normalize job should be prioritized");
+    let first_job = database
+        .jobs()
+        .claim_next(
+            "worker-h5-normalize-fence-first",
+            Duration::from_secs(1),
+            &[JobType::NormalizeAsset],
+        )
+        .await
+        .expect("first normalize attempt should be claimable")
+        .expect("first normalize attempt should exist");
+    let first_attempt = first_job.attempt().expect("first normalize job should have an attempt");
+    assert!(matches!(
+        database
+            .inbox()
+            .begin_asset_normalization(created.request.id, &first_attempt)
+            .await
+            .expect("first normalization should begin"),
+        sooqa_persistence::AssetNormalizationStart::Ready(_)
+    ));
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    database.jobs().recover_stale_leases().await.expect("stale normalize attempt should recover");
+    let second_job = database
+        .jobs()
+        .claim_next(
+            "worker-h5-normalize-fence-second",
+            Duration::from_secs(30),
+            &[JobType::NormalizeAsset],
+        )
+        .await
+        .expect("second normalize attempt should be claimable")
+        .expect("second normalize attempt should exist");
+    assert_eq!(second_job.id, first_job.id);
+    let second_attempt = second_job.attempt().expect("second normalize job should have an attempt");
+    assert!(matches!(
+        database
+            .inbox()
+            .begin_asset_normalization(created.request.id, &second_attempt)
+            .await
+            .expect("second normalization should begin"),
+        sooqa_persistence::AssetNormalizationStart::Ready(_)
+    ));
+    database
+        .inbox()
+        .complete_asset_normalization(
+            created.request.id,
+            &second_attempt,
+            AssetNormalization {
+                local_work_path: "/var/lib/sooqa/work/jobs/test/normalized/canonical.mp4"
+                    .to_owned(),
+                file_size_bytes: 10,
+                sha256: "a".repeat(64),
+                media_kind: SourceMediaKind::Video,
+                mime_type: Some("video/mp4".to_owned()),
+                container: Some("mp4".to_owned()),
+                video_codec: Some("h264".to_owned()),
+                audio_codec: Some("aac".to_owned()),
+                width: Some(16),
+                height: Some(16),
+                duration_ms: Some(1_000),
+                bit_rate: Some(1_000),
+            },
+        )
+        .await
+        .expect("second normalization should enqueue finalization");
+    database
+        .inbox()
+        .fail_asset_normalization(
+            created.request.id,
+            &first_attempt,
+            IngestStatus::FailedTerminal,
+            "stale_normalize",
+            "stale attempt must not change the finalize handoff",
+        )
+        .await
+        .expect("stale normalization failure should be ignored");
+
+    let status: String = sqlx::query_scalar("SELECT status FROM ingest_requests WHERE id = $1")
+        .bind(created.request.id)
+        .fetch_one(database.pool())
+        .await
+        .expect("ingest status should be queryable");
+    assert_eq!(status, "storing");
+    let finalize_job_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
+            .bind(format!("ingest:{}:finalize_ingest:v1", created.request.id))
+            .fetch_one(database.pool())
+            .await
+            .expect("finalize job count should be queryable");
+    assert_eq!(finalize_job_count, 1);
 
     clean_up(&database, &key_prefix).await;
 }
