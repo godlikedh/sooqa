@@ -35,6 +35,12 @@ pub struct SourceInspection {
     pub metadata: Value,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceDownload {
+    pub bytes: u64,
+    pub mime_type: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IngestKind {

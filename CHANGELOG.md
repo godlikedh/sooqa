@@ -6,6 +6,10 @@ All notable changes to sooqa will be documented here.
 
 ### Added
 
+- Composed the durable `download_source` worker handler with the existing
+  ingest/job schema, shared workspace, typed download metadata, and idempotent
+  `probe_asset` handoff; fenced completion and failure to the current job
+  lease attempt.
 - Composed production URL source inspection with the SSRF-hardened direct HTTP
   adapter; kept yt-dlp available behind its media boundary pending subprocess
   egress isolation.
