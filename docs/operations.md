@@ -79,8 +79,10 @@ cargo run -p sooqa-server -- storage-intents attach <intent-id> <chat-id> <messa
 ```
 
 Use `attach` when the Telegram message exists. It derives the asset, provider,
-and media kind from the intent and rejects chat or digest mismatches. Use
-`reset --confirm` only when the operator has verified that the external upload
+and media kind from the intent and rejects chat or digest mismatches. It also
+requires a positive Telegram message ID and non-empty file identifiers,
+trimming surrounding whitespace before storage. Use `reset --confirm` only
+when the operator has verified that the external upload
 did not create an object; reset retains the old job for history and creates a
 new upload generation with a fresh idempotency key.
 

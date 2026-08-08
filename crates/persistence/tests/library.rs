@@ -9,7 +9,7 @@ use sooqa_library::{
     StorageUploadAttachment, StorageUploadReservation, StorageUploadReservationRequest,
     StorageUploadStore,
 };
-use sooqa_persistence::Database;
+use sooqa_persistence::{Database, LibraryRepositoryError};
 use uuid::Uuid;
 
 async fn clean_up(database: &Database, content_id: Uuid, tag_id: Uuid, normalized_url: &str) {
@@ -362,9 +362,49 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
     let attachment = StorageUploadAttachment {
         storage_chat_id: -100123,
         storage_message_id: 789,
-        telegram_file_id: Some("file-id".to_owned()),
-        telegram_file_unique_id: Some("unique-id".to_owned()),
+        telegram_file_id: Some(" file-id ".to_owned()),
+        telegram_file_unique_id: Some(" unique-id ".to_owned()),
     };
+    for message_id in [0, -1] {
+        let error = library
+            .attach_storage_upload(
+                intent_id,
+                StorageUploadAttachment {
+                    storage_chat_id: -100123,
+                    storage_message_id: message_id,
+                    telegram_file_id: Some("file-id".to_owned()),
+                    telegram_file_unique_id: Some("unique-id".to_owned()),
+                },
+            )
+            .await
+            .expect_err("non-positive message IDs must be rejected");
+        assert!(matches!(
+            error,
+            LibraryRepositoryError::StorageUploadMessageIdInvalid { value } if value == message_id
+        ));
+    }
+    for (telegram_file_id, telegram_file_unique_id, field) in [
+        (Some("   ".to_owned()), Some("unique-id".to_owned()), "telegram_file_id"),
+        (Some("file-id".to_owned()), Some("\t".to_owned()), "telegram_file_unique_id"),
+    ] {
+        let error = library
+            .attach_storage_upload(
+                intent_id,
+                StorageUploadAttachment {
+                    storage_chat_id: -100123,
+                    storage_message_id: 789,
+                    telegram_file_id,
+                    telegram_file_unique_id,
+                },
+            )
+            .await
+            .expect_err("blank Telegram file identifiers must be rejected");
+        assert!(matches!(
+            error,
+            LibraryRepositoryError::StorageUploadAttachmentFieldEmpty { field: actual }
+                if actual == field
+        ));
+    }
     sqlx::query("UPDATE idempotency_records SET storage_asset_id = $2 WHERE id = $1")
         .bind(intent_id)
         .bind(other_asset.id)
@@ -391,6 +431,8 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
         .await
         .expect("upload intent should complete");
     assert_eq!(stored.asset_id, asset.id);
+    assert_eq!(stored.telegram_file_id.as_deref(), Some("file-id"));
+    assert_eq!(stored.telegram_file_unique_id.as_deref(), Some("unique-id"));
     assert_eq!(
         library
             .find_media_asset(asset.id)

@@ -213,6 +213,7 @@ impl LibraryRepository {
         intent_id: Uuid,
         attachment: StorageUploadAttachment,
     ) -> Result<StorageObject, LibraryRepositoryError> {
+        let attachment = validate_storage_upload_attachment(attachment)?;
         let mut transaction = self.pool.begin().await?;
         let intent = sqlx::query_as::<_, StorageUploadAttachmentRow>(
             r#"
@@ -2187,10 +2188,42 @@ pub enum LibraryRepositoryError {
     StorageUploadAssetNotCanonical(Uuid),
     #[error("storage upload asset {0} does not match the intent digest")]
     StorageUploadAssetHashMismatch(Uuid),
+    #[error("storage upload attachment message ID must be positive, got {value}")]
+    StorageUploadMessageIdInvalid { value: i64 },
+    #[error("storage upload attachment {field} must not be empty")]
+    StorageUploadAttachmentFieldEmpty { field: &'static str },
     #[error("database returned unknown media kind: {0}")]
     UnknownMediaKind(String),
     #[error("storage upload lease duration must be greater than zero")]
     InvalidStorageLeaseDuration,
+}
+
+fn validate_storage_upload_attachment(
+    mut attachment: StorageUploadAttachment,
+) -> Result<StorageUploadAttachment, LibraryRepositoryError> {
+    if attachment.storage_message_id <= 0 {
+        return Err(LibraryRepositoryError::StorageUploadMessageIdInvalid {
+            value: attachment.storage_message_id,
+        });
+    }
+    attachment.telegram_file_id =
+        Some(trim_storage_attachment_field(attachment.telegram_file_id, "telegram_file_id")?);
+    attachment.telegram_file_unique_id = Some(trim_storage_attachment_field(
+        attachment.telegram_file_unique_id,
+        "telegram_file_unique_id",
+    )?);
+    Ok(attachment)
+}
+
+fn trim_storage_attachment_field(
+    value: Option<String>,
+    field: &'static str,
+) -> Result<String, LibraryRepositoryError> {
+    let value = value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or(LibraryRepositoryError::StorageUploadAttachmentFieldEmpty { field })?;
+    Ok(value)
 }
 
 #[derive(Debug, FromRow)]
