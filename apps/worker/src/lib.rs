@@ -13,16 +13,25 @@ use std::{
     time::Duration,
 };
 
-use sooqa_inbox::{IngestKind, IngestStatus, SourceDownload};
+use sooqa_inbox::{
+    AssetNormalization, IngestFinalization, IngestKind, IngestStatus, SourceDownload,
+    SourceMediaKind,
+};
 use sooqa_jobs::{Job, JobCommand, JobStatus, JobType};
-use sooqa_library::StorageUploadStore;
+use sooqa_library::{
+    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem, NewMediaAssetDraft,
+    NewSourceRecordDraft, SourceType, StorageState, StorageUploadStore,
+};
 use sooqa_media::{
-    ArtifactPublicationError, DownloadError, DownloadLimits, DownloadedSource, FfprobeAdapter,
-    MediaWorkspace, SourceDownloader, SourceInput, WorkspaceArea, WorkspaceError, publish_artifact,
+    ArtifactPublicationError, DownloadError, DownloadLimits, DownloadedSource, FfmpegExecutor,
+    FfprobeAdapter, MediaProbe, MediaStreamKind, MediaWorkspace, NormalizationExecutionError,
+    NormalizationPlanner, SourceDownloader, SourceInput, WorkspaceArea, WorkspaceError,
+    publish_artifact,
 };
 use sooqa_persistence::{
-    AssetProbeStart, InboxRepository, InboxRepositoryError, JobRepository, JobRepositoryError,
-    SourceDownloadStart, SourceInspectionStart,
+    AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
+    IngestFinalizationStart, JobRepository, JobRepositoryError, LibraryRepository,
+    LibraryRepositoryError, SourceDownloadStart, SourceInspectionStart,
 };
 use sooqa_telegram::StorageUploadError;
 use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramStorageApi};
@@ -175,6 +184,30 @@ pub fn probe_asset_handler(
     })
 }
 
+pub fn normalize_asset_handler(
+    inbox: InboxRepository,
+    work_root: impl Into<std::path::PathBuf>,
+    planner: NormalizationPlanner,
+    executor: FfmpegExecutor,
+) -> HandlerFn {
+    let work_root = work_root.into();
+    Arc::new(move |job| {
+        let inbox = inbox.clone();
+        let work_root = work_root.clone();
+        let planner = planner.clone();
+        let executor = executor.clone();
+        Box::pin(async move { normalize_asset(&inbox, &work_root, &planner, &executor, job).await })
+    })
+}
+
+pub fn finalize_ingest_handler(inbox: InboxRepository, library: LibraryRepository) -> HandlerFn {
+    Arc::new(move |job| {
+        let inbox = inbox.clone();
+        let library = library.clone();
+        Box::pin(async move { finalize_ingest(&inbox, &library, job).await })
+    })
+}
+
 async fn probe_asset(
     inbox: &InboxRepository,
     work_root: &std::path::Path,
@@ -300,6 +333,558 @@ async fn fail_probe(
     };
     inbox
         .fail_asset_probe(ingest_request_id, job_attempt, status, &failure.class, &failure.message)
+        .await
+        .map_err(map_inbox_error)?;
+    Err(failure)
+}
+
+async fn normalize_asset(
+    inbox: &InboxRepository,
+    work_root: &std::path::Path,
+    planner: &NormalizationPlanner,
+    executor: &FfmpegExecutor,
+    job: Job,
+) -> Result<(), HandlerFailure> {
+    let ingest_request_id = match &job.command {
+        JobCommand::NormalizeAsset(payload) => payload.ingest_request_id,
+        _ => {
+            return Err(HandlerFailure::permanent(
+                "invalid_payload",
+                "normalize_asset handler received a different job command",
+            ));
+        }
+    };
+    let job_attempt = job.attempt().ok_or_else(|| {
+        HandlerFailure::permanent(
+            "invalid_job_state",
+            "normalize_asset handler requires a running job lease",
+        )
+    })?;
+    let request = match inbox.begin_asset_normalization(ingest_request_id, &job_attempt).await {
+        Ok(AssetNormalizationStart::Ready(request)) => request,
+        Ok(AssetNormalizationStart::AlreadyAdvanced(_)) => return Ok(()),
+        Err(error) => return Err(map_inbox_error(error)),
+    };
+    let media_kind = match request_media_kind(&request) {
+        Some(media_kind) => media_kind,
+        None => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent(
+                    "invalid_ingest_state",
+                    "ingest request has no stored source media kind",
+                ),
+            )
+            .await;
+        }
+    };
+    if media_kind != SourceMediaKind::Video {
+        return fail_normalization(
+            inbox,
+            ingest_request_id,
+            &job_attempt,
+            HandlerFailure::permanent(
+                "unsupported_media_kind",
+                format!("asset media kind {media_kind:?} is not supported by the video normalizer"),
+            ),
+        )
+        .await;
+    }
+    let probe = match request.original_input.get("probe").cloned() {
+        Some(probe) => match serde_json::from_value::<MediaProbe>(probe) {
+            Ok(probe) => probe,
+            Err(error) => {
+                return fail_normalization(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    HandlerFailure::permanent(
+                        "invalid_ingest_state",
+                        format!("stored media probe could not be decoded: {error}"),
+                    ),
+                )
+                .await;
+            }
+        },
+        None => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent(
+                    "invalid_ingest_state",
+                    "ingest request has no stored media probe",
+                ),
+            )
+            .await;
+        }
+    };
+    let (workspace_id, input_name) = if request.kind == IngestKind::Url {
+        (request.id, "source.bin")
+    } else {
+        let workspace_id = match request.original_input["telegram_workspace_id"]
+            .as_str()
+            .and_then(|value| value.parse().ok())
+        {
+            Some(workspace_id) => workspace_id,
+            None => {
+                return fail_normalization(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    HandlerFailure::permanent(
+                        "invalid_ingest_state",
+                        "Telegram ingest request has no valid workspace ID",
+                    ),
+                )
+                .await;
+            }
+        };
+        (workspace_id, "telegram-input.bin")
+    };
+    let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_workspace_error(error),
+            )
+            .await;
+        }
+    };
+    if let Err(error) = workspace.validate() {
+        return fail_normalization(
+            inbox,
+            ingest_request_id,
+            &job_attempt,
+            map_workspace_error(error),
+        )
+        .await;
+    }
+    let input_path = match workspace.path(WorkspaceArea::Source, input_name) {
+        Ok(path) => path,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_workspace_error(error),
+            )
+            .await;
+        }
+    };
+    let output_path = match workspace.path(WorkspaceArea::Normalized, "canonical.mp4") {
+        Ok(path) => path,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_workspace_error(error),
+            )
+            .await;
+        }
+    };
+    let plan = match planner.plan(&input_path, &output_path, &probe) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent("normalize_plan", error.to_string()),
+            )
+            .await;
+        }
+    };
+    let result = match executor.execute(&plan, std::future::pending()).await {
+        Ok(result) => result,
+        Err(error) => {
+            let retryable = normalization_error_is_retryable(&error);
+            let terminal = !retryable || job.attempt_count >= job.max_attempts;
+            let failure = if terminal {
+                HandlerFailure::permanent("normalize", error.to_string())
+            } else {
+                HandlerFailure::retryable("normalize_timeout", error.to_string())
+            };
+            return fail_normalization(inbox, ingest_request_id, &job_attempt, failure).await;
+        }
+    };
+    let normalization = normalization_metadata(result);
+    inbox
+        .complete_asset_normalization(ingest_request_id, &job_attempt, normalization)
+        .await
+        .map_err(map_inbox_error)?;
+    Ok(())
+}
+
+fn normalization_error_is_retryable(error: &NormalizationExecutionError) -> bool {
+    match error {
+        NormalizationExecutionError::Command(error) => error.is_timeout(),
+        NormalizationExecutionError::Probe(error) => error.is_retryable(),
+        _ => false,
+    }
+}
+
+fn request_media_kind(request: &sooqa_inbox::IngestRequest) -> Option<SourceMediaKind> {
+    let value = if request.kind == IngestKind::Url {
+        request.original_input.get("download")?.get("media_kind")?
+    } else {
+        request.original_input.get("media_kind")?
+    };
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn normalization_metadata(result: sooqa_media::NormalizationResult) -> AssetNormalization {
+    let video =
+        result.probe.streams.iter().find(|stream| matches!(&stream.kind, MediaStreamKind::Video));
+    let audio =
+        result.probe.streams.iter().find(|stream| matches!(&stream.kind, MediaStreamKind::Audio));
+    AssetNormalization {
+        local_work_path: result.output_path.to_string_lossy().into_owned(),
+        file_size_bytes: result.digest.bytes,
+        sha256: result.digest.sha256,
+        media_kind: SourceMediaKind::Video,
+        mime_type: Some("video/mp4".to_owned()),
+        container: result.probe.container_format,
+        video_codec: video.and_then(|stream| stream.codec.clone()),
+        audio_codec: audio.and_then(|stream| stream.codec.clone()),
+        width: video.and_then(|stream| stream.width),
+        height: video.and_then(|stream| stream.height),
+        duration_ms: result.probe.duration_ms,
+        bit_rate: result.probe.bit_rate,
+    }
+}
+
+async fn fail_normalization(
+    inbox: &InboxRepository,
+    ingest_request_id: uuid::Uuid,
+    job_attempt: &sooqa_jobs::JobAttempt,
+    failure: HandlerFailure,
+) -> Result<(), HandlerFailure> {
+    let status = if failure.retryable {
+        IngestStatus::FailedRetryable
+    } else {
+        IngestStatus::FailedTerminal
+    };
+    inbox
+        .fail_asset_normalization(
+            ingest_request_id,
+            job_attempt,
+            status,
+            &failure.class,
+            &failure.message,
+        )
+        .await
+        .map_err(map_inbox_error)?;
+    Err(failure)
+}
+
+async fn finalize_ingest(
+    inbox: &InboxRepository,
+    library: &LibraryRepository,
+    job: Job,
+) -> Result<(), HandlerFailure> {
+    let ingest_request_id = match &job.command {
+        JobCommand::FinalizeIngest(payload) => payload.ingest_request_id,
+        _ => {
+            return Err(HandlerFailure::permanent(
+                "invalid_payload",
+                "finalize_ingest handler received a different job command",
+            ));
+        }
+    };
+    let job_attempt = job.attempt().ok_or_else(|| {
+        HandlerFailure::permanent(
+            "invalid_job_state",
+            "finalize_ingest handler requires a running job lease",
+        )
+    })?;
+    let request = match inbox.begin_ingest_finalization(ingest_request_id, &job_attempt).await {
+        Ok(IngestFinalizationStart::Ready(request)) => request,
+        Ok(IngestFinalizationStart::AlreadyAdvanced(_)) => return Ok(()),
+        Err(error) => return Err(map_inbox_error(error)),
+    };
+    let normalization = match request.original_input.get("normalization").cloned() {
+        Some(value) => match serde_json::from_value::<AssetNormalization>(value) {
+            Ok(normalization) => normalization,
+            Err(error) => {
+                return fail_finalization(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    HandlerFailure::permanent(
+                        "invalid_ingest_state",
+                        format!("stored normalization metadata could not be decoded: {error}"),
+                    ),
+                )
+                .await;
+            }
+        },
+        None => {
+            return fail_finalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent(
+                    "invalid_ingest_state",
+                    "ingest request has no stored normalization metadata",
+                ),
+            )
+            .await;
+        }
+    };
+    let asset_draft = match normalization_to_library_asset(&normalization) {
+        Ok(asset) => asset,
+        Err(failure) => {
+            return fail_finalization(inbox, ingest_request_id, &job_attempt, failure).await;
+        }
+    };
+    let source = source_record_for_request(&request);
+    let resolution = match library
+        .resolve_exact_duplicate(ExactDuplicateRequest {
+            content_item: NewContentItem {
+                kind: ContentKind::Video,
+                preferred_title: request
+                    .page_title
+                    .clone()
+                    .or_else(|| request.supplied_caption.clone()),
+                editorial_description: None,
+                notes: None,
+            },
+            asset: asset_draft.clone(),
+            source,
+        })
+        .await
+    {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            return fail_finalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_library_error(error),
+            )
+            .await;
+        }
+    };
+    let canonical_asset = match library
+        .record_canonical_asset(
+            resolution.content_item.id,
+            asset_draft.for_content_item(resolution.content_item.id),
+        )
+        .await
+    {
+        Ok(asset) => asset,
+        Err(error) => {
+            return fail_finalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_library_error(error),
+            )
+            .await;
+        }
+    };
+    inbox
+        .complete_ingest_finalization(
+            ingest_request_id,
+            &job_attempt,
+            IngestFinalization {
+                content_item_id: resolution.content_item.id,
+                canonical_asset_id: canonical_asset.id,
+            },
+        )
+        .await
+        .map_err(map_inbox_error)?;
+    Ok(())
+}
+
+fn normalization_to_library_asset(
+    normalization: &AssetNormalization,
+) -> Result<NewMediaAssetDraft, HandlerFailure> {
+    Ok(NewMediaAssetDraft {
+        role: AssetRole::Canonical,
+        media_kind: MediaKind::Video,
+        mime_type: normalization.mime_type.clone(),
+        container: normalization.container.clone(),
+        video_codec: normalization.video_codec.clone(),
+        audio_codec: normalization.audio_codec.clone(),
+        width: to_database_dimension(normalization.width, "width")?,
+        height: to_database_dimension(normalization.height, "height")?,
+        duration_ms: normalization.duration_ms,
+        bit_rate: normalization.bit_rate,
+        file_size_bytes: Some(normalization.file_size_bytes),
+        sha256: Some(decode_sha256(&normalization.sha256)?),
+        local_work_path: Some(normalization.local_work_path.clone()),
+        storage_state: StorageState::Local,
+    })
+}
+
+fn to_database_dimension(
+    value: Option<u32>,
+    field: &'static str,
+) -> Result<Option<i32>, HandlerFailure> {
+    value
+        .map(|value| {
+            i32::try_from(value).map_err(|_| {
+                HandlerFailure::permanent(
+                    "invalid_normalization",
+                    format!("normalized {field} does not fit the library schema"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn decode_sha256(value: &str) -> Result<Vec<u8>, HandlerFailure> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 || !bytes.is_ascii() {
+        return Err(HandlerFailure::permanent(
+            "invalid_normalization",
+            "normalized SHA-256 digest must contain 64 hexadecimal characters",
+        ));
+    }
+    let mut digest = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let high = decode_hex_digit(pair[0]).ok_or_else(|| {
+            HandlerFailure::permanent(
+                "invalid_normalization",
+                "normalized SHA-256 digest is not hexadecimal",
+            )
+        })?;
+        let low = decode_hex_digit(pair[1]).ok_or_else(|| {
+            HandlerFailure::permanent(
+                "invalid_normalization",
+                "normalized SHA-256 digest is not hexadecimal",
+            )
+        })?;
+        digest.push((high << 4) | low);
+    }
+    Ok(digest)
+}
+
+fn decode_hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn source_record_for_request(request: &sooqa_inbox::IngestRequest) -> NewSourceRecordDraft {
+    let (source_type, normalized_url, platform, platform_content_id) = match request.kind {
+        IngestKind::Url => (SourceType::DirectUrl, Some(request.source_url.clone()), None, None),
+        IngestKind::TelegramMessage => (
+            SourceType::Telegram,
+            None,
+            Some("telegram".to_owned()),
+            Some(request.source_url.clone()),
+        ),
+        IngestKind::Upload => (
+            SourceType::Upload,
+            None,
+            Some("sooqa_ingest".to_owned()),
+            Some(request.id.to_string()),
+        ),
+    };
+    NewSourceRecordDraft {
+        ingest_request_id: Some(request.id),
+        source_type,
+        original_url: Some(request.source_url.clone()),
+        normalized_url,
+        platform,
+        platform_content_id,
+        author_name: None,
+        source_title: request.page_title.clone(),
+        source_description: request.supplied_caption.clone(),
+        source_published_at: None,
+        metadata_json: source_provenance_for_request(request),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SourceProvenance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_kind: Option<SourceMediaKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telegram_update_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telegram_chat_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telegram_message_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telegram_file_unique_id: Option<String>,
+}
+
+fn source_provenance_for_request(request: &sooqa_inbox::IngestRequest) -> serde_json::Value {
+    let input = &request.original_input;
+    let download = input.get("download");
+    let media_kind = request_media_kind(request);
+    let mime_type = if request.kind == IngestKind::Url {
+        download
+            .and_then(|value| value.get("mime_type"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    } else {
+        input.get("mime_type").and_then(serde_json::Value::as_str).map(ToOwned::to_owned)
+    };
+    let source_size_bytes = if request.kind == IngestKind::Url {
+        download.and_then(|value| value.get("bytes")).and_then(serde_json::Value::as_u64)
+    } else {
+        input.get("file_size").and_then(serde_json::Value::as_u64)
+    };
+    let provenance = SourceProvenance {
+        media_kind,
+        mime_type,
+        source_size_bytes,
+        telegram_update_id: input.get("telegram_update_id").and_then(serde_json::Value::as_i64),
+        telegram_chat_id: input.get("telegram_chat_id").and_then(serde_json::Value::as_i64),
+        telegram_message_id: input.get("telegram_message_id").and_then(serde_json::Value::as_i64),
+        telegram_file_unique_id: input
+            .get("telegram_file_unique_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+    };
+    serde_json::to_value(provenance).expect("source provenance is serializable")
+}
+
+fn map_library_error(error: LibraryRepositoryError) -> HandlerFailure {
+    let message = error.to_string();
+    match error {
+        LibraryRepositoryError::Database(_) => HandlerFailure::retryable("database_error", message),
+        _ => HandlerFailure::permanent("library_error", message),
+    }
+}
+
+async fn fail_finalization(
+    inbox: &InboxRepository,
+    ingest_request_id: uuid::Uuid,
+    job_attempt: &sooqa_jobs::JobAttempt,
+    failure: HandlerFailure,
+) -> Result<(), HandlerFailure> {
+    let status = if failure.retryable {
+        IngestStatus::FailedRetryable
+    } else {
+        IngestStatus::FailedTerminal
+    };
+    inbox
+        .fail_ingest_finalization(
+            ingest_request_id,
+            job_attempt,
+            status,
+            &failure.class,
+            &failure.message,
+        )
         .await
         .map_err(map_inbox_error)?;
     Err(failure)
@@ -534,7 +1119,11 @@ async fn download_source(
         .complete_source_download(
             ingest_request_id,
             &job_attempt,
-            SourceDownload { bytes: downloaded.bytes, mime_type: downloaded.mime_type },
+            SourceDownload {
+                bytes: downloaded.bytes,
+                mime_type: downloaded.mime_type,
+                media_kind: inspection.media_kind,
+            },
         )
         .await
         .map_err(map_inbox_error)?;
@@ -1030,5 +1619,19 @@ mod tests {
             validate_timing(Duration::from_secs(1), Duration::ZERO),
             Err(WorkerError::InvalidLeaseDuration)
         ));
+    }
+
+    #[test]
+    fn sha256_decoder_accepts_hex_and_rejects_malformed_utf8_without_panicking() {
+        let digest = decode_sha256(&"ab".repeat(32)).expect("hex digest should decode");
+        assert_eq!(digest, vec![0xab; 32]);
+
+        let malformed = "é".repeat(32);
+        let error = decode_sha256(&malformed).expect_err("non-ASCII digest should be rejected");
+        assert_eq!(error.class, "invalid_normalization");
+
+        let error = decode_sha256(&format!("{}g", "0".repeat(63)))
+            .expect_err("non-hex digest should be rejected");
+        assert_eq!(error.class, "invalid_normalization");
     }
 }

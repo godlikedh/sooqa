@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::normalize::requires_frame_rate_cap;
 use crate::publication::{TempArtifact, publish_or_reuse};
 use crate::{
-    CommandError, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommandRunner, FfprobeAdapter, FileDigest,
-    HashError, MediaProbe, MediaStreamKind, NormalizationPlan, ProbeError, sha256_file,
+    AudioCodec, CanonicalContainer, CommandError, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommandRunner,
+    FfprobeAdapter, FileDigest, HashError, MediaProbe, MediaStreamKind, NormalizationPlan,
+    PixelFormat, ProbeError, VideoCodec, sha256_file,
 };
 
 const MAX_PROGRESS_LINE_BYTES: usize = 4096;
@@ -215,7 +217,7 @@ impl FfmpegExecutor {
         }
 
         let probe = self.ffprobe.probe(output_path).await?;
-        validate_output_probe(&probe)?;
+        validate_output_probe(&probe, plan.profile())?;
         let digest = sha256_file(output_path).await?;
         Ok((progress, probe, digest))
     }
@@ -229,22 +231,57 @@ fn temporary_output_path(output: &Path) -> PathBuf {
     output.with_file_name(file_name)
 }
 
-fn validate_output_probe(probe: &MediaProbe) -> Result<(), NormalizationExecutionError> {
-    let is_mp4 = probe.container_format.as_deref().is_some_and(|value| {
-        value.split(',').any(|format| {
-            let format = format.trim();
-            format.eq_ignore_ascii_case("mp4") || format.eq_ignore_ascii_case("mov")
-        })
-    });
+fn validate_output_probe(
+    probe: &MediaProbe,
+    profile: crate::CanonicalVideoProfile,
+) -> Result<(), NormalizationExecutionError> {
+    let is_mp4 = matches!(profile.container, CanonicalContainer::Mp4)
+        && probe.container_format.as_deref().is_some_and(|value| {
+            value.split(',').any(|format| format.trim().eq_ignore_ascii_case("mp4"))
+        });
     if !is_mp4 {
         return Err(NormalizationExecutionError::InvalidOutputFormat {
             format: probe.container_format.clone(),
         });
     }
-    if !probe.streams.iter().any(|stream| stream.kind == MediaStreamKind::Video) {
-        return Err(NormalizationExecutionError::OutputHasNoVideo);
+    let video = probe
+        .streams
+        .iter()
+        .find(|stream| stream.kind == MediaStreamKind::Video)
+        .ok_or(NormalizationExecutionError::OutputHasNoVideo)?;
+    if video.codec.as_deref() != Some(VideoCodec::H264.probe_name()) {
+        return Err(invalid_output_profile("video codec is not H.264"));
+    }
+    if video.pixel_format.as_deref() != Some(PixelFormat::Yuv420p.ffmpeg_name()) {
+        return Err(invalid_output_profile("video pixel format is not yuv420p"));
+    }
+    if video
+        .width
+        .zip(video.height)
+        .is_none_or(|(width, height)| width > profile.max_width || height > profile.max_height)
+    {
+        return Err(invalid_output_profile("video dimensions exceed the canonical profile"));
+    }
+    if video.rotation_degrees.unwrap_or_default() != 0
+        || requires_frame_rate_cap(video, profile.max_frame_rate)
+    {
+        return Err(invalid_output_profile(
+            "video rotation or frame rate exceeds the canonical profile",
+        ));
+    }
+    if probe
+        .streams
+        .iter()
+        .filter(|stream| stream.kind == MediaStreamKind::Audio)
+        .any(|stream| stream.codec.as_deref() != Some(AudioCodec::Aac.probe_name()))
+    {
+        return Err(invalid_output_profile("audio codec is not AAC"));
     }
     Ok(())
+}
+
+fn invalid_output_profile(message: &'static str) -> NormalizationExecutionError {
+    NormalizationExecutionError::InvalidOutputProfile { message }
 }
 
 fn bounded_text(bytes: &[u8]) -> String {
@@ -293,6 +330,8 @@ pub enum NormalizationExecutionError {
     InvalidOutputFormat { format: Option<String> },
     #[error("normalized output contains no video stream")]
     OutputHasNoVideo,
+    #[error("normalized output does not satisfy the canonical profile: {message}")]
+    InvalidOutputProfile { message: &'static str },
     #[error("could not validate normalized output: {0}")]
     Probe(#[from] ProbeError),
     #[error("could not hash normalized output: {0}")]
@@ -497,6 +536,48 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ffmpeg_args.windows(2).any(|pair| pair == ["-progress", "pipe:1"]));
         tokio::fs::remove_file(output_path).await.expect("output should be removed");
+    }
+
+    #[tokio::test]
+    async fn rejects_output_that_does_not_match_the_canonical_profile() {
+        let output_path = std::env::temp_dir()
+            .join(format!("sooqa-invalid-normalized-{}.mp4", uuid::Uuid::new_v4()));
+        let invalid_probe = br#"{
+          "streams": [{
+            "index": 0,
+            "codec_type": "video",
+            "codec_name": "vp9",
+            "pix_fmt": "yuv420p",
+            "width": 320,
+            "height": 240,
+            "avg_frame_rate": "25/1"
+          }],
+          "format": {"format_name": "mp4", "duration": "1.0", "size": "16"}
+        }"#;
+        let runner = Arc::new(SequenceRunner::new(vec![
+            success(b"frame=25\nout_time_ms=1000000\nprogress=end\n"),
+            success(invalid_probe),
+        ]));
+        let ffprobe = FfprobeAdapter::with_runner(
+            "ffprobe",
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+        );
+        let executor = FfmpegExecutor::with_runner(
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            ffprobe,
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        let plan = planner().plan("input.mp4", &output_path, &probe()).expect("plan should build");
+
+        let error = executor
+            .execute(&plan, std::future::pending())
+            .await
+            .expect_err("invalid canonical output should be rejected");
+        assert!(matches!(error, NormalizationExecutionError::InvalidOutputProfile { .. }));
+        let _ = tokio::fs::remove_file(output_path).await;
     }
 
     #[tokio::test]

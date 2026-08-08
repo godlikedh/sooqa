@@ -35,8 +35,9 @@ just test-integration
 The `-- --ignored` part is intentional: Cargo uses the first `--` to stop
 parsing Cargo test options and passes `--ignored` to the test harness, which
 then runs tests marked `#[ignore]`. The integration recipe covers persistence,
-API ingest and library routes, worker behavior, source inspection, and source
-download handoff, and the probe-to-normalize durable handoff.
+API ingest and library routes, worker behavior, source inspection, source
+download handoff, probe-to-normalize handoff, fake-runner normalization,
+canonical library finalization, and the storage-upload job handoff.
 
 The current `teloxide` dependency graph also emits a known Rust
 future-incompatibility warning for the transitive `proc-macro-error2` crate
@@ -52,8 +53,9 @@ proc-macro-error2 v2.0.1
 ```
 
 The production worker uses direct HTTP for URL inspection, so it does not need
-an external binary for that path. The yt-dlp adapter is tested separately and
-is not enabled in the worker until its subprocess egress is isolated. Media
+an external binary for that path. The composed probe and normalization handlers
+require `ffprobe` and `ffmpeg`. The yt-dlp adapter is tested separately and is
+not enabled in the worker until its subprocess egress is isolated. Media
 integration tests that need locally installed binaries are separate:
 
 ```bash
@@ -62,6 +64,10 @@ just test-media
 
 CI installs ffmpeg for those tests. Normal unit tests use fake command runners
 and do not contact Telegram or third-party media sites.
+
+The current composed normalizer accepts video only. Image and audio ingests
+are intentionally recorded by probing and then fail terminally with
+`unsupported_media_kind` until their normalization paths are added.
 
 ## Telegram adapter
 

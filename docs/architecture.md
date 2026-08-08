@@ -78,8 +78,17 @@ its subprocess egress has an equivalent SSRF boundary.
 Media messages are downloaded into a per-update workspace, then create a
 Telegram ingest request and `probe_asset` job. The probe handler validates the
 shared workspace and uses ffprobe before recording typed probe metadata and
-atomically enqueuing the existing `normalize_asset` job. Normalization remains
-the next worker composition slice.
+atomically enqueuing the existing `normalize_asset` job. The normalization
+handler consumes that typed probe, executes the canonical video profile with
+ffmpeg, validates and hashes the published `normalized/canonical.mp4`, records
+typed normalization metadata, and atomically enqueues `finalize_ingest`. The
+finalization handler uses the existing exact-dedup/library repository to create
+or reuse the canonical content item, asset, and source record, then marks the
+ingest completed and leaves the existing storage-upload job queued for a
+capable Telegram worker.
+The composed normalizer is intentionally video-only: image and audio probes
+are recorded but finish terminally with `unsupported_media_kind` until their
+dedicated normalization slices are implemented.
 
 Storage uploads use an idempotency record as a durable intent bound to the
 asset, job, provider, storage chat, and upload generation. A reservation has
@@ -112,14 +121,14 @@ terminate the group with a short TERM grace period followed by KILL and reap
 the direct child. Non-Unix builds use the direct-child fallback until a native
 Job Object implementation is added.
 
-The current worker composition requires ffprobe. It does not preflight ffmpeg
-or yt-dlp until a handler requiring either tool is enabled. The container
-image includes all three tools and creates a writable `/var/lib/sooqa/work`.
+The current worker composition requires ffprobe and ffmpeg. It does not
+preflight yt-dlp until a handler requiring it is enabled. The container image
+includes all three tools and creates a writable `/var/lib/sooqa/work`.
 
 ## State of the pipeline
 
 Implemented primitives and boundaries do not imply an end-to-end publisher.
-The remaining composition work is normalization/finalization, review-facing
-library actions, and Telegram publication. The historical roadmap in
+The remaining composition work is fingerprinting/near-duplicate review,
+review-facing library actions, and Telegram publication. The historical roadmap in
 `docs/reference/PROJECT_SPEC.md` is useful context but is not the authority for
 those claims.

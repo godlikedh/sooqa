@@ -28,9 +28,9 @@ DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa \
 
 The worker discovers its registered job capabilities and preflights only the
 external binaries those handlers need. The composed source-inspection handler
-uses direct HTTP and needs no external binary; the probe handler needs
-`ffprobe`. yt-dlp is not enabled in the worker until its subprocess egress is
-isolated, and ffmpeg is not required until a normalization handler uses it.
+uses direct HTTP and needs no external binary; the probe and normalization
+handlers need `ffprobe` and `ffmpeg`. yt-dlp is not enabled in the worker until
+its subprocess egress is isolated.
 The worker also creates and writes a small check file in the work root before
 polling. The supplied container image installs ffmpeg, ffprobe, and yt-dlp and
 creates a writable `/var/lib/sooqa/work` for the non-root `sooqa` user.

@@ -15,6 +15,7 @@ sooqa-persistence = { path = "../../crates/persistence" }
 sooqa-runtime = { path = "../../crates/runtime" }
 sooqa-telegram = { path = "../../crates/telegram" }
 serde_json.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
