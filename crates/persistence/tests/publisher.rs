@@ -3,10 +3,10 @@ use std::env;
 use sooqa_library::{
     AssetRole, ContentKind, MediaKind, NewContentItem, NewMediaAsset, StorageState,
 };
-use sooqa_persistence::Database;
+use sooqa_persistence::{Database, post_draft_create_request_hash};
 use sooqa_publisher::{
     CooldownViolation, NewChannelPolicy, NewPostDraft, NewPublicationSchedule, NewTargetChannel,
-    PostDraftStatus, PostDraftUpdate, PublicationAttemptStatus,
+    PostDraftStatus, PostDraftUpdate, PublicationAttemptStatus, PublicationScheduleScope,
 };
 use time::Duration;
 use uuid::Uuid;
@@ -150,12 +150,62 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
     let replay = second.expect("concurrent schedule request should replay");
     assert_eq!(replay.id, schedule.id);
     assert_eq!(schedule.publish_at.nanosecond() % 1_000, 0);
+    sqlx::query("UPDATE publication_schedules SET idempotency_scope = 'legacy' WHERE id = $1")
+        .bind(schedule.id)
+        .execute(database.pool())
+        .await
+        .expect("legacy schedule fixture should be writable");
     let replay = database
         .publisher()
         .create_publication_schedule(schedule_request(&schedule, &key_prefix))
         .await
-        .expect("same schedule request should replay after commit");
+        .expect("legacy schedule request should replay after migration");
     assert_eq!(replay.id, schedule.id);
+    let legacy_publish_now = database
+        .publisher()
+        .create_publication_schedule_with_scope(
+            NewPublicationSchedule::try_new(
+                schedule.post_draft_id,
+                time::OffsetDateTime::now_utc(),
+                format!("{key_prefix}-schedule"),
+            )
+            .expect("legacy publish-now request should be valid"),
+            PublicationScheduleScope::PublishNow,
+        )
+        .await
+        .expect("legacy publish-now request should replay after migration");
+    assert_eq!(legacy_publish_now.id, schedule.id);
+    let legacy_draft_key = format!("{key_prefix}-legacy-draft");
+    sqlx::query(
+        r#"
+        INSERT INTO idempotency_records (
+            scope, idempotency_key, request_hash, resource_type, resource_id,
+            response_status, response_body
+        )
+        VALUES ('publisher:draft:create', $1, $2, 'post_draft', $3, 201, $4)
+        "#,
+    )
+    .bind(&legacy_draft_key)
+    .bind(vec![99_u8; 32])
+    .bind(draft.id)
+    .bind(serde_json::json!({"id": draft.id, "status": "editing"}))
+    .execute(database.pool())
+    .await
+    .expect("legacy draft idempotency fixture should insert");
+    let legacy_draft_replay = database
+        .publisher()
+        .replay_post_draft_create(
+            &legacy_draft_key,
+            &post_draft_create_request_hash(content.id, target.id, Some("caption"), Some("HTML")),
+            content.id,
+            target.id,
+            Some("caption"),
+            Some("HTML"),
+        )
+        .await
+        .expect("legacy draft idempotency should replay")
+        .expect("legacy draft should exist");
+    assert_eq!(legacy_draft_replay.id, draft.id);
     let due = database
         .publisher()
         .list_due_publication_schedules(time::OffsetDateTime::now_utc(), 10)
@@ -401,6 +451,11 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
         .execute(database.pool())
         .await
         .expect("published post should clean up");
+    sqlx::query("DELETE FROM idempotency_records WHERE scope = 'publisher:draft:create' AND idempotency_key = $1")
+        .bind(&legacy_draft_key)
+        .execute(database.pool())
+        .await
+        .expect("legacy draft idempotency fixture should clean up");
     sqlx::query("DELETE FROM publication_schedules WHERE id = $1")
         .bind(schedule.id)
         .execute(database.pool())

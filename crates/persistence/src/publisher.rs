@@ -227,6 +227,7 @@ impl PublisherRepository {
         request_hash: &[u8],
     ) -> Result<CreatePostDraftResult, PublisherRepositoryError> {
         let idempotency_key = normalize_idempotency_key(idempotency_key.into())?;
+        let legacy_request_hash = post_draft_legacy_request_hash(&new_draft);
         let draft_id = Uuid::now_v7();
         let mut transaction = self.pool.begin().await?;
         let inserted = sqlx::query_scalar::<_, Uuid>(
@@ -262,9 +263,16 @@ impl PublisherRepository {
             .fetch_one(&mut *transaction)
             .await?;
             if existing.request_hash.as_slice() != request_hash {
-                return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
+                if existing.request_hash.as_slice() != legacy_request_hash.as_slice() {
+                    return Err(PublisherRepositoryError::DraftIdempotencyConflict(
+                        idempotency_key,
+                    ));
+                }
+                let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
+                transaction.commit().await?;
+                return Ok(CreatePostDraftResult { draft, created: false });
             }
-            let draft = idempotency_draft_snapshot(&existing)?;
+            let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
             transaction.commit().await?;
             return Ok(CreatePostDraftResult { draft, created: false });
         }
@@ -308,6 +316,10 @@ impl PublisherRepository {
         &self,
         idempotency_key: &str,
         request_hash: &[u8],
+        content_item_id: Uuid,
+        target_channel_id: Uuid,
+        caption: Option<&str>,
+        parse_mode: Option<&str>,
     ) -> Result<Option<PostDraft>, PublisherRepositoryError> {
         let idempotency_key = normalize_idempotency_key(idempotency_key.to_owned())?;
         let mut transaction = self.pool.begin().await?;
@@ -328,9 +340,20 @@ impl PublisherRepository {
             return Ok(None);
         };
         if existing.request_hash.as_slice() != request_hash {
-            return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
+            let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
+            if !legacy_create_request_matches(
+                &draft,
+                content_item_id,
+                target_channel_id,
+                caption,
+                parse_mode,
+            ) {
+                return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
+            }
+            transaction.commit().await?;
+            return Ok(Some(draft));
         }
-        let draft = idempotency_draft_snapshot(&existing)?;
+        let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
         transaction.commit().await?;
         Ok(Some(draft))
     }
@@ -410,7 +433,7 @@ impl PublisherRepository {
             {
                 return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
             }
-            let draft = idempotency_draft_snapshot(&existing)?;
+            let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
             transaction.commit().await?;
             return Ok(draft);
         }
@@ -455,7 +478,7 @@ impl PublisherRepository {
         if existing.request_hash.as_slice() != request_hash {
             return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
         }
-        let draft = idempotency_draft_snapshot(&existing)?;
+        let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
         transaction.commit().await?;
         Ok(Some(draft))
     }
@@ -501,6 +524,28 @@ impl PublisherRepository {
             "#,
         )
         .bind(scope.as_str())
+        .bind(&schedule.idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            if !schedule_request_matches(&existing, &schedule, scope) {
+                return Err(PublisherRepositoryError::ScheduleIdempotencyConflict(
+                    schedule.idempotency_key,
+                ));
+            }
+            transaction.commit().await?;
+            return existing.into_publication_schedule();
+        }
+        if let Some(existing) = sqlx::query_as::<_, PublicationScheduleRow>(
+            r#"
+            SELECT id, post_draft_id, status, publish_at, not_before, not_after,
+                   priority, cooldown_override, idempotency_scope, idempotency_key,
+                   created_at, updated_at
+            FROM publication_schedules
+            WHERE idempotency_scope = 'legacy' AND idempotency_key = $1
+            FOR UPDATE
+            "#,
+        )
         .bind(&schedule.idempotency_key)
         .fetch_optional(&mut *transaction)
         .await?
@@ -1099,8 +1144,45 @@ fn idempotency_draft_snapshot(
     Ok(serde_json::from_value(body)?)
 }
 
+async fn idempotency_draft_snapshot_or_load(
+    transaction: &mut Transaction<'_, Postgres>,
+    record: &IdempotencyResourceRow,
+) -> Result<PostDraft, PublisherRepositoryError> {
+    match idempotency_draft_snapshot(record) {
+        Ok(draft) => Ok(draft),
+        Err(_) => {
+            let draft_id =
+                record.resource_id.ok_or(PublisherRepositoryError::IncompleteIdempotencyRecord)?;
+            load_post_draft(transaction, draft_id).await
+        }
+    }
+}
+
+fn legacy_create_request_matches(
+    draft: &PostDraft,
+    content_item_id: Uuid,
+    target_channel_id: Uuid,
+    caption: Option<&str>,
+    parse_mode: Option<&str>,
+) -> bool {
+    draft.content_item_id == content_item_id
+        && draft.target_channel_id == target_channel_id
+        && draft.caption.as_deref() == caption
+        && parse_mode.is_none_or(|parse_mode| draft.parse_mode.as_deref() == Some(parse_mode))
+}
+
 fn hash_uuid(hasher: &mut Sha256, value: Uuid) {
     hasher.update(value.as_bytes());
+}
+
+fn post_draft_legacy_request_hash(draft: &NewPostDraft) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hash_uuid(&mut hasher, draft.content_item_id);
+    hash_uuid(&mut hasher, draft.asset_id);
+    hash_uuid(&mut hasher, draft.target_channel_id);
+    hash_optional_string(&mut hasher, draft.caption.as_deref());
+    hash_optional_string(&mut hasher, draft.parse_mode.as_deref());
+    hasher.finalize().to_vec()
 }
 
 fn hash_optional_string(hasher: &mut Sha256, value: Option<&str>) {

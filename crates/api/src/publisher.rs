@@ -48,7 +48,14 @@ async fn create_draft(
     );
     if let Some(draft) = state
         .publisher
-        .replay_post_draft_create(&idempotency_key, &request_hash)
+        .replay_post_draft_create(
+            &idempotency_key,
+            &request_hash,
+            payload.content_item_id,
+            payload.target_channel_id,
+            caption.as_deref(),
+            requested_parse_mode.as_deref(),
+        )
         .await
         .map_err(|error| map_publisher_error(error, &headers))?
     {
@@ -415,6 +422,9 @@ fn validate_caption(
 }
 
 fn valid_html_markup(value: &str) -> bool {
+    if !valid_html_entities(value) {
+        return false;
+    }
     let mut open_tags = Vec::new();
     let mut cursor = 0;
     while let Some(relative_start) = value[cursor..].find('<') {
@@ -444,6 +454,12 @@ fn valid_html_markup(value: &str) -> bool {
             let name = &tag[..name_end];
             let attributes = tag[name_end..].trim();
             let name = name.to_ascii_lowercase();
+            if name == "code"
+                && !attributes.is_empty()
+                && open_tags.last().map(String::as_str) != Some("pre")
+            {
+                return false;
+            }
             if !matches!(
                 name.as_str(),
                 "b" | "strong"
@@ -487,6 +503,24 @@ fn html_tag_end(value: &str, start: usize) -> Option<usize> {
     None
 }
 
+fn valid_html_entities(value: &str) -> bool {
+    let mut cursor = 0;
+    while let Some(relative_start) = value[cursor..].find('&') {
+        let start = cursor + relative_start;
+        let entity = &value[start..];
+        if !["&lt;", "&gt;", "&amp;", "&quot;"].iter().any(|allowed| entity.starts_with(allowed)) {
+            return false;
+        }
+        let length = ["&lt;", "&gt;", "&amp;", "&quot;"]
+            .iter()
+            .find(|allowed| entity.starts_with(**allowed))
+            .map(|allowed| allowed.len())
+            .expect("allowed HTML entity should have a length");
+        cursor = start + length;
+    }
+    true
+}
+
 fn valid_html_attributes(name: &str, attributes: &str) -> bool {
     match name {
         "a" => {
@@ -507,7 +541,8 @@ fn valid_html_attributes(name: &str, attributes: &str) -> bool {
                     || value.starts_with("tg://"))
         }
         "span" => attributes == "class=\"tg-spoiler\"" || attributes == "class='tg-spoiler'",
-        "code" | "pre" => attributes.is_empty() || valid_language_attribute(attributes),
+        "code" => attributes.is_empty() || valid_language_attribute(attributes),
+        "pre" => attributes.is_empty(),
         _ => attributes.is_empty(),
     }
 }
@@ -592,7 +627,7 @@ fn valid_markdown_v2(value: &str) -> bool {
                 index += 1;
                 continue;
             }
-            link_url_allowed = false;
+            return false;
         }
 
         if character == '\\' {
@@ -640,7 +675,7 @@ fn valid_markdown_v2(value: &str) -> bool {
         }
         index += 1;
     }
-    delimiters.is_empty()
+    !link_url_allowed && delimiters.is_empty()
 }
 
 fn toggle_delimiter<T: PartialEq>(delimiters: &mut Vec<T>, delimiter: T) {
@@ -787,9 +822,12 @@ mod tests {
     fn validates_balanced_telegram_html() {
         assert!(valid_html_markup("<b>bold</b> <a href=\"https://example.test\">link</a>"));
         assert!(valid_html_markup("<pre><code class=\"language-rust\">*literal*</code></pre>"));
+        assert!(valid_html_markup("escaped &lt;tag&gt; &amp; &quot;quote&quot;"));
         assert!(!valid_html_markup("<b>unclosed"));
         assert!(!valid_html_markup("<b>mismatched</i>"));
         assert!(!valid_html_markup("<script>unsafe</script>"));
+        assert!(!valid_html_markup("unknown &entity;"));
+        assert!(!valid_html_markup("<code class=\"language-rust\">standalone</code>"));
     }
 
     #[test]
@@ -798,6 +836,7 @@ mod tests {
         assert!(valid_markdown_v2("escaped \\* punctuation"));
         assert!(valid_markdown_v2("`*literal*`"));
         assert!(!valid_markdown_v2("*unclosed"));
+        assert!(!valid_markdown_v2("[link]"));
         assert!(!valid_markdown_v2("plain - dash"));
         assert!(!valid_markdown_v2("trailing escape\\"));
     }
