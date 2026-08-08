@@ -15,6 +15,8 @@ tags:
     description: Search and editorial Library operations
   - name: duplicate-candidates
     description: Review perceptual duplicate candidates
+  - name: publisher
+    description: Post drafts and durable publication schedules
 paths:
   /api/v1/ingest-requests:
     post:
@@ -75,6 +77,175 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/post-drafts:
+    post:
+      tags: [publisher]
+      operationId: createPostDraft
+      summary: Create a publication draft
+      description: Creates a draft from an active Library item whose canonical asset is already stored.
+      security:
+        - bearerAuth: []
+      x-required-scope: publisher:write
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PostDraftCreateRequest'
+      responses:
+        '201':
+          description: Publication draft created or replayed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostDraft'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/post-drafts/{id}:
+    get:
+      tags: [publisher]
+      operationId: getPostDraft
+      summary: Get a publication draft
+      security:
+        - bearerAuth: []
+      x-required-scope: publisher:read
+      parameters:
+        - $ref: '#/components/parameters/PostDraftId'
+      responses:
+        '200':
+          description: Publication draft
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostDraft'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      tags: [publisher]
+      operationId: updatePostDraft
+      summary: Edit or ready a publication draft
+      security:
+        - bearerAuth: []
+      x-required-scope: publisher:write
+      parameters:
+        - $ref: '#/components/parameters/PostDraftId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PostDraftUpdateRequest'
+      responses:
+        '200':
+          description: Updated publication draft
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostDraft'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/post-drafts/{id}/schedule:
+    post:
+      tags: [publisher]
+      operationId: schedulePostDraft
+      summary: Schedule a ready publication draft
+      security:
+        - bearerAuth: []
+      x-required-scope: publisher:write
+      parameters:
+        - $ref: '#/components/parameters/PostDraftId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublicationScheduleRequest'
+      responses:
+        '202':
+          description: Durable publication schedule created or replayed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicationSchedule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/post-drafts/{id}/publish-now:
+    post:
+      tags: [publisher]
+      operationId: publishPostDraftNow
+      summary: Publish a ready draft immediately
+      description: Creates a due publication schedule; Telegram delivery is performed by a later worker slice.
+      security:
+        - bearerAuth: []
+      x-required-scope: publisher:write
+      parameters:
+        - $ref: '#/components/parameters/PostDraftId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: Durable immediate publication schedule created or replayed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicationSchedule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/InternalError'
   /api/v1/library/items:
@@ -478,6 +649,13 @@ components:
       schema:
         type: string
         format: uuid
+    PostDraftId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
   responses:
     BadRequest:
       description: Invalid request
@@ -522,6 +700,158 @@ components:
           schema:
             $ref: '#/components/schemas/ApiErrorEnvelope'
   schemas:
+    PostDraftCreateRequest:
+      type: object
+      required: [content_item_id, target_channel_id]
+      additionalProperties: false
+      properties:
+        content_item_id:
+          type: string
+          format: uuid
+        target_channel_id:
+          type: string
+          format: uuid
+        caption:
+          type: string
+          maxLength: 1024
+          nullable: true
+        parse_mode:
+          type: string
+          enum: [HTML, MarkdownV2]
+          nullable: true
+    PostDraftUpdateRequest:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        caption:
+          type: string
+          maxLength: 1024
+          nullable: true
+        parse_mode:
+          type: string
+          enum: [HTML, MarkdownV2]
+          nullable: true
+        status:
+          type: string
+          enum: [editing, ready, cancelled]
+        expected_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+    PostDraft:
+      type: object
+      required:
+        - id
+        - content_item_id
+        - asset_id
+        - target_channel_id
+        - caption
+        - parse_mode
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        content_item_id:
+          type: string
+          format: uuid
+        asset_id:
+          type: string
+          format: uuid
+        target_channel_id:
+          type: string
+          format: uuid
+        caption:
+          type: string
+          nullable: true
+        parse_mode:
+          type: string
+          enum: [HTML, MarkdownV2]
+          nullable: true
+        status:
+          type: string
+          enum: [editing, ready, scheduled, published, cancelled]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    PublicationScheduleRequest:
+      type: object
+      required: [publish_at]
+      additionalProperties: false
+      properties:
+        publish_at:
+          type: string
+          format: date-time
+        not_before:
+          type: string
+          format: date-time
+          nullable: true
+        not_after:
+          type: string
+          format: date-time
+          nullable: true
+        priority:
+          type: integer
+          format: int32
+          default: 0
+        cooldown_override:
+          type: boolean
+          nullable: true
+    PublicationSchedule:
+      type: object
+      required:
+        - id
+        - post_draft_id
+        - status
+        - publish_at
+        - not_before
+        - not_after
+        - priority
+        - cooldown_override
+        - idempotency_key
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        post_draft_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, queued, publishing, published, failed, unknown, cancelled]
+        publish_at:
+          type: string
+          format: date-time
+        not_before:
+          type: string
+          format: date-time
+          nullable: true
+        not_after:
+          type: string
+          format: date-time
+          nullable: true
+        priority:
+          type: integer
+          format: int32
+        cooldown_override:
+          type: boolean
+          nullable: true
+        idempotency_key:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
     DuplicateCandidateListResponse:
       type: object
       required: [items]

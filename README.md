@@ -19,8 +19,9 @@ The repository currently provides:
   Telegram storage-upload intent flow;
 - an explicit storage-intent reconciliation CLI for ambiguous Telegram
   uploads.
-- Publisher foundation persistence for target channels, channel policies, post
-  drafts, publication schedules, attempts, and published-post history.
+- Authenticated Publisher draft and schedule API backed by target channels,
+  channel policies, post drafts, publication schedules, attempts, and
+  published-post history.
 
 The composed worker registers `inspect_source` with the SSRF-hardened direct
 HTTP adapter, `download_source` into the shared media workspace, `probe_asset`,
@@ -33,7 +34,7 @@ image artifact (plus an image thumbnail) and queues `finalize_ingest`;
 finalization creates or reuses the canonical library rows, fingerprints videos
 using the existing ingest JSON metadata, scores them against completed videos,
 and writes duplicate candidates using the existing schema. Storage upload and
-the Publisher foundation remain separate boundaries; Telegram publication
+the Publisher persistence remains a separate boundary; Telegram publication
 itself is not enabled yet.
 
 Active documentation is the authority for current behavior:

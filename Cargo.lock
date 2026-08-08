@@ -2052,6 +2052,7 @@ dependencies = [
  "sooqa-inbox",
  "sooqa-library",
  "sooqa-persistence",
+ "sooqa-publisher",
  "sqlx",
  "time",
  "tokio",

@@ -18,10 +18,14 @@ schedule, attempt, and published-post tables. Migration 0012 adds the default
 used by the running-attempt repository path while preserving upgrades from
 databases that already applied 0011. Migration 0013 adds ambiguous-publication
 state, one-running-attempt protection, and database-level asset/content
-ownership constraints. Deploy all forward migrations before deploying code
-that relies on those columns or tables. These Publisher tables are durable
-foundation only; the scheduler and Telegram publication handler are not
-enabled yet.
+ownership constraints. Migration 0014 separates schedule and publish-now
+idempotency scopes without changing caller keys. Migration 0015 preserves
+pre-scope schedules as legacy rows because their original command cannot be
+reconstructed. Migration 0016 snapshots pre-existing draft idempotency
+responses before the new immutable replay path is deployed. Deploy all forward
+migrations before deploying code that relies on those columns or tables. The
+Publisher API now creates drafts and durable schedules; the scheduler and
+Telegram publication handler are not enabled yet.
 
 ## Worker
 

@@ -17,7 +17,10 @@ pub use inbox::{
 };
 pub use jobs::{JobRepository, JobRepositoryError};
 pub use library::{LibraryRepository, LibraryRepositoryError, StoredVideoFingerprint};
-pub use publisher::{PublisherRepository, PublisherRepositoryError};
+pub use publisher::{
+    CreatePostDraftResult, PublisherRepository, PublisherRepositoryError,
+    post_draft_create_request_hash, post_draft_update_request_hash,
+};
 pub use telegram::{
     TelegramRepository, TelegramRepositoryError, TelegramUpdateClaim, TelegramUpdateClaimResult,
     TelegramUpdateReceipt,

@@ -2,6 +2,7 @@
 
 mod duplicate_candidates;
 mod library;
+mod publisher;
 
 use std::time::Duration;
 
@@ -19,7 +20,8 @@ use sooqa_inbox::{
 };
 use sooqa_persistence::{
     DeviceToken, DeviceTokenRepository, DeviceTokenRepositoryError, InboxRepository,
-    InboxRepositoryError, LibraryRepository, LibraryRepositoryError,
+    InboxRepositoryError, LibraryRepository, LibraryRepositoryError, PublisherRepository,
+    PublisherRepositoryError,
 };
 use time::OffsetDateTime;
 use tower_http::{
@@ -48,6 +50,7 @@ pub struct ApiState {
     inbox: InboxRepository,
     device_tokens: DeviceTokenRepository,
     library: LibraryRepository,
+    publisher: PublisherRepository,
 }
 
 impl ApiState {
@@ -55,8 +58,9 @@ impl ApiState {
         inbox: InboxRepository,
         device_tokens: DeviceTokenRepository,
         library: LibraryRepository,
+        publisher: PublisherRepository,
     ) -> Self {
-        Self { inbox, device_tokens, library }
+        Self { inbox, device_tokens, library, publisher }
     }
 }
 
@@ -67,6 +71,7 @@ pub fn router(settings: ApiSettings, state: ApiState) -> Router {
         .route("/api/v1/ingest-requests/{id}", get(get_ingest))
         .merge(library::routes())
         .merge(duplicate_candidates::routes())
+        .merge(publisher::routes())
         .with_state(state);
 
     add_layers(router, settings)
@@ -318,6 +323,100 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
         }
         error => {
             error!(error = %error, "library API repository operation failed");
+            ApiError::internal(headers)
+        }
+    }
+}
+
+fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> ApiError {
+    match error {
+        PublisherRepositoryError::TargetChannelMissing(_) => ApiError::not_found(
+            "target_channel_not_found",
+            "The target channel was not found",
+            headers,
+        ),
+        PublisherRepositoryError::TargetChannelDisabled(_) => {
+            ApiError::conflict("target_channel_disabled", "The target channel is disabled", headers)
+        }
+        PublisherRepositoryError::PostDraftMissing(_) => {
+            ApiError::not_found("post_draft_not_found", "The post draft was not found", headers)
+        }
+        PublisherRepositoryError::ContentItemMissing(_) => {
+            ApiError::not_found("library_item_not_found", "The library item was not found", headers)
+        }
+        PublisherRepositoryError::ContentItemNotPublishable { .. }
+        | PublisherRepositoryError::CanonicalAssetMismatch { .. }
+        | PublisherRepositoryError::AssetNotPublishable { .. } => ApiError::conflict(
+            "asset_not_publishable",
+            "The library item is not ready for publication",
+            headers,
+        ),
+        PublisherRepositoryError::ScheduleMissing(_) => ApiError::not_found(
+            "publication_schedule_not_found",
+            "The publication schedule was not found",
+            headers,
+        ),
+        PublisherRepositoryError::DraftNotReady { .. } => ApiError::conflict(
+            "draft_not_ready",
+            "The post draft must be ready before it can be scheduled",
+            headers,
+        ),
+        PublisherRepositoryError::OptimisticConflict(_) => ApiError::conflict(
+            "post_draft_changed",
+            "The post draft changed since it was read",
+            headers,
+        ),
+        PublisherRepositoryError::DraftIdempotencyConflict(_)
+        | PublisherRepositoryError::ScheduleIdempotencyConflict(_) => ApiError::conflict(
+            "idempotency_conflict",
+            "The Idempotency-Key payload conflicts with the original request",
+            headers,
+        ),
+        PublisherRepositoryError::InvalidScheduleState { .. }
+        | PublisherRepositoryError::ManagedScheduleTransitionRequired { .. } => ApiError::conflict(
+            "invalid_publication_state",
+            "The publication schedule cannot be changed in its current state",
+            headers,
+        ),
+        PublisherRepositoryError::Validation(validation) => match validation {
+            sooqa_publisher::PublisherValidationError::EmptyIdempotencyKey
+            | sooqa_publisher::PublisherValidationError::IdempotencyKeyTooLong { .. } => {
+                ApiError::bad_request(
+                    "invalid_idempotency_key",
+                    "The Idempotency-Key header must be between 1 and 255 characters",
+                    headers,
+                )
+            }
+            sooqa_publisher::PublisherValidationError::InvalidScheduleWindow => {
+                ApiError::bad_request(
+                    "invalid_schedule_window",
+                    "The publication schedule window is invalid",
+                    headers,
+                )
+            }
+            sooqa_publisher::PublisherValidationError::InvalidStatusTransition { .. } => {
+                ApiError::conflict(
+                    "invalid_post_draft_state",
+                    "The post draft cannot transition to the requested state",
+                    headers,
+                )
+            }
+            _ => ApiError::bad_request(
+                "invalid_publication_request",
+                "The publication request is invalid",
+                headers,
+            ),
+        },
+        PublisherRepositoryError::InvalidLimit(_) => {
+            ApiError::bad_request("invalid_limit", "The limit must be between 1 and 100", headers)
+        }
+        PublisherRepositoryError::AssetContentMismatch { .. } => ApiError::conflict(
+            "asset_content_mismatch",
+            "The selected asset does not belong to the content item",
+            headers,
+        ),
+        error => {
+            error!(error = %error, "publisher API repository operation failed");
             ApiError::internal(headers)
         }
     }

@@ -108,6 +108,7 @@ fn app_with_settings(fixture: &Fixture, settings: ApiSettings) -> axum::Router {
             fixture.database.inbox(),
             fixture.database.device_tokens(),
             fixture.database.library(),
+            fixture.database.publisher(),
         ),
     )
 }

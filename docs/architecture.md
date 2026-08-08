@@ -122,29 +122,32 @@ creates a new upload generation with a new idempotency key. Attach accepts only
 Telegram result fields and derives the asset, provider, and media kind from
 the locked durable intent and canonical asset.
 
-## Publisher foundation
+## Publisher API and foundation
 
-The Publisher boundary now has durable state for the next composition slice:
+The Publisher boundary now exposes authenticated draft and scheduling commands on
+top of durable state:
 
 ```mermaid
 flowchart LR
-    CONTENT[(Library content + assets)] --> DRAFT[Post draft]
+    CONTENT[(Library content + assets)] --> API[Publisher HTTP API]
+    API --> DRAFT[Post draft]
     CHANNEL[Target channel] --> POLICY[Channel policy]
     DRAFT --> SCHEDULE[Publication schedule]
     SCHEDULE --> ATTEMPT[Publication attempt history]
     SCHEDULE --> POST[Published post history]
 ```
 
-Persistence validates the draft's asset/content relationship, restricts draft
-and schedule state transitions, atomically moves a ready draft to scheduled,
-and preserves schedule creation idempotency by request key. Due schedules are
-ordered durably; publication attempts retain Telegram request keys and
+The API requires `publisher:read` or `publisher:write`, checks that content is
+active with an uploaded canonical asset, and checks that the target channel is
+enabled. Draft create/edit commands use the shared `idempotency_records` table;
+schedule commands use the schedule's durable idempotency key. Editing uses the
+existing optimistic `updated_at` field, and ready drafts are atomically moved to
+scheduled by persistence. No HTTP command calls Telegram: the remaining
+composition is the due scheduler and Telegram publication handler. Due schedules
+are ordered durably; publication attempts retain Telegram request keys and
 responses, and an ambiguous result moves the schedule out of the automatic
 retry queue until it is explicitly reconciled. Successful publication records
 the attempt, schedule, draft, and Telegram message history in one transaction.
-The remaining composition is the draft/schedule API, a scheduler, and a
-Telegram publication handler; no network publication happens in this
-foundation slice.
 
 ## Filesystem and subprocess safety
 

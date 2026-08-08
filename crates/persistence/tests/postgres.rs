@@ -56,6 +56,7 @@ async fn migrations_are_idempotent_and_create_core_tables() {
         "publication_schedules_due_idx",
         "publication_attempts_schedule_idx",
         "publication_attempts_running_schedule_idx",
+        "publication_schedules_idempotency_idx",
         "published_posts_content_channel_idx",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
@@ -65,6 +66,17 @@ async fn migrations_are_idempotent_and_create_core_tables() {
             .expect("index existence query should succeed");
         assert!(exists, "expected index {} to exist", index);
     }
+
+    let idempotency_scope_default: String = sqlx::query_scalar(
+        "SELECT column_default FROM information_schema.columns WHERE table_name = 'publication_schedules' AND column_name = 'idempotency_scope'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("idempotency scope default should be queryable");
+    assert!(
+        idempotency_scope_default.contains("legacy"),
+        "pre-scope schedule rows must remain replayable as legacy records"
+    );
 }
 
 #[tokio::test]
