@@ -53,10 +53,11 @@ proc-macro-error2 v2.0.1
 ```
 
 The production worker uses direct HTTP for URL inspection, so it does not need
-an external binary for that path. The composed probe and normalization handlers
-require `ffprobe` and `ffmpeg`. The yt-dlp adapter is tested separately and is
-not enabled in the worker until its subprocess egress is isolated. Media
-integration tests that need locally installed binaries are separate:
+an external binary for that path. The composed probe, normalization, and video
+fingerprint handlers require `ffprobe` and `ffmpeg`. The yt-dlp adapter is
+tested separately and is not enabled in the worker until its subprocess egress
+is isolated. Media integration tests that need locally installed binaries are
+separate:
 
 ```bash
 just test-media
@@ -72,7 +73,10 @@ normalization reuses existing outputs only when their encoded bytes match the
 current input and profile. Image finalization records both canonical and
 thumbnail assets. Telegram documents with missing or generic metadata are
 downloaded for probing; explicitly unsupported document metadata is rejected
-at the adapter boundary. Audio,
+at the adapter boundary. Finalization uses the existing ingest JSON metadata
+to queue the versioned `frame_dhash_v1` video fingerprint job without a schema
+migration. Videos persist their fingerprint after frame extraction; images skip
+the video-only stage and complete normally. Audio,
 animation, and unknown media are intentionally recorded by probing and then
 fail terminally with `unsupported_media_kind` until their normalization paths
 are added.

@@ -1,4 +1,4 @@
-use serde_json::json;
+use serde_json::{Value, json};
 use sooqa_inbox::{
     AssetNormalization, IngestFinalization, IngestKind, IngestRequest, IngestStateError,
     IngestStatus, IngestSubmission, SourceDownload, SourceInspection, SourceMediaKind,
@@ -452,6 +452,81 @@ impl InboxRepository {
             request.original_input =
                 json!({ "source": request.original_input, "finalization": finalization });
         }
+        request.transition_to(IngestStatus::Fingerprinting)?;
+        request.error_code = None;
+        request.error_message = None;
+        request.completed_at = None;
+        request.updated_at = OffsetDateTime::now_utc();
+        sqlx::query(
+            "UPDATE ingest_requests SET original_input = $2, updated_at = $3 WHERE id = $1",
+        )
+        .bind(request.id)
+        .bind(&request.original_input)
+        .bind(request.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        update_ingest_state(&mut transaction, &request).await?;
+        insert_fingerprint_job(&mut transaction, &request).await?;
+        transaction.commit().await?;
+        Ok(request)
+    }
+
+    pub async fn begin_ingest_fingerprinting(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+    ) -> Result<IngestFingerprintStart, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        let start = if request.original_input.get("fingerprint").is_some()
+            || !lock_current_job_attempt(&mut transaction, attempt).await?
+        {
+            IngestFingerprintStart::AlreadyAdvanced(request)
+        } else {
+            match request.status {
+                IngestStatus::Fingerprinting => IngestFingerprintStart::Ready(request),
+                IngestStatus::FailedRetryable => {
+                    request.transition_to(IngestStatus::Fingerprinting)?;
+                    request.error_code = None;
+                    request.error_message = None;
+                    request.completed_at = None;
+                    request.updated_at = OffsetDateTime::now_utc();
+                    update_ingest_state(&mut transaction, &request).await?;
+                    IngestFingerprintStart::Ready(request)
+                }
+                _ => IngestFingerprintStart::AlreadyAdvanced(request),
+            }
+        };
+        transaction.commit().await?;
+        Ok(start)
+    }
+
+    pub async fn complete_ingest_fingerprint(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+        fingerprint: Option<Value>,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        if request.status != IngestStatus::Fingerprinting
+            || request.original_input.get("fingerprint").is_some()
+            || !lock_current_job_attempt(&mut transaction, attempt).await?
+        {
+            transaction.commit().await?;
+            return Ok(request);
+        }
+
+        if let Some(fingerprint) = fingerprint {
+            if let Some(object) = request.original_input.as_object_mut() {
+                object.insert("fingerprint".to_owned(), fingerprint);
+            } else {
+                request.original_input = json!({
+                    "source": request.original_input,
+                    "fingerprint": fingerprint,
+                });
+            }
+        }
         request.transition_to(IngestStatus::Completed)?;
         request.error_code = None;
         request.error_message = None;
@@ -468,6 +543,28 @@ impl InboxRepository {
         update_ingest_state(&mut transaction, &request).await?;
         transaction.commit().await?;
         Ok(request)
+    }
+
+    pub async fn fail_ingest_fingerprint(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+        status: IngestStatus,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        self.fail_ingest_step(
+            id,
+            status,
+            error_code,
+            error_message,
+            IngestFailureGuard {
+                ignore_completed_download: false,
+                attempt: Some(attempt),
+                expected_status: Some(IngestStatus::Fingerprinting),
+            },
+        )
+        .await
     }
 
     pub async fn fail_ingest_finalization(
@@ -712,6 +809,12 @@ pub enum IngestFinalizationStart {
     AlreadyAdvanced(IngestRequest),
 }
 
+#[derive(Debug, Clone)]
+pub enum IngestFingerprintStart {
+    Ready(IngestRequest),
+    AlreadyAdvanced(IngestRequest),
+}
+
 struct IngestFailureGuard<'a> {
     ignore_completed_download: bool,
     attempt: Option<&'a JobAttempt>,
@@ -860,6 +963,26 @@ async fn insert_finalize_job(
     .bind(job.job_type().as_str())
     .bind(job.payload_json())
     .bind(format!("ingest:{}:finalize_ingest:v1", request.id))
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn insert_fingerprint_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &IngestRequest,
+) -> Result<(), sqlx::Error> {
+    let job = NewJob::compute_fingerprint(request.id);
+    sqlx::query(
+        r#"
+        INSERT INTO jobs (job_type, payload_json, idempotency_key)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+        "#,
+    )
+    .bind(job.job_type().as_str())
+    .bind(job.payload_json())
+    .bind(format!("ingest:{}:compute_fingerprint:v1", request.id))
     .execute(&mut **transaction)
     .await?;
     Ok(())

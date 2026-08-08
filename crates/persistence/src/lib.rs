@@ -11,7 +11,8 @@ pub use device_tokens::{
 };
 pub use inbox::{
     AssetNormalizationStart, AssetProbeStart, CreateIngestResult, InboxRepository,
-    InboxRepositoryError, IngestFinalizationStart, SourceDownloadStart, SourceInspectionStart,
+    InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart, SourceDownloadStart,
+    SourceInspectionStart,
 };
 pub use jobs::{JobRepository, JobRepositoryError};
 pub use library::{LibraryRepository, LibraryRepositoryError};

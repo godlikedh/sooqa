@@ -6,17 +6,17 @@ use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
 use sooqa_jobs::JobType;
 use sooqa_media::{
     BinaryCheck, CanonicalImageProfile, CanonicalVideoProfile, DirectHttpDownloader,
-    DownloadLimits, FfmpegExecutor, FfprobeAdapter, ImageNormalizer, MediaWorkspace,
-    NormalizationPlanner, ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter,
-    diagnose_binaries,
+    DownloadLimits, FfmpegExecutor, FfprobeAdapter, FrameExtractor, ImageNormalizer,
+    MediaWorkspace, NormalizationPlanner, ProcessCommandRunner, SourceDownloader,
+    SourceDownloaderRouter, diagnose_binaries,
 };
 use sooqa_persistence::Database;
 use uuid::Uuid;
 
 use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
 use sooqa_worker::{
-    HandlerRegistry, Worker, download_source_handler, finalize_ingest_handler,
-    inspect_source_handler, normalize_asset_handler, probe_asset_handler,
+    HandlerRegistry, Worker, compute_fingerprint_handler, download_source_handler,
+    finalize_ingest_handler, inspect_source_handler, normalize_asset_handler, probe_asset_handler,
     upload_storage_asset_handler,
 };
 
@@ -85,6 +85,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     handlers.register(JobType::NormalizeAsset, move |job| normalize_handler(job));
     tracing::info!("asset normalization handler enabled");
+    let fingerprint_handler = compute_fingerprint_handler(
+        database.inbox(),
+        config.media.work_root.clone(),
+        FrameExtractor::new(config.media.ffmpeg_path.clone(), Duration::from_secs(300)),
+    );
+    handlers.register(JobType::ComputeFingerprint, move |job| fingerprint_handler(job));
+    tracing::info!("video fingerprint handler enabled");
     let finalize_handler = finalize_ingest_handler(database.inbox(), database.library());
     handlers.register(JobType::FinalizeIngest, move |job| finalize_handler(job));
     tracing::info!("ingest finalization handler enabled");

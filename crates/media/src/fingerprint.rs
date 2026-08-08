@@ -138,11 +138,21 @@ impl FrameExtractor {
         input_name: &str,
         duration_ms: u64,
     ) -> Result<FrameExtractionResult, FrameExtractionError> {
+        self.extract_from_area(workspace, WorkspaceArea::Source, input_name, duration_ms).await
+    }
+
+    pub async fn extract_from_area(
+        &self,
+        workspace: &MediaWorkspace,
+        area: WorkspaceArea,
+        input_name: &str,
+        duration_ms: u64,
+    ) -> Result<FrameExtractionResult, FrameExtractionError> {
         if duration_ms == 0 {
             return Err(FrameExtractionError::InvalidDuration);
         }
         workspace.validate()?;
-        let input_path = workspace.path(WorkspaceArea::Source, input_name)?;
+        let input_path = workspace.path(area, input_name)?;
         let input_metadata = tokio::fs::symlink_metadata(&input_path).await.map_err(|source| {
             FrameExtractionError::InputFile { path: input_path.clone(), source }
         })?;
@@ -231,8 +241,18 @@ impl FrameExtractor {
         input_name: &str,
         probe: &MediaProbe,
     ) -> Result<FrameExtractionResult, FrameExtractionError> {
+        self.extract_for_probe_from_area(workspace, WorkspaceArea::Source, input_name, probe).await
+    }
+
+    pub async fn extract_for_probe_from_area(
+        &self,
+        workspace: &MediaWorkspace,
+        area: WorkspaceArea,
+        input_name: &str,
+        probe: &MediaProbe,
+    ) -> Result<FrameExtractionResult, FrameExtractionError> {
         let duration_ms = probe.duration_ms.ok_or(FrameExtractionError::MissingDuration)?;
-        self.extract(workspace, input_name, duration_ms).await
+        self.extract_from_area(workspace, area, input_name, duration_ms).await
     }
 
     async fn extract_frame(

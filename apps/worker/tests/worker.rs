@@ -14,13 +14,13 @@ use sooqa_inbox::{IngestSubmission, SubmittedVia, TelegramSubmissionInput};
 use sooqa_jobs::{Job, JobType, NewJob};
 use sooqa_media::{
     CanonicalImageProfile, CanonicalVideoProfile, CommandError, ExternalCommand,
-    ExternalCommandOutput, ExternalCommandRunner, FfmpegExecutor, FfprobeAdapter, ImageNormalizer,
-    MediaWorkspace, NormalizationPlanner, WorkspaceArea,
+    ExternalCommandOutput, ExternalCommandRunner, FfmpegExecutor, FfprobeAdapter, FrameExtractor,
+    ImageNormalizer, MediaWorkspace, NormalizationPlanner, WorkspaceArea,
 };
 use sooqa_persistence::Database;
 use sooqa_worker::{
-    HandlerFuture, HandlerRegistry, Worker, finalize_ingest_handler, normalize_asset_handler,
-    probe_asset_handler,
+    HandlerFuture, HandlerRegistry, Worker, compute_fingerprint_handler, finalize_ingest_handler,
+    normalize_asset_handler, probe_asset_handler,
 };
 use tokio::{
     sync::{Mutex, Notify, oneshot},
@@ -82,6 +82,29 @@ impl ExternalCommandRunner for FakeImageProbeRunner {
             success: true,
             exit_code: Some(0),
             stdout: br#"{"format":{"format_name":"png_pipe","size":"10"},"streams":[{"index":0,"codec_type":"video","codec_name":"png","width":400,"height":200}]}"#.to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FakeFingerprintRunner;
+
+#[async_trait]
+impl ExternalCommandRunner for FakeFingerprintRunner {
+    async fn run(&self, command: ExternalCommand) -> Result<ExternalCommandOutput, CommandError> {
+        let output = PathBuf::from(
+            command.args().last().expect("ffmpeg frame output argument should be present"),
+        );
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(32, 24, Rgba([20, 40, 80, u8::MAX])))
+            .save_with_format(&output, ImageFormat::Png)
+            .expect("fake ffmpeg should write a fingerprint frame");
+        Ok(ExternalCommandOutput {
+            success: true,
+            exit_code: Some(0),
+            stdout: Vec::new(),
             stderr: Vec::new(),
             stdout_truncated: false,
             stderr_truncated: false,
@@ -719,6 +742,35 @@ async fn normalize_handler_executes_ffmpeg_and_enqueues_finalize() {
         .complete(finalize_job.id, "worker-h5-finalize")
         .await
         .expect("finalize job should complete");
+    let fingerprint_job = database
+        .jobs()
+        .claim_next(
+            "worker-h5-fingerprint",
+            Duration::from_secs(30),
+            &[JobType::ComputeFingerprint],
+        )
+        .await
+        .expect("fingerprint job should be claimable")
+        .expect("fingerprint job should exist");
+    let fingerprint_handler = compute_fingerprint_handler(
+        database.inbox(),
+        work_root.clone(),
+        FrameExtractor::with_runner(
+            "ffmpeg",
+            Duration::from_secs(1),
+            4096,
+            Arc::new(FakeFingerprintRunner),
+        ),
+    );
+    fingerprint_handler(fingerprint_job.clone()).await.expect("fingerprint job should succeed");
+    fingerprint_handler(fingerprint_job.clone())
+        .await
+        .expect("fingerprint replay should be idempotent");
+    database
+        .jobs()
+        .complete(fingerprint_job.id, "worker-h5-fingerprint")
+        .await
+        .expect("fingerprint job should complete");
 
     let (status, original_input): (String, serde_json::Value) =
         sqlx::query_as("SELECT status, original_input FROM ingest_requests WHERE id = $1")
@@ -727,6 +779,9 @@ async fn normalize_handler_executes_ffmpeg_and_enqueues_finalize() {
             .await
             .expect("Telegram ingest should remain queryable");
     assert_eq!(status, "completed");
+    assert_eq!(original_input["fingerprint"]["version"], "frame_dhash_v1");
+    assert_eq!(original_input["fingerprint"]["duration_ms"], 1_000);
+    assert_eq!(original_input["fingerprint"]["frames"].as_array().unwrap().len(), 7);
     assert_eq!(original_input["normalization"]["media_kind"], "video");
     assert_eq!(original_input["normalization"]["file_size_bytes"], 16);
     assert!(!original_input["normalization"]["sha256"].as_str().unwrap_or_default().is_empty());
@@ -1022,6 +1077,34 @@ async fn normalize_handler_composes_image_canonical_and_thumbnail_assets() {
         .complete(finalize_job.id, "worker-h6-image-finalize")
         .await
         .expect("image finalize job should complete");
+    let fingerprint_job = database
+        .jobs()
+        .claim_next(
+            "worker-h6-image-fingerprint",
+            Duration::from_secs(30),
+            &[JobType::ComputeFingerprint],
+        )
+        .await
+        .expect("image fingerprint job should be claimable")
+        .expect("image fingerprint job should exist");
+    let fingerprint_handler = compute_fingerprint_handler(
+        database.inbox(),
+        work_root.clone(),
+        FrameExtractor::with_runner(
+            "ffmpeg",
+            Duration::from_secs(1),
+            4096,
+            Arc::new(FakeFingerprintRunner),
+        ),
+    );
+    fingerprint_handler(fingerprint_job.clone())
+        .await
+        .expect("image fingerprint job should skip cleanly");
+    database
+        .jobs()
+        .complete(fingerprint_job.id, "worker-h6-image-fingerprint")
+        .await
+        .expect("image fingerprint job should complete");
 
     let (status, original_input): (String, serde_json::Value) =
         sqlx::query_as("SELECT status, original_input FROM ingest_requests WHERE id = $1")
@@ -1030,6 +1113,7 @@ async fn normalize_handler_composes_image_canonical_and_thumbnail_assets() {
             .await
             .expect("image ingest should remain queryable");
     assert_eq!(status, "completed");
+    assert!(original_input.get("fingerprint").is_none());
     assert_eq!(original_input["normalization"]["media_kind"], "image");
     assert_eq!(original_input["normalization"]["mime_type"], "image/jpeg");
     assert!(original_input["normalization"]["thumbnail"].is_object());

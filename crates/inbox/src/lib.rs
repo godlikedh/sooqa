@@ -208,8 +208,11 @@ impl IngestStatus {
                 | (Self::Normalizing, Self::Fingerprinting)
                 | (Self::Normalizing, Self::Storing)
                 | (Self::Fingerprinting, Self::SimilarityCheck)
+                | (Self::Fingerprinting, Self::Completed)
                 | (Self::SimilarityCheck, Self::Storing)
                 | (Self::FailedRetryable, Self::Storing)
+                | (Self::FailedRetryable, Self::Fingerprinting)
+                | (Self::Storing, Self::Fingerprinting)
                 | (Self::Storing, Self::Completed)
         )
     }
@@ -639,6 +642,12 @@ mod tests {
         ] {
             storing.transition_to(status).expect("normalization handoff should be valid");
         }
+        storing
+            .transition_to(IngestStatus::Fingerprinting)
+            .expect("stored content should enter fingerprinting");
+        storing
+            .transition_to(IngestStatus::Completed)
+            .expect("fingerprinted content should complete");
 
         assert!(request.transition_to(IngestStatus::Queued).is_err());
 
