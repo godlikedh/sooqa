@@ -75,7 +75,7 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
             file_size_bytes: Some(8),
             sha256: Some(vec![41; 32]),
             local_work_path: Some(format!("/tmp/{key_prefix}.mp4")),
-            storage_state: StorageState::Local,
+            storage_state: StorageState::Uploaded,
         })
         .await
         .expect("canonical asset should be created");

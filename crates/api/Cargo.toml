@@ -11,6 +11,7 @@ serde_json.workspace = true
 sooqa-inbox = { path = "../inbox" }
 sooqa-library = { path = "../library" }
 sooqa-persistence = { path = "../persistence" }
+sooqa-publisher = { path = "../publisher" }
 serde.workspace = true
 time.workspace = true
 tracing.workspace = true

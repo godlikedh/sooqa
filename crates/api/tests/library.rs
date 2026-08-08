@@ -167,6 +167,7 @@ fn app(fixture: &Fixture) -> axum::Router {
             fixture.database.inbox(),
             fixture.database.device_tokens(),
             fixture.database.library(),
+            fixture.database.publisher(),
         ),
     )
 }

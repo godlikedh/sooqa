@@ -1,0 +1,512 @@
+use axum::{
+    Json, Router,
+    extract::{Json as JsonExtractor, Path, State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
+    routing::{get, post},
+};
+use serde::{Deserialize, Serialize};
+use sooqa_library::{ContentStatus, StorageState};
+use sooqa_publisher::{
+    NewPostDraft, NewPublicationSchedule, PostDraft, PostDraftStatus, PostDraftUpdate,
+    PublicationSchedule,
+};
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+use super::{
+    ApiError, ApiState, authorize, map_library_error, map_publisher_error, required_header,
+};
+
+const MAX_CAPTION_LENGTH: usize = 1_024;
+
+pub(crate) fn routes() -> Router<ApiState> {
+    Router::new()
+        .route("/api/v1/post-drafts", post(create_draft))
+        .route("/api/v1/post-drafts/{id}", get(get_draft).patch(update_draft))
+        .route("/api/v1/post-drafts/{id}/schedule", post(schedule_draft))
+        .route("/api/v1/post-drafts/{id}/publish-now", post(publish_now))
+}
+
+async fn create_draft(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Result<JsonExtractor<CreateDraftRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<PostDraftResponse>), ApiError> {
+    authorize(&state.device_tokens, &headers, "publisher:write").await?;
+    let idempotency_key = idempotency_key(&headers)?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+
+    let item = state
+        .library
+        .find_library_item(payload.content_item_id)
+        .await
+        .map_err(|error| map_library_error(error, &headers))?
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "library_item_not_found",
+                "The library item was not found",
+                &headers,
+            )
+        })?;
+    let asset_id =
+        publishable_asset(&item.content_item.status, item.canonical_asset.as_ref(), &headers)?;
+    let target = state
+        .publisher
+        .find_target_channel(payload.target_channel_id)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "target_channel_not_found",
+                "The target channel was not found",
+                &headers,
+            )
+        })?;
+    if !target.is_enabled {
+        return Err(ApiError::conflict(
+            "target_channel_disabled",
+            "The target channel is disabled",
+            &headers,
+        ));
+    }
+
+    let parse_mode = match payload.parse_mode {
+        Some(value) => normalize_parse_mode(Some(value), &headers)?,
+        None => normalize_parse_mode(target.default_parse_mode, &headers)?,
+    };
+    let caption = normalize_caption(payload.caption, parse_mode.as_deref(), &headers)?;
+    let draft = state
+        .publisher
+        .create_post_draft_idempotent(
+            NewPostDraft {
+                content_item_id: payload.content_item_id,
+                asset_id,
+                target_channel_id: payload.target_channel_id,
+                caption,
+                parse_mode,
+            },
+            idempotency_key,
+        )
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?
+        .draft;
+
+    Ok((StatusCode::CREATED, Json(PostDraftResponse::from_draft(&draft))))
+}
+
+async fn get_draft(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(raw_id): Path<String>,
+) -> Result<Json<PostDraftResponse>, ApiError> {
+    authorize(&state.device_tokens, &headers, "publisher:read").await?;
+    let id = parse_uuid(&raw_id, "post_draft_id", "The post draft ID must be a UUID", &headers)?;
+    let draft = state
+        .publisher
+        .find_post_draft(id)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?
+        .ok_or_else(|| {
+            ApiError::not_found("post_draft_not_found", "The post draft was not found", &headers)
+        })?;
+    Ok(Json(PostDraftResponse::from_draft(&draft)))
+}
+
+async fn update_draft(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(raw_id): Path<String>,
+    body: Result<JsonExtractor<UpdateDraftRequest>, JsonRejection>,
+) -> Result<Json<PostDraftResponse>, ApiError> {
+    authorize(&state.device_tokens, &headers, "publisher:write").await?;
+    let id = parse_uuid(&raw_id, "post_draft_id", "The post draft ID must be a UUID", &headers)?;
+    let idempotency_key = idempotency_key(&headers)?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    if payload.caption.is_none() && payload.parse_mode.is_none() && payload.status.is_none() {
+        return Err(ApiError::bad_request(
+            "empty_update",
+            "The request must contain at least one editable field",
+            &headers,
+        ));
+    }
+
+    let current = state
+        .publisher
+        .find_post_draft(id)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?
+        .ok_or_else(|| {
+            ApiError::not_found("post_draft_not_found", "The post draft was not found", &headers)
+        })?;
+    if !matches!(current.status, PostDraftStatus::Editing | PostDraftStatus::Ready) {
+        return Err(ApiError::conflict(
+            "invalid_post_draft_state",
+            "Only editing or ready drafts can be changed",
+            &headers,
+        ));
+    }
+    let status = payload
+        .status
+        .as_deref()
+        .map(PostDraftStatus::try_from)
+        .transpose()
+        .map_err(|_| {
+            ApiError::bad_request(
+                "invalid_post_draft_status",
+                "The post draft status is invalid",
+                &headers,
+            )
+        })?
+        .map(|status| match status {
+            PostDraftStatus::Editing | PostDraftStatus::Ready | PostDraftStatus::Cancelled => {
+                Ok(status)
+            }
+            PostDraftStatus::Scheduled | PostDraftStatus::Published => Err(ApiError::bad_request(
+                "invalid_post_draft_status",
+                "The requested post draft status is managed by publication",
+                &headers,
+            )),
+        })
+        .transpose()?;
+
+    let caption = match payload.caption {
+        Some(value) => Some(normalize_caption(value, None, &headers)?),
+        None => None,
+    };
+    let parse_mode = match payload.parse_mode {
+        Some(value) => Some(normalize_parse_mode(value, &headers)?),
+        None => None,
+    };
+    let effective_caption = match &caption {
+        Some(value) => value.as_deref(),
+        None => current.caption.as_deref(),
+    };
+    let effective_parse_mode = match &parse_mode {
+        Some(value) => value.as_deref(),
+        None => current.parse_mode.as_deref(),
+    };
+    validate_caption(effective_caption, effective_parse_mode, &headers)?;
+    if status == Some(PostDraftStatus::Ready) {
+        let item = state
+            .library
+            .find_library_item(current.content_item_id)
+            .await
+            .map_err(|error| map_library_error(error, &headers))?
+            .ok_or_else(|| {
+                ApiError::not_found(
+                    "library_item_not_found",
+                    "The library item was not found",
+                    &headers,
+                )
+            })?;
+        publishable_asset(&item.content_item.status, item.canonical_asset.as_ref(), &headers)?;
+    }
+
+    let draft = state
+        .publisher
+        .update_post_draft_idempotent(
+            id,
+            PostDraftUpdate {
+                caption,
+                parse_mode,
+                status,
+                expected_updated_at: payload.expected_updated_at,
+            },
+            idempotency_key,
+        )
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
+    Ok(Json(PostDraftResponse::from_draft(&draft)))
+}
+
+async fn schedule_draft(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(raw_id): Path<String>,
+    body: Result<JsonExtractor<ScheduleRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<PublicationScheduleResponse>), ApiError> {
+    authorize(&state.device_tokens, &headers, "publisher:write").await?;
+    let draft_id =
+        parse_uuid(&raw_id, "post_draft_id", "The post draft ID must be a UUID", &headers)?;
+    let idempotency_key = idempotency_key(&headers)?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    let schedule = NewPublicationSchedule::try_new(draft_id, payload.publish_at, idempotency_key)
+        .map_err(|error| map_publisher_error(error.into(), &headers))?;
+    let schedule = state
+        .publisher
+        .create_publication_schedule(NewPublicationSchedule {
+            not_before: payload.not_before,
+            not_after: payload.not_after,
+            priority: payload.priority,
+            cooldown_override: payload.cooldown_override,
+            ..schedule
+        })
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
+    Ok((StatusCode::ACCEPTED, Json(PublicationScheduleResponse::from_schedule(&schedule))))
+}
+
+async fn publish_now(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(raw_id): Path<String>,
+) -> Result<(StatusCode, Json<PublicationScheduleResponse>), ApiError> {
+    authorize(&state.device_tokens, &headers, "publisher:write").await?;
+    let draft_id =
+        parse_uuid(&raw_id, "post_draft_id", "The post draft ID must be a UUID", &headers)?;
+    let idempotency_key = idempotency_key(&headers)?;
+    let schedule = NewPublicationSchedule::try_new(
+        draft_id,
+        OffsetDateTime::now_utc(),
+        idempotency_key.clone(),
+    )
+    .map_err(|error| map_publisher_error(error.into(), &headers))?;
+    let schedule = match state.publisher.create_publication_schedule(schedule).await {
+        Ok(schedule) => schedule,
+        Err(
+            error @ sooqa_persistence::PublisherRepositoryError::ScheduleIdempotencyConflict(_),
+        ) => {
+            match state
+                .publisher
+                .find_publication_schedule_by_idempotency_key(&idempotency_key)
+                .await
+                .map_err(|lookup_error| map_publisher_error(lookup_error, &headers))?
+            {
+                Some(schedule) if schedule.post_draft_id == draft_id => schedule,
+                _ => return Err(map_publisher_error(error, &headers)),
+            }
+        }
+        Err(error) => return Err(map_publisher_error(error, &headers)),
+    };
+    Ok((StatusCode::ACCEPTED, Json(PublicationScheduleResponse::from_schedule(&schedule))))
+}
+
+fn publishable_asset(
+    status: &ContentStatus,
+    asset: Option<&sooqa_library::MediaAsset>,
+    headers: &HeaderMap,
+) -> Result<Uuid, ApiError> {
+    if *status != ContentStatus::Active {
+        return Err(ApiError::conflict(
+            "content_not_publishable",
+            "Only active library items can be published",
+            headers,
+        ));
+    }
+    let asset = asset.ok_or_else(|| {
+        ApiError::conflict(
+            "asset_not_publishable",
+            "The library item has no canonical asset",
+            headers,
+        )
+    })?;
+    if asset.storage_state != StorageState::Uploaded {
+        return Err(ApiError::conflict(
+            "asset_not_publishable",
+            "The canonical asset is not stored in Telegram yet",
+            headers,
+        ));
+    }
+    Ok(asset.id)
+}
+
+fn idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
+    let value = required_header(headers, "idempotency-key")?.trim();
+    if value.is_empty() || value.chars().count() > 255 {
+        return Err(ApiError::bad_request(
+            "invalid_idempotency_key",
+            "The Idempotency-Key header must be between 1 and 255 characters",
+            headers,
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn normalize_caption(
+    caption: Option<String>,
+    parse_mode: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<Option<String>, ApiError> {
+    let caption = caption.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
+    validate_caption(caption.as_deref(), parse_mode, headers)?;
+    Ok(caption)
+}
+
+fn normalize_parse_mode(
+    parse_mode: Option<String>,
+    headers: &HeaderMap,
+) -> Result<Option<String>, ApiError> {
+    let parse_mode =
+        parse_mode.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
+    if let Some(value) = parse_mode.as_deref()
+        && !matches!(value, "HTML" | "MarkdownV2")
+    {
+        return Err(ApiError::bad_request(
+            "invalid_parse_mode",
+            "The parse mode must be HTML or MarkdownV2",
+            headers,
+        ));
+    }
+    Ok(parse_mode)
+}
+
+fn validate_caption(
+    caption: Option<&str>,
+    parse_mode: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    if let Some(caption) = caption {
+        if caption.chars().count() > MAX_CAPTION_LENGTH {
+            return Err(ApiError::bad_request(
+                "caption_too_long",
+                "The caption must be at most 1024 characters",
+                headers,
+            ));
+        }
+        if caption.contains('\0') {
+            return Err(ApiError::bad_request(
+                "invalid_caption",
+                "The caption contains an invalid character",
+                headers,
+            ));
+        }
+    }
+    if let Some(parse_mode) = parse_mode
+        && !matches!(parse_mode, "HTML" | "MarkdownV2")
+    {
+        return Err(ApiError::bad_request(
+            "invalid_parse_mode",
+            "The parse mode must be HTML or MarkdownV2",
+            headers,
+        ));
+    }
+    Ok(())
+}
+
+fn parse_uuid(
+    raw: &str,
+    code: &'static str,
+    message: &'static str,
+    headers: &HeaderMap,
+) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(raw).map_err(|_| ApiError::bad_request(code, message, headers))
+}
+
+fn map_json_rejection(rejection: JsonRejection, headers: &HeaderMap) -> ApiError {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::payload_too_large(headers)
+    } else {
+        ApiError::bad_request("invalid_json", "The request body must be valid JSON", headers)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDraftRequest {
+    content_item_id: Uuid,
+    target_channel_id: Uuid,
+    #[serde(default)]
+    caption: Option<String>,
+    #[serde(default)]
+    parse_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateDraftRequest {
+    #[serde(default)]
+    caption: Option<Option<String>>,
+    #[serde(default)]
+    parse_mode: Option<Option<String>>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    #[serde(with = "time::serde::rfc3339::option")]
+    expected_updated_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleRequest {
+    #[serde(with = "time::serde::rfc3339")]
+    publish_at: OffsetDateTime,
+    #[serde(default)]
+    #[serde(with = "time::serde::rfc3339::option")]
+    not_before: Option<OffsetDateTime>,
+    #[serde(default)]
+    #[serde(with = "time::serde::rfc3339::option")]
+    not_after: Option<OffsetDateTime>,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default)]
+    cooldown_override: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct PostDraftResponse {
+    id: Uuid,
+    content_item_id: Uuid,
+    asset_id: Uuid,
+    target_channel_id: Uuid,
+    caption: Option<String>,
+    parse_mode: Option<String>,
+    status: PostDraftStatus,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+}
+
+impl PostDraftResponse {
+    fn from_draft(draft: &PostDraft) -> Self {
+        Self {
+            id: draft.id,
+            content_item_id: draft.content_item_id,
+            asset_id: draft.asset_id,
+            target_channel_id: draft.target_channel_id,
+            caption: draft.caption.clone(),
+            parse_mode: draft.parse_mode.clone(),
+            status: draft.status,
+            created_at: draft.created_at,
+            updated_at: draft.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PublicationScheduleResponse {
+    id: Uuid,
+    post_draft_id: Uuid,
+    status: sooqa_publisher::PublicationScheduleStatus,
+    #[serde(with = "time::serde::rfc3339")]
+    publish_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    not_before: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    not_after: Option<OffsetDateTime>,
+    priority: i32,
+    cooldown_override: Option<bool>,
+    idempotency_key: String,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+}
+
+impl PublicationScheduleResponse {
+    fn from_schedule(schedule: &PublicationSchedule) -> Self {
+        Self {
+            id: schedule.id,
+            post_draft_id: schedule.post_draft_id,
+            status: schedule.status,
+            publish_at: schedule.publish_at,
+            not_before: schedule.not_before,
+            not_after: schedule.not_after,
+            priority: schedule.priority,
+            cooldown_override: schedule.cooldown_override,
+            idempotency_key: schedule.idempotency_key.clone(),
+            created_at: schedule.created_at,
+            updated_at: schedule.updated_at,
+        }
+    }
+}

@@ -1,4 +1,6 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use sooqa_library::{ContentStatus, StorageState};
 use sooqa_publisher::{
     ChannelPolicy, NewChannelPolicy, NewPostDraft, NewPublicationSchedule, NewTargetChannel,
     PostDraft, PostDraftStatus, PostDraftUpdate, PublicationAttempt, PublicationAttemptStatus,
@@ -11,9 +13,18 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+const DRAFT_CREATE_IDEMPOTENCY_SCOPE: &str = "publisher:draft:create";
+const DRAFT_UPDATE_IDEMPOTENCY_SCOPE: &str = "publisher:draft:update";
+
 #[derive(Clone)]
 pub struct PublisherRepository {
     pool: PgPool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreatePostDraftResult {
+    pub draft: PostDraft,
+    pub created: bool,
 }
 
 impl PublisherRepository {
@@ -209,6 +220,84 @@ impl PublisherRepository {
         row.into_post_draft()
     }
 
+    pub async fn create_post_draft_idempotent(
+        &self,
+        new_draft: NewPostDraft,
+        idempotency_key: impl Into<String>,
+    ) -> Result<CreatePostDraftResult, PublisherRepositoryError> {
+        let idempotency_key = normalize_idempotency_key(idempotency_key.into())?;
+        let request_hash = post_draft_request_hash(&new_draft);
+        let draft_id = Uuid::now_v7();
+        let mut transaction = self.pool.begin().await?;
+        let inserted = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO idempotency_records (
+                scope, idempotency_key, request_hash, resource_type, resource_id,
+                response_status, response_body
+            )
+            VALUES ($1, $2, $3, 'post_draft', $4, 201, $5)
+            ON CONFLICT (scope, idempotency_key) DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(DRAFT_CREATE_IDEMPOTENCY_SCOPE)
+        .bind(&idempotency_key)
+        .bind(&request_hash)
+        .bind(draft_id)
+        .bind(serde_json::json!({ "id": draft_id, "status": "editing" }))
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        if inserted.is_none() {
+            let existing = sqlx::query_as::<_, IdempotencyResourceRow>(
+                r#"
+                SELECT request_hash, resource_id
+                FROM idempotency_records
+                WHERE scope = $1 AND idempotency_key = $2
+                FOR UPDATE
+                "#,
+            )
+            .bind(DRAFT_CREATE_IDEMPOTENCY_SCOPE)
+            .bind(&idempotency_key)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if existing.request_hash.as_slice() != request_hash.as_slice() {
+                return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
+            }
+            let draft_id = existing
+                .resource_id
+                .ok_or(PublisherRepositoryError::IncompleteIdempotencyRecord)?;
+            let draft = load_post_draft(&mut transaction, draft_id).await?;
+            transaction.commit().await?;
+            return Ok(CreatePostDraftResult { draft, created: false });
+        }
+
+        ensure_target_channel_enabled(&mut transaction, new_draft.target_channel_id).await?;
+        ensure_publishable_asset(&mut transaction, new_draft.content_item_id, new_draft.asset_id)
+            .await?;
+        let row = sqlx::query_as::<_, PostDraftRow>(
+            r#"
+            INSERT INTO post_drafts (
+                id, content_item_id, asset_id, target_channel_id, caption, parse_mode
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, content_item_id, asset_id, target_channel_id, caption,
+                      parse_mode, status, created_at, updated_at
+            "#,
+        )
+        .bind(draft_id)
+        .bind(new_draft.content_item_id)
+        .bind(new_draft.asset_id)
+        .bind(new_draft.target_channel_id)
+        .bind(new_draft.caption)
+        .bind(new_draft.parse_mode)
+        .fetch_one(&mut *transaction)
+        .await?
+        .into_post_draft()?;
+        transaction.commit().await?;
+        Ok(CreatePostDraftResult { draft: row, created: true })
+    }
+
     pub async fn find_post_draft(
         &self,
         id: Uuid,
@@ -233,40 +322,65 @@ impl PublisherRepository {
         update: PostDraftUpdate,
     ) -> Result<PostDraft, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
-        let mut draft = load_post_draft(&mut transaction, id).await?;
-        if let Some(expected_updated_at) = update.expected_updated_at
-            && draft.updated_at != expected_updated_at
-        {
-            return Err(PublisherRepositoryError::OptimisticConflict(id));
-        }
-        if let Some(caption) = update.caption {
-            draft.caption = caption;
-        }
-        if let Some(parse_mode) = update.parse_mode {
-            draft.parse_mode = parse_mode;
-        }
-        if let Some(status) = update.status {
-            draft.status = transition_post_draft_status(draft.status, status)?;
-        }
-        draft.updated_at = OffsetDateTime::now_utc();
-        let row = sqlx::query_as::<_, PostDraftRow>(
+        let draft = update_post_draft_in_transaction(&mut transaction, id, update).await?;
+        transaction.commit().await?;
+        Ok(draft)
+    }
+
+    pub async fn update_post_draft_idempotent(
+        &self,
+        id: Uuid,
+        update: PostDraftUpdate,
+        idempotency_key: impl Into<String>,
+    ) -> Result<PostDraft, PublisherRepositoryError> {
+        let idempotency_key = normalize_idempotency_key(idempotency_key.into())?;
+        let request_hash = post_draft_update_hash(id, &update);
+        let mut transaction = self.pool.begin().await?;
+        let inserted = sqlx::query_scalar::<_, Uuid>(
             r#"
-            UPDATE post_drafts
-            SET caption = $2, parse_mode = $3, status = $4, updated_at = $5
-            WHERE id = $1
-            RETURNING id, content_item_id, asset_id, target_channel_id, caption,
-                      parse_mode, status, created_at, updated_at
+            INSERT INTO idempotency_records (
+                scope, idempotency_key, request_hash, resource_type, resource_id,
+                response_status, response_body
+            )
+            VALUES ($1, $2, $3, 'post_draft', $4, 200, $5)
+            ON CONFLICT (scope, idempotency_key) DO NOTHING
+            RETURNING id
             "#,
         )
-        .bind(draft.id)
-        .bind(&draft.caption)
-        .bind(&draft.parse_mode)
-        .bind(draft.status.as_str())
-        .bind(draft.updated_at)
-        .fetch_one(&mut *transaction)
+        .bind(DRAFT_UPDATE_IDEMPOTENCY_SCOPE)
+        .bind(&idempotency_key)
+        .bind(&request_hash)
+        .bind(id)
+        .bind(serde_json::json!({ "id": id }))
+        .fetch_optional(&mut *transaction)
         .await?;
+
+        if inserted.is_none() {
+            let existing = sqlx::query_as::<_, IdempotencyResourceRow>(
+                r#"
+                SELECT request_hash, resource_id
+                FROM idempotency_records
+                WHERE scope = $1 AND idempotency_key = $2
+                FOR UPDATE
+                "#,
+            )
+            .bind(DRAFT_UPDATE_IDEMPOTENCY_SCOPE)
+            .bind(&idempotency_key)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if existing.request_hash.as_slice() != request_hash.as_slice()
+                || existing.resource_id != Some(id)
+            {
+                return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
+            }
+            let draft = load_post_draft(&mut transaction, id).await?;
+            transaction.commit().await?;
+            return Ok(draft);
+        }
+
+        let draft = update_post_draft_in_transaction(&mut transaction, id, update).await?;
         transaction.commit().await?;
-        row.into_post_draft()
+        Ok(draft)
     }
 
     pub async fn create_publication_schedule(
@@ -324,6 +438,8 @@ impl PublisherRepository {
                 status: draft.status,
             });
         }
+        ensure_publishable_asset(&mut transaction, draft.content_item_id, draft.asset_id).await?;
+        ensure_target_channel_enabled(&mut transaction, draft.target_channel_id).await?;
         let inserted = sqlx::query_as::<_, PublicationScheduleRow>(
             r#"
             INSERT INTO publication_schedules (
@@ -408,6 +524,24 @@ impl PublisherRepository {
             "#,
         )
         .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(PublicationScheduleRow::into_publication_schedule).transpose()
+    }
+
+    pub async fn find_publication_schedule_by_idempotency_key(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<PublicationSchedule>, PublisherRepositoryError> {
+        let row = sqlx::query_as::<_, PublicationScheduleRow>(
+            r#"
+            SELECT id, post_draft_id, status, publish_at, not_before, not_after,
+                   priority, cooldown_override, idempotency_key, created_at, updated_at
+            FROM publication_schedules
+            WHERE idempotency_key = $1
+            "#,
+        )
+        .bind(idempotency_key)
         .fetch_optional(&self.pool)
         .await?;
         row.map(PublicationScheduleRow::into_publication_schedule).transpose()
@@ -720,6 +854,177 @@ async fn ensure_asset_belongs_to_content(
     Ok(())
 }
 
+async fn ensure_publishable_asset(
+    transaction: &mut Transaction<'_, Postgres>,
+    content_item_id: Uuid,
+    asset_id: Uuid,
+) -> Result<(), PublisherRepositoryError> {
+    let content = sqlx::query_as::<_, PublishableContentRow>(
+        "SELECT status, canonical_asset_id FROM content_items WHERE id = $1 FOR UPDATE",
+    )
+    .bind(content_item_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(PublisherRepositoryError::ContentItemMissing(content_item_id))?;
+    let status = parse_enum("content_items.status", &content.status)?;
+    if status != ContentStatus::Active {
+        return Err(PublisherRepositoryError::ContentItemNotPublishable {
+            id: content_item_id,
+            status,
+        });
+    }
+    if content.canonical_asset_id != Some(asset_id) {
+        return Err(PublisherRepositoryError::CanonicalAssetMismatch { content_item_id, asset_id });
+    }
+    let storage_state = sqlx::query_scalar::<_, String>(
+        "SELECT storage_state FROM media_assets WHERE id = $1 AND content_item_id = $2 AND role = 'canonical' FOR UPDATE",
+    )
+    .bind(asset_id)
+    .bind(content_item_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(PublisherRepositoryError::AssetContentMismatch {
+        content_item_id,
+        asset_id,
+    })?;
+    let storage_state = parse_enum("media_assets.storage_state", &storage_state)?;
+    if storage_state != StorageState::Uploaded {
+        return Err(PublisherRepositoryError::AssetNotPublishable { asset_id, storage_state });
+    }
+    Ok(())
+}
+
+async fn ensure_target_channel_enabled(
+    transaction: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+) -> Result<(), PublisherRepositoryError> {
+    let enabled = sqlx::query_scalar::<_, bool>(
+        "SELECT is_enabled FROM target_channels WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    match enabled {
+        None => Err(PublisherRepositoryError::TargetChannelMissing(id)),
+        Some(false) => Err(PublisherRepositoryError::TargetChannelDisabled(id)),
+        Some(true) => Ok(()),
+    }
+}
+
+async fn update_post_draft_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    update: PostDraftUpdate,
+) -> Result<PostDraft, PublisherRepositoryError> {
+    let mut draft = load_post_draft(transaction, id).await?;
+    if let Some(expected_updated_at) = update.expected_updated_at
+        && draft.updated_at != expected_updated_at
+    {
+        return Err(PublisherRepositoryError::OptimisticConflict(id));
+    }
+    if let Some(caption) = update.caption {
+        draft.caption = caption;
+    }
+    if let Some(parse_mode) = update.parse_mode {
+        draft.parse_mode = parse_mode;
+    }
+    if let Some(status) = update.status {
+        draft.status = transition_post_draft_status(draft.status, status)?;
+    }
+    draft.updated_at = OffsetDateTime::now_utc();
+    let row = sqlx::query_as::<_, PostDraftRow>(
+        r#"
+        UPDATE post_drafts
+        SET caption = $2, parse_mode = $3, status = $4, updated_at = $5
+        WHERE id = $1
+        RETURNING id, content_item_id, asset_id, target_channel_id, caption,
+                  parse_mode, status, created_at, updated_at
+        "#,
+    )
+    .bind(draft.id)
+    .bind(&draft.caption)
+    .bind(&draft.parse_mode)
+    .bind(draft.status.as_str())
+    .bind(draft.updated_at)
+    .fetch_one(&mut **transaction)
+    .await?;
+    row.into_post_draft()
+}
+
+fn normalize_idempotency_key(key: String) -> Result<String, PublisherRepositoryError> {
+    let key = key.trim().to_owned();
+    if key.is_empty() {
+        return Err(PublisherRepositoryError::Validation(
+            PublisherValidationError::EmptyIdempotencyKey,
+        ));
+    }
+    if key.chars().count() > 255 {
+        return Err(PublisherRepositoryError::Validation(
+            PublisherValidationError::IdempotencyKeyTooLong { max: 255 },
+        ));
+    }
+    Ok(key)
+}
+
+fn post_draft_request_hash(draft: &NewPostDraft) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hash_uuid(&mut hasher, draft.content_item_id);
+    hash_uuid(&mut hasher, draft.asset_id);
+    hash_uuid(&mut hasher, draft.target_channel_id);
+    hash_optional_string(&mut hasher, draft.caption.as_deref());
+    hash_optional_string(&mut hasher, draft.parse_mode.as_deref());
+    hasher.finalize().to_vec()
+}
+
+fn post_draft_update_hash(id: Uuid, update: &PostDraftUpdate) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hash_uuid(&mut hasher, id);
+    hash_optional_optional_string(&mut hasher, &update.caption);
+    hash_optional_optional_string(&mut hasher, &update.parse_mode);
+    match update.status {
+        Some(status) => {
+            hasher.update([1]);
+            hasher.update(status.as_str().as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    match update.expected_updated_at {
+        Some(timestamp) => {
+            hasher.update([1]);
+            hasher.update(timestamp.unix_timestamp_nanos().to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.finalize().to_vec()
+}
+
+fn hash_uuid(hasher: &mut Sha256, value: Uuid) {
+    hasher.update(value.as_bytes());
+}
+
+fn hash_optional_string(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn hash_optional_optional_string(hasher: &mut Sha256, value: &Option<Option<String>>) {
+    match value {
+        None => hasher.update([0]),
+        Some(None) => hasher.update([1, 0]),
+        Some(Some(value)) => {
+            hasher.update([1, 1]);
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+}
+
 async fn load_post_draft(
     transaction: &mut Transaction<'_, Postgres>,
     id: Uuid,
@@ -864,6 +1169,12 @@ pub enum PublisherRepositoryError {
     NumberOverflow { field: &'static str },
     #[error("target channel {0} was not found")]
     TargetChannelMissing(Uuid),
+    #[error("target channel {0} is disabled")]
+    TargetChannelDisabled(Uuid),
+    #[error("content item {0} was not found")]
+    ContentItemMissing(Uuid),
+    #[error("content item {id} is not publishable in status {status:?}")]
+    ContentItemNotPublishable { id: Uuid, status: ContentStatus },
     #[error("post draft {0} was not found")]
     PostDraftMissing(Uuid),
     #[error("publication schedule {0} was not found")]
@@ -874,10 +1185,18 @@ pub enum PublisherRepositoryError {
     DraftNotReady { id: Uuid, status: PostDraftStatus },
     #[error("publication schedule idempotency key conflicts with another request: {0}")]
     ScheduleIdempotencyConflict(String),
+    #[error("post draft idempotency key conflicts with another request: {0}")]
+    DraftIdempotencyConflict(String),
+    #[error("idempotency record is missing its resource")]
+    IncompleteIdempotencyRecord,
     #[error("post draft {0} was updated by another request")]
     OptimisticConflict(Uuid),
     #[error("asset {asset_id} does not belong to content item {content_item_id}")]
     AssetContentMismatch { content_item_id: Uuid, asset_id: Uuid },
+    #[error("asset {asset_id} is not the canonical asset for content item {content_item_id}")]
+    CanonicalAssetMismatch { content_item_id: Uuid, asset_id: Uuid },
+    #[error("asset {asset_id} is not publishable in storage state {storage_state:?}")]
+    AssetNotPublishable { asset_id: Uuid, storage_state: StorageState },
     #[error("publication schedule {id} cannot transition from status {status:?}")]
     InvalidScheduleState { id: Uuid, status: PublicationScheduleStatus },
     #[error("publication schedule {id} requires its attempt operation to transition to {target:?}")]
@@ -898,6 +1217,18 @@ pub enum PublisherRepositoryError {
     PublishedPostConflict(Uuid),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+}
+
+#[derive(Debug, FromRow)]
+struct IdempotencyResourceRow {
+    request_hash: Vec<u8>,
+    resource_id: Option<Uuid>,
+}
+
+#[derive(Debug, FromRow)]
+struct PublishableContentRow {
+    status: String,
+    canonical_asset_id: Option<Uuid>,
 }
 
 #[derive(Debug, FromRow)]

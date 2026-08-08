@@ -35,7 +35,8 @@ just test-integration
 The `-- --ignored` part is intentional: Cargo uses the first `--` to stop
 parsing Cargo test options and passes `--ignored` to the test harness, which
 then runs tests marked `#[ignore]`. The integration recipe covers persistence,
-API ingest and library routes, Publisher repositories, worker behavior, source
+API ingest, library routes, and authenticated Publisher draft/schedule routes,
+Publisher repositories, worker behavior, source
 download handoff, probe-to-normalize handoff, fake-runner normalization,
 canonical library finalization, video fingerprint extraction, similarity
 candidate generation, the storage-upload job handoff, and the Publisher
