@@ -273,6 +273,12 @@ impl PublisherRepository {
         &self,
         schedule: NewPublicationSchedule,
     ) -> Result<PublicationSchedule, PublisherRepositoryError> {
+        let schedule = NewPublicationSchedule {
+            publish_at: truncate_to_microseconds(schedule.publish_at),
+            not_before: schedule.not_before.map(truncate_to_microseconds),
+            not_after: schedule.not_after.map(truncate_to_microseconds),
+            ..schedule
+        };
         schedule.validate()?;
         let mut transaction = self.pool.begin().await?;
         // A unique index can reject a duplicate only after the caller has
@@ -824,6 +830,12 @@ async fn insert_or_load_published_post(
 
 fn to_i64(value: u64, field: &'static str) -> Result<i64, PublisherRepositoryError> {
     i64::try_from(value).map_err(|_| PublisherRepositoryError::NumberOverflow { field })
+}
+
+fn truncate_to_microseconds(value: OffsetDateTime) -> OffsetDateTime {
+    value
+        .replace_nanosecond((value.nanosecond() / 1_000) * 1_000)
+        .expect("truncating a valid timestamp's nanoseconds remains valid")
 }
 
 #[derive(Debug, Error)]

@@ -134,7 +134,9 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
         .await
         .expect("draft should become ready");
 
-    let publish_at = time::OffsetDateTime::now_utc() - Duration::minutes(1);
+    let publish_at = (time::OffsetDateTime::now_utc() - Duration::minutes(1))
+        .replace_nanosecond(123_456_789)
+        .expect("test timestamp should be valid");
     let schedule =
         NewPublicationSchedule::try_new(draft.id, publish_at, format!("{key_prefix}-schedule"))
             .expect("schedule should be valid");
