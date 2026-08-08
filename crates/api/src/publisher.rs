@@ -429,6 +429,9 @@ fn valid_html_markup(value: &str) -> bool {
     let mut cursor = 0;
     while let Some(relative_start) = value[cursor..].find('<') {
         let start = cursor + relative_start;
+        if value[cursor..start].contains('>') {
+            return false;
+        }
         let Some(end) = html_tag_end(value, start) else {
             return false;
         };
@@ -484,7 +487,7 @@ fn valid_html_markup(value: &str) -> bool {
         }
         cursor = end + 1;
     }
-    open_tags.is_empty()
+    !value[cursor..].contains('>') && open_tags.is_empty()
 }
 
 fn html_tag_end(value: &str, start: usize) -> Option<usize> {
@@ -508,15 +511,29 @@ fn valid_html_entities(value: &str) -> bool {
     while let Some(relative_start) = value[cursor..].find('&') {
         let start = cursor + relative_start;
         let entity = &value[start..];
-        if !["&lt;", "&gt;", "&amp;", "&quot;"].iter().any(|allowed| entity.starts_with(allowed)) {
+        if let Some(allowed) =
+            ["&lt;", "&gt;", "&amp;", "&quot;"].iter().find(|allowed| entity.starts_with(**allowed))
+        {
+            cursor = start + allowed.len();
+            continue;
+        }
+        let Some(relative_end) = entity.find(';') else {
+            return false;
+        };
+        let numeric = &entity[1..relative_end];
+        let digits = numeric.strip_prefix("#x").or_else(|| numeric.strip_prefix("#X"));
+        let valid_numeric = match digits {
+            Some(digits) => {
+                !digits.is_empty() && digits.chars().all(|character| character.is_ascii_hexdigit())
+            }
+            None => numeric.strip_prefix('#').is_some_and(|digits| {
+                !digits.is_empty() && digits.chars().all(|character| character.is_ascii_digit())
+            }),
+        };
+        if !valid_numeric {
             return false;
         }
-        let length = ["&lt;", "&gt;", "&amp;", "&quot;"]
-            .iter()
-            .find(|allowed| entity.starts_with(**allowed))
-            .map(|allowed| allowed.len())
-            .expect("allowed HTML entity should have a length");
-        cursor = start + length;
+        cursor = start + relative_end + 1;
     }
     true
 }
@@ -822,11 +839,12 @@ mod tests {
     fn validates_balanced_telegram_html() {
         assert!(valid_html_markup("<b>bold</b> <a href=\"https://example.test\">link</a>"));
         assert!(valid_html_markup("<pre><code class=\"language-rust\">*literal*</code></pre>"));
-        assert!(valid_html_markup("escaped &lt;tag&gt; &amp; &quot;quote&quot;"));
+        assert!(valid_html_markup("escaped &lt;tag&gt; &amp; &quot;quote&quot; &#x3c; &#62;"));
         assert!(!valid_html_markup("<b>unclosed"));
         assert!(!valid_html_markup("<b>mismatched</i>"));
         assert!(!valid_html_markup("<script>unsafe</script>"));
         assert!(!valid_html_markup("unknown &entity;"));
+        assert!(!valid_html_markup("raw > text"));
         assert!(!valid_html_markup("<code class=\"language-rust\">standalone</code>"));
     }
 

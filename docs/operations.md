@@ -21,9 +21,11 @@ state, one-running-attempt protection, and database-level asset/content
 ownership constraints. Migration 0014 separates schedule and publish-now
 idempotency scopes without changing caller keys. Migration 0015 preserves
 pre-scope schedules as legacy rows because their original command cannot be
-reconstructed. Deploy all forward migrations before deploying code that relies
-on those columns or tables. The Publisher API now creates drafts and durable
-schedules; the scheduler and Telegram publication handler are not enabled yet.
+reconstructed. Migration 0016 snapshots pre-existing draft idempotency
+responses before the new immutable replay path is deployed. Deploy all forward
+migrations before deploying code that relies on those columns or tables. The
+Publisher API now creates drafts and durable schedules; the scheduler and
+Telegram publication handler are not enabled yet.
 
 ## Worker
 

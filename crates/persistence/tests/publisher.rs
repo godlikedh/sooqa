@@ -188,7 +188,7 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
     .bind(&legacy_draft_key)
     .bind(vec![99_u8; 32])
     .bind(draft.id)
-    .bind(serde_json::json!({"id": draft.id, "status": "editing"}))
+    .bind(serde_json::to_value(&draft).expect("legacy draft snapshot should serialize"))
     .execute(database.pool())
     .await
     .expect("legacy draft idempotency fixture should insert");

@@ -268,18 +268,18 @@ impl PublisherRepository {
                         idempotency_key,
                     ));
                 }
-                let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
+                let draft = idempotency_draft_snapshot(&existing)?;
                 transaction.commit().await?;
                 return Ok(CreatePostDraftResult { draft, created: false });
             }
-            let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
+            let draft = idempotency_draft_snapshot(&existing)?;
             transaction.commit().await?;
             return Ok(CreatePostDraftResult { draft, created: false });
         }
 
-        ensure_target_channel_enabled(&mut transaction, new_draft.target_channel_id).await?;
         ensure_publishable_asset(&mut transaction, new_draft.content_item_id, new_draft.asset_id)
             .await?;
+        ensure_target_channel_enabled(&mut transaction, new_draft.target_channel_id).await?;
         let row = sqlx::query_as::<_, PostDraftRow>(
             r#"
             INSERT INTO post_drafts (
@@ -340,7 +340,7 @@ impl PublisherRepository {
             return Ok(None);
         };
         if existing.request_hash.as_slice() != request_hash {
-            let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
+            let draft = idempotency_draft_snapshot(&existing)?;
             if !legacy_create_request_matches(
                 &draft,
                 content_item_id,
@@ -353,7 +353,7 @@ impl PublisherRepository {
             transaction.commit().await?;
             return Ok(Some(draft));
         }
-        let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
+        let draft = idempotency_draft_snapshot(&existing)?;
         transaction.commit().await?;
         Ok(Some(draft))
     }
@@ -433,7 +433,7 @@ impl PublisherRepository {
             {
                 return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
             }
-            let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
+            let draft = idempotency_draft_snapshot(&existing)?;
             transaction.commit().await?;
             return Ok(draft);
         }
@@ -478,7 +478,7 @@ impl PublisherRepository {
         if existing.request_hash.as_slice() != request_hash {
             return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
         }
-        let draft = idempotency_draft_snapshot_or_load(&mut transaction, &existing).await?;
+        let draft = idempotency_draft_snapshot(&existing)?;
         transaction.commit().await?;
         Ok(Some(draft))
     }
@@ -1142,20 +1142,6 @@ fn idempotency_draft_snapshot(
         .clone()
         .ok_or(PublisherRepositoryError::IncompleteIdempotencyRecord)?;
     Ok(serde_json::from_value(body)?)
-}
-
-async fn idempotency_draft_snapshot_or_load(
-    transaction: &mut Transaction<'_, Postgres>,
-    record: &IdempotencyResourceRow,
-) -> Result<PostDraft, PublisherRepositoryError> {
-    match idempotency_draft_snapshot(record) {
-        Ok(draft) => Ok(draft),
-        Err(_) => {
-            let draft_id =
-                record.resource_id.ok_or(PublisherRepositoryError::IncompleteIdempotencyRecord)?;
-            load_post_draft(transaction, draft_id).await
-        }
-    }
 }
 
 fn legacy_create_request_matches(
