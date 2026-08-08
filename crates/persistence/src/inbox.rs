@@ -890,14 +890,16 @@ fn request_file_name(request: &IngestRequest) -> Option<&str> {
 fn request_image_format_is_supported(request: &IngestRequest, probe: &serde_json::Value) -> bool {
     let declared = request_mime_type(request)
         .map(image_format_from_mime)
+        .filter(|format| *format != ImageFormatKind::Unknown)
         .or_else(|| request_file_name(request).map(image_format_from_file_name))
         .unwrap_or(ImageFormatKind::Unknown);
     let probed = probed_image_format(probe);
-    match declared {
-        ImageFormatKind::Jpeg => matches!(probed, ImageFormatKind::Jpeg | ImageFormatKind::Unknown),
-        ImageFormatKind::Png => matches!(probed, ImageFormatKind::Png | ImageFormatKind::Unknown),
+    match probed {
+        ImageFormatKind::Jpeg | ImageFormatKind::Png => true,
         ImageFormatKind::Unsupported => false,
-        ImageFormatKind::Unknown => matches!(probed, ImageFormatKind::Jpeg | ImageFormatKind::Png),
+        ImageFormatKind::Unknown => {
+            matches!(declared, ImageFormatKind::Jpeg | ImageFormatKind::Png)
+        }
     }
 }
 
@@ -907,8 +909,10 @@ fn image_format_from_mime(mime_type: &str) -> ImageFormatKind {
         ImageFormatKind::Jpeg
     } else if mime_type.eq_ignore_ascii_case("image/png") {
         ImageFormatKind::Png
-    } else {
+    } else if mime_type.to_ascii_lowercase().starts_with("image/") {
         ImageFormatKind::Unsupported
+    } else {
+        ImageFormatKind::Unknown
     }
 }
 

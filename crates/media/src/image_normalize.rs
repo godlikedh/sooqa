@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io::{self, BufReader, BufWriter, Write},
+    io::{self, BufReader, Cursor, Write},
     path::{Path, PathBuf},
 };
 
@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{FileDigest, HashError, MediaWorkspace, WorkspaceArea, WorkspaceError, sha256_file};
+use crate::{
+    FileDigest, HashError, MediaWorkspace, WorkspaceArea, WorkspaceError, sha256_bytes,
+    sha256_file, sha256_file_sync,
+};
 
 const DEFAULT_MAX_WIDTH: u32 = 1920;
 const DEFAULT_MAX_HEIGHT: u32 = 1080;
@@ -269,6 +272,8 @@ pub enum ImageNormalizationError {
     OutputExists { path: PathBuf },
     #[error("existing image output is invalid at {path}: {reason}")]
     ExistingOutputInvalid { path: PathBuf, reason: String },
+    #[error("existing image output conflicts with the normalized input at {path}")]
+    ExistingOutputConflict { path: PathBuf },
     #[error("image output paths collide: {path}")]
     OutputPathCollision { path: PathBuf },
     #[error("could not write image output {path}: {source}")]
@@ -376,18 +381,25 @@ fn ensure_output(
     max_width: u32,
     max_height: u32,
 ) -> Result<EnsuredOutput, ImageNormalizationError> {
+    let encoded = encode_image_bytes(image, format, profile.jpeg_quality, path)?;
+    let expected_digest = sha256_bytes(&encoded);
     if let Some((width, height)) =
-        existing_output_dimensions(path, format, profile, max_width, max_height)?
+        existing_output_dimensions(path, format, profile, max_width, max_height, &expected_digest)?
     {
         return Ok(EnsuredOutput { width, height, created: false });
     }
 
-    match write_image(path, image, format, profile.jpeg_quality) {
+    match write_image(path, &encoded) {
         Ok(()) => Ok(EnsuredOutput { width: image.width(), height: image.height(), created: true }),
         Err(error @ ImageNormalizationError::OutputExists { .. }) => {
-            if let Some((width, height)) =
-                existing_output_dimensions(path, format, profile, max_width, max_height)?
-            {
+            if let Some((width, height)) = existing_output_dimensions(
+                path,
+                format,
+                profile,
+                max_width,
+                max_height,
+                &expected_digest,
+            )? {
                 Ok(EnsuredOutput { width, height, created: false })
             } else {
                 Err(error)
@@ -403,6 +415,7 @@ fn existing_output_dimensions(
     profile: CanonicalImageProfile,
     max_width: u32,
     max_height: u32,
+    expected_digest: &FileDigest,
 ) -> Result<Option<(u32, u32)>, ImageNormalizationError> {
     if let Some(parent) = symlinked_parent(path)
         .map_err(|source| ImageNormalizationError::Output { path: path.to_owned(), source })?
@@ -460,6 +473,10 @@ fn existing_output_dimensions(
                 max_height
             ),
         });
+    }
+    let actual_digest = sha256_file_sync(path)?;
+    if actual_digest != *expected_digest {
+        return Err(ImageNormalizationError::ExistingOutputConflict { path: path.to_owned() });
     }
     Ok(Some((image.width(), image.height())))
 }
@@ -582,12 +599,25 @@ fn with_extension(path: &Path, extension: &str) -> PathBuf {
     output
 }
 
-fn write_image(
-    path: &Path,
+fn encode_image_bytes(
     image: &DynamicImage,
     format: CanonicalImageFormat,
     jpeg_quality: u8,
-) -> Result<(), ImageNormalizationError> {
+    path: &Path,
+) -> Result<Vec<u8>, ImageNormalizationError> {
+    let mut bytes = Cursor::new(Vec::new());
+    match format {
+        CanonicalImageFormat::Jpeg => JpegEncoder::new_with_quality(&mut bytes, jpeg_quality)
+            .encode_image(image)
+            .map_err(|source| ImageNormalizationError::Encode { path: path.to_owned(), source })?,
+        CanonicalImageFormat::Png => image
+            .write_to(&mut bytes, format.image_format())
+            .map_err(|source| ImageNormalizationError::Encode { path: path.to_owned(), source })?,
+    }
+    Ok(bytes.into_inner())
+}
+
+fn write_image(path: &Path, encoded: &[u8]) -> Result<(), ImageNormalizationError> {
     validate_output_path(path)?;
     let file_name = path.file_name().ok_or_else(|| ImageNormalizationError::Output {
         path: path.to_owned(),
@@ -599,28 +629,14 @@ fn write_image(
         |source| ImageNormalizationError::Output { path: temporary_path.clone(), source },
     )?;
     let result = (|| {
-        let mut writer = BufWriter::new(file);
-        match format {
-            CanonicalImageFormat::Jpeg => JpegEncoder::new_with_quality(&mut writer, jpeg_quality)
-                .encode_image(image)
-                .map_err(|source| ImageNormalizationError::Encode {
-                    path: path.to_owned(),
-                    source,
-                })?,
-            CanonicalImageFormat::Png => {
-                image.write_to(&mut writer, format.image_format()).map_err(|source| {
-                    ImageNormalizationError::Encode { path: path.to_owned(), source }
-                })?
-            }
-        }
-        writer
-            .flush()
+        let mut file = file;
+        file.write_all(encoded)
             .map_err(|source| ImageNormalizationError::Output { path: path.to_owned(), source })?;
-        writer
-            .get_ref()
-            .sync_all()
+        file.flush()
             .map_err(|source| ImageNormalizationError::Output { path: path.to_owned(), source })?;
-        drop(writer);
+        file.sync_all()
+            .map_err(|source| ImageNormalizationError::Output { path: path.to_owned(), source })?;
+        drop(file);
         match fs::hard_link(&temporary_path, path) {
             Ok(()) => {}
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
@@ -702,7 +718,7 @@ fn symlinked_parent(path: &Path) -> Result<Option<PathBuf>, io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use image::{ImageBuffer, Rgba};
+    use image::{ImageBuffer, Rgb, Rgba};
     use uuid::Uuid;
 
     use super::*;
@@ -716,6 +732,13 @@ mod tests {
         let image = ImageBuffer::from_pixel(width, height, pixel);
         DynamicImage::ImageRgba8(image)
             .save_with_format(path, ImageFormat::Png)
+            .expect("test image should be written");
+    }
+
+    fn write_jpeg(path: &Path, pixel: Rgb<u8>, width: u32, height: u32) {
+        let image = ImageBuffer::from_pixel(width, height, pixel);
+        DynamicImage::ImageRgb8(image)
+            .save_with_format(path, ImageFormat::Jpeg)
             .expect("test image should be written");
     }
 
@@ -827,6 +850,68 @@ mod tests {
             std::fs::read(&canonical).expect("existing output should load"),
             b"existing output"
         );
+        workspace.cleanup().await.expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn valid_but_different_canonical_output_is_not_reused() {
+        let workspace =
+            MediaWorkspace::create(temp_path("different-canonical-workspace"), Uuid::new_v4())
+                .await
+                .expect("workspace should be created");
+        let input =
+            workspace.path(WorkspaceArea::Source, "input.png").expect("input path should be valid");
+        let canonical = workspace
+            .path(WorkspaceArea::Normalized, "canonical.jpg")
+            .expect("canonical path should be valid");
+        write_png(&input, Rgba([40, 80, 120, u8::MAX]), 20, 10);
+        write_jpeg(&canonical, Rgb([220, 20, 20]), 20, 10);
+        let existing = std::fs::read(&canonical).expect("existing output should be readable");
+        let normalizer = ImageNormalizer::new(CanonicalImageProfile::default())
+            .expect("profile should be valid");
+        let plan = normalizer
+            .plan(&workspace, "input.png", "canonical", "thumbnail")
+            .expect("normalization plan should be valid");
+
+        let error = normalizer
+            .execute(&plan)
+            .await
+            .expect_err("different existing output should not be reused");
+        assert!(matches!(error, ImageNormalizationError::ExistingOutputConflict { .. }));
+        assert_eq!(std::fs::read(&canonical).expect("existing output should remain"), existing);
+        workspace.cleanup().await.expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn valid_but_different_thumbnail_output_is_not_reused() {
+        let workspace =
+            MediaWorkspace::create(temp_path("different-thumbnail-workspace"), Uuid::new_v4())
+                .await
+                .expect("workspace should be created");
+        let input =
+            workspace.path(WorkspaceArea::Source, "input.png").expect("input path should be valid");
+        let canonical = workspace
+            .path(WorkspaceArea::Normalized, "canonical.jpg")
+            .expect("canonical path should be valid");
+        let thumbnail = workspace
+            .path(WorkspaceArea::Previews, "thumbnail.jpg")
+            .expect("thumbnail path should be valid");
+        write_png(&input, Rgba([40, 80, 120, u8::MAX]), 400, 200);
+        write_jpeg(&thumbnail, Rgb([220, 20, 20]), 320, 160);
+        let existing = std::fs::read(&thumbnail).expect("existing output should be readable");
+        let normalizer = ImageNormalizer::new(CanonicalImageProfile::default())
+            .expect("profile should be valid");
+        let plan = normalizer
+            .plan(&workspace, "input.png", "canonical", "thumbnail")
+            .expect("normalization plan should be valid");
+
+        let error = normalizer
+            .execute(&plan)
+            .await
+            .expect_err("different existing output should not be reused");
+        assert!(matches!(error, ImageNormalizationError::ExistingOutputConflict { .. }));
+        assert!(!canonical.exists(), "new canonical output should be cleaned after conflict");
+        assert_eq!(std::fs::read(&thumbnail).expect("existing output should remain"), existing);
         workspace.cleanup().await.expect("workspace should be removed");
     }
 

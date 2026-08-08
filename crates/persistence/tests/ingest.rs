@@ -178,10 +178,11 @@ async fn unsupported_image_format_does_not_enqueue_static_normalization() {
 
     let key_prefix = format!("h6-image-format-{}-", Uuid::new_v4());
     clean_up(&database, &key_prefix).await;
-    for (case, mime_type, file_name) in [
-        ("declared-webp", Some("image/webp"), None),
-        ("filename-webp", None, Some("photo.webp")),
-        ("mismatched-mime", Some("image/png"), None),
+    for (case, mime_type, file_name, probed_format, supported) in [
+        ("declared-webp", Some("image/webp"), None, "webp", false),
+        ("filename-webp", None, Some("photo.webp"), "webp", false),
+        ("mismatched-mime", Some("image/png"), None, "webp", false),
+        ("supported-mismatch", Some("image/jpeg"), Some("photo.jpg"), "png", true),
     ] {
         let created = database
             .inbox()
@@ -216,29 +217,34 @@ async fn unsupported_image_format_does_not_enqueue_static_normalization() {
                 created.request.id,
                 &attempt,
                 serde_json::json!({
-                    "container_format": "webp",
+                    "container_format": probed_format,
                     "size_bytes": 10,
-                    "streams": [{"kind": "video", "codec": "webp"}]
+                    "streams": [{"kind": "video", "codec": probed_format}]
                 }),
             )
             .await
             .expect("unsupported image probe should be recorded");
 
-        let (status, error_code): (String, String) =
+        let (status, error_code): (String, Option<String>) =
             sqlx::query_as("SELECT status, error_code FROM ingest_requests WHERE id = $1")
                 .bind(created.request.id)
                 .fetch_one(database.pool())
                 .await
                 .expect("unsupported image state should be queryable");
-        assert_eq!(status, "failed_terminal");
-        assert_eq!(error_code, "unsupported_image_format");
+        if supported {
+            assert_eq!(status, "normalizing");
+            assert!(error_code.is_none());
+        } else {
+            assert_eq!(status, "failed_terminal");
+            assert_eq!(error_code.as_deref(), Some("unsupported_image_format"));
+        }
         let normalize_job_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
                 .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
                 .fetch_one(database.pool())
                 .await
                 .expect("normalize job count should be queryable");
-        assert_eq!(normalize_job_count, 0);
+        assert_eq!(normalize_job_count, i64::from(supported));
     }
 
     clean_up(&database, &key_prefix).await;
@@ -257,8 +263,16 @@ async fn probe_kind_routes_to_the_composed_normalizer_or_terminal_failure() {
     let key_prefix = format!("h5-kind-{}-", Uuid::new_v4());
     clean_up(&database, &key_prefix).await;
     for (index, media_kind) in ["image", "audio", "animation"].into_iter().enumerate() {
-        let submission =
-            telegram_submission_with_kind(&format!("{key_prefix}{media_kind}"), media_kind);
+        let submission = if media_kind == "image" {
+            telegram_submission_with_kind_and_metadata(
+                &format!("{key_prefix}{media_kind}"),
+                media_kind,
+                Some("application/octet-stream"),
+                Some("photo.png"),
+            )
+        } else {
+            telegram_submission_with_kind(&format!("{key_prefix}{media_kind}"), media_kind)
+        };
         let created = database
             .inbox()
             .create_ingest(submission)
