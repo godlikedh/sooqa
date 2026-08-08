@@ -447,6 +447,11 @@ impl PublisherRepository {
     ) -> Result<PublicationSchedule, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut schedule = load_publication_schedule(&mut transaction, id).await?;
+        if schedule.status == PublicationScheduleStatus::Publishing
+            || target == PublicationScheduleStatus::Published
+        {
+            return Err(PublisherRepositoryError::ManagedScheduleTransitionRequired { id, target });
+        }
         schedule.status = transition_publication_schedule_status(schedule.status, target)?;
         schedule.updated_at = OffsetDateTime::now_utc();
         let row = sqlx::query_as::<_, PublicationScheduleRow>(
@@ -474,6 +479,13 @@ impl PublisherRepository {
     ) -> Result<PublicationAttempt, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut schedule = load_publication_schedule(&mut transaction, schedule_id).await?;
+        let draft = load_post_draft(&mut transaction, schedule.post_draft_id).await?;
+        if draft.status != PostDraftStatus::Scheduled {
+            return Err(PublisherRepositoryError::DraftNotReady {
+                id: draft.id,
+                status: draft.status,
+            });
+        }
         if schedule.status == PublicationScheduleStatus::Pending
             || schedule.status == PublicationScheduleStatus::Queued
             || schedule.status == PublicationScheduleStatus::Failed
@@ -864,6 +876,8 @@ pub enum PublisherRepositoryError {
     AssetContentMismatch { content_item_id: Uuid, asset_id: Uuid },
     #[error("publication schedule {id} cannot transition from status {status:?}")]
     InvalidScheduleState { id: Uuid, status: PublicationScheduleStatus },
+    #[error("publication schedule {id} requires its attempt operation to transition to {target:?}")]
+    ManagedScheduleTransitionRequired { id: Uuid, target: PublicationScheduleStatus },
     #[error("publication attempt must finish with a terminal status")]
     AttemptMustFinish,
     #[error("successful publication must atomically record its Telegram message")]

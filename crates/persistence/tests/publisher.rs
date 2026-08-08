@@ -165,6 +165,82 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
         1
     );
 
+    let cancelled_draft = database
+        .publisher()
+        .create_post_draft(NewPostDraft {
+            content_item_id: content.id,
+            asset_id: asset.id,
+            target_channel_id: target.id,
+            caption: None,
+            parse_mode: None,
+        })
+        .await
+        .expect("cancelled-draft fixture should be created");
+    let cancelled_draft = database
+        .publisher()
+        .update_post_draft(
+            cancelled_draft.id,
+            PostDraftUpdate {
+                caption: None,
+                parse_mode: None,
+                status: Some(PostDraftStatus::Ready),
+                expected_updated_at: Some(cancelled_draft.updated_at),
+            },
+        )
+        .await
+        .expect("cancelled-draft fixture should become ready");
+    let cancelled_schedule = database
+        .publisher()
+        .create_publication_schedule(
+            NewPublicationSchedule::try_new(
+                cancelled_draft.id,
+                publish_at,
+                format!("{key_prefix}-cancelled"),
+            )
+            .expect("cancelled schedule should be valid"),
+        )
+        .await
+        .expect("cancelled schedule should be created");
+    let cancelled_draft = database
+        .publisher()
+        .find_post_draft(cancelled_draft.id)
+        .await
+        .expect("cancelled draft should reload")
+        .expect("cancelled draft should exist");
+    let cancelled_draft = database
+        .publisher()
+        .update_post_draft(
+            cancelled_draft.id,
+            PostDraftUpdate {
+                caption: None,
+                parse_mode: None,
+                status: Some(PostDraftStatus::Cancelled),
+                expected_updated_at: Some(cancelled_draft.updated_at),
+            },
+        )
+        .await
+        .expect("cancelled-draft fixture should be cancelled");
+    assert!(matches!(
+        database
+            .publisher()
+            .start_publication_attempt(cancelled_schedule.id, None)
+            .await,
+        Err(sooqa_persistence::PublisherRepositoryError::DraftNotReady {
+            id,
+            status: PostDraftStatus::Cancelled,
+        }) if id == cancelled_draft.id
+    ));
+    sqlx::query("DELETE FROM publication_schedules WHERE id = $1")
+        .bind(cancelled_schedule.id)
+        .execute(database.pool())
+        .await
+        .expect("cancelled schedule should clean up");
+    sqlx::query("DELETE FROM post_drafts WHERE id = $1")
+        .bind(cancelled_draft.id)
+        .execute(database.pool())
+        .await
+        .expect("cancelled draft should clean up");
+
     let attempt = database
         .publisher()
         .start_publication_attempt(schedule.id, Some(format!("{key_prefix}-telegram")))
@@ -180,6 +256,19 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
             schedule_id,
             attempt_number: 1,
         }) if schedule_id == schedule.id
+    ));
+    assert!(matches!(
+        database
+            .publisher()
+            .transition_publication_schedule(
+                schedule.id,
+                sooqa_publisher::PublicationScheduleStatus::Failed,
+            )
+            .await,
+        Err(sooqa_persistence::PublisherRepositoryError::ManagedScheduleTransitionRequired {
+            id,
+            target: sooqa_publisher::PublicationScheduleStatus::Failed,
+        }) if id == schedule.id
     ));
     let ambiguous = database
         .publisher()
