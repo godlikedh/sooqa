@@ -9,12 +9,13 @@ use std::{
 };
 
 use async_trait::async_trait;
+use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 use sooqa_inbox::{IngestSubmission, SubmittedVia, TelegramSubmissionInput};
 use sooqa_jobs::{Job, JobType, NewJob};
 use sooqa_media::{
-    CanonicalVideoProfile, CommandError, ExternalCommand, ExternalCommandOutput,
-    ExternalCommandRunner, FfmpegExecutor, FfprobeAdapter, MediaWorkspace, NormalizationPlanner,
-    WorkspaceArea,
+    CanonicalImageProfile, CanonicalVideoProfile, CommandError, ExternalCommand,
+    ExternalCommandOutput, ExternalCommandRunner, FfmpegExecutor, FfprobeAdapter, ImageNormalizer,
+    MediaWorkspace, NormalizationPlanner, WorkspaceArea,
 };
 use sooqa_persistence::Database;
 use sooqa_worker::{
@@ -64,6 +65,23 @@ impl ExternalCommandRunner for FakeProbeRunner {
             success: true,
             exit_code: Some(0),
             stdout: br#"{"format":{"format_name":"webm","duration":"1.0","size":"10"},"streams":[{"index":0,"codec_type":"video","codec_name":"vp9","width":16,"height":16}]}"#.to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FakeImageProbeRunner;
+
+#[async_trait]
+impl ExternalCommandRunner for FakeImageProbeRunner {
+    async fn run(&self, _command: ExternalCommand) -> Result<ExternalCommandOutput, CommandError> {
+        Ok(ExternalCommandOutput {
+            success: true,
+            exit_code: Some(0),
+            stdout: br#"{"format":{"format_name":"png_pipe","size":"10"},"streams":[{"index":0,"codec_type":"video","codec_name":"png","width":400,"height":200}]}"#.to_vec(),
             stderr: Vec::new(),
             stdout_truncated: false,
             stderr_truncated: false,
@@ -667,8 +685,14 @@ async fn normalize_handler_executes_ffmpeg_and_enqueues_finalize() {
     let executor = FfmpegExecutor::with_runner(runner, ffprobe, Duration::from_secs(1), 4096);
     let planner = NormalizationPlanner::new("ffmpeg", CanonicalVideoProfile::default())
         .expect("canonical profile should be valid");
-    let normalize_handler =
-        normalize_asset_handler(database.inbox(), work_root.clone(), planner, executor);
+    let normalize_handler = normalize_asset_handler(
+        database.inbox(),
+        work_root.clone(),
+        planner,
+        executor,
+        ImageNormalizer::new(CanonicalImageProfile::default())
+            .expect("canonical image profile should be valid"),
+    );
     normalize_handler(normalize_job.clone()).await.expect("normalize job should succeed");
     database
         .jobs()
@@ -784,7 +808,7 @@ async fn normalize_handler_executes_ffmpeg_and_enqueues_finalize() {
     let storage_job_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM jobs WHERE job_type = 'upload_storage_asset' AND payload_json->>'asset_id' = $1",
     )
-    .bind(canonical_asset_id)
+    .bind(canonical_asset_id.to_string())
     .fetch_one(database.pool())
     .await
     .expect("storage upload job count should be queryable");
@@ -847,5 +871,261 @@ async fn normalize_handler_executes_ffmpeg_and_enqueues_finalize() {
         .await
         .expect("Telegram ingest should be cleaned up");
     workspace.cleanup().await.expect("workspace should be cleaned");
+    tokio::fs::remove_dir_all(work_root).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn normalize_handler_composes_image_canonical_and_thumbnail_assets() {
+    let _test_guard = integration_test_lock().await;
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let key_prefix = format!("h6-image-{}-", Uuid::new_v4());
+    let work_root = std::env::temp_dir().join(format!("sooqa-h6-image-{}", Uuid::new_v4()));
+    let workspace_id = Uuid::new_v4();
+    let workspace = MediaWorkspace::create(&work_root, workspace_id)
+        .await
+        .expect("workspace should be created");
+    let input_path = workspace
+        .path(WorkspaceArea::Source, "telegram-input.bin")
+        .expect("workspace source path should be valid");
+    DynamicImage::ImageRgba8(ImageBuffer::from_pixel(400, 200, Rgba([40, 80, 120, u8::MAX])))
+        .save_with_format(&input_path, ImageFormat::Png)
+        .expect("test image should be written");
+
+    let submission = IngestSubmission::try_new_telegram(TelegramSubmissionInput {
+        source_reference: "telegram://42/102".to_owned(),
+        submitted_via: SubmittedVia::TelegramBot,
+        submitted_by_admin_id: None,
+        original_input: serde_json::json!({
+            "telegram_workspace_id": workspace_id,
+            "telegram_update_id": 102,
+            "telegram_chat_id": 42,
+            "telegram_message_id": 102,
+            "telegram_file_unique_id": "worker-test-image-file",
+            "file_size": 10,
+            "mime_type": "image/png",
+            "local_work_path": input_path,
+            "media_kind": "video",
+        }),
+        supplied_caption: Some("image caption".to_owned()),
+        idempotency_key: Some(format!("{}request", key_prefix)),
+    })
+    .expect("Telegram submission should be valid");
+    let created = database
+        .inbox()
+        .create_ingest(submission)
+        .await
+        .expect("Telegram image ingest should be created");
+    sqlx::query("UPDATE jobs SET priority = 500000 WHERE idempotency_key = $1")
+        .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
+        .execute(database.pool())
+        .await
+        .expect("image probe job should be prioritized");
+
+    let probe_job = database
+        .jobs()
+        .claim_next("worker-h6-image-probe", Duration::from_secs(30), &[JobType::ProbeAsset])
+        .await
+        .expect("image probe job should be claimable")
+        .expect("image probe job should exist");
+    let probe_handler = probe_asset_handler(
+        database.inbox(),
+        work_root.clone(),
+        FfprobeAdapter::with_runner(
+            "ffprobe",
+            Duration::from_secs(1),
+            4096,
+            Arc::new(FakeImageProbeRunner),
+        ),
+    );
+    probe_handler(probe_job.clone()).await.expect("image probe should succeed");
+    database
+        .jobs()
+        .complete(probe_job.id, "worker-h6-image-probe")
+        .await
+        .expect("image probe job should complete");
+
+    let first_normalize_job = database
+        .jobs()
+        .claim_next(
+            "worker-h6-image-normalize-stale",
+            Duration::from_secs(1),
+            &[JobType::NormalizeAsset],
+        )
+        .await
+        .expect("image normalize job should be claimable")
+        .expect("image normalize job should exist");
+    let first_normalize_attempt =
+        first_normalize_job.attempt().expect("first normalize job should have an attempt");
+    database
+        .inbox()
+        .begin_asset_normalization(created.request.id, &first_normalize_attempt)
+        .await
+        .expect("first image normalization should begin");
+    let image_normalizer = ImageNormalizer::new(CanonicalImageProfile::default())
+        .expect("canonical image profile should be valid");
+    let replay_plan = image_normalizer
+        .plan(&workspace, "telegram-input.bin", "canonical", "thumbnail")
+        .expect("image replay plan should be valid");
+    image_normalizer
+        .execute(&replay_plan)
+        .await
+        .expect("stale image attempt should publish valid outputs");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    database
+        .jobs()
+        .recover_stale_leases()
+        .await
+        .expect("stale image normalization lease should recover");
+    let normalize_job = database
+        .jobs()
+        .claim_next(
+            "worker-h6-image-normalize-retry",
+            Duration::from_secs(30),
+            &[JobType::NormalizeAsset],
+        )
+        .await
+        .expect("recovered image normalize job should be claimable")
+        .expect("recovered image normalize job should exist");
+    assert_eq!(normalize_job.id, first_normalize_job.id);
+    assert_eq!(normalize_job.attempt_count, 2);
+    let normalize_handler = normalize_asset_handler(
+        database.inbox(),
+        work_root.clone(),
+        NormalizationPlanner::new("ffmpeg", CanonicalVideoProfile::default())
+            .expect("canonical video profile should be valid"),
+        FfmpegExecutor::new(Arc::new(FakeNormalizeRunner), "ffprobe", Duration::from_secs(1)),
+        image_normalizer,
+    );
+    normalize_handler(normalize_job.clone()).await.expect("image normalization should succeed");
+    database
+        .jobs()
+        .complete(normalize_job.id, "worker-h6-image-normalize-retry")
+        .await
+        .expect("image normalize job should complete");
+
+    let finalize_job = database
+        .jobs()
+        .claim_next("worker-h6-image-finalize", Duration::from_secs(30), &[JobType::FinalizeIngest])
+        .await
+        .expect("image finalize job should be claimable")
+        .expect("image finalize job should exist");
+    let finalize_handler = finalize_ingest_handler(database.inbox(), database.library());
+    finalize_handler(finalize_job.clone()).await.expect("image finalization should succeed");
+    database
+        .jobs()
+        .complete(finalize_job.id, "worker-h6-image-finalize")
+        .await
+        .expect("image finalize job should complete");
+
+    let (status, original_input): (String, serde_json::Value) =
+        sqlx::query_as("SELECT status, original_input FROM ingest_requests WHERE id = $1")
+            .bind(created.request.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("image ingest should remain queryable");
+    assert_eq!(status, "completed");
+    assert_eq!(original_input["normalization"]["media_kind"], "image");
+    assert_eq!(original_input["normalization"]["mime_type"], "image/jpeg");
+    assert!(original_input["normalization"]["thumbnail"].is_object());
+    assert_eq!(original_input["normalization"]["thumbnail"]["width"], 320);
+    assert_eq!(original_input["normalization"]["thumbnail"]["height"], 160);
+
+    let content_item_id = original_input["finalization"]["content_item_id"]
+        .as_str()
+        .expect("content item ID should be stored")
+        .parse::<Uuid>()
+        .expect("content item ID should be a UUID");
+    let canonical_asset_id = original_input["finalization"]["canonical_asset_id"]
+        .as_str()
+        .expect("canonical asset ID should be stored")
+        .parse::<Uuid>()
+        .expect("canonical asset ID should be a UUID");
+    let (content_kind, canonical_kind, canonical_mime, canonical_path): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT ci.kind, ma.media_kind, ma.mime_type, ma.local_work_path FROM content_items ci JOIN media_assets ma ON ma.id = ci.canonical_asset_id WHERE ci.id = $1",
+    )
+    .bind(content_item_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("image canonical rows should be queryable");
+    assert_eq!(content_kind, "image");
+    assert_eq!(canonical_kind, "image");
+    assert_eq!(canonical_mime.as_deref(), Some("image/jpeg"));
+    assert!(
+        canonical_path.as_deref().is_some_and(|path| path.ends_with("normalized/canonical.jpg"))
+    );
+    let (thumbnail_count, thumbnail_path): (i64, Option<String>) = sqlx::query_as(
+        "SELECT count(*), min(local_work_path) FROM media_assets WHERE content_item_id = $1 AND role = 'thumbnail'",
+    )
+    .bind(content_item_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("image thumbnail row should be queryable");
+    assert_eq!(thumbnail_count, 1);
+    assert!(thumbnail_path.as_deref().is_some_and(|path| path.ends_with("previews/thumbnail.jpg")));
+
+    let storage_job_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE job_type = 'upload_storage_asset' AND payload_json->>'asset_id' = $1",
+    )
+    .bind(canonical_asset_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("image storage job should be queryable");
+    assert_eq!(storage_job_count, 1);
+
+    sqlx::query("DELETE FROM jobs WHERE payload_json->>'ingest_request_id' = $1 OR payload_json->>'asset_id' = $2")
+        .bind(created.request.id.to_string())
+        .bind(canonical_asset_id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("image jobs should be cleaned up");
+    sqlx::query("DELETE FROM idempotency_records WHERE storage_asset_id IN (SELECT id FROM media_assets WHERE content_item_id = $1)")
+        .bind(content_item_id)
+        .execute(database.pool())
+        .await
+        .expect("image storage idempotency records should be cleaned up");
+    sqlx::query("DELETE FROM source_records WHERE content_item_id = $1")
+        .bind(content_item_id)
+        .execute(database.pool())
+        .await
+        .expect("image source record should be cleaned up");
+    sqlx::query("UPDATE content_items SET canonical_asset_id = NULL WHERE id = $1")
+        .bind(content_item_id)
+        .execute(database.pool())
+        .await
+        .expect("image canonical pointer should be cleared");
+    sqlx::query("DELETE FROM media_assets WHERE content_item_id = $1")
+        .bind(content_item_id)
+        .execute(database.pool())
+        .await
+        .expect("image assets should be cleaned up");
+    sqlx::query("DELETE FROM content_items WHERE id = $1")
+        .bind(content_item_id)
+        .execute(database.pool())
+        .await
+        .expect("image content should be cleaned up");
+    sqlx::query(
+        "DELETE FROM idempotency_records WHERE scope = 'ingest:create' AND idempotency_key LIKE $1",
+    )
+    .bind(format!("{}%", key_prefix))
+    .execute(database.pool())
+    .await
+    .expect("image ingest idempotency records should be cleaned up");
+    sqlx::query("DELETE FROM ingest_requests WHERE id = $1")
+        .bind(created.request.id)
+        .execute(database.pool())
+        .await
+        .expect("image ingest should be cleaned up");
+    workspace.cleanup().await.expect("image workspace should be cleaned");
     tokio::fs::remove_dir_all(work_root).await.ok();
 }

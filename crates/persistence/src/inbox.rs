@@ -229,10 +229,26 @@ impl InboxRepository {
             transaction.commit().await?;
             return Ok(request);
         }
+        let declared_media_kind = request_media_kind(&request);
+        let detected_media_kind = probed_media_kind(&probe);
+        let media_kind = detected_media_kind.or(declared_media_kind);
+        let probed_format = probed_image_format(&probe);
+        let unsupported_image_format = media_kind == Some(SourceMediaKind::Image)
+            && !request_image_format_is_supported(&request, &probe);
         if let Some(object) = request.original_input.as_object_mut() {
             object.insert("probe".to_owned(), probe);
+            if let Some(media_kind) = detected_media_kind {
+                object.insert(
+                    "probed_media_kind".to_owned(),
+                    serde_json::to_value(media_kind).expect("source media kind is serializable"),
+                );
+            }
         } else {
-            request.original_input = json!({ "source": request.original_input, "probe": probe });
+            request.original_input = json!({
+                "source": request.original_input,
+                "probe": probe,
+                "probed_media_kind": detected_media_kind,
+            });
         }
         request.updated_at = OffsetDateTime::now_utc();
         sqlx::query(
@@ -244,17 +260,26 @@ impl InboxRepository {
         .execute(&mut *transaction)
         .await?;
 
-        let media_kind = request_media_kind(&request);
-        if media_kind != Some(SourceMediaKind::Video) {
+        if !matches!(media_kind, Some(SourceMediaKind::Video | SourceMediaKind::Image))
+            || unsupported_image_format
+        {
             request.transition_to(IngestStatus::FailedTerminal)?;
-            request.error_code = Some(if media_kind.is_some() {
-                "unsupported_media_kind".to_owned()
-            } else {
-                "invalid_ingest_state".to_owned()
+            request.error_code = Some(match media_kind {
+                Some(SourceMediaKind::Image) if unsupported_image_format => {
+                    "unsupported_image_format".to_owned()
+                }
+                Some(_) => "unsupported_media_kind".to_owned(),
+                None => "invalid_ingest_state".to_owned(),
             });
             request.error_message = Some(match media_kind {
+                Some(SourceMediaKind::Image) if unsupported_image_format => format!(
+                    "image input is not a supported JPEG/PNG (declared MIME {:?}, file name {:?}, probed format {:?})",
+                    request_mime_type(&request),
+                    request_file_name(&request),
+                    probed_format
+                ),
                 Some(media_kind) => format!(
-                    "asset media kind {media_kind:?} is not supported by the video normalizer"
+                    "asset media kind {media_kind:?} is not supported by the composed normalizers"
                 ),
                 None => "ingest request has no stored source media kind".to_owned(),
             });
@@ -841,12 +866,155 @@ async fn insert_finalize_job(
 }
 
 fn request_media_kind(request: &IngestRequest) -> Option<SourceMediaKind> {
+    if let Some(value) = request.original_input.get("probed_media_kind")
+        && let Ok(media_kind) = serde_json::from_value(value.clone())
+    {
+        return Some(media_kind);
+    }
     let value = if request.kind == IngestKind::Url {
         request.original_input.get("download")?.get("media_kind")?
     } else {
         request.original_input.get("media_kind")?
     };
     serde_json::from_value(value.clone()).ok()
+}
+
+fn request_mime_type(request: &IngestRequest) -> Option<&str> {
+    let value = if request.kind == IngestKind::Url {
+        request.original_input.get("download")?.get("mime_type")?
+    } else {
+        request.original_input.get("mime_type")?
+    };
+    value.as_str()
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ImageFormatKind {
+    Jpeg,
+    Png,
+    Unsupported,
+    Unknown,
+}
+
+fn request_file_name(request: &IngestRequest) -> Option<&str> {
+    if request.kind == IngestKind::Url {
+        None
+    } else {
+        request.original_input.get("file_name")?.as_str()
+    }
+}
+
+fn request_image_format_is_supported(request: &IngestRequest, probe: &serde_json::Value) -> bool {
+    let declared = request_mime_type(request)
+        .map(image_format_from_mime)
+        .filter(|format| *format != ImageFormatKind::Unknown)
+        .or_else(|| request_file_name(request).map(image_format_from_file_name))
+        .unwrap_or(ImageFormatKind::Unknown);
+    let probed = probed_image_format(probe);
+    match probed {
+        ImageFormatKind::Jpeg | ImageFormatKind::Png => true,
+        ImageFormatKind::Unsupported => false,
+        ImageFormatKind::Unknown => {
+            matches!(declared, ImageFormatKind::Jpeg | ImageFormatKind::Png)
+        }
+    }
+}
+
+fn image_format_from_mime(mime_type: &str) -> ImageFormatKind {
+    let mime_type = mime_type.split(';').next().map(str::trim).unwrap_or_default();
+    if mime_type.eq_ignore_ascii_case("image/jpeg") {
+        ImageFormatKind::Jpeg
+    } else if mime_type.eq_ignore_ascii_case("image/png") {
+        ImageFormatKind::Png
+    } else if mime_type.to_ascii_lowercase().starts_with("image/") {
+        ImageFormatKind::Unsupported
+    } else {
+        ImageFormatKind::Unknown
+    }
+}
+
+fn image_format_from_file_name(file_name: &str) -> ImageFormatKind {
+    match file_name.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
+        Some("jpg" | "jpeg") => ImageFormatKind::Jpeg,
+        Some("png") => ImageFormatKind::Png,
+        Some("gif" | "webp" | "avif") => ImageFormatKind::Unsupported,
+        _ => ImageFormatKind::Unknown,
+    }
+}
+
+fn probed_image_format(probe: &serde_json::Value) -> ImageFormatKind {
+    let container = probe.get("container_format").and_then(serde_json::Value::as_str);
+    let codec = probe.get("streams").and_then(serde_json::Value::as_array).and_then(|streams| {
+        streams.iter().find_map(|stream| {
+            (stream.get("kind").and_then(serde_json::Value::as_str) == Some("video"))
+                .then(|| stream.get("codec").and_then(serde_json::Value::as_str))
+                .flatten()
+        })
+    });
+    for value in [container, codec].into_iter().flatten() {
+        let value = value.to_ascii_lowercase();
+        let kind = if value.contains("jpeg") || value.contains("mjpeg") {
+            ImageFormatKind::Jpeg
+        } else if value.contains("png") {
+            ImageFormatKind::Png
+        } else if value.contains("gif") || value.contains("webp") || value.contains("avif") {
+            ImageFormatKind::Unsupported
+        } else {
+            ImageFormatKind::Unknown
+        };
+        if kind != ImageFormatKind::Unknown {
+            return kind;
+        }
+    }
+    ImageFormatKind::Unknown
+}
+
+fn probed_media_kind(probe: &serde_json::Value) -> Option<SourceMediaKind> {
+    let container = probe.get("container_format").and_then(serde_json::Value::as_str);
+    let codecs = probe
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|stream| stream.get("kind").and_then(serde_json::Value::as_str) == Some("video"))
+        .filter_map(|stream| stream.get("codec").and_then(serde_json::Value::as_str));
+    let codecs = codecs.collect::<Vec<_>>();
+    let container = container.map(str::to_ascii_lowercase);
+    let is_gif = container.as_deref().is_some_and(|value| value.contains("gif"))
+        || codecs.iter().any(|value| value.to_ascii_lowercase().contains("gif"));
+    if is_gif {
+        return Some(SourceMediaKind::Animation);
+    }
+
+    let is_image_container = container.as_deref().is_some_and(|value| {
+        ["image2", "png", "jpeg", "jpg", "webp", "avif", "mjpeg"]
+            .iter()
+            .any(|format| value.contains(format))
+    });
+    let is_image_codec = codecs
+        .iter()
+        .any(|value| ["png", "webp"].iter().any(|format| value.eq_ignore_ascii_case(format)))
+        || (container.is_none() && codecs.iter().any(|value| value.eq_ignore_ascii_case("mjpeg")));
+    if is_image_container || is_image_codec {
+        return Some(SourceMediaKind::Image);
+    }
+
+    let streams = probe.get("streams").and_then(serde_json::Value::as_array);
+    if streams.is_some_and(|streams| {
+        streams
+            .iter()
+            .any(|stream| stream.get("kind").and_then(serde_json::Value::as_str) == Some("video"))
+    }) {
+        return Some(SourceMediaKind::Video);
+    }
+    if streams.is_some_and(|streams| {
+        streams
+            .iter()
+            .any(|stream| stream.get("kind").and_then(serde_json::Value::as_str) == Some("audio"))
+    }) {
+        return Some(SourceMediaKind::Audio);
+    }
+    None
 }
 
 async fn load_request(

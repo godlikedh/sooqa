@@ -681,6 +681,57 @@ async fn exact_duplicate_resolution_reuses_content_and_attaches_new_sources() {
 
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL instance"]
+async fn exact_duplicate_resolution_ignores_thumbnail_hashes() {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+    let library = database.library();
+    let canonical_url = format!("https://library.test/thumbnail-dedup/{}", Uuid::new_v4());
+    let duplicate_url = format!("https://library.test/thumbnail-dedup/{}", Uuid::new_v4());
+    let created = library
+        .resolve_exact_duplicate(exact_duplicate_request(vec![16; 32], &canonical_url))
+        .await
+        .expect("canonical content should be created");
+    library
+        .record_thumbnail_asset(
+            created.content_item.id,
+            NewMediaAsset {
+                content_item_id: created.content_item.id,
+                role: AssetRole::Thumbnail,
+                media_kind: MediaKind::Video,
+                mime_type: Some("image/jpeg".to_owned()),
+                container: Some("jpeg".to_owned()),
+                video_codec: None,
+                audio_codec: None,
+                width: Some(320),
+                height: Some(180),
+                duration_ms: None,
+                bit_rate: None,
+                file_size_bytes: Some(12),
+                sha256: Some(vec![17; 32]),
+                local_work_path: Some("/var/lib/sooqa/work/test/thumbnail.jpg".to_owned()),
+                storage_state: StorageState::Local,
+            },
+        )
+        .await
+        .expect("thumbnail should be recorded");
+
+    let resolved = library
+        .resolve_exact_duplicate(exact_duplicate_request(vec![17; 32], &duplicate_url))
+        .await
+        .expect("thumbnail hash should not resolve as canonical content");
+    assert!(resolved.content_created);
+    assert_ne!(resolved.content_item.id, created.content_item.id);
+    assert_eq!(resolved.canonical_asset.role, AssetRole::Canonical);
+
+    clean_up_content(&database, resolved.content_item.id).await;
+    clean_up_content(&database, created.content_item.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
 async fn exact_duplicate_resolution_checks_platform_identity_before_hash() {
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
@@ -822,6 +873,66 @@ async fn recording_canonical_asset_is_idempotent_and_hash_unique() {
 
     clean_up_content(&database, first.id).await;
     clean_up_content(&database, second.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn recording_thumbnail_asset_is_idempotent_without_storage_upload() {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+    let library = database.library();
+    let content = library
+        .create_content_item(NewContentItem::new(ContentKind::Image))
+        .await
+        .expect("image content item should be created");
+    let thumbnail = || NewMediaAsset {
+        content_item_id: content.id,
+        role: AssetRole::Thumbnail,
+        media_kind: MediaKind::Image,
+        mime_type: Some("image/jpeg".to_owned()),
+        container: Some("jpg".to_owned()),
+        video_codec: None,
+        audio_codec: None,
+        width: Some(320),
+        height: Some(160),
+        duration_ms: None,
+        bit_rate: None,
+        file_size_bytes: Some(42),
+        sha256: Some(vec![13; 32]),
+        local_work_path: Some(format!("/var/lib/sooqa/work/{}/thumbnail.jpg", content.id)),
+        storage_state: StorageState::Local,
+    };
+
+    let recorded = library
+        .record_thumbnail_asset(content.id, thumbnail())
+        .await
+        .expect("thumbnail should be recorded");
+    let replayed = library
+        .record_thumbnail_asset(content.id, thumbnail())
+        .await
+        .expect("thumbnail replay should be idempotent");
+    assert_eq!(replayed.id, recorded.id);
+    let thumbnail_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM media_assets WHERE content_item_id = $1 AND role = 'thumbnail'",
+    )
+    .bind(content.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("thumbnail count should load");
+    assert_eq!(thumbnail_count, 1);
+    let storage_job_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE job_type = 'upload_storage_asset' AND payload_json->>'asset_id' = $1",
+    )
+    .bind(recorded.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("thumbnail storage jobs should load");
+    assert_eq!(storage_job_count, 0);
+
+    clean_up_content(&database, content.id).await;
 }
 
 #[tokio::test]

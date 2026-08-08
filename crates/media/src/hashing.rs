@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,40 @@ pub async fn sha256_file(path: impl AsRef<Path>) -> Result<FileDigest, HashError
         let read = file
             .read(&mut buffer)
             .await
+            .map_err(|source| HashError::Io { path: path.clone(), source })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes = bytes.checked_add(read as u64).ok_or_else(|| HashError::Io {
+            path: path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file size overflowed while hashing",
+            ),
+        })?;
+    }
+
+    Ok(FileDigest { bytes, sha256: hex_digest(&hasher.finalize()) })
+}
+
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> FileDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    FileDigest { bytes: bytes.len() as u64, sha256: hex_digest(&hasher.finalize()) }
+}
+
+pub(crate) fn sha256_file_sync(path: impl AsRef<Path>) -> Result<FileDigest, HashError> {
+    let path = path.as_ref().to_owned();
+    let mut file = std::fs::File::open(&path)
+        .map_err(|source| HashError::Io { path: path.clone(), source })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
+    let mut bytes = 0_u64;
+
+    loop {
+        let read = file
+            .read(&mut buffer)
             .map_err(|source| HashError::Io { path: path.clone(), source })?;
         if read == 0 {
             break;

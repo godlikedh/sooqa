@@ -227,7 +227,7 @@ impl IngestService for DatabaseIngestService {
             "file_size": command.file_size,
             "mime_type": command.mime_type,
             "file_name": command.file_name,
-            "media_kind": command.media_kind.as_str(),
+            "media_kind": command.media_kind.map(sooqa_library::MediaKind::as_str),
             "local_work_path": command.local_work_path,
         });
         let submission = IngestSubmission::try_new_telegram(TelegramSubmissionInput {

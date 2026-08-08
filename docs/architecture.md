@@ -78,17 +78,21 @@ its subprocess egress has an equivalent SSRF boundary.
 Media messages are downloaded into a per-update workspace, then create a
 Telegram ingest request and `probe_asset` job. The probe handler validates the
 shared workspace and uses ffprobe before recording typed probe metadata and
-atomically enqueuing the existing `normalize_asset` job. The normalization
-handler consumes that typed probe, executes the canonical video profile with
-ffmpeg, validates and hashes the published `normalized/canonical.mp4`, records
-typed normalization metadata, and atomically enqueues `finalize_ingest`. The
-finalization handler uses the existing exact-dedup/library repository to create
-or reuse the canonical content item, asset, and source record, then marks the
-ingest completed and leaves the existing storage-upload job queued for a
-capable Telegram worker.
-The composed normalizer is intentionally video-only: image and audio probes
-are recorded but finish terminally with `unsupported_media_kind` until their
-dedicated normalization slices are implemented.
+atomically enqueuing the existing `normalize_asset` job. Probe-derived media
+kind is authoritative when it is identifiable; Telegram MIME type and
+filename are hints used only when probing is inconclusive. Documents with
+missing or generic Telegram metadata are still admitted to probing, while
+explicitly unsupported documents are rejected before download. The normalization
+handler dispatches from the typed source media kind. Videos use the canonical
+ffmpeg profile, output validation, and SHA-256 hashing; images use the existing
+bounded JPEG/PNG normalizer, which also creates a thumbnail. Both paths record
+typed normalization metadata and atomically enqueue `finalize_ingest`.
+Finalization uses the existing exact-dedup/library repository to create or
+reuse the canonical content item, asset, source record, and (for images)
+thumbnail asset, then marks the ingest completed and leaves the existing
+storage-upload job queued for a capable Telegram worker. Audio, animation, and
+unknown media remain terminal `unsupported_media_kind` cases until their
+dedicated normalization paths are implemented.
 
 Storage uploads use an idempotency record as a durable intent bound to the
 asset, job, provider, storage chat, and upload generation. A reservation has

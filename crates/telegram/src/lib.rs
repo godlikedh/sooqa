@@ -68,6 +68,13 @@ pub enum TelegramMedia {
         mime_type: Option<String>,
         file_name: Option<String>,
     },
+    ProbeableDocument {
+        file_id: String,
+        file_unique_id: String,
+        file_size: Option<u32>,
+        mime_type: Option<String>,
+        file_name: Option<String>,
+    },
     UnsupportedDocument {
         file_name: Option<String>,
         mime_type: Option<String>,
@@ -120,7 +127,7 @@ pub struct MediaIngestCommand {
     pub message_id: i64,
     pub chat_id: i64,
     pub submitted_by_user_id: i64,
-    pub media_kind: MediaKind,
+    pub media_kind: Option<MediaKind>,
     pub workspace_id: Uuid,
     pub file_id: String,
     pub file_unique_id: String,
@@ -411,7 +418,7 @@ where
         media: TelegramMedia,
     ) -> Result<HandleOutcome, TelegramError> {
         let rate_limit_key = RateLimitKey { user_id: message.user_id, chat_id: message.chat_id };
-        let response = match media {
+        let (media_kind, file_id, file_unique_id, file_size, mime_type, file_name) = match media {
             TelegramMedia::UnsupportedDocument { file_name, mime_type } => {
                 let response = format!(
                     "⚠️ Unsupported Telegram document{}{}",
@@ -432,95 +439,98 @@ where
                 file_size,
                 mime_type,
                 file_name,
-            } => {
-                if file_size.map(u64::from).is_some_and(|size| size > self.max_download_bytes) {
-                    let response = format!(
-                        "⚠️ Telegram file exceeds the configured download limit of {} bytes",
-                        self.max_download_bytes
-                    );
-                    if !self.allow_response(message.user_id, message.chat_id) {
-                        self.complete(claim).await?;
-                        return Ok(HandleOutcome::RateLimited);
-                    }
-                    self.send_and_complete(claim, message.chat_id, &response, rate_limit_key)
-                        .await?;
-                    return Ok(HandleOutcome::MediaRejected);
+            } => (Some(media_kind), file_id, file_unique_id, file_size, mime_type, file_name),
+            TelegramMedia::ProbeableDocument {
+                file_id,
+                file_unique_id,
+                file_size,
+                mime_type,
+                file_name,
+            } => (None, file_id, file_unique_id, file_size, mime_type, file_name),
+        };
+        let response = {
+            if file_size.map(u64::from).is_some_and(|size| size > self.max_download_bytes) {
+                let response = format!(
+                    "⚠️ Telegram file exceeds the configured download limit of {} bytes",
+                    self.max_download_bytes
+                );
+                if !self.allow_response(message.user_id, message.chat_id) {
+                    self.complete(claim).await?;
+                    return Ok(HandleOutcome::RateLimited);
                 }
-                let user_id = message.user_id.expect("authorized Telegram messages have a user ID");
-                let Some(ingest_service) = self.ingest_service.as_ref() else {
-                    self.release(claim).await?;
-                    return Err(TelegramError::Ingest(Box::new(IngestUnavailable)));
-                };
-                let workspace_id = telegram_workspace_id(message.update_id);
-                let workspace =
-                    match MediaWorkspace::create(&self.media_work_root, workspace_id).await {
-                        Ok(workspace) => workspace,
-                        Err(error) => {
-                            self.clear_response(rate_limit_key);
-                            self.release(claim).await?;
-                            return Err(TelegramError::MediaDownload(Box::new(error)));
-                        }
-                    };
-                let local_work_path =
-                    match workspace.path(WorkspaceArea::Source, "telegram-input.bin") {
-                        Ok(path) => path,
-                        Err(error) => {
-                            let _ = workspace.cleanup().await;
-                            self.clear_response(rate_limit_key);
-                            self.release(claim).await?;
-                            return Err(TelegramError::MediaDownload(Box::new(error)));
-                        }
-                    };
-                if let Err(error) = self.api.download_file(&file_id, &local_work_path).await {
-                    self.clear_response(rate_limit_key);
-                    if A::is_retryable_error(&error) {
-                        let _ = workspace.cleanup().await;
-                        self.release(claim).await?;
-                        return Err(TelegramError::MediaDownload(Box::new(error)));
-                    }
-                    let _ = workspace.cleanup().await;
-                    let response = format!("⚠️ Telegram file cannot be downloaded: {error}");
-                    if !self.allow_response(message.user_id, message.chat_id) {
-                        self.complete(claim).await?;
-                        return Ok(HandleOutcome::RateLimited);
-                    }
-                    self.send_and_complete(claim, message.chat_id, &response, rate_limit_key)
-                        .await?;
-                    return Ok(HandleOutcome::MediaRejected);
-                }
-
-                let accepted = match ingest_service
-                    .create_media(MediaIngestCommand {
-                        update_id: message.update_id,
-                        message_id: message.message_id,
-                        chat_id: message.chat_id,
-                        submitted_by_user_id: user_id,
-                        media_kind,
-                        workspace_id,
-                        file_id,
-                        file_unique_id,
-                        file_size,
-                        mime_type,
-                        file_name,
-                        caption: message.caption.clone(),
-                        local_work_path,
-                        idempotency_key: format!("telegram:update:{}:v1", message.update_id),
-                    })
-                    .await
-                {
-                    Ok(accepted) => accepted,
-                    Err(error) => {
-                        let _ = workspace.cleanup().await;
-                        self.clear_response(rate_limit_key);
-                        self.release(claim).await?;
-                        return Err(TelegramError::Ingest(Box::new(error)));
-                    }
-                };
-                format!(
-                    "✅ Ingest queued\nID: {}\nStatus: {}",
-                    accepted.request_id, accepted.status
-                )
+                self.send_and_complete(claim, message.chat_id, &response, rate_limit_key).await?;
+                return Ok(HandleOutcome::MediaRejected);
             }
+            let user_id = message.user_id.expect("authorized Telegram messages have a user ID");
+            let Some(ingest_service) = self.ingest_service.as_ref() else {
+                self.release(claim).await?;
+                return Err(TelegramError::Ingest(Box::new(IngestUnavailable)));
+            };
+            let workspace_id = telegram_workspace_id(message.update_id);
+            let workspace = match MediaWorkspace::create(&self.media_work_root, workspace_id).await
+            {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    self.clear_response(rate_limit_key);
+                    self.release(claim).await?;
+                    return Err(TelegramError::MediaDownload(Box::new(error)));
+                }
+            };
+            let local_work_path = match workspace.path(WorkspaceArea::Source, "telegram-input.bin")
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = workspace.cleanup().await;
+                    self.clear_response(rate_limit_key);
+                    self.release(claim).await?;
+                    return Err(TelegramError::MediaDownload(Box::new(error)));
+                }
+            };
+            if let Err(error) = self.api.download_file(&file_id, &local_work_path).await {
+                self.clear_response(rate_limit_key);
+                if A::is_retryable_error(&error) {
+                    let _ = workspace.cleanup().await;
+                    self.release(claim).await?;
+                    return Err(TelegramError::MediaDownload(Box::new(error)));
+                }
+                let _ = workspace.cleanup().await;
+                let response = format!("⚠️ Telegram file cannot be downloaded: {error}");
+                if !self.allow_response(message.user_id, message.chat_id) {
+                    self.complete(claim).await?;
+                    return Ok(HandleOutcome::RateLimited);
+                }
+                self.send_and_complete(claim, message.chat_id, &response, rate_limit_key).await?;
+                return Ok(HandleOutcome::MediaRejected);
+            }
+
+            let accepted = match ingest_service
+                .create_media(MediaIngestCommand {
+                    update_id: message.update_id,
+                    message_id: message.message_id,
+                    chat_id: message.chat_id,
+                    submitted_by_user_id: user_id,
+                    media_kind,
+                    workspace_id,
+                    file_id,
+                    file_unique_id,
+                    file_size,
+                    mime_type,
+                    file_name,
+                    caption: message.caption.clone(),
+                    local_work_path,
+                    idempotency_key: format!("telegram:update:{}:v1", message.update_id),
+                })
+                .await
+            {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    let _ = workspace.cleanup().await;
+                    self.clear_response(rate_limit_key);
+                    self.release(claim).await?;
+                    return Err(TelegramError::Ingest(Box::new(error)));
+                }
+            };
+            format!("✅ Ingest queued\nID: {}\nStatus: {}", accepted.request_id, accepted.status)
         };
         if !self.allow_response(message.user_id, message.chat_id) {
             self.complete(claim).await?;
@@ -661,9 +671,8 @@ fn message_media(message: &Message) -> Option<TelegramMedia> {
     }
     let document = message.document()?;
     let mime_type = document.mime_type.as_ref().map(ToString::to_string);
-    let media_kind = document_media_kind(mime_type.as_deref(), document.file_name.as_deref());
-    match media_kind {
-        Some(media_kind) => Some(TelegramMedia::Supported {
+    match classify_document(mime_type.as_deref(), document.file_name.as_deref()) {
+        DocumentClassification::Supported(media_kind) => Some(TelegramMedia::Supported {
             media_kind,
             file_id: document.file.id.to_string(),
             file_unique_id: document.file.unique_id.to_string(),
@@ -671,38 +680,85 @@ fn message_media(message: &Message) -> Option<TelegramMedia> {
             mime_type,
             file_name: document.file_name.clone(),
         }),
-        None => Some(TelegramMedia::UnsupportedDocument {
+        DocumentClassification::Probeable => Some(TelegramMedia::ProbeableDocument {
+            file_id: document.file.id.to_string(),
+            file_unique_id: document.file.unique_id.to_string(),
+            file_size: Some(document.file.size),
+            mime_type,
+            file_name: document.file_name.clone(),
+        }),
+        DocumentClassification::Unsupported => Some(TelegramMedia::UnsupportedDocument {
             file_name: document.file_name.clone(),
             mime_type,
         }),
     }
 }
 
-fn document_media_kind(mime_type: Option<&str>, file_name: Option<&str>) -> Option<MediaKind> {
-    let mime_type = mime_type.unwrap_or_default().to_ascii_lowercase();
-    if mime_type.starts_with("video/") {
-        return Some(MediaKind::Video);
-    }
-    if mime_type == "image/gif" {
-        return Some(MediaKind::Animation);
-    }
-    if mime_type.starts_with("image/") {
-        return Some(MediaKind::Image);
-    }
-    if mime_type.starts_with("audio/") {
-        return Some(MediaKind::Audio);
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DocumentClassification {
+    Supported(MediaKind),
+    Probeable,
+    Unsupported,
+}
+
+fn classify_document(mime_type: Option<&str>, file_name: Option<&str>) -> DocumentClassification {
+    if let Some(mime_type) = mime_type {
+        let mime_type =
+            mime_type.split(';').next().map(str::trim).unwrap_or_default().to_ascii_lowercase();
+        if mime_type.starts_with("video/") {
+            return DocumentClassification::Supported(MediaKind::Video);
+        }
+        if mime_type == "image/gif" {
+            return DocumentClassification::Supported(MediaKind::Animation);
+        }
+        if matches!(mime_type.as_str(), "image/jpeg" | "image/png") {
+            return DocumentClassification::Supported(MediaKind::Image);
+        }
+        if mime_type.starts_with("image/") {
+            return DocumentClassification::Unsupported;
+        }
+        if mime_type.starts_with("audio/") {
+            return DocumentClassification::Supported(MediaKind::Audio);
+        }
+        if matches!(
+            mime_type.as_str(),
+            "application/pdf"
+                | "application/zip"
+                | "application/x-7z-compressed"
+                | "application/x-rar-compressed"
+                | "text/plain"
+        ) {
+            return DocumentClassification::Unsupported;
+        }
+        if mime_type.eq_ignore_ascii_case("application/octet-stream")
+            || mime_type.eq_ignore_ascii_case("binary/octet-stream")
+        {
+            return classify_document_filename(file_name);
+        }
     }
 
+    classify_document_filename(file_name)
+}
+
+fn classify_document_filename(file_name: Option<&str>) -> DocumentClassification {
     let extension = file_name
         .and_then(|name| Path::new(name).extension())
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase);
     match extension.as_deref() {
-        Some("gif") => Some(MediaKind::Animation),
-        Some("jpg" | "jpeg" | "png" | "webp" | "avif") => Some(MediaKind::Image),
-        Some("mp4" | "webm" | "mkv" | "mov" | "avi") => Some(MediaKind::Video),
-        Some("mp3" | "m4a" | "wav" | "flac" | "ogg") => Some(MediaKind::Audio),
-        _ => None,
+        Some("gif") => DocumentClassification::Supported(MediaKind::Animation),
+        Some("jpg" | "jpeg" | "png") => DocumentClassification::Supported(MediaKind::Image),
+        Some("mp4" | "webm" | "mkv" | "mov" | "avi") => {
+            DocumentClassification::Supported(MediaKind::Video)
+        }
+        Some("mp3" | "m4a" | "wav" | "flac" | "ogg") => {
+            DocumentClassification::Supported(MediaKind::Audio)
+        }
+        Some(
+            "avif" | "webp" | "zip" | "rar" | "7z" | "pdf" | "txt" | "doc" | "docx" | "xls"
+            | "xlsx" | "ppt" | "pptx",
+        ) => DocumentClassification::Unsupported,
+        _ => DocumentClassification::Probeable,
     }
 }
 
@@ -1487,7 +1543,7 @@ mod tests {
                 message_id: 99,
                 chat_id: 42,
                 submitted_by_user_id: 123,
-                media_kind: MediaKind::Video,
+                media_kind: Some(MediaKind::Video),
                 workspace_id: telegram_workspace_id(11),
                 file_id: "file-id".to_owned(),
                 file_unique_id: "unique-id".to_owned(),
@@ -1569,6 +1625,46 @@ mod tests {
             api.messages.lock().unwrap().as_slice(),
             &[(42, "⚠️ Unsupported Telegram document: archive.zip (application/zip)".to_owned())]
         );
+    }
+
+    #[tokio::test]
+    async fn probeable_telegram_document_is_downloaded_without_declared_kind() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        let service =
+            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+        let message = IncomingMessage {
+            update_id: 14,
+            message_id: 102,
+            user_id: Some(123),
+            chat_id: 42,
+            is_private: true,
+            text: None,
+            caption: None,
+            media: Some(TelegramMedia::ProbeableDocument {
+                file_id: "unknown-media".to_owned(),
+                file_unique_id: "unknown-media-unique".to_owned(),
+                file_size: Some(42),
+                mime_type: Some("application/octet-stream".to_owned()),
+                file_name: None,
+            }),
+        };
+
+        assert_eq!(
+            service.handle_message(message).await.unwrap(),
+            HandleOutcome::Responded(Command::Add)
+        );
+        let command = ingest.media_commands.lock().unwrap().pop().expect("media should be queued");
+        assert_eq!(command.media_kind, None);
+        assert_eq!(command.mime_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(command.file_name, None);
+        assert_eq!(api.downloads.lock().unwrap().as_slice(), &["unknown-media".to_owned()]);
+        MediaWorkspace::create(default_media_work_root(), telegram_workspace_id(14))
+            .await
+            .expect("test workspace should exist")
+            .cleanup()
+            .await
+            .expect("test workspace should be cleaned");
     }
 
     #[tokio::test]
@@ -1765,17 +1861,44 @@ mod tests {
     }
 
     #[test]
-    fn document_media_kind_uses_mime_then_safe_filename_fallback() {
+    fn document_classifier_prioritizes_explicit_mime_and_probes_unknowns() {
         assert_eq!(
-            document_media_kind(Some("video/mp4"), Some("not-video.txt")),
-            Some(MediaKind::Video)
+            classify_document(Some("video/mp4"), Some("not-video.txt")),
+            DocumentClassification::Supported(MediaKind::Video)
         );
-        assert_eq!(document_media_kind(None, Some("clip.WEBM")), Some(MediaKind::Video));
         assert_eq!(
-            document_media_kind(Some("image/gif"), Some("animation.bin")),
-            Some(MediaKind::Animation)
+            classify_document(Some("IMAGE/PNG; charset=binary"), Some("photo.webp")),
+            DocumentClassification::Supported(MediaKind::Image)
         );
-        assert_eq!(document_media_kind(Some("application/zip"), Some("archive.zip")), None);
+        assert_eq!(
+            classify_document(Some("image/webp"), Some("photo.png")),
+            DocumentClassification::Unsupported
+        );
+        assert_eq!(
+            classify_document(Some("application/pdf"), Some("clip.mp4")),
+            DocumentClassification::Unsupported
+        );
+        assert_eq!(
+            classify_document(Some("application/octet-stream"), Some("clip.WEBM")),
+            DocumentClassification::Supported(MediaKind::Video)
+        );
+        assert_eq!(
+            classify_document(Some("application/octet-stream"), Some("photo.webp")),
+            DocumentClassification::Unsupported
+        );
+        assert_eq!(
+            classify_document(Some("application/x-unknown"), None),
+            DocumentClassification::Probeable
+        );
+        assert_eq!(classify_document(None, Some("mystery.bin")), DocumentClassification::Probeable);
+        assert_eq!(
+            classify_document(None, Some("archive.zip")),
+            DocumentClassification::Unsupported
+        );
+        assert_eq!(
+            classify_document(Some("image/gif"), Some("animation.bin")),
+            DocumentClassification::Supported(MediaKind::Animation)
+        );
     }
 
     #[test]

@@ -26,6 +26,23 @@ fn telegram_submission(key: &str) -> IngestSubmission {
 }
 
 fn telegram_submission_with_kind(key: &str, media_kind: &str) -> IngestSubmission {
+    telegram_submission_with_kind_and_mime(key, media_kind, None)
+}
+
+fn telegram_submission_with_kind_and_mime(
+    key: &str,
+    media_kind: &str,
+    mime_type: Option<&str>,
+) -> IngestSubmission {
+    telegram_submission_with_kind_and_metadata(key, media_kind, mime_type, None)
+}
+
+fn telegram_submission_with_kind_and_metadata(
+    key: &str,
+    media_kind: &str,
+    mime_type: Option<&str>,
+    file_name: Option<&str>,
+) -> IngestSubmission {
     IngestSubmission::try_new_telegram(TelegramSubmissionInput {
         source_reference: "telegram://42/99".to_owned(),
         submitted_via: SubmittedVia::TelegramBot,
@@ -35,6 +52,8 @@ fn telegram_submission_with_kind(key: &str, media_kind: &str) -> IngestSubmissio
             "telegram_message_id": 99,
             "telegram_file_unique_id": "unique-file",
             "media_kind": media_kind,
+            "mime_type": mime_type,
+            "file_name": file_name,
             "local_work_path": "/tmp/sooqa-telegram-11.bin",
         }),
         supplied_caption: Some("caption".to_owned()),
@@ -149,7 +168,92 @@ async fn creates_ingest_and_inspect_job_atomically_with_idempotency() {
 
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL instance"]
-async fn unsupported_probe_kind_does_not_enqueue_video_normalization() {
+async fn unsupported_image_format_does_not_enqueue_static_normalization() {
+    let _test_guard = integration_test_lock().await;
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let key_prefix = format!("h6-image-format-{}-", Uuid::new_v4());
+    clean_up(&database, &key_prefix).await;
+    for (case, mime_type, file_name, probed_format, supported) in [
+        ("declared-webp", Some("image/webp"), None, "webp", false),
+        ("filename-webp", None, Some("photo.webp"), "webp", false),
+        ("mismatched-mime", Some("image/png"), None, "webp", false),
+        ("supported-mismatch", Some("image/jpeg"), Some("photo.jpg"), "png", true),
+        ("declared-image-probed-video", Some("image/png"), Some("photo.png"), "webm", true),
+    ] {
+        let created = database
+            .inbox()
+            .create_ingest(telegram_submission_with_kind_and_metadata(
+                &format!("{key_prefix}{case}"),
+                "image",
+                mime_type,
+                file_name,
+            ))
+            .await
+            .expect("unsupported image ingest should be created");
+        sqlx::query("UPDATE jobs SET priority = 200000 WHERE idempotency_key = $1")
+            .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
+            .execute(database.pool())
+            .await
+            .expect("image probe job should be prioritized");
+        let job = database
+            .jobs()
+            .claim_next("worker-h6-image-format", Duration::from_secs(30), &[JobType::ProbeAsset])
+            .await
+            .expect("image probe job should be claimable")
+            .expect("image probe job should exist");
+        let attempt = job.attempt().expect("claimed job should have an attempt");
+        database
+            .inbox()
+            .begin_asset_probe(created.request.id, &attempt)
+            .await
+            .expect("probe should begin");
+        database
+            .inbox()
+            .complete_asset_probe(
+                created.request.id,
+                &attempt,
+                serde_json::json!({
+                    "container_format": probed_format,
+                    "size_bytes": 10,
+                    "streams": [{"kind": "video", "codec": probed_format}]
+                }),
+            )
+            .await
+            .expect("unsupported image probe should be recorded");
+
+        let (status, error_code): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_code FROM ingest_requests WHERE id = $1")
+                .bind(created.request.id)
+                .fetch_one(database.pool())
+                .await
+                .expect("unsupported image state should be queryable");
+        if supported {
+            assert_eq!(status, "normalizing");
+            assert!(error_code.is_none());
+        } else {
+            assert_eq!(status, "failed_terminal");
+            assert_eq!(error_code.as_deref(), Some("unsupported_image_format"));
+        }
+        let normalize_job_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
+                .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
+                .fetch_one(database.pool())
+                .await
+                .expect("normalize job count should be queryable");
+        assert_eq!(normalize_job_count, i64::from(supported));
+    }
+
+    clean_up(&database, &key_prefix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn probe_kind_routes_to_the_composed_normalizer_or_terminal_failure() {
     let _test_guard = integration_test_lock().await;
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
@@ -160,12 +264,19 @@ async fn unsupported_probe_kind_does_not_enqueue_video_normalization() {
     let key_prefix = format!("h5-kind-{}-", Uuid::new_v4());
     clean_up(&database, &key_prefix).await;
     for (index, media_kind) in ["image", "audio", "animation"].into_iter().enumerate() {
-        let created = database
-            .inbox()
-            .create_ingest(telegram_submission_with_kind(
+        let submission = if media_kind == "image" {
+            telegram_submission_with_kind_and_metadata(
                 &format!("{key_prefix}{media_kind}"),
                 media_kind,
-            ))
+                Some("application/octet-stream"),
+                Some("photo.png"),
+            )
+        } else {
+            telegram_submission_with_kind(&format!("{key_prefix}{media_kind}"), media_kind)
+        };
+        let created = database
+            .inbox()
+            .create_ingest(submission)
             .await
             .expect("unsupported ingest should be created");
         sqlx::query("UPDATE jobs SET priority = $2 WHERE idempotency_key = $1")
@@ -186,13 +297,18 @@ async fn unsupported_probe_kind_does_not_enqueue_video_normalization() {
             .begin_asset_probe(created.request.id, &attempt)
             .await
             .expect("probe should begin");
+        let probe = if media_kind == "image" {
+            serde_json::json!({
+                "container_format": "png",
+                "size_bytes": 10,
+                "streams": [{"kind": "video", "codec": "png"}]
+            })
+        } else {
+            serde_json::json!({"container_format": "unsupported", "size_bytes": 10})
+        };
         database
             .inbox()
-            .complete_asset_probe(
-                created.request.id,
-                &attempt,
-                serde_json::json!({"container_format": "unsupported", "size_bytes": 10}),
-            )
+            .complete_asset_probe(created.request.id, &attempt, probe)
             .await
             .expect("unsupported probe should be recorded");
         database
@@ -201,21 +317,26 @@ async fn unsupported_probe_kind_does_not_enqueue_video_normalization() {
             .await
             .expect("unsupported probe job should complete");
 
-        let (status, error_code): (String, String) =
+        let (status, error_code): (String, Option<String>) =
             sqlx::query_as("SELECT status, error_code FROM ingest_requests WHERE id = $1")
                 .bind(created.request.id)
                 .fetch_one(database.pool())
                 .await
                 .expect("unsupported ingest state should be queryable");
-        assert_eq!(status, "failed_terminal");
-        assert_eq!(error_code, "unsupported_media_kind");
+        if media_kind == "image" {
+            assert_eq!(status, "normalizing");
+            assert!(error_code.is_none(), "image normalization should not have an error");
+        } else {
+            assert_eq!(status, "failed_terminal");
+            assert_eq!(error_code.as_deref(), Some("unsupported_media_kind"));
+        }
         let normalize_job_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
                 .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
                 .fetch_one(database.pool())
                 .await
                 .expect("normalize job count should be queryable");
-        assert_eq!(normalize_job_count, 0);
+        assert_eq!(normalize_job_count, i64::from(media_kind == "image"));
     }
 
     clean_up(&database, &key_prefix).await;
@@ -488,6 +609,7 @@ async fn stale_normalization_failure_cannot_poison_a_newer_finalize_handoff() {
                 height: Some(16),
                 duration_ms: Some(1_000),
                 bit_rate: Some(1_000),
+                thumbnail: None,
             },
         )
         .await

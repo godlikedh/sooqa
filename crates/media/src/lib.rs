@@ -45,6 +45,7 @@ pub use fingerprint::{
     frame_dhash_v1, select_fingerprint_timestamps,
 };
 pub use hashing::{FileDigest, HashError, sha256_file};
+pub(crate) use hashing::{sha256_bytes, sha256_file_sync};
 pub use image_normalize::{
     CanonicalImageFormat, CanonicalImageProfile, ImageNormalizationError, ImageNormalizationPlan,
     ImageNormalizationResult, ImageNormalizer, ImageProfileError,
