@@ -377,8 +377,22 @@ async fn probe_handler_consumes_telegram_media_from_the_shared_workspace() {
             .fetch_one(database.pool())
             .await
             .expect("Telegram ingest should remain queryable");
-    assert_eq!(status, "probing");
+    assert_eq!(status, "normalizing");
     assert_eq!(original_input["probe"]["container_format"], "webm");
+    let (normalize_job_type, normalize_payload, normalize_key): (
+        String,
+        serde_json::Value,
+        String,
+    ) = sqlx::query_as(
+        "SELECT job_type, payload_json, idempotency_key FROM jobs WHERE idempotency_key = $1",
+    )
+    .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
+    .fetch_one(database.pool())
+    .await
+    .expect("normalize job should be durable");
+    assert_eq!(normalize_job_type, "normalize_asset");
+    assert_eq!(normalize_payload["ingest_request_id"], created.request.id.to_string());
+    assert_eq!(normalize_key, format!("ingest:{}:normalize_asset:v1", created.request.id));
 
     sqlx::query("DELETE FROM jobs WHERE payload_json->>'ingest_request_id' = $1 OR id = $2")
         .bind(created.request.id.to_string())
@@ -498,7 +512,7 @@ async fn probe_handler_retries_after_a_retryable_probe_failure() {
             .fetch_one(database.pool())
             .await
             .expect("ingest status should be queryable"),
-        "probing"
+        "normalizing"
     );
 
     sqlx::query("DELETE FROM jobs WHERE payload_json->>'ingest_request_id' = $1")

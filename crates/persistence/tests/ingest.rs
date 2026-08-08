@@ -1,8 +1,9 @@
-use std::env;
+use std::{env, time::Duration};
 
 use sooqa_inbox::{
     IngestStatus, IngestSubmission, IngestSubmissionInput, SubmittedVia, TelegramSubmissionInput,
 };
+use sooqa_jobs::JobType;
 use sooqa_persistence::{Database, InboxRepositoryError};
 use uuid::Uuid;
 
@@ -176,6 +177,103 @@ async fn creates_telegram_ingest_and_probe_job_atomically() {
         .expect("repeated Telegram ingest should be idempotent");
     assert!(!repeated.created);
     assert_eq!(repeated.request.id, first.request.id);
+
+    clean_up(&database, &key_prefix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn stale_probe_failure_cannot_poison_a_newer_normalize_handoff() {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let key_prefix = format!("h5-probe-fence-{}-", Uuid::new_v4());
+    clean_up(&database, &key_prefix).await;
+    let key = format!("{key_prefix}telegram");
+    let created = database
+        .inbox()
+        .create_ingest(telegram_submission(&key))
+        .await
+        .expect("Telegram ingest should be created");
+    sqlx::query("UPDATE jobs SET priority = 100000 WHERE idempotency_key = $1")
+        .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
+        .execute(database.pool())
+        .await
+        .expect("probe job should be prioritized");
+
+    let first_job = database
+        .jobs()
+        .claim_next("worker-h5-stale-probe", Duration::from_secs(1), &[JobType::ProbeAsset])
+        .await
+        .expect("first probe attempt should be claimable")
+        .expect("first probe attempt should exist");
+    assert_eq!(first_job.attempt_count, 1);
+    let first_attempt = first_job.attempt().expect("claimed job should have an attempt");
+    assert!(matches!(
+        database
+            .inbox()
+            .begin_asset_probe(created.request.id, &first_attempt)
+            .await
+            .expect("first probe should begin"),
+        sooqa_persistence::AssetProbeStart::Ready(_)
+    ));
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    database.jobs().recover_stale_leases().await.expect("stale probe attempt should be recovered");
+    let second_job = database
+        .jobs()
+        .claim_next("worker-h5-fresh-probe", Duration::from_secs(30), &[JobType::ProbeAsset])
+        .await
+        .expect("second probe attempt should be claimable")
+        .expect("second probe attempt should exist");
+    assert_eq!(second_job.id, first_job.id);
+    assert_eq!(second_job.attempt_count, 2);
+    let second_attempt = second_job.attempt().expect("reclaimed job should have an attempt");
+    assert!(matches!(
+        database
+            .inbox()
+            .begin_asset_probe(created.request.id, &second_attempt)
+            .await
+            .expect("second probe should begin"),
+        sooqa_persistence::AssetProbeStart::Ready(_)
+    ));
+    database
+        .inbox()
+        .complete_asset_probe(
+            created.request.id,
+            &second_attempt,
+            serde_json::json!({"container_format": "webm", "size_bytes": 10}),
+        )
+        .await
+        .expect("second probe should enqueue normalization");
+    database
+        .inbox()
+        .fail_asset_probe(
+            created.request.id,
+            &first_attempt,
+            IngestStatus::FailedTerminal,
+            "stale_probe",
+            "stale attempt must not change the request",
+        )
+        .await
+        .expect("stale failure should be ignored");
+
+    let status: String = sqlx::query_scalar("SELECT status FROM ingest_requests WHERE id = $1")
+        .bind(created.request.id)
+        .fetch_one(database.pool())
+        .await
+        .expect("ingest status should be queryable");
+    assert_eq!(status, "normalizing");
+    let normalize_job_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
+            .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
+            .fetch_one(database.pool())
+            .await
+            .expect("normalize job count should be queryable");
+    assert_eq!(normalize_job_count, 1);
 
     clean_up(&database, &key_prefix).await;
 }

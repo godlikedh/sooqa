@@ -6,6 +6,8 @@ All notable changes to sooqa will be documented here.
 
 ### Added
 
+- Made successful `probe_asset` completion advance the ingest to
+  `normalizing` and enqueue the existing `normalize_asset` job atomically.
 - Composed the durable `download_source` worker handler with the existing
   ingest/job schema, shared workspace, typed download metadata, and idempotent
   `probe_asset` handoff; fenced completion and failure to the current job

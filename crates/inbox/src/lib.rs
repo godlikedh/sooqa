@@ -166,6 +166,7 @@ impl IngestStatus {
             (Self::Received, Self::Queued)
                 | (Self::Queued, Self::Downloading)
                 | (Self::Downloading, Self::Probing)
+                | (Self::Probing, Self::Normalizing)
                 | (Self::Probing, Self::ExactDedupCheck)
                 | (Self::ExactDedupCheck, Self::Normalizing)
                 | (Self::Normalizing, Self::Fingerprinting)
@@ -590,6 +591,19 @@ mod tests {
         }
 
         assert!(request.transition_to(IngestStatus::Queued).is_err());
+
+        let mut direct_normalizing =
+            IngestRequest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
+        for status in [
+            IngestStatus::Queued,
+            IngestStatus::Downloading,
+            IngestStatus::Probing,
+            IngestStatus::Normalizing,
+        ] {
+            direct_normalizing
+                .transition_to(status)
+                .expect("direct probe-to-normalize transition should be valid");
+        }
 
         let mut retrying =
             IngestRequest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
