@@ -50,7 +50,9 @@ proc-macro-error2 v2.0.1
     └── teloxide v0.17.0
 ```
 
-Media integration tests that need locally installed binaries are separate:
+The production worker now preflights `yt-dlp` because URL inspection is enabled;
+direct HTTP inspection does not require an external binary. Media integration
+tests that need locally installed binaries are separate:
 
 ```bash
 just test-media

@@ -20,10 +20,10 @@ The repository currently provides:
 - an explicit storage-intent reconciliation CLI for ambiguous Telegram
   uploads.
 
-The composed worker currently registers `probe_asset` and, when configured,
-`upload_storage_asset`. Source inspection, downloading, normalization,
-library finalization, and publishing remain separate boundaries until their
-handlers are composed into the production workflow.
+The composed worker registers `inspect_source` with direct HTTP/yt-dlp routing,
+`probe_asset`, and, when configured, `upload_storage_asset`. Download-job
+execution, normalization, library finalization, and publishing remain separate
+boundaries until their handlers are composed into the production workflow.
 
 Active documentation is the authority for current behavior:
 

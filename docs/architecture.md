@@ -65,10 +65,13 @@ ffmpeg, or yt-dlp is running.
 ## Current Telegram paths
 
 URL messages call the Inbox service and create a durable `inspect_source` job.
-The production worker does not yet register that handler. Media messages are
-downloaded into a per-update workspace, then create a Telegram ingest request
-and `probe_asset` job. The probe handler validates the shared workspace and
-uses ffprobe before recording typed probe metadata.
+The production worker registers that handler with a router: recognizable media
+responses stay on the SSRF-hardened direct HTTP adapter, while page-like
+responses and upstream HTTP status failures fall back to yt-dlp. The selected
+adapter is retained in the typed inspection payload for the later download job.
+Media messages are downloaded into a per-update workspace, then create a
+Telegram ingest request and `probe_asset` job. The probe handler validates the
+shared workspace and uses ffprobe before recording typed probe metadata.
 
 Storage uploads use an idempotency record as a durable intent bound to the
 asset, job, provider, storage chat, and upload generation. A reservation has
@@ -108,8 +111,7 @@ image includes all three tools and creates a writable `/var/lib/sooqa/work`.
 ## State of the pipeline
 
 Implemented primitives and boundaries do not imply an end-to-end publisher.
-The remaining composition work is source inspection/download orchestration,
-normalization/finalization, review-facing library actions, and Telegram
-publication. The historical roadmap in
+The remaining composition work is download execution, normalization/finalization,
+review-facing library actions, and Telegram publication. The historical roadmap in
 `docs/reference/PROJECT_SPEC.md` is useful context but is not the authority for
 those claims.

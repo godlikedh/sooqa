@@ -5,13 +5,18 @@ use std::{error::Error, sync::Arc, time::Duration};
 use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
 use sooqa_jobs::JobType;
 use sooqa_media::{
-    BinaryCheck, FfprobeAdapter, MediaWorkspace, ProcessCommandRunner, diagnose_binaries,
+    BinaryCheck, DirectHttpDownloader, DownloadLimits, FfprobeAdapter, MediaWorkspace,
+    ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter, YtDlpConfig, YtDlpDownloader,
+    diagnose_binaries,
 };
 use sooqa_persistence::Database;
 use uuid::Uuid;
 
 use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
-use sooqa_worker::{HandlerRegistry, Worker, probe_asset_handler, upload_storage_asset_handler};
+use sooqa_worker::{
+    HandlerRegistry, Worker, inspect_source_handler, probe_asset_handler,
+    upload_storage_asset_handler,
+};
 
 #[tokio::main]
 async fn main() {
@@ -35,6 +40,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
         config.secrets.database_url.as_ref().ok_or(ConfigError::MissingSecret("database URL"))?;
     let database = Database::connect_secret(database_url, config.database.max_connections).await?;
     let mut handlers = HandlerRegistry::new();
+    let download_limits = DownloadLimits {
+        max_bytes: config.telegram.max_download_bytes,
+        ..DownloadLimits::default()
+    };
+    let ytdlp_config =
+        YtDlpConfig::new(config.media.ytdlp_path.clone(), config.media.ytdlp_format.clone())?;
+    let source_downloader: Arc<dyn SourceDownloader> = Arc::new(SourceDownloaderRouter::new(
+        Arc::new(DirectHttpDownloader::new(download_limits)),
+        Arc::new(YtDlpDownloader::with_limits(ytdlp_config, download_limits)),
+    ));
+    let inspect_handler = inspect_source_handler(database.inbox(), source_downloader);
+    handlers.register(JobType::InspectSource, move |job| inspect_handler(job));
+    tracing::info!("source inspection handlers enabled (direct HTTP and yt-dlp)");
     let probe_handler = probe_asset_handler(
         database.inbox(),
         config.media.work_root.clone(),
@@ -86,6 +104,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
             "ffprobe",
             config.media.ffprobe_path.clone(),
             ["-version"],
+        ));
+    }
+    if capabilities.contains(&JobType::InspectSource) {
+        binary_checks.push(BinaryCheck::new(
+            "yt-dlp",
+            config.media.ytdlp_path.clone(),
+            ["--version"],
         ));
     }
     let binary_diagnostics =

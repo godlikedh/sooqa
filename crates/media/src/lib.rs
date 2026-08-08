@@ -2,6 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -108,6 +109,54 @@ pub trait SourceDownloader: Send + Sync {
     }
 }
 
+/// Selects the direct HTTP adapter for recognizable media responses and uses
+/// yt-dlp for page-like URLs or upstream responses that direct HTTP cannot
+/// handle. The selected adapter is recorded in `SourceInspection` so the
+/// later download job uses the same boundary.
+#[derive(Clone)]
+pub struct SourceDownloaderRouter {
+    direct_http: Arc<dyn SourceDownloader>,
+    ytdlp: Arc<dyn SourceDownloader>,
+}
+
+impl SourceDownloaderRouter {
+    pub fn new(direct_http: Arc<dyn SourceDownloader>, ytdlp: Arc<dyn SourceDownloader>) -> Self {
+        Self { direct_http, ytdlp }
+    }
+}
+
+#[async_trait]
+impl SourceDownloader for SourceDownloaderRouter {
+    async fn inspect(&self, source: &SourceInput) -> Result<SourceInspection, DownloadError> {
+        match self.direct_http.inspect(source).await {
+            Ok(inspection) if inspection.media_kind != SourceMediaKind::Unknown => Ok(inspection),
+            Ok(_) => self.ytdlp.inspect(source).await,
+            Err(error) if should_try_ytdlp(&error) => self.ytdlp.inspect(source).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn download(
+        &self,
+        inspection: &SourceInspection,
+        destination: &Path,
+        limits: &DownloadLimits,
+    ) -> Result<DownloadedSource, DownloadError> {
+        match inspection.adapter.as_str() {
+            "direct_http" => self.direct_http.download(inspection, destination, limits).await,
+            "yt_dlp" => self.ytdlp.download(inspection, destination, limits).await,
+            adapter => Err(DownloadError::terminal(
+                "unknown_source_adapter",
+                format!("source inspection selected unsupported adapter {adapter:?}"),
+            )),
+        }
+    }
+}
+
+fn should_try_ytdlp(error: &DownloadError) -> bool {
+    matches!(error, DownloadError::Terminal { class, .. } if class == "upstream_http_status")
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Error)]
 pub enum DownloadError {
     #[error("{message}")]
@@ -141,7 +190,57 @@ impl DownloadError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[derive(Clone)]
+    struct StubDownloader {
+        inspection: Result<SourceInspection, DownloadError>,
+        downloads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SourceDownloader for StubDownloader {
+        async fn inspect(&self, _source: &SourceInput) -> Result<SourceInspection, DownloadError> {
+            self.inspection.clone()
+        }
+
+        async fn download(
+            &self,
+            _inspection: &SourceInspection,
+            destination: &Path,
+            _limits: &DownloadLimits,
+        ) -> Result<DownloadedSource, DownloadError> {
+            self.downloads.fetch_add(1, Ordering::Relaxed);
+            Ok(DownloadedSource {
+                path: destination.to_owned(),
+                bytes: 1,
+                mime_type: Some("video/mp4".to_owned()),
+            })
+        }
+    }
+
+    fn inspection(adapter: &str, media_kind: SourceMediaKind) -> SourceInspection {
+        SourceInspection {
+            adapter: adapter.to_owned(),
+            source_url: "https://example.test/watch".to_owned(),
+            resolved_url: None,
+            media_kind,
+            mime_type: Some("video/mp4".to_owned()),
+            content_length_bytes: Some(1),
+            title: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn source() -> SourceInput {
+        SourceInput {
+            ingest_request_id: Uuid::from_u128(1),
+            source_url: "https://example.test/watch".to_owned(),
+            page_url: None,
+        }
+    }
 
     #[test]
     fn source_inspection_round_trips_as_job_payload() {
@@ -160,5 +259,94 @@ mod tests {
         let decoded: SourceInspection =
             serde_json::from_value(value).expect("inspection should deserialize");
         assert_eq!(decoded, inspection);
+    }
+
+    #[tokio::test]
+    async fn router_falls_back_to_ytdlp_for_page_like_direct_responses() {
+        let direct_downloads = Arc::new(AtomicUsize::new(0));
+        let ytdlp_downloads = Arc::new(AtomicUsize::new(0));
+        let router = SourceDownloaderRouter::new(
+            Arc::new(StubDownloader {
+                inspection: Ok(inspection("direct_http", SourceMediaKind::Unknown)),
+                downloads: Arc::clone(&direct_downloads),
+            }),
+            Arc::new(StubDownloader {
+                inspection: Ok(inspection("yt_dlp", SourceMediaKind::Video)),
+                downloads: Arc::clone(&ytdlp_downloads),
+            }),
+        );
+
+        let inspection = router.inspect(&source()).await.expect("yt-dlp inspection should win");
+        assert_eq!(inspection.adapter, "yt_dlp");
+        assert_eq!(inspection.media_kind, SourceMediaKind::Video);
+        let destination = PathBuf::from("source.bin");
+        router
+            .download(&inspection, &destination, &DownloadLimits::default())
+            .await
+            .expect("download should use the selected adapter");
+        assert_eq!(direct_downloads.load(Ordering::Relaxed), 0);
+        assert_eq!(ytdlp_downloads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn router_keeps_recognized_direct_media_on_http_adapter() {
+        let direct_downloads = Arc::new(AtomicUsize::new(0));
+        let ytdlp_downloads = Arc::new(AtomicUsize::new(0));
+        let router = SourceDownloaderRouter::new(
+            Arc::new(StubDownloader {
+                inspection: Ok(inspection("direct_http", SourceMediaKind::Video)),
+                downloads: Arc::clone(&direct_downloads),
+            }),
+            Arc::new(StubDownloader {
+                inspection: Ok(inspection("yt_dlp", SourceMediaKind::Video)),
+                downloads: Arc::clone(&ytdlp_downloads),
+            }),
+        );
+
+        let inspection = router.inspect(&source()).await.expect("direct inspection should win");
+        assert_eq!(inspection.adapter, "direct_http");
+        let destination = PathBuf::from("source.bin");
+        router
+            .download(&inspection, &destination, &DownloadLimits::default())
+            .await
+            .expect("download should use the selected adapter");
+        assert_eq!(direct_downloads.load(Ordering::Relaxed), 1);
+        assert_eq!(ytdlp_downloads.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn router_falls_back_for_upstream_http_statuses_but_not_security_errors() {
+        let ytdlp_downloads = Arc::new(AtomicUsize::new(0));
+        let ytdlp = Arc::new(StubDownloader {
+            inspection: Ok(inspection("yt_dlp", SourceMediaKind::Video)),
+            downloads: Arc::clone(&ytdlp_downloads),
+        });
+        let fallback = SourceDownloaderRouter::new(
+            Arc::new(StubDownloader {
+                inspection: Err(DownloadError::terminal(
+                    "upstream_http_status",
+                    "source returned HTTP status 403",
+                )),
+                downloads: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::clone(&ytdlp) as Arc<dyn SourceDownloader>,
+        );
+        assert_eq!(
+            fallback.inspect(&source()).await.expect("yt-dlp should be tried").adapter,
+            "yt_dlp"
+        );
+
+        let blocked = SourceDownloaderRouter::new(
+            Arc::new(StubDownloader {
+                inspection: Err(DownloadError::terminal("ssrf_blocked", "private address")),
+                downloads: Arc::new(AtomicUsize::new(0)),
+            }),
+            ytdlp,
+        );
+        assert!(matches!(
+            blocked.inspect(&source()).await,
+            Err(DownloadError::Terminal { class, .. }) if class == "ssrf_blocked"
+        ));
+        assert_eq!(ytdlp_downloads.load(Ordering::Relaxed), 0);
     }
 }
