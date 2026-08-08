@@ -1,15 +1,23 @@
-use sqlx::{FromRow, postgres::PgPool};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
 use thiserror::Error;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-#[derive(Clone)]
+/// Telegram update receipts are deliberately process-local.  They are a
+/// delivery optimization, not application state; the five-table reset keeps
+/// retries and business effects in `ingests`, `media`, `posts`, and jobs.
+#[derive(Clone, Default)]
 pub struct TelegramRepository {
-    pool: PgPool,
+    receipts: Arc<Mutex<HashMap<i64, TelegramUpdateReceipt>>>,
 }
 
 impl TelegramRepository {
-    pub(crate) fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
     pub async fn claim_update(
@@ -19,58 +27,56 @@ impl TelegramRepository {
         if update_id <= 0 {
             return Err(TelegramRepositoryError::InvalidUpdateId(update_id));
         }
-        let claim_token = sqlx::query_scalar::<_, Uuid>(
-            r#"
-            INSERT INTO telegram_update_receipts (update_id, claim_token, claimed_at)
-            VALUES ($1, gen_random_uuid(), now())
-            ON CONFLICT (update_id) DO UPDATE
-            SET claim_token = gen_random_uuid(), claimed_at = now()
-            WHERE telegram_update_receipts.completed_at IS NULL
-              AND (
-                  telegram_update_receipts.claim_token IS NULL
-                  OR telegram_update_receipts.claimed_at < now() - interval '5 minutes'
-              )
-            RETURNING claim_token
-            "#,
-        )
-        .bind(update_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        if let Some(claim_token) = claim_token {
+        let mut receipts =
+            self.receipts.lock().map_err(|_| TelegramRepositoryError::LockPoisoned)?;
+        let now = OffsetDateTime::now_utc();
+        if let Some(receipt) = receipts.get_mut(&update_id) {
+            if receipt.completed_at.is_some() {
+                return Ok(TelegramUpdateClaimResult::Completed);
+            }
+            if receipt.claimed_at.is_some_and(|claimed_at| claimed_at > now - Duration::minutes(5))
+            {
+                return Ok(TelegramUpdateClaimResult::InProgress);
+            }
+            receipt.claim_token = Some(Uuid::new_v4());
+            receipt.claimed_at = Some(now);
             return Ok(TelegramUpdateClaimResult::Claimed(TelegramUpdateClaim {
                 update_id,
-                claim_token,
+                claim_token: receipt.claim_token.expect("claim token was set"),
             }));
         }
-
-        let state = sqlx::query_as::<_, TelegramUpdateState>(
-            "SELECT completed_at FROM telegram_update_receipts WHERE update_id = $1",
-        )
-        .bind(update_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(TelegramRepositoryError::ClaimLost(update_id))?;
-        if state.completed_at.is_some() {
-            Ok(TelegramUpdateClaimResult::Completed)
-        } else {
-            Ok(TelegramUpdateClaimResult::InProgress)
-        }
+        let token = Uuid::new_v4();
+        receipts.insert(
+            update_id,
+            TelegramUpdateReceipt {
+                update_id,
+                received_at: now,
+                claim_token: Some(token),
+                claimed_at: Some(now),
+                completed_at: None,
+            },
+        );
+        Ok(TelegramUpdateClaimResult::Claimed(TelegramUpdateClaim {
+            update_id,
+            claim_token: token,
+        }))
     }
 
     pub async fn complete_update(
         &self,
         claim: TelegramUpdateClaim,
     ) -> Result<(), TelegramRepositoryError> {
-        let result = sqlx::query(
-            "UPDATE telegram_update_receipts SET claim_token = NULL, claimed_at = NULL, completed_at = now() WHERE update_id = $1 AND claim_token = $2 AND completed_at IS NULL",
-        )
-        .bind(claim.update_id)
-        .bind(claim.claim_token)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() != 1 {
+        let mut receipts =
+            self.receipts.lock().map_err(|_| TelegramRepositoryError::LockPoisoned)?;
+        let receipt = receipts
+            .get_mut(&claim.update_id)
+            .ok_or(TelegramRepositoryError::ClaimLost(claim.update_id))?;
+        if receipt.completed_at.is_some() || receipt.claim_token != Some(claim.claim_token) {
             return Err(TelegramRepositoryError::ClaimLost(claim.update_id));
         }
+        receipt.claim_token = None;
+        receipt.claimed_at = None;
+        receipt.completed_at = Some(OffsetDateTime::now_utc());
         Ok(())
     }
 
@@ -78,16 +84,16 @@ impl TelegramRepository {
         &self,
         claim: TelegramUpdateClaim,
     ) -> Result<(), TelegramRepositoryError> {
-        let result = sqlx::query(
-            "UPDATE telegram_update_receipts SET claim_token = NULL, claimed_at = NULL WHERE update_id = $1 AND claim_token = $2 AND completed_at IS NULL",
-        )
-        .bind(claim.update_id)
-        .bind(claim.claim_token)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() != 1 {
+        let mut receipts =
+            self.receipts.lock().map_err(|_| TelegramRepositoryError::LockPoisoned)?;
+        let receipt = receipts
+            .get_mut(&claim.update_id)
+            .ok_or(TelegramRepositoryError::ClaimLost(claim.update_id))?;
+        if receipt.completed_at.is_some() || receipt.claim_token != Some(claim.claim_token) {
             return Err(TelegramRepositoryError::ClaimLost(claim.update_id));
         }
+        receipt.claim_token = None;
+        receipt.claimed_at = None;
         Ok(())
     }
 
@@ -95,27 +101,18 @@ impl TelegramRepository {
         &self,
         update_id: i64,
     ) -> Result<Option<TelegramUpdateReceipt>, TelegramRepositoryError> {
-        Ok(sqlx::query_as::<_, TelegramUpdateReceipt>(
-            "SELECT update_id, received_at, claim_token, claimed_at, completed_at FROM telegram_update_receipts WHERE update_id = $1",
-        )
-        .bind(update_id)
-        .fetch_optional(&self.pool)
-        .await?)
+        let receipts = self.receipts.lock().map_err(|_| TelegramRepositoryError::LockPoisoned)?;
+        Ok(receipts.get(&update_id).cloned())
     }
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, Clone)]
 pub struct TelegramUpdateReceipt {
     pub update_id: i64,
-    pub received_at: time::OffsetDateTime,
+    pub received_at: OffsetDateTime,
     pub claim_token: Option<Uuid>,
-    pub claimed_at: Option<time::OffsetDateTime>,
-    pub completed_at: Option<time::OffsetDateTime>,
-}
-
-#[derive(Debug, FromRow)]
-struct TelegramUpdateState {
-    completed_at: Option<time::OffsetDateTime>,
+    pub claimed_at: Option<OffsetDateTime>,
+    pub completed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -135,8 +132,8 @@ pub enum TelegramUpdateClaimResult {
 pub enum TelegramRepositoryError {
     #[error("Telegram update ID must be positive: {0}")]
     InvalidUpdateId(i64),
-    #[error("Telegram update repository database operation failed: {0}")]
-    Database(#[from] sqlx::Error),
     #[error("Telegram update claim was lost: {0}")]
     ClaimLost(i64),
+    #[error("Telegram update repository lock was poisoned")]
+    LockPoisoned,
 }

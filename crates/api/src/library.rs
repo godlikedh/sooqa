@@ -17,11 +17,11 @@ use super::{ApiError, ApiState, authorize, map_library_error};
 
 pub(crate) fn routes() -> Router<ApiState> {
     Router::new()
-        .route("/api/v1/library/items", get(search_items))
-        .route("/api/v1/library/items/{id}", get(get_item).patch(update_item))
-        .route("/api/v1/library/items/{id}/archive", post(archive_item))
-        .route("/api/v1/library/items/{id}/tags", post(add_tag))
-        .route("/api/v1/library/items/{id}/tags/{tag}", delete(remove_tag))
+        .route("/api/v1/media", get(search_items))
+        .route("/api/v1/media/{id}", get(get_item).patch(update_item))
+        .route("/api/v1/media/{id}/archive", post(archive_item))
+        .route("/api/v1/media/{id}/tags", post(add_tag))
+        .route("/api/v1/media/{id}/tags/{tag}", delete(remove_tag))
 }
 
 async fn search_items(
@@ -29,7 +29,7 @@ async fn search_items(
     headers: HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<LibrarySearchResponse>, ApiError> {
-    authorize(&state.device_tokens, &headers, "library:read").await?;
+    authorize(&state.api_token, &headers, "media:read").await?;
     let query = params.into_domain(&headers)?;
     let page = state
         .library
@@ -37,7 +37,7 @@ async fn search_items(
         .await
         .map_err(|error| map_library_error(error, &headers))?;
     Ok(Json(LibrarySearchResponse {
-        items: page.items.iter().map(LibrarySearchItemResponse::from_summary).collect(),
+        items: page.items.iter().map(MediaResponse::from_summary).collect(),
         next_cursor: page.next_cursor.as_ref().map(encode_cursor),
     }))
 }
@@ -46,8 +46,8 @@ async fn get_item(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-) -> Result<Json<LibraryDetailResponse>, ApiError> {
-    authorize(&state.device_tokens, &headers, "library:read").await?;
+) -> Result<Json<MediaResponse>, ApiError> {
+    authorize(&state.api_token, &headers, "media:read").await?;
     let item = state
         .library
         .find_library_item(id)
@@ -60,7 +60,7 @@ async fn get_item(
                 &headers,
             )
         })?;
-    Ok(Json(LibraryDetailResponse::from_detail(&item)))
+    Ok(Json(MediaResponse::from_detail(&item)))
 }
 
 async fn update_item(
@@ -68,8 +68,8 @@ async fn update_item(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
     body: Result<JsonExtractor<UpdateItemRequest>, JsonRejection>,
-) -> Result<Json<LibraryDetailResponse>, ApiError> {
-    authorize(&state.device_tokens, &headers, "library:write").await?;
+) -> Result<Json<MediaResponse>, ApiError> {
+    authorize(&state.api_token, &headers, "media:write").await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     let update = ContentItemUpdate {
@@ -95,15 +95,15 @@ async fn update_item(
                 &headers,
             )
         })?;
-    Ok(Json(LibraryDetailResponse::from_detail(&item)))
+    Ok(Json(MediaResponse::from_detail(&item)))
 }
 
 async fn archive_item(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-) -> Result<Json<LibraryDetailResponse>, ApiError> {
-    authorize(&state.device_tokens, &headers, "library:write").await?;
+) -> Result<Json<MediaResponse>, ApiError> {
+    authorize(&state.api_token, &headers, "media:write").await?;
     state
         .library
         .archive_content_item(id)
@@ -121,7 +121,7 @@ async fn archive_item(
                 &headers,
             )
         })?;
-    Ok(Json(LibraryDetailResponse::from_detail(&item)))
+    Ok(Json(MediaResponse::from_detail(&item)))
 }
 
 async fn add_tag(
@@ -130,7 +130,7 @@ async fn add_tag(
     Path(id): Path<Uuid>,
     body: Result<JsonExtractor<TagRequest>, JsonRejection>,
 ) -> Result<Json<TagResponse>, ApiError> {
-    authorize(&state.device_tokens, &headers, "library:write").await?;
+    authorize(&state.api_token, &headers, "media:write").await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     let tag = NewTag::try_new(payload.tag)
@@ -145,7 +145,7 @@ async fn remove_tag(
     headers: HeaderMap,
     Path((id, tag)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&state.device_tokens, &headers, "library:write").await?;
+    authorize(&state.api_token, &headers, "media:write").await?;
     let tag = NewTag::try_new(tag)
         .map_err(|_| ApiError::bad_request("invalid_tag", "The tag is invalid", &headers))?;
     state
@@ -264,120 +264,105 @@ struct TagRequest {
 
 #[derive(Debug, Serialize)]
 struct LibrarySearchResponse {
-    items: Vec<LibrarySearchItemResponse>,
+    items: Vec<MediaResponse>,
     next_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct LibrarySearchItemResponse {
+struct MediaResponse {
     id: Uuid,
     kind: ContentKind,
     status: ContentStatus,
-    preferred_title: Option<String>,
-    editorial_description: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
     notes: Option<String>,
-    canonical_asset: Option<AssetResponse>,
-    tags: Vec<TagResponse>,
-    source_count: u64,
-    #[serde(with = "time::serde::rfc3339")]
-    created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    updated_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339::option")]
-    archived_at: Option<OffsetDateTime>,
-}
-
-impl LibrarySearchItemResponse {
-    fn from_summary(item: &LibraryItemSummary) -> Self {
-        Self {
-            id: item.content_item.id,
-            kind: item.content_item.kind,
-            status: item.content_item.status,
-            preferred_title: item.content_item.preferred_title.clone(),
-            editorial_description: item.content_item.editorial_description.clone(),
-            notes: item.content_item.notes.clone(),
-            canonical_asset: item.canonical_asset.as_ref().map(AssetResponse::from_asset),
-            tags: item.tags.iter().map(TagResponse::from_tag).collect(),
-            source_count: item.source_count,
-            created_at: item.content_item.created_at,
-            updated_at: item.content_item.updated_at,
-            archived_at: item.content_item.archived_at,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct LibraryDetailResponse {
-    id: Uuid,
-    kind: ContentKind,
-    status: ContentStatus,
-    preferred_title: Option<String>,
-    editorial_description: Option<String>,
-    notes: Option<String>,
-    canonical_asset: Option<AssetResponse>,
-    tags: Vec<TagResponse>,
-    sources: Vec<SourceResponse>,
-    #[serde(with = "time::serde::rfc3339")]
-    created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    updated_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339::option")]
-    archived_at: Option<OffsetDateTime>,
-}
-
-impl LibraryDetailResponse {
-    fn from_detail(item: &LibraryItemDetail) -> Self {
-        Self {
-            id: item.content_item.id,
-            kind: item.content_item.kind,
-            status: item.content_item.status,
-            preferred_title: item.content_item.preferred_title.clone(),
-            editorial_description: item.content_item.editorial_description.clone(),
-            notes: item.content_item.notes.clone(),
-            canonical_asset: item.canonical_asset.as_ref().map(AssetResponse::from_asset),
-            tags: item.tags.iter().map(TagResponse::from_tag).collect(),
-            sources: item.sources.iter().map(SourceResponse::from_source).collect(),
-            created_at: item.content_item.created_at,
-            updated_at: item.content_item.updated_at,
-            archived_at: item.content_item.archived_at,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct AssetResponse {
-    id: Uuid,
-    role: sooqa_library::AssetRole,
-    media_kind: sooqa_library::MediaKind,
+    storage_state: Option<String>,
+    source_url: Option<String>,
+    source_metadata: Option<Value>,
     mime_type: Option<String>,
     container: Option<String>,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
     width: Option<i32>,
     height: Option<i32>,
     duration_ms: Option<u64>,
     bit_rate: Option<u64>,
     file_size_bytes: Option<u64>,
-    storage_state: sooqa_library::StorageState,
+    sha256: Option<String>,
+    tags: Vec<TagResponse>,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    archived_at: Option<OffsetDateTime>,
 }
 
-impl AssetResponse {
-    fn from_asset(asset: &sooqa_library::MediaAsset) -> Self {
+impl MediaResponse {
+    fn from_summary(item: &LibraryItemSummary) -> Self {
+        Self::from_parts(
+            &item.content_item,
+            item.canonical_asset.as_ref(),
+            item.tags.as_slice(),
+            &[],
+        )
+    }
+
+    fn from_detail(item: &LibraryItemDetail) -> Self {
+        Self::from_parts(
+            &item.content_item,
+            item.canonical_asset.as_ref(),
+            item.tags.as_slice(),
+            item.sources.as_slice(),
+        )
+    }
+
+    fn from_parts(
+        item: &sooqa_library::ContentItem,
+        asset: Option<&sooqa_library::MediaAsset>,
+        tags: &[sooqa_library::Tag],
+        sources: &[sooqa_library::SourceRecord],
+    ) -> Self {
+        let source = sources.first();
         Self {
-            id: asset.id,
-            role: asset.role,
-            media_kind: asset.media_kind,
-            mime_type: asset.mime_type.clone(),
-            container: asset.container.clone(),
-            width: asset.width,
-            height: asset.height,
-            duration_ms: asset.duration_ms,
-            bit_rate: asset.bit_rate,
-            file_size_bytes: asset.file_size_bytes,
-            storage_state: asset.storage_state,
-            created_at: asset.created_at,
+            id: item.id,
+            kind: item.kind,
+            status: item.status,
+            title: item.preferred_title.clone(),
+            description: item.editorial_description.clone(),
+            notes: item.notes.clone(),
+            storage_state: asset.map(|asset| {
+                match asset.storage_state {
+                    sooqa_library::StorageState::Uploaded => "ready",
+                    sooqa_library::StorageState::Missing => "missing",
+                    sooqa_library::StorageState::Local => "pending_storage",
+                }
+                .to_owned()
+            }),
+            source_url: source.and_then(|source| {
+                source.normalized_url.clone().or_else(|| source.original_url.clone())
+            }),
+            source_metadata: source.map(|source| source.metadata_json.clone()),
+            mime_type: asset.and_then(|asset| asset.mime_type.clone()),
+            container: asset.and_then(|asset| asset.container.clone()),
+            video_codec: asset.and_then(|asset| asset.video_codec.clone()),
+            audio_codec: asset.and_then(|asset| asset.audio_codec.clone()),
+            width: asset.and_then(|asset| asset.width),
+            height: asset.and_then(|asset| asset.height),
+            duration_ms: asset.and_then(|asset| asset.duration_ms),
+            bit_rate: asset.and_then(|asset| asset.bit_rate),
+            file_size_bytes: asset.and_then(|asset| asset.file_size_bytes),
+            sha256: asset.and_then(|asset| asset.sha256.as_deref().map(hex_digest)),
+            tags: tags.iter().map(TagResponse::from_tag).collect(),
+            created_at: item.created_at,
+            updated_at: item.updated_at,
+            archived_at: item.archived_at,
         }
     }
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -396,43 +381,6 @@ impl TagResponse {
             normalized_name: tag.normalized_name.clone(),
             display_name: tag.display_name.clone(),
             created_at: tag.created_at,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct SourceResponse {
-    id: Uuid,
-    source_type: sooqa_library::SourceType,
-    original_url: Option<String>,
-    normalized_url: Option<String>,
-    platform: Option<String>,
-    platform_content_id: Option<String>,
-    author_name: Option<String>,
-    source_title: Option<String>,
-    source_description: Option<String>,
-    #[serde(with = "time::serde::rfc3339::option")]
-    source_published_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339")]
-    retrieved_at: OffsetDateTime,
-    metadata_json: Value,
-}
-
-impl SourceResponse {
-    fn from_source(source: &sooqa_library::SourceRecord) -> Self {
-        Self {
-            id: source.id,
-            source_type: source.source_type,
-            original_url: source.original_url.clone(),
-            normalized_url: source.normalized_url.clone(),
-            platform: source.platform.clone(),
-            platform_content_id: source.platform_content_id.clone(),
-            author_name: source.author_name.clone(),
-            source_title: source.source_title.clone(),
-            source_description: source.source_description.clone(),
-            source_published_at: source.source_published_at,
-            retrieved_at: source.retrieved_at,
-            metadata_json: source.metadata_json.clone(),
         }
     }
 }

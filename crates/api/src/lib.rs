@@ -1,6 +1,5 @@
 //! HTTP API boundary for sooqa.
 
-mod duplicate_candidates;
 mod library;
 mod publisher;
 
@@ -15,14 +14,15 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sooqa_inbox::{
     IngestRequest, IngestSubmission, IngestSubmissionInput, IngestValidationError, SubmittedVia,
 };
 use sooqa_persistence::{
-    DeviceToken, DeviceTokenRepository, DeviceTokenRepositoryError, InboxRepository,
-    InboxRepositoryError, LibraryRepository, LibraryRepositoryError, PublisherRepository,
-    PublisherRepositoryError,
+    InboxRepository, InboxRepositoryError, LibraryRepository, LibraryRepositoryError,
+    PublisherRepository, PublisherRepositoryError,
 };
+use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use tower_http::{
     limit::RequestBodyLimitLayer,
@@ -48,7 +48,7 @@ impl Default for ApiSettings {
 #[derive(Clone)]
 pub struct ApiState {
     inbox: InboxRepository,
-    device_tokens: DeviceTokenRepository,
+    pub(crate) api_token: String,
     library: LibraryRepository,
     publisher: PublisherRepository,
 }
@@ -56,11 +56,11 @@ pub struct ApiState {
 impl ApiState {
     pub fn new(
         inbox: InboxRepository,
-        device_tokens: DeviceTokenRepository,
+        api_token: impl Into<String>,
         library: LibraryRepository,
         publisher: PublisherRepository,
     ) -> Self {
-        Self { inbox, device_tokens, library, publisher }
+        Self { inbox, api_token: api_token.into(), library, publisher }
     }
 }
 
@@ -70,7 +70,6 @@ pub fn router(settings: ApiSettings, state: ApiState) -> Router {
         .route("/api/v1/ingest-requests", post(create_ingest))
         .route("/api/v1/ingest-requests/{id}", get(get_ingest))
         .merge(library::routes())
-        .merge(duplicate_candidates::routes())
         .merge(publisher::routes())
         .with_state(state);
 
@@ -112,7 +111,7 @@ async fn create_ingest(
     headers: HeaderMap,
     body: Result<JsonExtractor<IngestCreateRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<IngestAcceptedResponse>), ApiError> {
-    authorize(&state.device_tokens, &headers, "ingest:create").await?;
+    authorize(&state.api_token, &headers, "ingest:create").await?;
     let idempotency_key = required_header(&headers, "idempotency-key")?;
     let JsonExtractor(payload) = body.map_err(|rejection| {
         if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -153,7 +152,7 @@ async fn get_ingest(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<IngestResponse>), ApiError> {
-    authorize(&state.device_tokens, &headers, "ingest:read").await?;
+    authorize(&state.api_token, &headers, "ingest:read").await?;
     let request = state
         .inbox
         .find(id)
@@ -167,28 +166,29 @@ async fn get_ingest(
 }
 
 async fn authorize(
-    repository: &DeviceTokenRepository,
+    expected_token: &str,
     headers: &HeaderMap,
     required_scope: &str,
-) -> Result<DeviceToken, ApiError> {
+) -> Result<(), ApiError> {
     let token = bearer_token(headers)?;
-    let device = repository
-        .authenticate(token)
-        .await
-        .map_err(|error| map_token_error(error, headers))?
-        .ok_or_else(|| {
-            ApiError::unauthorized("invalid_token", "The bearer token is invalid", headers)
-        })?;
-
-    if !device.scopes.iter().any(|scope| scope == required_scope || scope == "admin") {
-        return Err(ApiError::forbidden(
-            "insufficient_scope",
-            "The bearer token does not grant the required scope",
+    let expected = Sha256::digest(expected_token.as_bytes());
+    let actual = Sha256::digest(token.as_bytes());
+    if expected.ct_eq(&actual).unwrap_u8() != 1 {
+        return Err(ApiError::unauthorized(
+            "invalid_token",
+            "The bearer token is invalid",
             headers,
         ));
     }
-
-    Ok(device)
+    if expected_token.is_empty() {
+        return Err(ApiError::forbidden(
+            "api_token_not_configured",
+            "The API bearer token is not configured",
+            headers,
+        ));
+    }
+    let _ = required_scope;
+    Ok(())
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -270,52 +270,30 @@ fn map_repository_error(error: InboxRepositoryError, headers: &HeaderMap) -> Api
     }
 }
 
-fn map_token_error(error: DeviceTokenRepositoryError, headers: &HeaderMap) -> ApiError {
-    error!(error = %error, "device token authentication failed");
-    ApiError::internal(headers)
-}
-
 fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiError {
     match error {
         LibraryRepositoryError::ResourceMissing(_) => {
-            ApiError::not_found("library_item_not_found", "The library item was not found", headers)
+            ApiError::not_found("media_not_found", "The media item was not found", headers)
         }
-        LibraryRepositoryError::DuplicateCandidateMissing(_) => ApiError::not_found(
-            "duplicate_candidate_not_found",
-            "The duplicate candidate was not found",
-            headers,
-        ),
-        LibraryRepositoryError::OptimisticConflict(_) => ApiError::conflict(
-            "library_item_changed",
-            "The library item changed since it was read",
-            headers,
-        ),
+        LibraryRepositoryError::OptimisticConflict(_) => {
+            ApiError::conflict("media_changed", "The media item changed since it was read", headers)
+        }
         LibraryRepositoryError::EmptyUpdate => ApiError::bad_request(
             "empty_update",
             "The request must contain at least one editable field",
             headers,
         ),
         LibraryRepositoryError::InvalidState { operation, .. } => ApiError::conflict(
-            "invalid_library_state",
+            "invalid_media_state",
             match operation {
-                "archive" => "The library item cannot be archived in its current state",
-                _ => "The library item cannot be changed in its current state",
+                "archive" => "The media item cannot be archived in its current state",
+                _ => "The media item cannot be changed in its current state",
             },
-            headers,
-        ),
-        LibraryRepositoryError::InvalidCandidateState { .. } => ApiError::conflict(
-            "invalid_candidate_state",
-            "The duplicate candidate has already been resolved",
-            headers,
-        ),
-        LibraryRepositoryError::DuplicateCandidateIdempotencyConflict(_) => ApiError::conflict(
-            "idempotency_conflict",
-            "The Idempotency-Key conflicts with an earlier decision",
             headers,
         ),
         LibraryRepositoryError::TagNotAttached => ApiError::not_found(
             "tag_not_attached",
-            "The tag is not attached to the library item",
+            "The tag is not attached to the media item",
             headers,
         ),
         LibraryRepositoryError::InvalidLimit { .. } => {
@@ -330,42 +308,36 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
 
 fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> ApiError {
     match error {
-        PublisherRepositoryError::TargetChannelMissing(_) => ApiError::not_found(
-            "target_channel_not_found",
-            "The target channel was not found",
-            headers,
-        ),
+        PublisherRepositoryError::TargetChannelMissing(_) => {
+            ApiError::not_found("channel_not_found", "The channel was not found", headers)
+        }
         PublisherRepositoryError::TargetChannelDisabled(_) => {
-            ApiError::conflict("target_channel_disabled", "The target channel is disabled", headers)
+            ApiError::conflict("channel_disabled", "The channel is disabled", headers)
         }
         PublisherRepositoryError::PostDraftMissing(_) => {
-            ApiError::not_found("post_draft_not_found", "The post draft was not found", headers)
+            ApiError::not_found("post_not_found", "The post was not found", headers)
         }
         PublisherRepositoryError::ContentItemMissing(_) => {
-            ApiError::not_found("library_item_not_found", "The library item was not found", headers)
+            ApiError::not_found("media_not_found", "The media item was not found", headers)
         }
         PublisherRepositoryError::ContentItemNotPublishable { .. }
         | PublisherRepositoryError::CanonicalAssetMismatch { .. }
         | PublisherRepositoryError::AssetNotPublishable { .. } => ApiError::conflict(
-            "asset_not_publishable",
-            "The library item is not ready for publication",
+            "media_not_publishable",
+            "The media item is not ready for publication",
             headers,
         ),
-        PublisherRepositoryError::ScheduleMissing(_) => ApiError::not_found(
-            "publication_schedule_not_found",
-            "The publication schedule was not found",
-            headers,
-        ),
+        PublisherRepositoryError::ScheduleMissing(_) => {
+            ApiError::not_found("post_not_found", "The post was not found", headers)
+        }
         PublisherRepositoryError::DraftNotReady { .. } => ApiError::conflict(
-            "draft_not_ready",
-            "The post draft must be ready before it can be scheduled",
+            "post_not_ready",
+            "The post must be ready before it can be scheduled",
             headers,
         ),
-        PublisherRepositoryError::OptimisticConflict(_) => ApiError::conflict(
-            "post_draft_changed",
-            "The post draft changed since it was read",
-            headers,
-        ),
+        PublisherRepositoryError::OptimisticConflict(_) => {
+            ApiError::conflict("post_changed", "The post changed since it was read", headers)
+        }
         PublisherRepositoryError::DraftIdempotencyConflict(_)
         | PublisherRepositoryError::ScheduleIdempotencyConflict(_) => ApiError::conflict(
             "idempotency_conflict",
@@ -396,8 +368,8 @@ fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> 
             }
             sooqa_publisher::PublisherValidationError::InvalidStatusTransition { .. } => {
                 ApiError::conflict(
-                    "invalid_post_draft_state",
-                    "The post draft cannot transition to the requested state",
+                    "invalid_post_state",
+                    "The post cannot transition to the requested state",
                     headers,
                 )
             }
@@ -411,8 +383,8 @@ fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> 
             ApiError::bad_request("invalid_limit", "The limit must be between 1 and 100", headers)
         }
         PublisherRepositoryError::AssetContentMismatch { .. } => ApiError::conflict(
-            "asset_content_mismatch",
-            "The selected asset does not belong to the content item",
+            "media_mismatch",
+            "The selected media does not match the post",
             headers,
         ),
         error => {

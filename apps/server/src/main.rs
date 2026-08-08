@@ -64,6 +64,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let database =
         sooqa_persistence::Database::connect_secret(database_url, config.database.max_connections)
             .await?;
+    let api_token = config
+        .secrets
+        .api_token
+        .as_ref()
+        .filter(|token| token.is_configured())
+        .ok_or(ConfigError::MissingSecret("API token"))?;
     let listener = TcpListener::bind(&config.server.listen_address).await?;
     let api_settings = sooqa_api::ApiSettings {
         request_body_limit_bytes: config.server.request_body_limit_bytes,
@@ -73,7 +79,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         api_settings,
         sooqa_api::ApiState::new(
             database.inbox(),
-            database.device_tokens(),
+            api_token.expose_secret(),
             database.library(),
             database.publisher(),
         ),

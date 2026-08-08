@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use sooqa_library::{ContentStatus, StorageState};
 use sooqa_persistence::{post_draft_create_request_hash, post_draft_update_request_hash};
 use sooqa_publisher::{
-    NewPostDraft, NewPublicationSchedule, PostDraft, PostDraftStatus, PostDraftUpdate,
-    PublicationSchedule, PublicationScheduleScope,
+    NewPostDraft, NewPublicationSchedule, NewTargetChannel, PostDraft, PostDraftStatus,
+    PostDraftUpdate, PublicationSchedule, PublicationScheduleScope, TargetChannel,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -22,18 +22,74 @@ const MAX_CAPTION_LENGTH: usize = 1_024;
 
 pub(crate) fn routes() -> Router<ApiState> {
     Router::new()
-        .route("/api/v1/post-drafts", post(create_draft))
-        .route("/api/v1/post-drafts/{id}", get(get_draft).patch(update_draft))
-        .route("/api/v1/post-drafts/{id}/schedule", post(schedule_draft))
-        .route("/api/v1/post-drafts/{id}/publish-now", post(publish_now))
+        .route("/api/v1/channels", get(list_channels).post(create_channel))
+        .route("/api/v1/channels/{id}", get(get_channel))
+        .route("/api/v1/posts", post(create_draft))
+        .route("/api/v1/posts/{id}", get(get_draft).patch(update_draft))
+        .route("/api/v1/posts/{id}/schedule", post(schedule_draft))
+        .route("/api/v1/posts/{id}/publish", post(publish_now))
+}
+
+async fn list_channels(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<ChannelListResponse>, ApiError> {
+    authorize(&state.api_token, &headers, "channels:read").await?;
+    let channels = state
+        .publisher
+        .list_target_channels(false)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
+    Ok(Json(ChannelListResponse {
+        items: channels.iter().map(ChannelResponse::from_channel).collect(),
+    }))
+}
+
+async fn create_channel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Result<JsonExtractor<CreateChannelRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ChannelResponse>), ApiError> {
+    authorize(&state.api_token, &headers, "channels:write").await?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    let mut channel =
+        NewTargetChannel::try_new(payload.name, payload.telegram_chat_id).map_err(|_| {
+            ApiError::bad_request("invalid_channel", "The channel payload is invalid", &headers)
+        })?;
+    channel.default_parse_mode = normalize_parse_mode(payload.default_parse_mode, &headers)?;
+    channel.default_disable_notification = payload.default_disable_notification;
+    let channel = state
+        .publisher
+        .create_target_channel(channel)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
+    Ok((StatusCode::CREATED, Json(ChannelResponse::from_channel(&channel))))
+}
+
+async fn get_channel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ChannelResponse>, ApiError> {
+    authorize(&state.api_token, &headers, "channels:read").await?;
+    let channel = state
+        .publisher
+        .find_target_channel(id)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?
+        .ok_or_else(|| {
+            ApiError::not_found("channel_not_found", "The channel was not found", &headers)
+        })?;
+    Ok(Json(ChannelResponse::from_channel(&channel)))
 }
 
 async fn create_draft(
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: Result<JsonExtractor<CreateDraftRequest>, JsonRejection>,
-) -> Result<(StatusCode, Json<PostDraftResponse>), ApiError> {
-    authorize(&state.device_tokens, &headers, "publisher:write").await?;
+) -> Result<(StatusCode, Json<PostResponse>), ApiError> {
+    authorize(&state.api_token, &headers, "publisher:write").await?;
     let idempotency_key = idempotency_key(&headers)?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
@@ -41,8 +97,8 @@ async fn create_draft(
     let caption = normalize_caption(payload.caption.clone(), None, &headers)?;
     let requested_parse_mode = normalize_parse_mode(payload.parse_mode.clone(), &headers)?;
     let request_hash = post_draft_create_request_hash(
-        payload.content_item_id,
-        payload.target_channel_id,
+        payload.media_id,
+        payload.channel_id,
         caption.as_deref(),
         requested_parse_mode.as_deref(),
     );
@@ -51,34 +107,30 @@ async fn create_draft(
         .replay_post_draft_create(
             &idempotency_key,
             &request_hash,
-            payload.content_item_id,
-            payload.target_channel_id,
+            payload.media_id,
+            payload.channel_id,
             caption.as_deref(),
             requested_parse_mode.as_deref(),
         )
         .await
         .map_err(|error| map_publisher_error(error, &headers))?
     {
-        return Ok((StatusCode::CREATED, Json(PostDraftResponse::from_draft(&draft))));
+        return Ok((StatusCode::CREATED, Json(PostResponse::from_draft(&draft))));
     }
 
     let item = state
         .library
-        .find_library_item(payload.content_item_id)
+        .find_library_item(payload.media_id)
         .await
         .map_err(|error| map_library_error(error, &headers))?
         .ok_or_else(|| {
-            ApiError::not_found(
-                "library_item_not_found",
-                "The library item was not found",
-                &headers,
-            )
+            ApiError::not_found("media_not_found", "The media item was not found", &headers)
         })?;
     let asset_id =
         publishable_asset(&item.content_item.status, item.canonical_asset.as_ref(), &headers)?;
     let target = state
         .publisher
-        .find_target_channel(payload.target_channel_id)
+        .find_target_channel(payload.channel_id)
         .await
         .map_err(|error| map_publisher_error(error, &headers))?
         .ok_or_else(|| {
@@ -105,9 +157,9 @@ async fn create_draft(
         .publisher
         .create_post_draft_idempotent(
             NewPostDraft {
-                content_item_id: payload.content_item_id,
+                content_item_id: payload.media_id,
                 asset_id,
-                target_channel_id: payload.target_channel_id,
+                target_channel_id: payload.channel_id,
                 caption,
                 parse_mode,
             },
@@ -118,25 +170,23 @@ async fn create_draft(
         .map_err(|error| map_publisher_error(error, &headers))?
         .draft;
 
-    Ok((StatusCode::CREATED, Json(PostDraftResponse::from_draft(&draft))))
+    Ok((StatusCode::CREATED, Json(PostResponse::from_draft(&draft))))
 }
 
 async fn get_draft(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(raw_id): Path<String>,
-) -> Result<Json<PostDraftResponse>, ApiError> {
-    authorize(&state.device_tokens, &headers, "publisher:read").await?;
-    let id = parse_uuid(&raw_id, "post_draft_id", "The post draft ID must be a UUID", &headers)?;
+) -> Result<Json<PostResponse>, ApiError> {
+    authorize(&state.api_token, &headers, "publisher:read").await?;
+    let id = parse_uuid(&raw_id, "post_id", "The post ID must be a UUID", &headers)?;
     let draft = state
         .publisher
         .find_post_draft(id)
         .await
         .map_err(|error| map_publisher_error(error, &headers))?
-        .ok_or_else(|| {
-            ApiError::not_found("post_draft_not_found", "The post draft was not found", &headers)
-        })?;
-    Ok(Json(PostDraftResponse::from_draft(&draft)))
+        .ok_or_else(|| ApiError::not_found("post_not_found", "The post was not found", &headers))?;
+    Ok(Json(PostResponse::from_draft(&draft)))
 }
 
 async fn update_draft(
@@ -144,9 +194,9 @@ async fn update_draft(
     headers: HeaderMap,
     Path(raw_id): Path<String>,
     body: Result<JsonExtractor<UpdateDraftRequest>, JsonRejection>,
-) -> Result<Json<PostDraftResponse>, ApiError> {
-    authorize(&state.device_tokens, &headers, "publisher:write").await?;
-    let id = parse_uuid(&raw_id, "post_draft_id", "The post draft ID must be a UUID", &headers)?;
+) -> Result<Json<PostResponse>, ApiError> {
+    authorize(&state.api_token, &headers, "publisher:write").await?;
+    let id = parse_uuid(&raw_id, "post_id", "The post ID must be a UUID", &headers)?;
     let idempotency_key = idempotency_key(&headers)?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
@@ -164,19 +214,15 @@ async fn update_draft(
         .map(PostDraftStatus::try_from)
         .transpose()
         .map_err(|_| {
-            ApiError::bad_request(
-                "invalid_post_draft_status",
-                "The post draft status is invalid",
-                &headers,
-            )
+            ApiError::bad_request("invalid_post_status", "The post status is invalid", &headers)
         })?
         .map(|status| match status {
             PostDraftStatus::Editing | PostDraftStatus::Ready | PostDraftStatus::Cancelled => {
                 Ok(status)
             }
             PostDraftStatus::Scheduled | PostDraftStatus::Published => Err(ApiError::bad_request(
-                "invalid_post_draft_status",
-                "The requested post draft status is managed by publication",
+                "invalid_post_status",
+                "The requested post status is managed by publication",
                 &headers,
             )),
         })
@@ -203,7 +249,7 @@ async fn update_draft(
         .await
         .map_err(|error| map_publisher_error(error, &headers))?
     {
-        return Ok(Json(PostDraftResponse::from_draft(&draft)));
+        return Ok(Json(PostResponse::from_draft(&draft)));
     }
 
     let current = state
@@ -211,13 +257,11 @@ async fn update_draft(
         .find_post_draft(id)
         .await
         .map_err(|error| map_publisher_error(error, &headers))?
-        .ok_or_else(|| {
-            ApiError::not_found("post_draft_not_found", "The post draft was not found", &headers)
-        })?;
+        .ok_or_else(|| ApiError::not_found("post_not_found", "The post was not found", &headers))?;
     if !matches!(current.status, PostDraftStatus::Editing | PostDraftStatus::Ready) {
         return Err(ApiError::conflict(
-            "invalid_post_draft_state",
-            "Only editing or ready drafts can be changed",
+            "invalid_post_state",
+            "Only editable posts can be changed",
             &headers,
         ));
     }
@@ -237,11 +281,7 @@ async fn update_draft(
             .await
             .map_err(|error| map_library_error(error, &headers))?
             .ok_or_else(|| {
-                ApiError::not_found(
-                    "library_item_not_found",
-                    "The library item was not found",
-                    &headers,
-                )
+                ApiError::not_found("media_not_found", "The media item was not found", &headers)
             })?;
         publishable_asset(&item.content_item.status, item.canonical_asset.as_ref(), &headers)?;
     }
@@ -251,7 +291,7 @@ async fn update_draft(
         .update_post_draft_idempotent(id, update, idempotency_key)
         .await
         .map_err(|error| map_publisher_error(error, &headers))?;
-    Ok(Json(PostDraftResponse::from_draft(&draft)))
+    Ok(Json(PostResponse::from_draft(&draft)))
 }
 
 async fn schedule_draft(
@@ -260,9 +300,8 @@ async fn schedule_draft(
     Path(raw_id): Path<String>,
     body: Result<JsonExtractor<ScheduleRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<PublicationScheduleResponse>), ApiError> {
-    authorize(&state.device_tokens, &headers, "publisher:write").await?;
-    let draft_id =
-        parse_uuid(&raw_id, "post_draft_id", "The post draft ID must be a UUID", &headers)?;
+    authorize(&state.api_token, &headers, "publisher:write").await?;
+    let draft_id = parse_uuid(&raw_id, "post_id", "The post ID must be a UUID", &headers)?;
     let idempotency_key = idempotency_key(&headers)?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
@@ -287,9 +326,8 @@ async fn publish_now(
     headers: HeaderMap,
     Path(raw_id): Path<String>,
 ) -> Result<(StatusCode, Json<PublicationScheduleResponse>), ApiError> {
-    authorize(&state.device_tokens, &headers, "publisher:write").await?;
-    let draft_id =
-        parse_uuid(&raw_id, "post_draft_id", "The post draft ID must be a UUID", &headers)?;
+    authorize(&state.api_token, &headers, "publisher:write").await?;
+    let draft_id = parse_uuid(&raw_id, "post_id", "The post ID must be a UUID", &headers)?;
     let idempotency_key = idempotency_key(&headers)?;
     let schedule = NewPublicationSchedule::try_new(
         draft_id,
@@ -312,22 +350,22 @@ fn publishable_asset(
 ) -> Result<Uuid, ApiError> {
     if *status != ContentStatus::Active {
         return Err(ApiError::conflict(
-            "content_not_publishable",
-            "Only active library items can be published",
+            "media_not_publishable",
+            "Only active media can be published",
             headers,
         ));
     }
     let asset = asset.ok_or_else(|| {
         ApiError::conflict(
-            "asset_not_publishable",
-            "The library item has no canonical asset",
+            "media_not_publishable",
+            "The media item is not ready for publication",
             headers,
         )
     })?;
     if asset.storage_state != StorageState::Uploaded {
         return Err(ApiError::conflict(
-            "asset_not_publishable",
-            "The canonical asset is not stored in Telegram yet",
+            "media_not_publishable",
+            "The media item is not stored in Telegram yet",
             headers,
         ));
     }
@@ -726,8 +764,8 @@ fn map_json_rejection(rejection: JsonRejection, headers: &HeaderMap) -> ApiError
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateDraftRequest {
-    content_item_id: Uuid,
-    target_channel_id: Uuid,
+    media_id: Uuid,
+    channel_id: Uuid,
     #[serde(default)]
     caption: Option<String>,
     #[serde(default)]
@@ -766,11 +804,10 @@ struct ScheduleRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct PostDraftResponse {
+struct PostResponse {
     id: Uuid,
-    content_item_id: Uuid,
-    asset_id: Uuid,
-    target_channel_id: Uuid,
+    media_id: Uuid,
+    channel_id: Uuid,
     caption: Option<String>,
     parse_mode: Option<String>,
     status: PostDraftStatus,
@@ -780,13 +817,12 @@ struct PostDraftResponse {
     updated_at: OffsetDateTime,
 }
 
-impl PostDraftResponse {
+impl PostResponse {
     fn from_draft(draft: &PostDraft) -> Self {
         Self {
             id: draft.id,
-            content_item_id: draft.content_item_id,
-            asset_id: draft.asset_id,
-            target_channel_id: draft.target_channel_id,
+            media_id: draft.content_item_id,
+            channel_id: draft.target_channel_id,
             caption: draft.caption.clone(),
             parse_mode: draft.parse_mode.clone(),
             status: draft.status,
@@ -799,7 +835,7 @@ impl PostDraftResponse {
 #[derive(Debug, Serialize)]
 struct PublicationScheduleResponse {
     id: Uuid,
-    post_draft_id: Uuid,
+    post_id: Uuid,
     status: sooqa_publisher::PublicationScheduleStatus,
     #[serde(with = "time::serde::rfc3339")]
     publish_at: OffsetDateTime,
@@ -820,7 +856,7 @@ impl PublicationScheduleResponse {
     fn from_schedule(schedule: &PublicationSchedule) -> Self {
         Self {
             id: schedule.id,
-            post_draft_id: schedule.post_draft_id,
+            post_id: schedule.post_draft_id,
             status: schedule.status,
             publish_at: schedule.publish_at,
             not_before: schedule.not_before,
@@ -830,6 +866,51 @@ impl PublicationScheduleResponse {
             idempotency_key: schedule.idempotency_key.clone(),
             created_at: schedule.created_at,
             updated_at: schedule.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateChannelRequest {
+    name: String,
+    telegram_chat_id: i64,
+    #[serde(default)]
+    default_parse_mode: Option<String>,
+    #[serde(default)]
+    default_disable_notification: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ChannelListResponse {
+    items: Vec<ChannelResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChannelResponse {
+    id: Uuid,
+    name: String,
+    telegram_chat_id: i64,
+    is_enabled: bool,
+    default_parse_mode: Option<String>,
+    default_disable_notification: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+}
+
+impl ChannelResponse {
+    fn from_channel(channel: &TargetChannel) -> Self {
+        Self {
+            id: channel.id,
+            name: channel.name.clone(),
+            telegram_chat_id: channel.telegram_chat_id,
+            is_enabled: channel.is_enabled,
+            default_parse_mode: channel.default_parse_mode.clone(),
+            default_disable_notification: channel.default_disable_notification,
+            created_at: channel.created_at,
+            updated_at: channel.updated_at,
         }
     }
 }

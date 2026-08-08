@@ -1,15 +1,11 @@
 //! Database connection and migration boundaries for sooqa.
 
-mod device_tokens;
 mod inbox;
 mod jobs;
 mod library;
 mod publisher;
 mod telegram;
 
-pub use device_tokens::{
-    DeviceToken, DeviceTokenRepository, DeviceTokenRepositoryError, hash_device_token,
-};
 pub use inbox::{
     AssetNormalizationStart, AssetProbeStart, CreateIngestResult, InboxRepository,
     InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart, IngestSimilarityStart,
@@ -74,10 +70,6 @@ impl Database {
         InboxRepository::new(self.pool.clone())
     }
 
-    pub fn device_tokens(&self) -> DeviceTokenRepository {
-        DeviceTokenRepository::new(self.pool.clone())
-    }
-
     pub fn library(&self) -> LibraryRepository {
         LibraryRepository::new(self.pool.clone())
     }
@@ -87,7 +79,7 @@ impl Database {
     }
 
     pub fn telegram(&self) -> TelegramRepository {
-        TelegramRepository::new(self.pool.clone())
+        TelegramRepository::new()
     }
 
     pub fn pool(&self) -> &PgPool {

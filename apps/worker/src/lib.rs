@@ -19,9 +19,8 @@ use sooqa_inbox::{
 };
 use sooqa_jobs::{Job, JobCommand, JobStatus, JobType};
 use sooqa_library::{
-    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem,
-    NewDuplicateCandidate, NewMediaAssetDraft, NewSourceRecordDraft, SourceType, StorageState,
-    StorageUploadStore,
+    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem, NewMediaAssetDraft,
+    NewSourceRecordDraft, SourceType, StorageState, StorageUploadStore,
 };
 use sooqa_media::{
     ArtifactPublicationError, DownloadError, DownloadLimits, DownloadedSource, FfmpegExecutor,
@@ -217,15 +216,19 @@ pub fn finalize_ingest_handler(inbox: InboxRepository, library: LibraryRepositor
 
 pub fn compute_fingerprint_handler(
     inbox: InboxRepository,
+    library: LibraryRepository,
     work_root: impl Into<PathBuf>,
     extractor: FrameExtractor,
 ) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
+        let library = library.clone();
         let work_root = work_root.clone();
         let extractor = extractor.clone();
-        Box::pin(async move { compute_fingerprint(&inbox, &work_root, &extractor, job).await })
+        Box::pin(
+            async move { compute_fingerprint(&inbox, &library, &work_root, &extractor, job).await },
+        )
     })
 }
 
@@ -248,7 +251,7 @@ async fn probe_asset(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::ProbeAsset(payload) => payload.ingest_request_id,
+        JobCommand::ProbeAsset(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -380,7 +383,7 @@ async fn normalize_asset(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::NormalizeAsset(payload) => payload.ingest_request_id,
+        JobCommand::NormalizeAsset(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -775,7 +778,7 @@ async fn finalize_ingest(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::FinalizeIngest(payload) => payload.ingest_request_id,
+        JobCommand::FinalizeIngest(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -919,12 +922,13 @@ async fn finalize_ingest(
 
 async fn compute_fingerprint(
     inbox: &InboxRepository,
+    library: &LibraryRepository,
     work_root: &Path,
     extractor: &FrameExtractor,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::ComputeFingerprint(payload) => payload.ingest_request_id,
+        JobCommand::ComputeFingerprint(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -1046,6 +1050,19 @@ async fn compute_fingerprint(
     };
     let fingerprint =
         serde_json::to_value(result.fingerprint).expect("video fingerprints are serializable");
+    let media_id = request.media_id.ok_or_else(|| {
+        HandlerFailure::permanent(
+            "invalid_ingest_state",
+            "completed ingest has no media ID for fingerprint persistence",
+        )
+    })?;
+    if let Err(error) = library
+        .record_fingerprint(media_id, FingerprintVersion::FrameDHashV1.as_str(), &fingerprint)
+        .await
+    {
+        return fail_fingerprint(inbox, ingest_request_id, &job_attempt, map_library_error(error))
+            .await;
+    }
     inbox
         .complete_ingest_fingerprint(ingest_request_id, &job_attempt, Some(fingerprint))
         .await
@@ -1060,7 +1077,7 @@ async fn check_similarity(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::CheckSimilarity(payload) => payload.ingest_request_id,
+        JobCommand::CheckSimilarity(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -1153,26 +1170,13 @@ async fn check_similarity(
         ) {
             continue;
         }
-        let evidence_json = serde_json::to_value(&result.evidence)
-            .expect("similarity evidence should be serializable");
-        if let Err(error) = library
-            .upsert_duplicate_candidate(NewDuplicateCandidate {
-                left_content_item_id: input.content_item_id,
-                right_content_item_id: candidate.content_item_id,
-                algorithm_version: result.evidence.algorithm_version.as_str().to_owned(),
-                score_basis_points: result.score_basis_points(),
-                evidence_json,
-            })
-            .await
-        {
-            return fail_similarity(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                map_library_error(error),
-            )
-            .await;
-        }
+        tracing::info!(
+            ingest_id = %ingest_request_id,
+            existing_media_id = %candidate.content_item_id,
+            classification = ?result.classification,
+            score_basis_points = result.score_basis_points(),
+            "similar media detected; no duplicate aggregate is persisted in the MVP"
+        );
     }
     inbox
         .complete_ingest_similarity(ingest_request_id, &job_attempt)
@@ -1599,7 +1603,7 @@ where
     S: StorageUploadStore,
 {
     let (asset_id, generation) = match &job.command {
-        JobCommand::UploadStorageAsset(payload) => (payload.asset_id, payload.generation),
+        JobCommand::UploadStorageAsset(payload) => (payload.media_id, payload.generation),
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -1634,7 +1638,7 @@ async fn inspect_source(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::InspectSource(payload) => payload.ingest_request_id,
+        JobCommand::InspectSource(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -1689,9 +1693,7 @@ async fn download_source(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let (ingest_request_id, inspection) = match &job.command {
-        JobCommand::DownloadSource(payload) => {
-            (payload.ingest_request_id, payload.inspection.clone())
-        }
+        JobCommand::DownloadSource(payload) => (payload.ingest_id, payload.inspection.clone()),
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -2179,7 +2181,7 @@ impl Worker {
                         &failure.message,
                     )
                     .await?;
-                if updated.status == JobStatus::RetryWait {
+                if updated.status == JobStatus::Queued {
                     self.metrics.retried.fetch_add(1, Ordering::Relaxed);
                     info!(worker_id = %self.worker_id, job_id = %job.id, "job scheduled for retry");
                 } else {
@@ -2305,19 +2307,20 @@ mod tests {
         Job {
             id: Uuid::new_v4(),
             command: JobCommand::ComputeFingerprint(sooqa_jobs::IngestJobPayload {
-                ingest_request_id: Uuid::new_v4(),
+                ingest_id: Uuid::new_v4(),
             }),
             status: JobStatus::Running,
             priority: 0,
-            available_at: now,
+            run_at: now,
             attempt_count,
             max_attempts,
+            lease_token: Some(Uuid::new_v4()),
             lease_owner: Some("test-worker".to_owned()),
             lease_expires_at: None,
             last_heartbeat_at: None,
             last_error_class: None,
             last_error_message: None,
-            idempotency_key: None,
+            dedupe_key: None,
             created_at: now,
             updated_at: now,
             completed_at: None,

@@ -258,6 +258,7 @@ pub struct ObservabilityConfig {
 pub struct SecretConfig {
     pub database_url: Option<SecretString>,
     pub telegram_bot_token: Option<SecretString>,
+    pub api_token: Option<SecretString>,
 }
 
 impl fmt::Debug for SecretConfig {
@@ -266,6 +267,7 @@ impl fmt::Debug for SecretConfig {
             .debug_struct("SecretConfig")
             .field("database_url", &self.database_url)
             .field("telegram_bot_token", &self.telegram_bot_token)
+            .field("api_token", &self.api_token)
             .finish()
     }
 }
@@ -391,13 +393,14 @@ impl AppConfig {
             secrets: SecretConfig {
                 database_url: raw.secrets.database_url.map(SecretString::new),
                 telegram_bot_token: raw.secrets.telegram_bot_token.map(SecretString::new),
+                api_token: raw.secrets.api_token.map(SecretString::new),
             },
         })
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.max_download_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.max_download_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -422,6 +425,7 @@ impl AppConfig {
             self.observability.log_level,
             configured_state(self.secrets.database_url.as_ref()),
             configured_state(self.secrets.telegram_bot_token.as_ref()),
+            configured_state(self.secrets.api_token.as_ref()),
         )
     }
 
@@ -481,6 +485,9 @@ impl AppConfig {
         }
         if let Some(value) = optional_env_string("SOOQA_TELEGRAM_BOT_TOKEN")? {
             self.secrets.telegram_bot_token = Some(SecretString::new(value));
+        }
+        if let Some(value) = optional_env_string("SOOQA_API_TOKEN")? {
+            self.secrets.api_token = Some(SecretString::new(value));
         }
         if let Some(value) = optional_env_string("SOOQA_TELEGRAM_API_BASE_URL")? {
             self.telegram.api_base_url = value;
@@ -705,6 +712,7 @@ struct RawObservabilityConfig {
 struct RawSecretConfig {
     database_url: Option<String>,
     telegram_bot_token: Option<String>,
+    api_token: Option<String>,
 }
 
 #[derive(Debug, Error)]

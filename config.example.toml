@@ -33,4 +33,8 @@ max_download_bytes = 2147483648
 log_format = "json"
 log_level = "info"
 
+[secrets]
+# Keep this out of committed files in real deployments.
+# api_token = "replace-with-a-long-random-secret"
+
 # Keep secrets in the environment rather than committing them to a file.

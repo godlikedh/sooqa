@@ -87,6 +87,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     tracing::info!("asset normalization handler enabled");
     let fingerprint_handler = compute_fingerprint_handler(
         database.inbox(),
+        database.library(),
         config.media.work_root.clone(),
         FrameExtractor::new(config.media.ffmpeg_path.clone(), Duration::from_secs(300)),
     );
