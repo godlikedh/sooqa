@@ -722,6 +722,19 @@ async fn normalize_handler_executes_ffmpeg_and_enqueues_finalize() {
         .complete(normalize_job.id, "worker-h5-normalize")
         .await
         .expect("normalize job should complete");
+    let mut input: serde_json::Value =
+        sqlx::query_scalar("SELECT original_input FROM ingest_requests WHERE id = $1")
+            .bind(created.request.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("normalized ingest input should be queryable");
+    input["probe"]["duration_ms"] = serde_json::json!(9_000);
+    sqlx::query("UPDATE ingest_requests SET original_input = $2 WHERE id = $1")
+        .bind(created.request.id)
+        .bind(input)
+        .execute(database.pool())
+        .await
+        .expect("source probe fixture should be adjustable");
     sqlx::query("UPDATE jobs SET priority = 400000 WHERE idempotency_key = $1")
         .bind(format!("ingest:{}:finalize_ingest:v1", created.request.id))
         .execute(database.pool())
@@ -1085,26 +1098,8 @@ async fn normalize_handler_composes_image_canonical_and_thumbnail_assets() {
             &[JobType::ComputeFingerprint],
         )
         .await
-        .expect("image fingerprint job should be claimable")
-        .expect("image fingerprint job should exist");
-    let fingerprint_handler = compute_fingerprint_handler(
-        database.inbox(),
-        work_root.clone(),
-        FrameExtractor::with_runner(
-            "ffmpeg",
-            Duration::from_secs(1),
-            4096,
-            Arc::new(FakeFingerprintRunner),
-        ),
-    );
-    fingerprint_handler(fingerprint_job.clone())
-        .await
-        .expect("image fingerprint job should skip cleanly");
-    database
-        .jobs()
-        .complete(fingerprint_job.id, "worker-h6-image-fingerprint")
-        .await
-        .expect("image fingerprint job should complete");
+        .expect("image fingerprint job query should succeed");
+    assert!(fingerprint_job.is_none(), "images should not enqueue video fingerprint jobs");
 
     let (status, original_input): (String, serde_json::Value) =
         sqlx::query_as("SELECT status, original_input FROM ingest_requests WHERE id = $1")

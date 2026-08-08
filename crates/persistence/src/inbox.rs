@@ -452,10 +452,8 @@ impl InboxRepository {
             request.original_input =
                 json!({ "source": request.original_input, "finalization": finalization });
         }
-        request.transition_to(IngestStatus::Fingerprinting)?;
         request.error_code = None;
         request.error_message = None;
-        request.completed_at = None;
         request.updated_at = OffsetDateTime::now_utc();
         sqlx::query(
             "UPDATE ingest_requests SET original_input = $2, updated_at = $3 WHERE id = $1",
@@ -465,8 +463,16 @@ impl InboxRepository {
         .bind(request.updated_at)
         .execute(&mut *transaction)
         .await?;
-        update_ingest_state(&mut transaction, &request).await?;
-        insert_fingerprint_job(&mut transaction, &request).await?;
+        if normalized_media_kind(&request) == Some(SourceMediaKind::Video) {
+            request.transition_to(IngestStatus::Fingerprinting)?;
+            request.completed_at = None;
+            update_ingest_state(&mut transaction, &request).await?;
+            insert_fingerprint_job(&mut transaction, &request).await?;
+        } else {
+            request.transition_to(IngestStatus::Completed)?;
+            request.completed_at = Some(OffsetDateTime::now_utc());
+            update_ingest_state(&mut transaction, &request).await?;
+        }
         transaction.commit().await?;
         Ok(request)
     }
@@ -1000,6 +1006,14 @@ fn request_media_kind(request: &IngestRequest) -> Option<SourceMediaKind> {
         request.original_input.get("media_kind")?
     };
     serde_json::from_value(value.clone()).ok()
+}
+
+fn normalized_media_kind(request: &IngestRequest) -> Option<SourceMediaKind> {
+    request
+        .original_input
+        .get("normalization")
+        .and_then(|value| value.get("media_kind"))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
 }
 
 fn request_mime_type(request: &IngestRequest) -> Option<&str> {

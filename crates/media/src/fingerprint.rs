@@ -332,7 +332,12 @@ impl FrameExtractor {
                     Ok(())
                 }
                 Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                    Err(FrameExtractionError::OutputExists { path: output_path.to_owned() })
+                    if existing_frame_hash(output_path, self.decode_limits).await?.is_some() {
+                        let _ = tokio::fs::remove_file(&temporary_path).await;
+                        Ok(())
+                    } else {
+                        Err(FrameExtractionError::OutputExists { path: output_path.to_owned() })
+                    }
                 }
                 Err(source) => {
                     Err(FrameExtractionError::OutputFile { path: output_path.to_owned(), source })
@@ -496,6 +501,7 @@ mod tests {
     };
 
     use image::{ImageBuffer, Luma, Rgb};
+    use tokio::sync::Barrier;
     use uuid::Uuid;
 
     use super::*;
@@ -522,6 +528,35 @@ mod tests {
                 .save_with_format(&output, image::ImageFormat::Png)
                 .expect("fake ffmpeg should write a frame");
             self.commands.lock().expect("runner lock should not be poisoned").push_back(command);
+            Ok(ExternalCommandOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct ConcurrentRunner {
+        barrier: Arc<Barrier>,
+    }
+
+    #[async_trait]
+    impl ExternalCommandRunner for ConcurrentRunner {
+        async fn run(
+            &self,
+            command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            self.barrier.wait().await;
+            let output = PathBuf::from(command.args().last().expect("output argument exists"));
+            ImageBuffer::from_fn(18, 16, |x, y| {
+                Rgb([x.saturating_mul(10) as u8, y.saturating_mul(10) as u8, 80])
+            })
+            .save_with_format(&output, image::ImageFormat::Png)
+            .expect("fake ffmpeg should write a frame");
             Ok(ExternalCommandOutput {
                 success: true,
                 exit_code: Some(0),
@@ -633,6 +668,33 @@ mod tests {
             .expect_err("frame byte limit should be enforced");
         assert!(matches!(error, FrameExtractionError::FrameTooLarge { limit: 1, .. }));
 
+        workspace.cleanup().await.expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn concurrent_extraction_reuses_a_frame_published_by_the_other_attempt() {
+        let workspace = MediaWorkspace::create(temp_path("fingerprint-concurrent"), Uuid::new_v4())
+            .await
+            .expect("workspace should be created");
+        let input =
+            workspace.path(WorkspaceArea::Source, "input.mp4").expect("input path should be valid");
+        std::fs::write(&input, b"fake video").expect("fake input should be written");
+        let extractor = FrameExtractor::with_runner(
+            "/usr/bin/ffmpeg",
+            Duration::from_secs(5),
+            1024,
+            Arc::new(ConcurrentRunner { barrier: Arc::new(Barrier::new(2)) }),
+        );
+
+        let first = extractor.clone();
+        let second = extractor.clone();
+        let (first, second) = tokio::join!(
+            first.extract(&workspace, "input.mp4", 10_000),
+            second.extract(&workspace, "input.mp4", 10_000),
+        );
+        let first = first.expect("first extraction should succeed");
+        let second = second.expect("second extraction should succeed");
+        assert_eq!(first.fingerprint, second.fingerprint);
         workspace.cleanup().await.expect("workspace should be removed");
     }
 }

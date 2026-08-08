@@ -965,30 +965,16 @@ async fn compute_fingerprint(
         return Ok(());
     }
 
-    let probe = match request.original_input.get("probe").cloned() {
-        Some(value) => match serde_json::from_value::<MediaProbe>(value) {
-            Ok(probe) => probe,
-            Err(error) => {
-                return fail_fingerprint(
-                    inbox,
-                    ingest_request_id,
-                    &job_attempt,
-                    HandlerFailure::permanent(
-                        "invalid_ingest_state",
-                        format!("stored media probe could not be decoded: {error}"),
-                    ),
-                )
-                .await;
-            }
-        },
-        None => {
+    let duration_ms = match normalization.duration_ms {
+        Some(duration_ms) if duration_ms > 0 => duration_ms,
+        _ => {
             return fail_fingerprint(
                 inbox,
                 ingest_request_id,
                 &job_attempt,
                 HandlerFailure::permanent(
                     "invalid_ingest_state",
-                    "ingest request has no stored media probe",
+                    "video normalization has no valid canonical duration",
                 ),
             )
             .await;
@@ -1022,7 +1008,7 @@ async fn compute_fingerprint(
         .await;
     }
     let result = match extractor
-        .extract_for_probe_from_area(&workspace, WorkspaceArea::Normalized, "canonical.mp4", &probe)
+        .extract_from_area(&workspace, WorkspaceArea::Normalized, "canonical.mp4", duration_ms)
         .await
     {
         Ok(result) => result,
@@ -1031,7 +1017,7 @@ async fn compute_fingerprint(
                 inbox,
                 ingest_request_id,
                 &job_attempt,
-                map_fingerprint_error(error),
+                map_fingerprint_error(&job, error),
             )
             .await;
         }
@@ -1045,9 +1031,11 @@ async fn compute_fingerprint(
     Ok(())
 }
 
-fn map_fingerprint_error(error: FrameExtractionError) -> HandlerFailure {
+fn map_fingerprint_error(job: &Job, error: FrameExtractionError) -> HandlerFailure {
     let message = error.to_string();
-    if matches!(&error, FrameExtractionError::Command(error) if error.is_timeout()) {
+    let retryable = matches!(&error, FrameExtractionError::Command(error) if error.is_timeout())
+        && job.attempt_count < job.max_attempts;
+    if retryable {
         HandlerFailure::retryable("fingerprint_timeout", message)
     } else {
         HandlerFailure::permanent("fingerprint_failed", message)
@@ -2026,7 +2014,35 @@ fn validate_timing(poll_interval: Duration, lease_duration: Duration) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use sooqa_media::CommandError;
+
     use super::*;
+
+    fn running_compute_job(attempt_count: i32, max_attempts: i32) -> Job {
+        let now = OffsetDateTime::now_utc();
+        Job {
+            id: Uuid::new_v4(),
+            command: JobCommand::ComputeFingerprint(sooqa_jobs::IngestJobPayload {
+                ingest_request_id: Uuid::new_v4(),
+            }),
+            status: JobStatus::Running,
+            priority: 0,
+            available_at: now,
+            attempt_count,
+            max_attempts,
+            lease_owner: Some("test-worker".to_owned()),
+            lease_expires_at: None,
+            last_heartbeat_at: None,
+            last_error_class: None,
+            last_error_message: None,
+            idempotency_key: None,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        }
+    }
 
     fn test_handler(_job: Job) -> HandlerFuture {
         Box::pin(async { Ok(()) })
@@ -2065,5 +2081,22 @@ mod tests {
         let error = decode_sha256(&format!("{}g", "0".repeat(63)))
             .expect_err("non-hex digest should be rejected");
         assert_eq!(error.class, "invalid_normalization");
+    }
+
+    #[test]
+    fn fingerprint_timeout_becomes_terminal_on_the_last_attempt() {
+        let timeout_error = || {
+            FrameExtractionError::Command(CommandError::TimedOut {
+                program: PathBuf::from("ffmpeg"),
+                timeout: Duration::from_secs(1),
+            })
+        };
+        let retry = map_fingerprint_error(&running_compute_job(1, 5), timeout_error());
+        assert!(retry.retryable);
+        assert_eq!(retry.class, "fingerprint_timeout");
+
+        let exhausted = map_fingerprint_error(&running_compute_job(5, 5), timeout_error());
+        assert!(!exhausted.retryable);
+        assert_eq!(exhausted.class, "fingerprint_failed");
     }
 }
