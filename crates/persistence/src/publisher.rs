@@ -2,8 +2,9 @@ use serde_json::Value;
 use sooqa_publisher::{
     ChannelPolicy, NewChannelPolicy, NewPostDraft, NewPublicationSchedule, NewTargetChannel,
     PostDraft, PostDraftStatus, PostDraftUpdate, PublicationAttempt, PublicationAttemptStatus,
-    PublicationSchedule, PublicationScheduleStatus, PublishedPost, PublisherValidationError,
-    TargetChannel, transition_post_draft_status, transition_publication_schedule_status,
+    PublicationCompletion, PublicationSchedule, PublicationScheduleStatus, PublishedPost,
+    PublisherValidationError, TargetChannel, transition_post_draft_status,
+    transition_publication_schedule_status,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
@@ -274,6 +275,14 @@ impl PublisherRepository {
     ) -> Result<PublicationSchedule, PublisherRepositoryError> {
         schedule.validate()?;
         let mut transaction = self.pool.begin().await?;
+        // A unique index can reject a duplicate only after the caller has
+        // already changed the draft. Serialize requests for the same key
+        // before checking the existing schedule so a concurrent replay returns
+        // the original row instead of DraftNotReady.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))")
+            .bind(&schedule.idempotency_key)
+            .fetch_one(&mut *transaction)
+            .await?;
         if let Some(existing) = sqlx::query_as::<_, PublicationScheduleRow>(
             r#"
             SELECT id, post_draft_id, status, publish_at, not_before, not_after,
@@ -477,7 +486,20 @@ impl PublisherRepository {
             .bind(schedule_id)
             .execute(&mut *transaction)
             .await?;
-        } else if schedule.status != PublicationScheduleStatus::Publishing {
+        } else if schedule.status == PublicationScheduleStatus::Publishing {
+            let running_attempt = sqlx::query_scalar::<_, i32>(
+                "SELECT attempt_number FROM publication_attempts WHERE publication_schedule_id = $1 AND status = 'running' LIMIT 1 FOR UPDATE",
+            )
+            .bind(schedule_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if let Some(attempt_number) = running_attempt {
+                return Err(PublisherRepositoryError::AttemptAlreadyRunning {
+                    schedule_id,
+                    attempt_number,
+                });
+            }
+        } else {
             return Err(PublisherRepositoryError::InvalidScheduleState {
                 id: schedule_id,
                 status: schedule.status,
@@ -520,7 +542,17 @@ impl PublisherRepository {
         if status == PublicationAttemptStatus::Running {
             return Err(PublisherRepositoryError::AttemptMustFinish);
         }
+        if status == PublicationAttemptStatus::Succeeded {
+            return Err(PublisherRepositoryError::PublicationCompletionRequired);
+        }
         let mut transaction = self.pool.begin().await?;
+        let schedule = load_publication_schedule(&mut transaction, schedule_id).await?;
+        if schedule.status != PublicationScheduleStatus::Publishing {
+            return Err(PublisherRepositoryError::InvalidScheduleState {
+                id: schedule_id,
+                status: schedule.status,
+            });
+        }
         let row = sqlx::query_as::<_, PublicationAttemptRow>(
             r#"
             UPDATE publication_attempts
@@ -542,76 +574,109 @@ impl PublisherRepository {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(PublisherRepositoryError::AttemptMissing { schedule_id, attempt_number })?;
-        let schedule_status = if status == PublicationAttemptStatus::Succeeded {
-            PublicationScheduleStatus::Published
-        } else {
-            PublicationScheduleStatus::Failed
+        let schedule_status = match status {
+            PublicationAttemptStatus::Failed => PublicationScheduleStatus::Failed,
+            PublicationAttemptStatus::Unknown => PublicationScheduleStatus::Unknown,
+            PublicationAttemptStatus::Running | PublicationAttemptStatus::Succeeded => {
+                unreachable!("terminal status was validated before the transaction")
+            }
         };
         sqlx::query(
-            "UPDATE publication_schedules SET status = $2, updated_at = now() WHERE id = $1",
+            "UPDATE publication_schedules SET status = $2, updated_at = now() WHERE id = $1 AND status = 'publishing'",
         )
         .bind(schedule_id)
         .bind(schedule_status.as_str())
         .execute(&mut *transaction)
         .await?;
-        if status == PublicationAttemptStatus::Succeeded {
-            let schedule_draft_id: Uuid =
-                sqlx::query_scalar("SELECT post_draft_id FROM publication_schedules WHERE id = $1")
-                    .bind(schedule_id)
-                    .fetch_one(&mut *transaction)
-                    .await?;
-            sqlx::query(
-                "UPDATE post_drafts SET status = 'published', updated_at = now() WHERE id = $1 AND status = 'scheduled'",
-            )
-            .bind(schedule_draft_id)
-            .execute(&mut *transaction)
-            .await?;
-        }
         transaction.commit().await?;
         row.into_publication_attempt()
     }
 
-    pub async fn record_published_post(
+    pub async fn complete_publication_attempt(
         &self,
         schedule_id: Uuid,
+        attempt_number: i32,
         telegram_message_id: i64,
         caption_snapshot: Option<String>,
-    ) -> Result<PublishedPost, PublisherRepositoryError> {
+        response_json: Option<Value>,
+    ) -> Result<PublicationCompletion, PublisherRepositoryError> {
         if telegram_message_id <= 0 {
             return Err(PublisherRepositoryError::InvalidTelegramMessageId(telegram_message_id));
         }
         let mut transaction = self.pool.begin().await?;
-        let row = sqlx::query_as::<_, PublishedPostRow>(
+        let schedule = load_publication_schedule(&mut transaction, schedule_id).await?;
+        if schedule.status == PublicationScheduleStatus::Published {
+            let attempt =
+                load_publication_attempt(&mut transaction, schedule_id, attempt_number).await?;
+            if attempt.status != PublicationAttemptStatus::Succeeded {
+                return Err(PublisherRepositoryError::AttemptMissing {
+                    schedule_id,
+                    attempt_number,
+                });
+            }
+            let published = load_published_post(&mut transaction, schedule_id)
+                .await?
+                .ok_or(PublisherRepositoryError::PublishedPostMissing(schedule_id))?;
+            if published.telegram_message_id != telegram_message_id
+                || published.caption_snapshot.as_ref() != caption_snapshot.as_ref()
+            {
+                return Err(PublisherRepositoryError::PublishedPostConflict(schedule_id));
+            }
+            transaction.commit().await?;
+            return Ok(PublicationCompletion { attempt, published_post: published });
+        }
+        if schedule.status != PublicationScheduleStatus::Publishing {
+            return Err(PublisherRepositoryError::InvalidScheduleState {
+                id: schedule_id,
+                status: schedule.status,
+            });
+        }
+        let draft = load_post_draft(&mut transaction, schedule.post_draft_id).await?;
+        if draft.status != PostDraftStatus::Scheduled {
+            return Err(PublisherRepositoryError::DraftNotReady {
+                id: draft.id,
+                status: draft.status,
+            });
+        }
+        let attempt = sqlx::query_as::<_, PublicationAttemptRow>(
             r#"
-            INSERT INTO published_posts (
-                publication_schedule_id, content_item_id, asset_id, target_channel_id,
-                telegram_chat_id, telegram_message_id, caption_snapshot
-            )
-            SELECT ps.id, pd.content_item_id, pd.asset_id, pd.target_channel_id,
-                   tc.telegram_chat_id, $2, $3
-            FROM publication_schedules ps
-            JOIN post_drafts pd ON pd.id = ps.post_draft_id
-            JOIN target_channels tc ON tc.id = pd.target_channel_id
-            WHERE ps.id = $1
-            ON CONFLICT (publication_schedule_id) DO UPDATE SET
-                telegram_chat_id = EXCLUDED.telegram_chat_id,
-                telegram_message_id = EXCLUDED.telegram_message_id,
-                caption_snapshot = EXCLUDED.caption_snapshot,
-                published_at = now(),
-                status = 'active'
-            RETURNING id, publication_schedule_id, content_item_id, asset_id,
-                      target_channel_id, telegram_chat_id, telegram_message_id,
-                      caption_snapshot, published_at, status
+            UPDATE publication_attempts
+            SET status = 'succeeded', finished_at = now(), response_json = $3
+            WHERE publication_schedule_id = $1
+              AND attempt_number = $2
+              AND status = 'running'
+            RETURNING id, publication_schedule_id, attempt_number, status, started_at,
+                      finished_at, telegram_request_key, error_class, error_message, response_json
             "#,
         )
         .bind(schedule_id)
-        .bind(telegram_message_id)
-        .bind(caption_snapshot)
+        .bind(attempt_number)
+        .bind(response_json)
         .fetch_optional(&mut *transaction)
         .await?
-        .ok_or(PublisherRepositoryError::ScheduleMissing(schedule_id))?;
+        .ok_or(PublisherRepositoryError::AttemptMissing { schedule_id, attempt_number })?
+        .into_publication_attempt()?;
+        sqlx::query(
+            "UPDATE publication_schedules SET status = 'published', updated_at = now() WHERE id = $1 AND status = 'publishing'",
+        )
+        .bind(schedule_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE post_drafts SET status = 'published', updated_at = now() WHERE id = $1 AND status = 'scheduled'",
+        )
+        .bind(draft.id)
+        .execute(&mut *transaction)
+        .await?;
+        let published = insert_or_load_published_post(
+            &mut transaction,
+            schedule_id,
+            telegram_message_id,
+            caption_snapshot,
+        )
+        .await?;
         transaction.commit().await?;
-        row.into_published_post()
+        Ok(PublicationCompletion { attempt, published_post: published })
     }
 }
 
@@ -673,6 +738,90 @@ async fn load_publication_schedule(
     row.into_publication_schedule()
 }
 
+async fn load_publication_attempt(
+    transaction: &mut Transaction<'_, Postgres>,
+    schedule_id: Uuid,
+    attempt_number: i32,
+) -> Result<PublicationAttempt, PublisherRepositoryError> {
+    let row = sqlx::query_as::<_, PublicationAttemptRow>(
+        r#"
+        SELECT id, publication_schedule_id, attempt_number, status, started_at,
+               finished_at, telegram_request_key, error_class, error_message, response_json
+        FROM publication_attempts
+        WHERE publication_schedule_id = $1 AND attempt_number = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(schedule_id)
+    .bind(attempt_number)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(PublisherRepositoryError::AttemptMissing { schedule_id, attempt_number })?;
+    row.into_publication_attempt()
+}
+
+async fn load_published_post(
+    transaction: &mut Transaction<'_, Postgres>,
+    schedule_id: Uuid,
+) -> Result<Option<PublishedPost>, PublisherRepositoryError> {
+    let row = sqlx::query_as::<_, PublishedPostRow>(
+        r#"
+        SELECT id, publication_schedule_id, content_item_id, asset_id, target_channel_id,
+               telegram_chat_id, telegram_message_id, caption_snapshot, published_at, status
+        FROM published_posts
+        WHERE publication_schedule_id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(schedule_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.map(PublishedPostRow::into_published_post).transpose()
+}
+
+async fn insert_or_load_published_post(
+    transaction: &mut Transaction<'_, Postgres>,
+    schedule_id: Uuid,
+    telegram_message_id: i64,
+    caption_snapshot: Option<String>,
+) -> Result<PublishedPost, PublisherRepositoryError> {
+    let inserted = sqlx::query_as::<_, PublishedPostRow>(
+        r#"
+        INSERT INTO published_posts (
+            publication_schedule_id, content_item_id, asset_id, target_channel_id,
+            telegram_chat_id, telegram_message_id, caption_snapshot
+        )
+        SELECT ps.id, pd.content_item_id, pd.asset_id, pd.target_channel_id,
+               tc.telegram_chat_id, $2, $3
+        FROM publication_schedules ps
+        JOIN post_drafts pd ON pd.id = ps.post_draft_id
+        JOIN target_channels tc ON tc.id = pd.target_channel_id
+        WHERE ps.id = $1
+        ON CONFLICT (publication_schedule_id) DO NOTHING
+        RETURNING id, publication_schedule_id, content_item_id, asset_id,
+                  target_channel_id, telegram_chat_id, telegram_message_id,
+                  caption_snapshot, published_at, status
+        "#,
+    )
+    .bind(schedule_id)
+    .bind(telegram_message_id)
+    .bind(&caption_snapshot)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some(row) = inserted {
+        return row.into_published_post();
+    }
+    let existing = load_published_post(transaction, schedule_id)
+        .await?
+        .ok_or(PublisherRepositoryError::PublishedPostMissing(schedule_id))?;
+    if existing.telegram_message_id != telegram_message_id
+        || existing.caption_snapshot.as_ref() != caption_snapshot.as_ref()
+    {
+        return Err(PublisherRepositoryError::PublishedPostConflict(schedule_id));
+    }
+    Ok(existing)
+}
+
 fn to_i64(value: u64, field: &'static str) -> Result<i64, PublisherRepositoryError> {
     i64::try_from(value).map_err(|_| PublisherRepositoryError::NumberOverflow { field })
 }
@@ -705,10 +854,18 @@ pub enum PublisherRepositoryError {
     InvalidScheduleState { id: Uuid, status: PublicationScheduleStatus },
     #[error("publication attempt must finish with a terminal status")]
     AttemptMustFinish,
+    #[error("successful publication must atomically record its Telegram message")]
+    PublicationCompletionRequired,
+    #[error("publication schedule {schedule_id} already has running attempt {attempt_number}")]
+    AttemptAlreadyRunning { schedule_id: Uuid, attempt_number: i32 },
     #[error("publication limit must be between 1 and 100, got {0}")]
     InvalidLimit(u32),
     #[error("Telegram message ID must be positive, got {0}")]
     InvalidTelegramMessageId(i64),
+    #[error("published post for schedule {0} was not found")]
+    PublishedPostMissing(Uuid),
+    #[error("published post replay conflicts with the existing Telegram message for schedule {0}")]
+    PublishedPostConflict(Uuid),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 }

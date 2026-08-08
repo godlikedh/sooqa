@@ -138,9 +138,12 @@ flowchart LR
 Persistence validates the draft's asset/content relationship, restricts draft
 and schedule state transitions, atomically moves a ready draft to scheduled,
 and preserves schedule creation idempotency by request key. Due schedules are
-ordered durably and publication attempts retain Telegram request keys and
-responses. The remaining composition is the draft/schedule API, a scheduler,
-and a Telegram publication handler; no network publication happens in this
+ordered durably; publication attempts retain Telegram request keys and
+responses, and an ambiguous result moves the schedule out of the automatic
+retry queue until it is explicitly reconciled. Successful publication records
+the attempt, schedule, draft, and Telegram message history in one transaction.
+The remaining composition is the draft/schedule API, a scheduler, and a
+Telegram publication handler; no network publication happens in this
 foundation slice.
 
 ## Filesystem and subprocess safety

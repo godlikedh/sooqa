@@ -242,6 +242,7 @@ pub enum PublicationScheduleStatus {
     Publishing,
     Published,
     Failed,
+    Unknown,
     Cancelled,
 }
 
@@ -253,6 +254,7 @@ impl PublicationScheduleStatus {
             Self::Publishing => "publishing",
             Self::Published => "published",
             Self::Failed => "failed",
+            Self::Unknown => "unknown",
             Self::Cancelled => "cancelled",
         }
     }
@@ -269,8 +271,9 @@ impl PublicationScheduleStatus {
             (self, target),
             (Self::Pending, Self::Queued | Self::Publishing | Self::Cancelled)
                 | (Self::Queued, Self::Publishing | Self::Cancelled)
-                | (Self::Publishing, Self::Published | Self::Failed | Self::Cancelled)
+                | (Self::Publishing, Self::Published | Self::Failed | Self::Unknown)
                 | (Self::Failed, Self::Queued | Self::Cancelled)
+                | (Self::Unknown, Self::Queued | Self::Cancelled)
         )
     }
 }
@@ -285,6 +288,7 @@ impl TryFrom<&str> for PublicationScheduleStatus {
             "publishing" => Ok(Self::Publishing),
             "published" => Ok(Self::Published),
             "failed" => Ok(Self::Failed),
+            "unknown" => Ok(Self::Unknown),
             "cancelled" => Ok(Self::Cancelled),
             unknown => Err(unknown.to_owned()),
         }
@@ -415,6 +419,12 @@ pub struct PublishedPost {
     pub status: PublishedPostStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublicationCompletion {
+    pub attempt: PublicationAttempt,
+    pub published_post: PublishedPost,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublishedPostStatus {
@@ -532,6 +542,21 @@ mod tests {
             transition_publication_schedule_status(
                 PublicationScheduleStatus::Published,
                 PublicationScheduleStatus::Queued,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            transition_publication_schedule_status(
+                PublicationScheduleStatus::Publishing,
+                PublicationScheduleStatus::Unknown,
+            )
+            .expect("ambiguous publication should be preserved"),
+            PublicationScheduleStatus::Unknown
+        );
+        assert!(
+            transition_publication_schedule_status(
+                PublicationScheduleStatus::Publishing,
+                PublicationScheduleStatus::Cancelled,
             )
             .is_err()
         );

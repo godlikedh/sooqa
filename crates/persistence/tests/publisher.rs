@@ -86,6 +86,29 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
         .await
         .expect("canonical asset pointer should be set");
 
+    let mismatched_content = database
+        .library()
+        .create_content_item(NewContentItem::new(ContentKind::Video))
+        .await
+        .expect("second content fixture should be created");
+    let mismatched_draft = sqlx::query(
+        "INSERT INTO post_drafts (content_item_id, asset_id, target_channel_id) VALUES ($1, $2, $3)",
+    )
+    .bind(mismatched_content.id)
+    .bind(asset.id)
+    .bind(target.id)
+    .execute(database.pool())
+    .await;
+    assert!(
+        mismatched_draft.is_err(),
+        "database should reject a draft asset owned by another content item"
+    );
+    sqlx::query("DELETE FROM content_items WHERE id = $1")
+        .bind(mismatched_content.id)
+        .execute(database.pool())
+        .await
+        .expect("mismatched content fixture should clean up");
+
     let draft = database
         .publisher()
         .create_post_draft(NewPostDraft {
@@ -115,16 +138,20 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
     let schedule =
         NewPublicationSchedule::try_new(draft.id, publish_at, format!("{key_prefix}-schedule"))
             .expect("schedule should be valid");
-    let schedule = database
-        .publisher()
-        .create_publication_schedule(schedule.clone())
-        .await
-        .expect("publication schedule should be created");
+    let publisher_a = database.publisher();
+    let publisher_b = database.publisher();
+    let (first, second) = tokio::join!(
+        publisher_a.create_publication_schedule(schedule.clone()),
+        publisher_b.create_publication_schedule(schedule.clone()),
+    );
+    let schedule = first.expect("publication schedule should be created");
+    let replay = second.expect("concurrent schedule request should replay");
+    assert_eq!(replay.id, schedule.id);
     let replay = database
         .publisher()
         .create_publication_schedule(schedule_request(&schedule, &key_prefix))
         .await
-        .expect("same schedule request should replay");
+        .expect("same schedule request should replay after commit");
     assert_eq!(replay.id, schedule.id);
     assert_eq!(
         database
@@ -142,36 +169,96 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
         .await
         .expect("publication attempt should start");
     assert_eq!(attempt.attempt_number, 1);
-    let finished = database
+    assert!(matches!(
+        database
+            .publisher()
+            .start_publication_attempt(schedule.id, Some(format!("{key_prefix}-duplicate")))
+            .await,
+        Err(sooqa_persistence::PublisherRepositoryError::AttemptAlreadyRunning {
+            schedule_id,
+            attempt_number: 1,
+        }) if schedule_id == schedule.id
+    ));
+    let ambiguous = database
         .publisher()
         .finish_publication_attempt(
             schedule.id,
             attempt.attempt_number,
-            PublicationAttemptStatus::Succeeded,
+            PublicationAttemptStatus::Unknown,
+            Some("telegram_timeout"),
+            Some("request outcome is ambiguous"),
             None,
-            None,
-            Some(serde_json::json!({"message_id": 77})),
         )
         .await
-        .expect("publication attempt should finish");
-    assert_eq!(finished.status, PublicationAttemptStatus::Succeeded);
-    let published = database
-        .publisher()
-        .record_published_post(schedule.id, 77, Some("caption".to_owned()))
-        .await
-        .expect("published post should be recorded");
-    assert_eq!(published.telegram_chat_id, target.telegram_chat_id);
-    assert_eq!(published.telegram_message_id, 77);
+        .expect("ambiguous publication should be preserved");
+    assert_eq!(ambiguous.status, PublicationAttemptStatus::Unknown);
     assert_eq!(
         database
             .publisher()
-            .record_published_post(schedule.id, 77, Some("caption".to_owned()))
+            .list_due_publication_schedules(time::OffsetDateTime::now_utc(), 10)
             .await
-            .expect("published post replay should be idempotent")
-            .id,
-        published.id
+            .expect("due schedules should load")
+            .len(),
+        0
     );
-
+    database
+        .publisher()
+        .transition_publication_schedule(
+            schedule.id,
+            sooqa_publisher::PublicationScheduleStatus::Queued,
+        )
+        .await
+        .expect("explicit reconciliation should requeue the schedule");
+    let attempt = database
+        .publisher()
+        .start_publication_attempt(schedule.id, Some(format!("{key_prefix}-telegram-retry")))
+        .await
+        .expect("reconciled publication should start a new attempt");
+    assert_eq!(attempt.attempt_number, 2);
+    let completion = database
+        .publisher()
+        .complete_publication_attempt(
+            schedule.id,
+            attempt.attempt_number,
+            77,
+            Some("caption".to_owned()),
+            Some(serde_json::json!({"message_id": 77})),
+        )
+        .await
+        .expect("publication attempt should finish atomically");
+    assert_eq!(completion.attempt.status, PublicationAttemptStatus::Succeeded);
+    assert_eq!(completion.published_post.telegram_chat_id, target.telegram_chat_id);
+    assert_eq!(completion.published_post.telegram_message_id, 77);
+    assert_eq!(
+        database
+            .publisher()
+            .complete_publication_attempt(
+                schedule.id,
+                attempt.attempt_number,
+                77,
+                Some("caption".to_owned()),
+                Some(serde_json::json!({"message_id": 77})),
+            )
+            .await
+            .expect("same publication completion should replay")
+            .published_post
+            .id,
+        completion.published_post.id
+    );
+    assert!(matches!(
+        database
+            .publisher()
+            .complete_publication_attempt(
+                schedule.id,
+                attempt.attempt_number,
+                78,
+                Some("caption".to_owned()),
+                None,
+            )
+            .await,
+        Err(sooqa_persistence::PublisherRepositoryError::PublishedPostConflict(id))
+            if id == schedule.id
+    ));
     assert_eq!(
         database
             .publisher()

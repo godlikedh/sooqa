@@ -47,6 +47,7 @@ async fn migrations_are_idempotent_and_create_core_tables() {
         "media_assets_sha256_idx",
         "media_assets_canonical_sha256_idx",
         "media_assets_content_canonical_idx",
+        "media_assets_id_content_item_idx",
         "duplicate_candidates_pending_idx",
         "duplicate_candidate_events_candidate_idx",
         "duplicate_candidate_events_idempotency_idx",
@@ -54,6 +55,7 @@ async fn migrations_are_idempotent_and_create_core_tables() {
         "idempotency_records_storage_asset_idx",
         "publication_schedules_due_idx",
         "publication_attempts_schedule_idx",
+        "publication_attempts_running_schedule_idx",
         "published_posts_content_channel_idx",
     ] {
         let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
