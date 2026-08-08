@@ -6,8 +6,7 @@ use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
 use sooqa_jobs::JobType;
 use sooqa_media::{
     BinaryCheck, DirectHttpDownloader, DownloadLimits, FfprobeAdapter, MediaWorkspace,
-    ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter, YtDlpConfig, YtDlpDownloader,
-    diagnose_binaries,
+    ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter, diagnose_binaries,
 };
 use sooqa_persistence::Database;
 use uuid::Uuid;
@@ -44,15 +43,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
         max_bytes: config.telegram.max_download_bytes,
         ..DownloadLimits::default()
     };
-    let ytdlp_config =
-        YtDlpConfig::new(config.media.ytdlp_path.clone(), config.media.ytdlp_format.clone())?;
-    let source_downloader: Arc<dyn SourceDownloader> = Arc::new(SourceDownloaderRouter::new(
-        Arc::new(DirectHttpDownloader::new(download_limits)),
-        Arc::new(YtDlpDownloader::with_limits(ytdlp_config, download_limits)),
-    ));
+    let source_downloader: Arc<dyn SourceDownloader> = Arc::new(
+        SourceDownloaderRouter::direct_only(Arc::new(DirectHttpDownloader::new(download_limits))),
+    );
     let inspect_handler = inspect_source_handler(database.inbox(), source_downloader);
     handlers.register(JobType::InspectSource, move |job| inspect_handler(job));
-    tracing::info!("source inspection handlers enabled (direct HTTP and yt-dlp)");
+    tracing::info!("source inspection handler enabled (direct HTTP only)");
     let probe_handler = probe_asset_handler(
         database.inbox(),
         config.media.work_root.clone(),
@@ -104,13 +100,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
             "ffprobe",
             config.media.ffprobe_path.clone(),
             ["-version"],
-        ));
-    }
-    if capabilities.contains(&JobType::InspectSource) {
-        binary_checks.push(BinaryCheck::new(
-            "yt-dlp",
-            config.media.ytdlp_path.clone(),
-            ["--version"],
         ));
     }
     let binary_diagnostics =

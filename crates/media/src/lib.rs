@@ -109,19 +109,25 @@ pub trait SourceDownloader: Send + Sync {
     }
 }
 
-/// Selects the direct HTTP adapter for recognizable media responses and uses
-/// yt-dlp for page-like URLs or upstream responses that direct HTTP cannot
-/// handle. The selected adapter is recorded in `SourceInspection` so the
-/// later download job uses the same boundary.
+/// Selects the direct HTTP adapter for recognizable media responses and, when
+/// configured, uses yt-dlp for page-like URLs or upstream responses that
+/// direct HTTP cannot handle. The selected adapter is recorded in
+/// `SourceInspection` so the later download job uses the same boundary.
 #[derive(Clone)]
 pub struct SourceDownloaderRouter {
     direct_http: Arc<dyn SourceDownloader>,
-    ytdlp: Arc<dyn SourceDownloader>,
+    ytdlp: Option<Arc<dyn SourceDownloader>>,
 }
 
 impl SourceDownloaderRouter {
     pub fn new(direct_http: Arc<dyn SourceDownloader>, ytdlp: Arc<dyn SourceDownloader>) -> Self {
-        Self { direct_http, ytdlp }
+        Self { direct_http, ytdlp: Some(ytdlp) }
+    }
+
+    /// Builds a production-safe router until the yt-dlp process has an
+    /// equivalent egress/SSRF boundary.
+    pub fn direct_only(direct_http: Arc<dyn SourceDownloader>) -> Self {
+        Self { direct_http, ytdlp: None }
     }
 }
 
@@ -130,8 +136,17 @@ impl SourceDownloader for SourceDownloaderRouter {
     async fn inspect(&self, source: &SourceInput) -> Result<SourceInspection, DownloadError> {
         match self.direct_http.inspect(source).await {
             Ok(inspection) if inspection.media_kind != SourceMediaKind::Unknown => Ok(inspection),
-            Ok(_) => self.ytdlp.inspect(source).await,
-            Err(error) if should_try_ytdlp(&error) => self.ytdlp.inspect(source).await,
+            Ok(_) => match &self.ytdlp {
+                Some(ytdlp) => ytdlp.inspect(source).await,
+                None => Err(DownloadError::terminal(
+                    "unsupported_source",
+                    "direct HTTP did not recognize a supported media response",
+                )),
+            },
+            Err(error) if should_try_ytdlp(&error) => match &self.ytdlp {
+                Some(ytdlp) => ytdlp.inspect(source).await,
+                None => Err(error),
+            },
             Err(error) => Err(error),
         }
     }
@@ -144,7 +159,13 @@ impl SourceDownloader for SourceDownloaderRouter {
     ) -> Result<DownloadedSource, DownloadError> {
         match inspection.adapter.as_str() {
             "direct_http" => self.direct_http.download(inspection, destination, limits).await,
-            "yt_dlp" => self.ytdlp.download(inspection, destination, limits).await,
+            "yt_dlp" => match &self.ytdlp {
+                Some(ytdlp) => ytdlp.download(inspection, destination, limits).await,
+                None => Err(DownloadError::terminal(
+                    "source_adapter_disabled",
+                    "yt-dlp source adapter is not enabled in this worker",
+                )),
+            },
             adapter => Err(DownloadError::terminal(
                 "unknown_source_adapter",
                 format!("source inspection selected unsupported adapter {adapter:?}"),
@@ -348,5 +369,18 @@ mod tests {
             Err(DownloadError::Terminal { class, .. }) if class == "ssrf_blocked"
         ));
         assert_eq!(ytdlp_downloads.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn direct_only_router_rejects_unrecognized_sources() {
+        let router = SourceDownloaderRouter::direct_only(Arc::new(StubDownloader {
+            inspection: Ok(inspection("direct_http", SourceMediaKind::Unknown)),
+            downloads: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        assert!(matches!(
+            router.inspect(&source()).await,
+            Err(DownloadError::Terminal { class, .. }) if class == "unsupported_source"
+        ));
     }
 }

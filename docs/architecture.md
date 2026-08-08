@@ -65,10 +65,13 @@ ffmpeg, or yt-dlp is running.
 ## Current Telegram paths
 
 URL messages call the Inbox service and create a durable `inspect_source` job.
-The production worker registers that handler with a router: recognizable media
-responses stay on the SSRF-hardened direct HTTP adapter, while page-like
-responses and upstream HTTP status failures fall back to yt-dlp. The selected
-adapter is retained in the typed inspection payload for the later download job.
+The production worker registers that handler with a direct-only router:
+recognizable media responses stay on the SSRF-hardened direct HTTP adapter,
+while page-like responses are rejected as unsupported. The yt-dlp adapter is
+implemented behind the media boundary but is not enabled in the production
+worker until its subprocess egress has an equivalent SSRF boundary. The
+selected adapter is retained in the typed inspection payload for the later
+download job.
 Media messages are downloaded into a per-update workspace, then create a
 Telegram ingest request and `probe_asset` job. The probe handler validates the
 shared workspace and uses ffprobe before recording typed probe metadata.
