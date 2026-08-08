@@ -671,9 +671,8 @@ fn message_media(message: &Message) -> Option<TelegramMedia> {
     }
     let document = message.document()?;
     let mime_type = document.mime_type.as_ref().map(ToString::to_string);
-    let media_kind = document_media_kind(mime_type.as_deref(), document.file_name.as_deref());
-    match media_kind {
-        Some(media_kind) => Some(TelegramMedia::Supported {
+    match classify_document(mime_type.as_deref(), document.file_name.as_deref()) {
+        DocumentClassification::Supported(media_kind) => Some(TelegramMedia::Supported {
             media_kind,
             file_id: document.file.id.to_string(),
             file_unique_id: document.file.unique_id.to_string(),
@@ -681,64 +680,85 @@ fn message_media(message: &Message) -> Option<TelegramMedia> {
             mime_type,
             file_name: document.file_name.clone(),
         }),
-        None if document_is_probeable(mime_type.as_deref(), document.file_name.as_deref()) => {
-            Some(TelegramMedia::ProbeableDocument {
-                file_id: document.file.id.to_string(),
-                file_unique_id: document.file.unique_id.to_string(),
-                file_size: Some(document.file.size),
-                mime_type,
-                file_name: document.file_name.clone(),
-            })
-        }
-        None => Some(TelegramMedia::UnsupportedDocument {
+        DocumentClassification::Probeable => Some(TelegramMedia::ProbeableDocument {
+            file_id: document.file.id.to_string(),
+            file_unique_id: document.file.unique_id.to_string(),
+            file_size: Some(document.file.size),
+            mime_type,
+            file_name: document.file_name.clone(),
+        }),
+        DocumentClassification::Unsupported => Some(TelegramMedia::UnsupportedDocument {
             file_name: document.file_name.clone(),
             mime_type,
         }),
     }
 }
 
-fn document_is_probeable(mime_type: Option<&str>, file_name: Option<&str>) -> bool {
-    if let Some(mime_type) = mime_type {
-        let mime_type = mime_type.split(';').next().map(str::trim).unwrap_or_default();
-        return mime_type.eq_ignore_ascii_case("application/octet-stream")
-            || mime_type.eq_ignore_ascii_case("binary/octet-stream");
-    }
-
-    !matches!(
-        file_name
-            .and_then(|name| Path::new(name).extension())
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("zip" | "rar" | "7z" | "pdf" | "txt")
-    )
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DocumentClassification {
+    Supported(MediaKind),
+    Probeable,
+    Unsupported,
 }
 
-fn document_media_kind(mime_type: Option<&str>, file_name: Option<&str>) -> Option<MediaKind> {
-    let mime_type = mime_type.unwrap_or_default().to_ascii_lowercase();
-    if mime_type.starts_with("video/") {
-        return Some(MediaKind::Video);
-    }
-    if mime_type == "image/gif" {
-        return Some(MediaKind::Animation);
-    }
-    if mime_type.starts_with("image/") {
-        return Some(MediaKind::Image);
-    }
-    if mime_type.starts_with("audio/") {
-        return Some(MediaKind::Audio);
+fn classify_document(mime_type: Option<&str>, file_name: Option<&str>) -> DocumentClassification {
+    if let Some(mime_type) = mime_type {
+        let mime_type =
+            mime_type.split(';').next().map(str::trim).unwrap_or_default().to_ascii_lowercase();
+        if mime_type.starts_with("video/") {
+            return DocumentClassification::Supported(MediaKind::Video);
+        }
+        if mime_type == "image/gif" {
+            return DocumentClassification::Supported(MediaKind::Animation);
+        }
+        if matches!(mime_type.as_str(), "image/jpeg" | "image/png") {
+            return DocumentClassification::Supported(MediaKind::Image);
+        }
+        if mime_type.starts_with("image/") {
+            return DocumentClassification::Unsupported;
+        }
+        if mime_type.starts_with("audio/") {
+            return DocumentClassification::Supported(MediaKind::Audio);
+        }
+        if matches!(
+            mime_type.as_str(),
+            "application/pdf"
+                | "application/zip"
+                | "application/x-7z-compressed"
+                | "application/x-rar-compressed"
+                | "text/plain"
+        ) {
+            return DocumentClassification::Unsupported;
+        }
+        if mime_type.eq_ignore_ascii_case("application/octet-stream")
+            || mime_type.eq_ignore_ascii_case("binary/octet-stream")
+        {
+            return classify_document_filename(file_name);
+        }
     }
 
+    classify_document_filename(file_name)
+}
+
+fn classify_document_filename(file_name: Option<&str>) -> DocumentClassification {
     let extension = file_name
         .and_then(|name| Path::new(name).extension())
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase);
     match extension.as_deref() {
-        Some("gif") => Some(MediaKind::Animation),
-        Some("jpg" | "jpeg" | "png" | "webp" | "avif") => Some(MediaKind::Image),
-        Some("mp4" | "webm" | "mkv" | "mov" | "avi") => Some(MediaKind::Video),
-        Some("mp3" | "m4a" | "wav" | "flac" | "ogg") => Some(MediaKind::Audio),
-        _ => None,
+        Some("gif") => DocumentClassification::Supported(MediaKind::Animation),
+        Some("jpg" | "jpeg" | "png") => DocumentClassification::Supported(MediaKind::Image),
+        Some("mp4" | "webm" | "mkv" | "mov" | "avi") => {
+            DocumentClassification::Supported(MediaKind::Video)
+        }
+        Some("mp3" | "m4a" | "wav" | "flac" | "ogg") => {
+            DocumentClassification::Supported(MediaKind::Audio)
+        }
+        Some(
+            "avif" | "webp" | "zip" | "rar" | "7z" | "pdf" | "txt" | "doc" | "docx" | "xls"
+            | "xlsx" | "ppt" | "pptx",
+        ) => DocumentClassification::Unsupported,
+        _ => DocumentClassification::Probeable,
     }
 }
 
@@ -1841,17 +1861,44 @@ mod tests {
     }
 
     #[test]
-    fn document_media_kind_uses_mime_then_safe_filename_fallback() {
+    fn document_classifier_prioritizes_explicit_mime_and_probes_unknowns() {
         assert_eq!(
-            document_media_kind(Some("video/mp4"), Some("not-video.txt")),
-            Some(MediaKind::Video)
+            classify_document(Some("video/mp4"), Some("not-video.txt")),
+            DocumentClassification::Supported(MediaKind::Video)
         );
-        assert_eq!(document_media_kind(None, Some("clip.WEBM")), Some(MediaKind::Video));
         assert_eq!(
-            document_media_kind(Some("image/gif"), Some("animation.bin")),
-            Some(MediaKind::Animation)
+            classify_document(Some("IMAGE/PNG; charset=binary"), Some("photo.webp")),
+            DocumentClassification::Supported(MediaKind::Image)
         );
-        assert_eq!(document_media_kind(Some("application/zip"), Some("archive.zip")), None);
+        assert_eq!(
+            classify_document(Some("image/webp"), Some("photo.png")),
+            DocumentClassification::Unsupported
+        );
+        assert_eq!(
+            classify_document(Some("application/pdf"), Some("clip.mp4")),
+            DocumentClassification::Unsupported
+        );
+        assert_eq!(
+            classify_document(Some("application/octet-stream"), Some("clip.WEBM")),
+            DocumentClassification::Supported(MediaKind::Video)
+        );
+        assert_eq!(
+            classify_document(Some("application/octet-stream"), Some("photo.webp")),
+            DocumentClassification::Unsupported
+        );
+        assert_eq!(
+            classify_document(Some("application/x-unknown"), None),
+            DocumentClassification::Probeable
+        );
+        assert_eq!(classify_document(None, Some("mystery.bin")), DocumentClassification::Probeable);
+        assert_eq!(
+            classify_document(None, Some("archive.zip")),
+            DocumentClassification::Unsupported
+        );
+        assert_eq!(
+            classify_document(Some("image/gif"), Some("animation.bin")),
+            DocumentClassification::Supported(MediaKind::Animation)
+        );
     }
 
     #[test]
