@@ -144,7 +144,7 @@ pub struct IngestJobPayload {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishPostPayload {
-    pub post_id: String,
+    pub schedule_id: Uuid,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -285,8 +285,8 @@ impl NewJob {
         }))
     }
 
-    pub fn publish_post(post_id: impl Into<String>) -> Self {
-        Self::new(JobCommand::PublishPost(PublishPostPayload { post_id: post_id.into() }))
+    pub fn publish_post(schedule_id: Uuid) -> Self {
+        Self::new(JobCommand::PublishPost(PublishPostPayload { schedule_id }))
     }
 
     pub fn upload_storage_asset(asset_id: Uuid) -> Self {
@@ -441,6 +441,16 @@ mod tests {
             command,
             JobCommand::InspectSource(InspectSourcePayload { ingest_request_id: id })
         );
+    }
+
+    #[test]
+    fn publish_job_payload_carries_the_schedule_id() {
+        let schedule_id = Uuid::new_v4();
+        let new_job = NewJob::publish_post(schedule_id);
+        let command = JobCommand::from_payload(new_job.job_type(), new_job.payload_json())
+            .expect("publish payload should decode");
+
+        assert_eq!(command, JobCommand::PublishPost(PublishPostPayload { schedule_id }));
     }
 
     #[test]

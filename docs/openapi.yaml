@@ -721,8 +721,11 @@ components:
           nullable: true
     PostDraftUpdateRequest:
       type: object
-      minProperties: 1
       additionalProperties: false
+      anyOf:
+        - required: [caption]
+        - required: [parse_mode]
+        - required: [status]
       properties:
         caption:
           type: string

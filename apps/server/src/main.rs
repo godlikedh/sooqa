@@ -1,6 +1,6 @@
 //! HTTP server entry point for sooqa.
 
-use std::error::Error;
+use std::{error::Error, time::Duration};
 
 use axum::Router;
 use sooqa_config::{AppConfig, AppRole, CliCommand, CliOptions, ConfigError, StorageIntentCommand};
@@ -9,8 +9,9 @@ use sooqa_inbox::{
     TelegramSubmissionInput,
 };
 use sooqa_library::StorageUploadAttachment;
-use sooqa_persistence::InboxRepository;
-use sooqa_persistence::{TelegramRepository, TelegramRepositoryError};
+use sooqa_persistence::{
+    InboxRepository, PublisherRepository, TelegramRepository, TelegramRepositoryError,
+};
 use sooqa_telegram::{
     IngestAccepted, IngestService, MediaIngestCommand, TelegramRuntime, UpdateClaim,
     UpdateClaimResult, UpdateStore, UrlIngestCommand,
@@ -81,13 +82,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     tracing::info!(role = %config.role, "sooqa server started");
     let server = sooqa_server::serve(listener, app, sooqa_runtime::shutdown_signal());
-    if let Some(token) =
+    let mut scheduler = tokio::spawn(run_publisher_scheduler(
+        database.publisher(),
+        Duration::from_secs(config.publisher.scheduler_tick_seconds),
+    ));
+    let result: Result<(), Box<dyn Error>> = if let Some(token) =
         config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured())
     {
         let telegram = TelegramRuntime::new(
             token.expose_secret(),
             &config.telegram.api_base_url,
-            std::time::Duration::from_secs(config.telegram.poll_timeout_seconds),
+            Duration::from_secs(config.telegram.poll_timeout_seconds),
             DatabaseUpdateStore { repository: database.telegram() },
             config.telegram.admin_user_ids.clone(),
             config.telegram.storage_chat_id,
@@ -97,15 +102,38 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .with_max_download_bytes(config.telegram.max_download_bytes);
         tracing::info!(api_base_url = %config.telegram.api_base_url, "Telegram bot polling enabled");
         tokio::select! {
-            result = server => result?,
-            result = telegram.run() => result?,
+            result = server => Ok(result?),
+            result = telegram.run() => Ok(result?),
+            result = &mut scheduler => Ok(result?),
         }
     } else {
-        server.await?;
-    }
+        tokio::select! {
+            result = server => Ok(result?),
+            result = &mut scheduler => Ok(result?),
+        }
+    };
+    scheduler.abort();
+    let _ = scheduler.await;
+    result?;
     tracing::info!(role = %config.role, "sooqa server stopped");
 
     Ok(())
+}
+
+async fn run_publisher_scheduler(repository: PublisherRepository, tick: Duration) {
+    let mut interval = tokio::time::interval(tick);
+    loop {
+        interval.tick().await;
+        match repository.enqueue_due_publication_jobs(time::OffsetDateTime::now_utc(), 100).await {
+            Ok(schedules) if !schedules.is_empty() => {
+                tracing::info!(count = schedules.len(), "publisher scheduler enqueued jobs");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "publisher scheduler tick failed");
+            }
+        }
+    }
 }
 
 async fn run_storage_intent_command(

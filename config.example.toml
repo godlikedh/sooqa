@@ -7,6 +7,9 @@ request_timeout_seconds = 30
 poll_interval_seconds = 5
 lease_duration_seconds = 60
 
+[publisher]
+scheduler_tick_seconds = 15
+
 [media]
 work_root = "/var/lib/sooqa/work"
 ffmpeg_path = "ffmpeg"

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime, Time};
 use uuid::Uuid;
 
 const MAX_CHANNEL_NAME_LENGTH: usize = 128;
@@ -325,6 +325,39 @@ impl PublicationScheduleScope {
     }
 }
 
+/// The durable job key for a publication schedule. A scheduler may run more
+/// than once, but a schedule must create at most one publish job.
+pub fn publication_job_idempotency_key(schedule_id: Uuid) -> String {
+    format!("publisher:publish:{schedule_id}")
+}
+
+/// Return the next UTC instant at which channel cadence permits publication.
+/// `None` means that the policy does not currently defer the post.
+pub fn next_cadence_eligible_at(
+    now: OffsetDateTime,
+    last_published_at: Option<OffsetDateTime>,
+    published_today: u32,
+    policy: &ChannelPolicy,
+) -> Option<OffsetDateTime> {
+    let mut next = None;
+    if policy.minimum_post_interval_seconds > 0
+        && let Some(last_published_at) = last_published_at
+    {
+        let seconds = i64::try_from(policy.minimum_post_interval_seconds).unwrap_or(i64::MAX);
+        let candidate = last_published_at + Duration::seconds(seconds);
+        if candidate > now {
+            next = Some(candidate);
+        }
+    }
+    if policy.max_posts_per_day.is_some_and(|limit| published_today >= limit) {
+        let candidate = now.replace_time(Time::MIDNIGHT) + Duration::days(1);
+        if candidate > now && next.is_none_or(|current| candidate > current) {
+            next = Some(candidate);
+        }
+    }
+    next
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewPublicationSchedule {
     pub post_draft_id: Uuid,
@@ -615,5 +648,51 @@ mod tests {
         policy.similarity_threshold = 0.75;
         policy.max_posts_per_day = Some(0);
         assert_eq!(policy.validate(), Err(PublisherValidationError::InvalidDailyLimit));
+    }
+
+    #[test]
+    fn cadence_policy_returns_the_later_of_interval_and_next_utc_day() {
+        let now = OffsetDateTime::from_unix_timestamp(1_754_678_400)
+            .expect("test timestamp should be valid");
+        let mut policy = NewChannelPolicy::default_for(Uuid::now_v7());
+        policy.minimum_post_interval_seconds = 3_600;
+        policy.max_posts_per_day = Some(2);
+        let policy = ChannelPolicy {
+            target_channel_id: policy.target_channel_id,
+            minimum_post_interval_seconds: policy.minimum_post_interval_seconds,
+            same_content_cooldown_seconds: policy.same_content_cooldown_seconds,
+            similar_content_cooldown_seconds: policy.similar_content_cooldown_seconds,
+            similarity_threshold: policy.similarity_threshold,
+            on_cooldown_violation: policy.on_cooldown_violation,
+            allowed_windows_json: policy.allowed_windows_json,
+            max_posts_per_day: policy.max_posts_per_day,
+            jitter_seconds: policy.jitter_seconds,
+            updated_at: now,
+        };
+        let last_published_at = Some(now - Duration::minutes(30));
+
+        let next = next_cadence_eligible_at(now, last_published_at, 2, &policy)
+            .expect("cadence should defer publication");
+
+        assert_eq!(next, now.replace_time(Time::MIDNIGHT) + Duration::days(1));
+    }
+
+    #[test]
+    fn cadence_policy_allows_publication_when_limits_are_clear() {
+        let now = OffsetDateTime::now_utc();
+        let policy = ChannelPolicy {
+            target_channel_id: Uuid::now_v7(),
+            minimum_post_interval_seconds: 0,
+            same_content_cooldown_seconds: 0,
+            similar_content_cooldown_seconds: 0,
+            similarity_threshold: 0.75,
+            on_cooldown_violation: CooldownViolation::Warn,
+            allowed_windows_json: Value::Array(Vec::new()),
+            max_posts_per_day: None,
+            jitter_seconds: 0,
+            updated_at: now,
+        };
+
+        assert_eq!(next_cadence_eligible_at(now, None, 0, &policy), None);
     }
 }

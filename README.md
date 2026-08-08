@@ -21,7 +21,9 @@ The repository currently provides:
   uploads.
 - Authenticated Publisher draft and schedule API backed by target channels,
   channel policies, post drafts, publication schedules, attempts, and
-  published-post history.
+  published-post history;
+- an always-on PostgreSQL scheduler that atomically turns due schedules into
+  deterministic `publish_post` jobs and applies channel cadence limits.
 
 The composed worker registers `inspect_source` with the SSRF-hardened direct
 HTTP adapter, `download_source` into the shared media workspace, `probe_asset`,
@@ -34,7 +36,7 @@ image artifact (plus an image thumbnail) and queues `finalize_ingest`;
 finalization creates or reuses the canonical library rows, fingerprints videos
 using the existing ingest JSON metadata, scores them against completed videos,
 and writes duplicate candidates using the existing schema. Storage upload and
-the Publisher persistence remains a separate boundary; Telegram publication
+the Publisher scheduler remain separate durable boundaries; Telegram publication
 itself is not enabled yet.
 
 Active documentation is the authority for current behavior:

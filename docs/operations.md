@@ -24,8 +24,9 @@ pre-scope schedules as legacy rows because their original command cannot be
 reconstructed. Migration 0016 snapshots pre-existing draft idempotency
 responses before the new immutable replay path is deployed. Deploy all forward
 migrations before deploying code that relies on those columns or tables. The
-Publisher API now creates drafts and durable schedules; the scheduler and
-Telegram publication handler are not enabled yet.
+Publisher API creates drafts and durable schedules, and the server scheduler
+turns due schedules into deterministic `publish_post` jobs. Telegram publication
+is not enabled yet.
 
 ## Worker
 
@@ -36,6 +37,12 @@ server:
 DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa \
   cargo run -p sooqa-worker
 ```
+
+The server scheduler runs every `[publisher].scheduler_tick_seconds` (15 by
+default, configurable through `SOOQA_PUBLISHER_SCHEDULER_TICK_SECONDS`). It
+uses PostgreSQL row locks, so multiple server instances cannot enqueue duplicate
+publish jobs. It defers schedules that exceed a target channel's minimum
+interval or UTC daily limit.
 
 The worker discovers its registered job capabilities and preflights only the
 external binaries those handlers need. The composed source-inspection handler

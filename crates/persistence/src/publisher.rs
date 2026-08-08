@@ -1,12 +1,14 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use sooqa_jobs::NewJob;
 use sooqa_library::{ContentStatus, StorageState};
 use sooqa_publisher::{
     ChannelPolicy, NewChannelPolicy, NewPostDraft, NewPublicationSchedule, NewTargetChannel,
     PostDraft, PostDraftStatus, PostDraftUpdate, PublicationAttempt, PublicationAttemptStatus,
     PublicationCompletion, PublicationSchedule, PublicationScheduleScope,
     PublicationScheduleStatus, PublishedPost, PublisherValidationError, TargetChannel,
-    transition_post_draft_status, transition_publication_schedule_status,
+    next_cadence_eligible_at, publication_job_idempotency_key, transition_post_draft_status,
+    transition_publication_schedule_status,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
@@ -689,6 +691,123 @@ impl PublisherRepository {
         rows.into_iter().map(PublicationScheduleRow::into_publication_schedule).collect()
     }
 
+    /// Atomically claim due schedules and create their deterministic publish
+    /// jobs. The schedule row lock is the scheduler lease: concurrent server
+    /// instances skip rows already claimed by another transaction.
+    pub async fn enqueue_due_publication_jobs(
+        &self,
+        now: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<PublicationSchedule>, PublisherRepositoryError> {
+        if !(1..=100).contains(&limit) {
+            return Err(PublisherRepositoryError::InvalidLimit(limit));
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        let schedule_ids = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT id
+            FROM publication_schedules
+            WHERE status = 'pending'
+              AND publish_at <= $1
+              AND (not_before IS NULL OR not_before <= $1)
+              AND (not_after IS NULL OR not_after >= $1)
+            ORDER BY priority DESC, publish_at ASC, created_at ASC, id ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT $2
+            "#,
+        )
+        .bind(now)
+        .bind(i64::from(limit))
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        let mut enqueued = Vec::new();
+        for schedule_id in schedule_ids {
+            let schedule = load_publication_schedule(&mut transaction, schedule_id).await?;
+            let draft = load_post_draft(&mut transaction, schedule.post_draft_id).await?;
+            if draft.status != PostDraftStatus::Scheduled {
+                continue;
+            }
+
+            let Some(target) =
+                load_target_channel(&mut transaction, draft.target_channel_id).await?
+            else {
+                continue;
+            };
+            if !target.is_enabled {
+                continue;
+            }
+
+            let policy = load_channel_policy(&mut transaction, target.id).await?;
+            if let Some(policy) = policy {
+                let cadence = load_publication_cadence(&mut transaction, target.id, now).await?;
+                let published_today = u32::try_from(cadence.published_today).map_err(|_| {
+                    PublisherRepositoryError::NumberOverflow { field: "published_posts_today" }
+                })?;
+                if let Some(next_eligible_at) = next_cadence_eligible_at(
+                    now,
+                    cadence.last_published_at,
+                    published_today,
+                    &policy,
+                ) {
+                    if next_eligible_at > schedule.publish_at
+                        && schedule.not_after.is_none_or(|not_after| next_eligible_at <= not_after)
+                    {
+                        sqlx::query(
+                            "UPDATE publication_schedules SET publish_at = $2, updated_at = now() WHERE id = $1 AND status = 'pending'",
+                        )
+                        .bind(schedule.id)
+                        .bind(next_eligible_at)
+                        .execute(&mut *transaction)
+                        .await?;
+                    }
+                    continue;
+                }
+            }
+
+            let job = NewJob::publish_post(schedule.id)
+                .with_priority(schedule.priority)
+                .available_at(now)
+                .idempotency_key(publication_job_idempotency_key(schedule.id));
+            sqlx::query(
+                r#"
+                INSERT INTO jobs (
+                    job_type, payload_json, priority, available_at, max_attempts, idempotency_key
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+                "#,
+            )
+            .bind(job.job_type().as_str())
+            .bind(job.payload_json())
+            .bind(job.priority())
+            .bind(job.available_at_value())
+            .bind(job.max_attempts_value())
+            .bind(job.idempotency_key_value())
+            .execute(&mut *transaction)
+            .await?;
+
+            let queued = sqlx::query_as::<_, PublicationScheduleRow>(
+                r#"
+                UPDATE publication_schedules
+                SET status = 'queued', updated_at = now()
+                WHERE id = $1 AND status = 'pending'
+                RETURNING id, post_draft_id, status, publish_at, not_before, not_after,
+                          priority, cooldown_override, idempotency_scope, idempotency_key,
+                          created_at, updated_at
+                "#,
+            )
+            .bind(schedule.id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            enqueued.push(queued.into_publication_schedule()?);
+        }
+
+        transaction.commit().await?;
+        Ok(enqueued)
+    }
+
     pub async fn transition_publication_schedule(
         &self,
         id: Uuid,
@@ -1070,6 +1189,66 @@ async fn update_post_draft_in_transaction(
     row.into_post_draft()
 }
 
+async fn load_target_channel(
+    transaction: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+) -> Result<Option<TargetChannel>, PublisherRepositoryError> {
+    let row = sqlx::query_as::<_, TargetChannelRow>(
+        r#"
+        SELECT id, name, telegram_chat_id, is_enabled, default_parse_mode,
+               default_disable_notification, created_at, updated_at
+        FROM target_channels
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.map(TargetChannelRow::into_target_channel).transpose()
+}
+
+async fn load_channel_policy(
+    transaction: &mut Transaction<'_, Postgres>,
+    target_channel_id: Uuid,
+) -> Result<Option<ChannelPolicy>, PublisherRepositoryError> {
+    let row = sqlx::query_as::<_, ChannelPolicyRow>(
+        r#"
+        SELECT target_channel_id, minimum_post_interval_seconds,
+               same_content_cooldown_seconds, similar_content_cooldown_seconds,
+               similarity_threshold, on_cooldown_violation, allowed_windows_json,
+               max_posts_per_day, jitter_seconds, updated_at
+        FROM channel_policies
+        WHERE target_channel_id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(target_channel_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    row.map(ChannelPolicyRow::into_channel_policy).transpose()
+}
+
+async fn load_publication_cadence(
+    transaction: &mut Transaction<'_, Postgres>,
+    target_channel_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<PublicationCadenceRow, PublisherRepositoryError> {
+    let day_start = now.replace_time(time::Time::MIDNIGHT);
+    Ok(sqlx::query_as::<_, PublicationCadenceRow>(
+        r#"
+        SELECT MAX(published_at) AS last_published_at,
+               COUNT(*) FILTER (WHERE published_at >= $2)::bigint AS published_today
+        FROM published_posts
+        WHERE target_channel_id = $1
+        "#,
+    )
+    .bind(target_channel_id)
+    .bind(day_start)
+    .fetch_one(&mut **transaction)
+    .await?)
+}
+
 fn normalize_idempotency_key(key: String) -> Result<String, PublisherRepositoryError> {
     let key = key.trim().to_owned();
     if key.is_empty() {
@@ -1433,6 +1612,12 @@ struct IdempotencyResourceRow {
 struct PublishableContentRow {
     status: String,
     canonical_asset_id: Option<Uuid>,
+}
+
+#[derive(Debug, FromRow)]
+struct PublicationCadenceRow {
+    last_published_at: Option<OffsetDateTime>,
+    published_today: i64,
 }
 
 #[derive(Debug, FromRow)]

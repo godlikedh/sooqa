@@ -13,6 +13,7 @@ use thiserror::Error;
 const DEFAULT_SERVER_LISTEN_ADDRESS: &str = "0.0.0.0:8080";
 const DEFAULT_WORKER_POLL_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_WORKER_LEASE_DURATION_SECONDS: u64 = 60;
+const DEFAULT_PUBLISHER_SCHEDULER_TICK_SECONDS: u64 = 15;
 const DEFAULT_COMPANION_LISTEN_ADDRESS: &str = "127.0.0.1:47831";
 const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
 const DEFAULT_FFPROBE_PATH: &str = "ffprobe";
@@ -226,6 +227,11 @@ pub struct WorkerConfig {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PublisherConfig {
+    pub scheduler_tick_seconds: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MediaConfig {
     pub work_root: PathBuf,
     pub ffmpeg_path: PathBuf,
@@ -276,6 +282,7 @@ pub struct AppConfig {
     pub config_path: Option<PathBuf>,
     pub server: ServerConfig,
     pub worker: WorkerConfig,
+    pub publisher: PublisherConfig,
     pub media: MediaConfig,
     pub companion: CompanionConfig,
     pub database: DatabaseConfig,
@@ -334,6 +341,12 @@ impl AppConfig {
                     .worker
                     .lease_duration_seconds
                     .unwrap_or(DEFAULT_WORKER_LEASE_DURATION_SECONDS),
+            },
+            publisher: PublisherConfig {
+                scheduler_tick_seconds: raw
+                    .publisher
+                    .scheduler_tick_seconds
+                    .unwrap_or(DEFAULT_PUBLISHER_SCHEDULER_TICK_SECONDS),
             },
             media: MediaConfig {
                 work_root: raw
@@ -397,7 +410,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.max_download_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} publisher.scheduler_tick_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.max_download_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -405,6 +418,7 @@ impl AppConfig {
             self.server.listen_address,
             self.worker.poll_interval_seconds,
             self.worker.lease_duration_seconds,
+            self.publisher.scheduler_tick_seconds,
             self.media.work_root.display(),
             self.media.ffmpeg_path.display(),
             self.media.ffprobe_path.display(),
@@ -440,6 +454,13 @@ impl AppConfig {
             self.worker.lease_duration_seconds =
                 value.parse().map_err(|_| ConfigError::InvalidValue {
                     name: "SOOQA_WORKER_LEASE_DURATION_SECONDS".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
+        }
+        if let Some(value) = optional_env_string("SOOQA_PUBLISHER_SCHEDULER_TICK_SECONDS")? {
+            self.publisher.scheduler_tick_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_PUBLISHER_SCHEDULER_TICK_SECONDS".to_owned(),
                     reason: "expected a positive integer",
                 })?;
         }
@@ -532,6 +553,12 @@ impl AppConfig {
         if self.worker.lease_duration_seconds == 0 {
             return Err(ConfigError::InvalidValue {
                 name: "worker.lease_duration_seconds".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.publisher.scheduler_tick_seconds == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "publisher.scheduler_tick_seconds".to_owned(),
                 reason: "must be greater than zero",
             });
         }
@@ -637,6 +664,7 @@ impl AppConfig {
 struct RawConfig {
     server: RawServerConfig,
     worker: RawWorkerConfig,
+    publisher: RawPublisherConfig,
     media: RawMediaConfig,
     companion: RawCompanionConfig,
     database: RawDatabaseConfig,
@@ -675,6 +703,12 @@ struct RawServerConfig {
 struct RawWorkerConfig {
     poll_interval_seconds: Option<u64>,
     lease_duration_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawPublisherConfig {
+    scheduler_tick_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -839,6 +873,19 @@ mod tests {
         .expect("TOML should parse");
 
         let error = config.validate().expect_err("zero lease duration must fail");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn publisher_scheduler_tick_must_be_positive() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Server,
+            None,
+            "[publisher]\nscheduler_tick_seconds = 0\n",
+        )
+        .expect("TOML should parse");
+
+        let error = config.validate().expect_err("zero scheduler tick must fail");
         assert!(error.to_string().contains("greater than zero"));
     }
 

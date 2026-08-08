@@ -261,7 +261,7 @@ async fn worker_heartbeats_long_jobs_and_keeps_them_owned() {
         .expect("old heartbeat job should clean up");
     let job = database
         .jobs()
-        .enqueue(NewJob::publish_post("heartbeat").idempotency_key(key))
+        .enqueue(NewJob::publish_post(Uuid::new_v4()).idempotency_key(key))
         .await
         .expect("heartbeat job should enqueue");
 

@@ -41,7 +41,8 @@ download handoff, probe-to-normalize handoff, fake-runner normalization,
 canonical library finalization, video fingerprint extraction, similarity
 candidate generation, the storage-upload job handoff, and the Publisher
 schedule/attempt/history round trip, including concurrent idempotency,
-ambiguous-result reconciliation, and atomic publication completion.
+ambiguous-result reconciliation, atomic publication completion, and concurrent
+Publisher scheduler ticks with exact-time and cadence behavior.
 
 The current `teloxide` dependency graph also emits a known Rust
 future-incompatibility warning for the transitive `proc-macro-error2` crate

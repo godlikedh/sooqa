@@ -142,12 +142,17 @@ active with an uploaded canonical asset, and checks that the target channel is
 enabled. Draft create/edit commands use the shared `idempotency_records` table;
 schedule commands use the schedule's durable idempotency key. Editing uses the
 existing optimistic `updated_at` field, and ready drafts are atomically moved to
-scheduled by persistence. No HTTP command calls Telegram: the remaining
-composition is the due scheduler and Telegram publication handler. Due schedules
-are ordered durably; publication attempts retain Telegram request keys and
-responses, and an ambiguous result moves the schedule out of the automatic
-retry queue until it is explicitly reconciled. Successful publication records
-the attempt, schedule, draft, and Telegram message history in one transaction.
+scheduled by persistence. The always-on server runs a configured scheduler tick:
+it locks pending due schedules with `SKIP LOCKED`, re-checks the target and
+draft, applies the channel's minimum interval and daily limit, and atomically
+creates one deterministic `publish_post` job while moving the schedule to
+`queued`. A cadence violation moves `publish_at` to the next UTC-eligible time.
+No HTTP command or scheduler tick calls Telegram. The remaining composition is
+the Telegram publication handler. Publication attempts retain Telegram request
+keys and responses, and an ambiguous result moves the schedule out of the
+automatic retry queue until it is explicitly reconciled. Successful publication
+records the attempt, schedule, draft, and Telegram message history in one
+transaction.
 
 ## Filesystem and subprocess safety
 
@@ -175,7 +180,8 @@ includes all three tools and creates a writable `/var/lib/sooqa/work`.
 Implemented primitives and boundaries do not imply an end-to-end publisher.
 The current ingest path reaches scored duplicate candidates for videos and
 normalizes images into the Library. Publisher persistence is now ready for
-review-facing actions and scheduling; the remaining composition work is the
-Publisher API, scheduler, and Telegram publication. The historical roadmap in
+review-facing actions and scheduling, and the server now enqueues due publish
+jobs; the remaining composition work is the Telegram publication handler. The
+historical roadmap in
 `docs/reference/PROJECT_SPEC.md` is useful context but is not the authority for
 those claims.

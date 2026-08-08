@@ -167,7 +167,7 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
 
     let third_key = format!("b2-failed-{}", Uuid::new_v4());
     let third = jobs
-        .enqueue(NewJob::publish_post("example").with_priority(200).idempotency_key(third_key))
+        .enqueue(NewJob::publish_post(Uuid::new_v4()).with_priority(200).idempotency_key(third_key))
         .await
         .expect("failed job should enqueue");
     let failed_claim = jobs
