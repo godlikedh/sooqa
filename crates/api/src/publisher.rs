@@ -6,9 +6,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sooqa_library::{ContentStatus, StorageState};
+use sooqa_persistence::{post_draft_create_request_hash, post_draft_update_request_hash};
 use sooqa_publisher::{
     NewPostDraft, NewPublicationSchedule, PostDraft, PostDraftStatus, PostDraftUpdate,
-    PublicationSchedule,
+    PublicationSchedule, PublicationScheduleScope,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -36,6 +37,23 @@ async fn create_draft(
     let idempotency_key = idempotency_key(&headers)?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+
+    let caption = normalize_caption(payload.caption.clone(), None, &headers)?;
+    let requested_parse_mode = normalize_parse_mode(payload.parse_mode.clone(), &headers)?;
+    let request_hash = post_draft_create_request_hash(
+        payload.content_item_id,
+        payload.target_channel_id,
+        caption.as_deref(),
+        requested_parse_mode.as_deref(),
+    );
+    if let Some(draft) = state
+        .publisher
+        .replay_post_draft_create(&idempotency_key, &request_hash)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?
+    {
+        return Ok((StatusCode::CREATED, Json(PostDraftResponse::from_draft(&draft))));
+    }
 
     let item = state
         .library
@@ -71,11 +89,11 @@ async fn create_draft(
         ));
     }
 
-    let parse_mode = match payload.parse_mode {
-        Some(value) => normalize_parse_mode(Some(value), &headers)?,
+    let parse_mode = match requested_parse_mode {
+        Some(value) => Some(value),
         None => normalize_parse_mode(target.default_parse_mode, &headers)?,
     };
-    let caption = normalize_caption(payload.caption, parse_mode.as_deref(), &headers)?;
+    validate_caption(caption.as_deref(), parse_mode.as_deref(), &headers)?;
     let draft = state
         .publisher
         .create_post_draft_idempotent(
@@ -87,6 +105,7 @@ async fn create_draft(
                 parse_mode,
             },
             idempotency_key,
+            &request_hash,
         )
         .await
         .map_err(|error| map_publisher_error(error, &headers))?
@@ -132,21 +151,6 @@ async fn update_draft(
         ));
     }
 
-    let current = state
-        .publisher
-        .find_post_draft(id)
-        .await
-        .map_err(|error| map_publisher_error(error, &headers))?
-        .ok_or_else(|| {
-            ApiError::not_found("post_draft_not_found", "The post draft was not found", &headers)
-        })?;
-    if !matches!(current.status, PostDraftStatus::Editing | PostDraftStatus::Ready) {
-        return Err(ApiError::conflict(
-            "invalid_post_draft_state",
-            "Only editing or ready drafts can be changed",
-            &headers,
-        ));
-    }
     let status = payload
         .status
         .as_deref()
@@ -171,14 +175,45 @@ async fn update_draft(
         })
         .transpose()?;
 
-    let caption = match payload.caption {
+    let caption = match payload.caption.clone() {
         Some(value) => Some(normalize_caption(value, None, &headers)?),
         None => None,
     };
-    let parse_mode = match payload.parse_mode {
+    let parse_mode = match payload.parse_mode.clone() {
         Some(value) => Some(normalize_parse_mode(value, &headers)?),
         None => None,
     };
+    let update = PostDraftUpdate {
+        caption: caption.clone(),
+        parse_mode: parse_mode.clone(),
+        status,
+        expected_updated_at: payload.expected_updated_at,
+    };
+    let request_hash = post_draft_update_request_hash(id, &update);
+    if let Some(draft) = state
+        .publisher
+        .replay_post_draft_update(&idempotency_key, &request_hash)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?
+    {
+        return Ok(Json(PostDraftResponse::from_draft(&draft)));
+    }
+
+    let current = state
+        .publisher
+        .find_post_draft(id)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?
+        .ok_or_else(|| {
+            ApiError::not_found("post_draft_not_found", "The post draft was not found", &headers)
+        })?;
+    if !matches!(current.status, PostDraftStatus::Editing | PostDraftStatus::Ready) {
+        return Err(ApiError::conflict(
+            "invalid_post_draft_state",
+            "Only editing or ready drafts can be changed",
+            &headers,
+        ));
+    }
     let effective_caption = match &caption {
         Some(value) => value.as_deref(),
         None => current.caption.as_deref(),
@@ -206,16 +241,7 @@ async fn update_draft(
 
     let draft = state
         .publisher
-        .update_post_draft_idempotent(
-            id,
-            PostDraftUpdate {
-                caption,
-                parse_mode,
-                status,
-                expected_updated_at: payload.expected_updated_at,
-            },
-            idempotency_key,
-        )
+        .update_post_draft_idempotent(id, update, idempotency_key)
         .await
         .map_err(|error| map_publisher_error(error, &headers))?;
     Ok(Json(PostDraftResponse::from_draft(&draft)))
@@ -264,23 +290,11 @@ async fn publish_now(
         idempotency_key.clone(),
     )
     .map_err(|error| map_publisher_error(error.into(), &headers))?;
-    let schedule = match state.publisher.create_publication_schedule(schedule).await {
-        Ok(schedule) => schedule,
-        Err(
-            error @ sooqa_persistence::PublisherRepositoryError::ScheduleIdempotencyConflict(_),
-        ) => {
-            match state
-                .publisher
-                .find_publication_schedule_by_idempotency_key(&idempotency_key)
-                .await
-                .map_err(|lookup_error| map_publisher_error(lookup_error, &headers))?
-            {
-                Some(schedule) if schedule.post_draft_id == draft_id => schedule,
-                _ => return Err(map_publisher_error(error, &headers)),
-            }
-        }
-        Err(error) => return Err(map_publisher_error(error, &headers)),
-    };
+    let schedule = state
+        .publisher
+        .create_publication_schedule_with_scope(schedule, PublicationScheduleScope::PublishNow)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
     Ok((StatusCode::ACCEPTED, Json(PublicationScheduleResponse::from_schedule(&schedule))))
 }
 
@@ -339,18 +353,18 @@ fn normalize_parse_mode(
     parse_mode: Option<String>,
     headers: &HeaderMap,
 ) -> Result<Option<String>, ApiError> {
-    let parse_mode =
-        parse_mode.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
-    if let Some(value) = parse_mode.as_deref()
-        && !matches!(value, "HTML" | "MarkdownV2")
-    {
+    let Some(value) = parse_mode else {
+        return Ok(None);
+    };
+    let value = value.trim().to_owned();
+    if !matches!(value.as_str(), "HTML" | "MarkdownV2") {
         return Err(ApiError::bad_request(
             "invalid_parse_mode",
             "The parse mode must be HTML or MarkdownV2",
             headers,
         ));
     }
-    Ok(parse_mode)
+    Ok(Some(value))
 }
 
 fn validate_caption(
@@ -383,7 +397,258 @@ fn validate_caption(
             headers,
         ));
     }
+    if let (Some(caption), Some(parse_mode)) = (caption, parse_mode) {
+        let valid = match parse_mode {
+            "HTML" => valid_html_markup(caption),
+            "MarkdownV2" => valid_markdown_v2(caption),
+            _ => false,
+        };
+        if !valid {
+            return Err(ApiError::bad_request(
+                "invalid_caption_markup",
+                "The caption contains invalid Telegram markup",
+                headers,
+            ));
+        }
+    }
     Ok(())
+}
+
+fn valid_html_markup(value: &str) -> bool {
+    let mut open_tags = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_start) = value[cursor..].find('<') {
+        let start = cursor + relative_start;
+        let Some(end) = html_tag_end(value, start) else {
+            return false;
+        };
+        let tag = value[start + 1..end].trim();
+        if tag.is_empty() || tag.starts_with('!') || tag.ends_with('/') {
+            return false;
+        }
+        if let Some(closing) = tag.strip_prefix('/') {
+            if closing.is_empty()
+                || closing != closing.trim()
+                || !closing
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic() || character == '-')
+            {
+                return false;
+            }
+            let closing = closing.to_ascii_lowercase();
+            if open_tags.pop().as_deref() != Some(closing.as_str()) {
+                return false;
+            }
+        } else {
+            let name_end = tag.find(char::is_whitespace).unwrap_or(tag.len());
+            let name = &tag[..name_end];
+            let attributes = tag[name_end..].trim();
+            let name = name.to_ascii_lowercase();
+            if !matches!(
+                name.as_str(),
+                "b" | "strong"
+                    | "i"
+                    | "em"
+                    | "u"
+                    | "ins"
+                    | "s"
+                    | "strike"
+                    | "del"
+                    | "span"
+                    | "tg-spoiler"
+                    | "a"
+                    | "code"
+                    | "pre"
+                    | "blockquote"
+            ) || !valid_html_attributes(&name, attributes)
+            {
+                return false;
+            }
+            open_tags.push(name);
+        }
+        cursor = end + 1;
+    }
+    open_tags.is_empty()
+}
+
+fn html_tag_end(value: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (relative, character) in value[start..].char_indices() {
+        if let Some(current_quote) = quote {
+            if character == current_quote {
+                quote = None;
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '>' {
+            return Some(start + relative);
+        }
+    }
+    None
+}
+
+fn valid_html_attributes(name: &str, attributes: &str) -> bool {
+    match name {
+        "a" => {
+            let value = attributes
+                .strip_prefix("href=\"")
+                .and_then(|value| value.strip_suffix('"'))
+                .or_else(|| {
+                    attributes.strip_prefix("href='").and_then(|value| value.strip_suffix('\''))
+                });
+            let Some(value) = value else {
+                return false;
+            };
+            !value.is_empty()
+                && !value.contains('"')
+                && !value.contains('\'')
+                && (value.starts_with("http://")
+                    || value.starts_with("https://")
+                    || value.starts_with("tg://"))
+        }
+        "span" => attributes == "class=\"tg-spoiler\"" || attributes == "class='tg-spoiler'",
+        "code" | "pre" => attributes.is_empty() || valid_language_attribute(attributes),
+        _ => attributes.is_empty(),
+    }
+}
+
+fn valid_language_attribute(attributes: &str) -> bool {
+    let value = attributes
+        .strip_prefix("class=\"language-")
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            attributes.strip_prefix("class='language-").and_then(|value| value.strip_suffix('\''))
+        });
+    value.is_some_and(|value| {
+        !value.is_empty() && value.chars().all(|character| !character.is_whitespace())
+    })
+}
+
+fn valid_markdown_v2(value: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Delimiter {
+        Asterisk,
+        Underscore,
+        Tilde,
+        Backtick,
+        CodeBlock,
+        Spoiler,
+        LinkText,
+        LinkUrl,
+    }
+
+    let characters: Vec<char> = value.chars().collect();
+    let mut delimiters = Vec::new();
+    let mut link_url_allowed = false;
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index];
+
+        if matches!(delimiters.last(), Some(Delimiter::Backtick | Delimiter::CodeBlock)) {
+            let code_delimiter = delimiters.last().copied().expect("code delimiter should exist");
+            if character == '`' {
+                let mut count = 1;
+                while index + count < characters.len() && characters[index + count] == '`' {
+                    count += 1;
+                }
+                if (code_delimiter == Delimiter::CodeBlock && count >= 3)
+                    || (code_delimiter == Delimiter::Backtick && count == 1)
+                {
+                    delimiters.pop();
+                }
+                index += count;
+                continue;
+            }
+            if character == '\\' {
+                if index + 1 == characters.len() {
+                    return false;
+                }
+                index += 2;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+
+        if delimiters.last() == Some(&Delimiter::LinkUrl) {
+            if character == '\\' {
+                if index + 1 == characters.len() {
+                    return false;
+                }
+                index += 2;
+            } else if character == ')' {
+                delimiters.pop();
+                index += 1;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        if link_url_allowed {
+            if character == '(' {
+                delimiters.push(Delimiter::LinkUrl);
+                link_url_allowed = false;
+                index += 1;
+                continue;
+            }
+            link_url_allowed = false;
+        }
+
+        if character == '\\' {
+            if index + 1 == characters.len() {
+                return false;
+            }
+            index += 2;
+            continue;
+        }
+        if character == '`' {
+            let mut count = 1;
+            while index + count < characters.len() && characters[index + count] == '`' {
+                count += 1;
+            }
+            let delimiter = if count >= 3 { Delimiter::CodeBlock } else { Delimiter::Backtick };
+            toggle_delimiter(&mut delimiters, delimiter);
+            index += count;
+            continue;
+        }
+        if character == '|' && characters.get(index + 1) == Some(&'|') {
+            toggle_delimiter(&mut delimiters, Delimiter::Spoiler);
+            index += 2;
+            continue;
+        }
+        let delimiter = match character {
+            '*' => Some(Delimiter::Asterisk),
+            '_' => Some(Delimiter::Underscore),
+            '~' => Some(Delimiter::Tilde),
+            '[' => {
+                delimiters.push(Delimiter::LinkText);
+                None
+            }
+            ']' => {
+                if delimiters.pop() != Some(Delimiter::LinkText) {
+                    return false;
+                }
+                link_url_allowed = true;
+                None
+            }
+            ')' | '>' | '#' | '+' | '-' | '=' | '|' | '{' | '}' | '.' | '!' => return false,
+            _ => None,
+        };
+        if let Some(delimiter) = delimiter {
+            toggle_delimiter(&mut delimiters, delimiter);
+        }
+        index += 1;
+    }
+    delimiters.is_empty()
+}
+
+fn toggle_delimiter<T: PartialEq>(delimiters: &mut Vec<T>, delimiter: T) {
+    if delimiters.last() == Some(&delimiter) {
+        delimiters.pop();
+    } else {
+        delimiters.push(delimiter);
+    }
 }
 
 fn parse_uuid(
@@ -404,6 +669,7 @@ fn map_json_rejection(rejection: JsonRejection, headers: &HeaderMap) -> ApiError
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateDraftRequest {
     content_item_id: Uuid,
     target_channel_id: Uuid,
@@ -414,6 +680,7 @@ struct CreateDraftRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateDraftRequest {
     #[serde(default)]
     caption: Option<Option<String>>,
@@ -427,6 +694,7 @@ struct UpdateDraftRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScheduleRequest {
     #[serde(with = "time::serde::rfc3339")]
     publish_at: OffsetDateTime,
@@ -508,5 +776,29 @@ impl PublicationScheduleResponse {
             created_at: schedule.created_at,
             updated_at: schedule.updated_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{valid_html_markup, valid_markdown_v2};
+
+    #[test]
+    fn validates_balanced_telegram_html() {
+        assert!(valid_html_markup("<b>bold</b> <a href=\"https://example.test\">link</a>"));
+        assert!(valid_html_markup("<pre><code class=\"language-rust\">*literal*</code></pre>"));
+        assert!(!valid_html_markup("<b>unclosed"));
+        assert!(!valid_html_markup("<b>mismatched</i>"));
+        assert!(!valid_html_markup("<script>unsafe</script>"));
+    }
+
+    #[test]
+    fn validates_balanced_telegram_markdown_v2() {
+        assert!(valid_markdown_v2("*bold* and _italic_ [link](https://example.test)"));
+        assert!(valid_markdown_v2("escaped \\* punctuation"));
+        assert!(valid_markdown_v2("`*literal*`"));
+        assert!(!valid_markdown_v2("*unclosed"));
+        assert!(!valid_markdown_v2("plain - dash"));
+        assert!(!valid_markdown_v2("trailing escape\\"));
     }
 }

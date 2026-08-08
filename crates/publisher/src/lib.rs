@@ -310,6 +310,21 @@ pub struct PublicationSchedule {
     pub updated_at: OffsetDateTime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationScheduleScope {
+    Schedule,
+    PublishNow,
+}
+
+impl PublicationScheduleScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Schedule => "schedule",
+            Self::PublishNow => "publish_now",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewPublicationSchedule {
     pub post_draft_id: Uuid,

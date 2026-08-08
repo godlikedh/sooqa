@@ -369,6 +369,23 @@ async fn authenticated_publisher_api_creates_edits_and_schedules_drafts() {
     assert_eq!(schedule_replay.status(), StatusCode::ACCEPTED);
     assert_eq!(response_json(schedule_replay).await["id"], schedule_id);
 
+    let edit_after_schedule = app(&fixture)
+        .oneshot(request(
+            "PATCH",
+            format!("/api/v1/post-drafts/{draft_id}"),
+            Some(&fixture.write_token),
+            Some(&edit_key),
+            Some(json!({
+                "caption": "Ready caption",
+                "status": "ready",
+                "expected_updated_at": created_body["updated_at"]
+            })),
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(edit_after_schedule.status(), StatusCode::OK);
+    assert_eq!(response_json(edit_after_schedule).await["updated_at"], ready_body["updated_at"]);
+
     let now_create_key = format!("{}now-create", fixture.key_prefix);
     let now_created = app(&fixture)
         .oneshot(request(
@@ -403,7 +420,7 @@ async fn authenticated_publisher_api_creates_edits_and_schedules_drafts() {
         .expect("router should respond");
     assert_eq!(now_ready.status(), StatusCode::OK);
 
-    let now_key = format!("{}now", fixture.key_prefix);
+    let now_key = schedule_key.clone();
     let published_now = app(&fixture)
         .oneshot(request(
             "POST",
@@ -471,6 +488,24 @@ async fn publisher_api_validates_caption_and_parse_mode() {
         .expect("router should respond");
     assert_eq!(invalid_mode.status(), StatusCode::BAD_REQUEST);
     assert_eq!(response_json(invalid_mode).await["error"]["code"], "invalid_parse_mode");
+
+    let invalid_markup = app(&fixture)
+        .oneshot(request(
+            "POST",
+            "/api/v1/post-drafts".to_owned(),
+            Some(&fixture.write_token),
+            Some(&format!("{}markup", fixture.key_prefix)),
+            Some(json!({
+                "content_item_id": fixture.content_id,
+                "target_channel_id": fixture.target_channel_id,
+                "caption": "<b>unclosed",
+                "parse_mode": "HTML"
+            })),
+        ))
+        .await
+        .expect("router should respond");
+    assert_eq!(invalid_markup.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(invalid_markup).await["error"]["code"], "invalid_caption_markup");
 
     fixture.clean_up().await;
 }

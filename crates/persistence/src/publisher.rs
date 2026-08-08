@@ -4,9 +4,9 @@ use sooqa_library::{ContentStatus, StorageState};
 use sooqa_publisher::{
     ChannelPolicy, NewChannelPolicy, NewPostDraft, NewPublicationSchedule, NewTargetChannel,
     PostDraft, PostDraftStatus, PostDraftUpdate, PublicationAttempt, PublicationAttemptStatus,
-    PublicationCompletion, PublicationSchedule, PublicationScheduleStatus, PublishedPost,
-    PublisherValidationError, TargetChannel, transition_post_draft_status,
-    transition_publication_schedule_status,
+    PublicationCompletion, PublicationSchedule, PublicationScheduleScope,
+    PublicationScheduleStatus, PublishedPost, PublisherValidationError, TargetChannel,
+    transition_post_draft_status, transition_publication_schedule_status,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
@@ -224,9 +224,9 @@ impl PublisherRepository {
         &self,
         new_draft: NewPostDraft,
         idempotency_key: impl Into<String>,
+        request_hash: &[u8],
     ) -> Result<CreatePostDraftResult, PublisherRepositoryError> {
         let idempotency_key = normalize_idempotency_key(idempotency_key.into())?;
-        let request_hash = post_draft_request_hash(&new_draft);
         let draft_id = Uuid::now_v7();
         let mut transaction = self.pool.begin().await?;
         let inserted = sqlx::query_scalar::<_, Uuid>(
@@ -242,7 +242,7 @@ impl PublisherRepository {
         )
         .bind(DRAFT_CREATE_IDEMPOTENCY_SCOPE)
         .bind(&idempotency_key)
-        .bind(&request_hash)
+        .bind(request_hash)
         .bind(draft_id)
         .bind(serde_json::json!({ "id": draft_id, "status": "editing" }))
         .fetch_optional(&mut *transaction)
@@ -251,7 +251,7 @@ impl PublisherRepository {
         if inserted.is_none() {
             let existing = sqlx::query_as::<_, IdempotencyResourceRow>(
                 r#"
-                SELECT request_hash, resource_id
+                SELECT request_hash, resource_id, response_body
                 FROM idempotency_records
                 WHERE scope = $1 AND idempotency_key = $2
                 FOR UPDATE
@@ -261,13 +261,10 @@ impl PublisherRepository {
             .bind(&idempotency_key)
             .fetch_one(&mut *transaction)
             .await?;
-            if existing.request_hash.as_slice() != request_hash.as_slice() {
+            if existing.request_hash.as_slice() != request_hash {
                 return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
             }
-            let draft_id = existing
-                .resource_id
-                .ok_or(PublisherRepositoryError::IncompleteIdempotencyRecord)?;
-            let draft = load_post_draft(&mut transaction, draft_id).await?;
+            let draft = idempotency_draft_snapshot(&existing)?;
             transaction.commit().await?;
             return Ok(CreatePostDraftResult { draft, created: false });
         }
@@ -294,8 +291,48 @@ impl PublisherRepository {
         .fetch_one(&mut *transaction)
         .await?
         .into_post_draft()?;
+        let response_body = serde_json::to_value(&row)?;
+        sqlx::query(
+            "UPDATE idempotency_records SET response_body = $3 WHERE scope = $1 AND idempotency_key = $2",
+        )
+        .bind(DRAFT_CREATE_IDEMPOTENCY_SCOPE)
+        .bind(&idempotency_key)
+        .bind(response_body)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(CreatePostDraftResult { draft: row, created: true })
+    }
+
+    pub async fn replay_post_draft_create(
+        &self,
+        idempotency_key: &str,
+        request_hash: &[u8],
+    ) -> Result<Option<PostDraft>, PublisherRepositoryError> {
+        let idempotency_key = normalize_idempotency_key(idempotency_key.to_owned())?;
+        let mut transaction = self.pool.begin().await?;
+        let Some(existing) = sqlx::query_as::<_, IdempotencyResourceRow>(
+            r#"
+            SELECT request_hash, resource_id, response_body
+            FROM idempotency_records
+            WHERE scope = $1 AND idempotency_key = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(DRAFT_CREATE_IDEMPOTENCY_SCOPE)
+        .bind(&idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        if existing.request_hash.as_slice() != request_hash {
+            return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
+        }
+        let draft = idempotency_draft_snapshot(&existing)?;
+        transaction.commit().await?;
+        Ok(Some(draft))
     }
 
     pub async fn find_post_draft(
@@ -334,7 +371,7 @@ impl PublisherRepository {
         idempotency_key: impl Into<String>,
     ) -> Result<PostDraft, PublisherRepositoryError> {
         let idempotency_key = normalize_idempotency_key(idempotency_key.into())?;
-        let request_hash = post_draft_update_hash(id, &update);
+        let request_hash = post_draft_update_request_hash(id, &update);
         let mut transaction = self.pool.begin().await?;
         let inserted = sqlx::query_scalar::<_, Uuid>(
             r#"
@@ -358,7 +395,7 @@ impl PublisherRepository {
         if inserted.is_none() {
             let existing = sqlx::query_as::<_, IdempotencyResourceRow>(
                 r#"
-                SELECT request_hash, resource_id
+                SELECT request_hash, resource_id, response_body
                 FROM idempotency_records
                 WHERE scope = $1 AND idempotency_key = $2
                 FOR UPDATE
@@ -373,19 +410,68 @@ impl PublisherRepository {
             {
                 return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
             }
-            let draft = load_post_draft(&mut transaction, id).await?;
+            let draft = idempotency_draft_snapshot(&existing)?;
             transaction.commit().await?;
             return Ok(draft);
         }
 
         let draft = update_post_draft_in_transaction(&mut transaction, id, update).await?;
+        let response_body = serde_json::to_value(&draft)?;
+        sqlx::query(
+            "UPDATE idempotency_records SET response_body = $3 WHERE scope = $1 AND idempotency_key = $2",
+        )
+        .bind(DRAFT_UPDATE_IDEMPOTENCY_SCOPE)
+        .bind(&idempotency_key)
+        .bind(response_body)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(draft)
+    }
+
+    pub async fn replay_post_draft_update(
+        &self,
+        idempotency_key: &str,
+        request_hash: &[u8],
+    ) -> Result<Option<PostDraft>, PublisherRepositoryError> {
+        let idempotency_key = normalize_idempotency_key(idempotency_key.to_owned())?;
+        let mut transaction = self.pool.begin().await?;
+        let Some(existing) = sqlx::query_as::<_, IdempotencyResourceRow>(
+            r#"
+            SELECT request_hash, resource_id, response_body
+            FROM idempotency_records
+            WHERE scope = $1 AND idempotency_key = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(DRAFT_UPDATE_IDEMPOTENCY_SCOPE)
+        .bind(&idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        if existing.request_hash.as_slice() != request_hash {
+            return Err(PublisherRepositoryError::DraftIdempotencyConflict(idempotency_key));
+        }
+        let draft = idempotency_draft_snapshot(&existing)?;
+        transaction.commit().await?;
+        Ok(Some(draft))
     }
 
     pub async fn create_publication_schedule(
         &self,
         schedule: NewPublicationSchedule,
+    ) -> Result<PublicationSchedule, PublisherRepositoryError> {
+        self.create_publication_schedule_with_scope(schedule, PublicationScheduleScope::Schedule)
+            .await
+    }
+
+    pub async fn create_publication_schedule_with_scope(
+        &self,
+        schedule: NewPublicationSchedule,
+        scope: PublicationScheduleScope,
     ) -> Result<PublicationSchedule, PublisherRepositoryError> {
         let schedule = NewPublicationSchedule {
             publish_at: truncate_to_microseconds(schedule.publish_at),
@@ -401,29 +487,25 @@ impl PublisherRepository {
         // before checking the existing schedule so a concurrent replay returns
         // the original row instead of DraftNotReady.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))")
-            .bind(&schedule.idempotency_key)
+            .bind(format!("{}:{}", scope.as_str(), schedule.idempotency_key))
             .fetch_one(&mut *transaction)
             .await?;
         if let Some(existing) = sqlx::query_as::<_, PublicationScheduleRow>(
             r#"
             SELECT id, post_draft_id, status, publish_at, not_before, not_after,
-                   priority, cooldown_override, idempotency_key, created_at, updated_at
+                   priority, cooldown_override, idempotency_scope, idempotency_key,
+                   created_at, updated_at
             FROM publication_schedules
-            WHERE idempotency_key = $1
+            WHERE idempotency_scope = $1 AND idempotency_key = $2
             FOR UPDATE
             "#,
         )
+        .bind(scope.as_str())
         .bind(&schedule.idempotency_key)
         .fetch_optional(&mut *transaction)
         .await?
         {
-            if existing.post_draft_id != schedule.post_draft_id
-                || existing.publish_at != schedule.publish_at
-                || existing.not_before != schedule.not_before
-                || existing.not_after != schedule.not_after
-                || existing.priority != schedule.priority
-                || existing.cooldown_override != schedule.cooldown_override
-            {
+            if !schedule_request_matches(&existing, &schedule, scope) {
                 return Err(PublisherRepositoryError::ScheduleIdempotencyConflict(
                     schedule.idempotency_key,
                 ));
@@ -444,12 +526,13 @@ impl PublisherRepository {
             r#"
             INSERT INTO publication_schedules (
                 post_draft_id, publish_at, not_before, not_after, priority,
-                cooldown_override, idempotency_key
+                cooldown_override, idempotency_scope, idempotency_key
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (idempotency_key) DO NOTHING
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (idempotency_scope, idempotency_key) DO NOTHING
             RETURNING id, post_draft_id, status, publish_at, not_before, not_after,
-                      priority, cooldown_override, idempotency_key, created_at, updated_at
+                      priority, cooldown_override, idempotency_scope, idempotency_key,
+                      created_at, updated_at
             "#,
         )
         .bind(schedule.post_draft_id)
@@ -458,6 +541,7 @@ impl PublisherRepository {
         .bind(schedule.not_after)
         .bind(schedule.priority)
         .bind(schedule.cooldown_override)
+        .bind(scope.as_str())
         .bind(&schedule.idempotency_key)
         .fetch_optional(&mut *transaction)
         .await?;
@@ -485,22 +569,18 @@ impl PublisherRepository {
             let existing = sqlx::query_as::<_, PublicationScheduleRow>(
                 r#"
                 SELECT id, post_draft_id, status, publish_at, not_before, not_after,
-                       priority, cooldown_override, idempotency_key, created_at, updated_at
+                       priority, cooldown_override, idempotency_scope, idempotency_key,
+                       created_at, updated_at
                 FROM publication_schedules
-                WHERE idempotency_key = $1
+                WHERE idempotency_scope = $1 AND idempotency_key = $2
                 FOR UPDATE
                 "#,
             )
+            .bind(scope.as_str())
             .bind(&schedule.idempotency_key)
             .fetch_one(&mut *transaction)
             .await?;
-            if existing.post_draft_id != schedule.post_draft_id
-                || existing.publish_at != schedule.publish_at
-                || existing.not_before != schedule.not_before
-                || existing.not_after != schedule.not_after
-                || existing.priority != schedule.priority
-                || existing.cooldown_override != schedule.cooldown_override
-            {
+            if !schedule_request_matches(&existing, &schedule, scope) {
                 return Err(PublisherRepositoryError::ScheduleIdempotencyConflict(
                     schedule.idempotency_key,
                 ));
@@ -518,30 +598,13 @@ impl PublisherRepository {
         let row = sqlx::query_as::<_, PublicationScheduleRow>(
             r#"
             SELECT id, post_draft_id, status, publish_at, not_before, not_after,
-                   priority, cooldown_override, idempotency_key, created_at, updated_at
+                   priority, cooldown_override, idempotency_scope, idempotency_key,
+                   created_at, updated_at
             FROM publication_schedules
             WHERE id = $1
             "#,
         )
         .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(PublicationScheduleRow::into_publication_schedule).transpose()
-    }
-
-    pub async fn find_publication_schedule_by_idempotency_key(
-        &self,
-        idempotency_key: &str,
-    ) -> Result<Option<PublicationSchedule>, PublisherRepositoryError> {
-        let row = sqlx::query_as::<_, PublicationScheduleRow>(
-            r#"
-            SELECT id, post_draft_id, status, publish_at, not_before, not_after,
-                   priority, cooldown_override, idempotency_key, created_at, updated_at
-            FROM publication_schedules
-            WHERE idempotency_key = $1
-            "#,
-        )
-        .bind(idempotency_key)
         .fetch_optional(&self.pool)
         .await?;
         row.map(PublicationScheduleRow::into_publication_schedule).transpose()
@@ -558,7 +621,8 @@ impl PublisherRepository {
         let rows = sqlx::query_as::<_, PublicationScheduleRow>(
             r#"
             SELECT id, post_draft_id, status, publish_at, not_before, not_after,
-                   priority, cooldown_override, idempotency_key, created_at, updated_at
+                   priority, cooldown_override, idempotency_scope, idempotency_key,
+                   created_at, updated_at
             FROM publication_schedules
             WHERE status IN ('pending', 'queued', 'failed')
               AND publish_at <= $1
@@ -598,7 +662,8 @@ impl PublisherRepository {
             SET status = $2, updated_at = $3
             WHERE id = $1
             RETURNING id, post_draft_id, status, publish_at, not_before, not_after,
-                      priority, cooldown_override, idempotency_key, created_at, updated_at
+                      priority, cooldown_override, idempotency_scope, idempotency_key,
+                      created_at, updated_at
             "#,
         )
         .bind(id)
@@ -931,6 +996,10 @@ async fn update_post_draft_in_transaction(
     if let Some(status) = update.status {
         draft.status = transition_post_draft_status(draft.status, status)?;
     }
+    if draft.status == PostDraftStatus::Ready {
+        ensure_publishable_asset(transaction, draft.content_item_id, draft.asset_id).await?;
+        ensure_target_channel_enabled(transaction, draft.target_channel_id).await?;
+    }
     draft.updated_at = OffsetDateTime::now_utc();
     let row = sqlx::query_as::<_, PostDraftRow>(
         r#"
@@ -966,17 +1035,39 @@ fn normalize_idempotency_key(key: String) -> Result<String, PublisherRepositoryE
     Ok(key)
 }
 
-fn post_draft_request_hash(draft: &NewPostDraft) -> Vec<u8> {
+fn schedule_request_matches(
+    existing: &PublicationScheduleRow,
+    requested: &NewPublicationSchedule,
+    scope: PublicationScheduleScope,
+) -> bool {
+    if existing.post_draft_id != requested.post_draft_id {
+        return false;
+    }
+    if scope == PublicationScheduleScope::PublishNow {
+        return true;
+    }
+    existing.publish_at == requested.publish_at
+        && existing.not_before == requested.not_before
+        && existing.not_after == requested.not_after
+        && existing.priority == requested.priority
+        && existing.cooldown_override == requested.cooldown_override
+}
+
+pub fn post_draft_create_request_hash(
+    content_item_id: Uuid,
+    target_channel_id: Uuid,
+    caption: Option<&str>,
+    parse_mode: Option<&str>,
+) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    hash_uuid(&mut hasher, draft.content_item_id);
-    hash_uuid(&mut hasher, draft.asset_id);
-    hash_uuid(&mut hasher, draft.target_channel_id);
-    hash_optional_string(&mut hasher, draft.caption.as_deref());
-    hash_optional_string(&mut hasher, draft.parse_mode.as_deref());
+    hash_uuid(&mut hasher, content_item_id);
+    hash_uuid(&mut hasher, target_channel_id);
+    hash_optional_string(&mut hasher, caption);
+    hash_optional_string(&mut hasher, parse_mode);
     hasher.finalize().to_vec()
 }
 
-fn post_draft_update_hash(id: Uuid, update: &PostDraftUpdate) -> Vec<u8> {
+pub fn post_draft_update_request_hash(id: Uuid, update: &PostDraftUpdate) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hash_uuid(&mut hasher, id);
     hash_optional_optional_string(&mut hasher, &update.caption);
@@ -996,6 +1087,16 @@ fn post_draft_update_hash(id: Uuid, update: &PostDraftUpdate) -> Vec<u8> {
         None => hasher.update([0]),
     }
     hasher.finalize().to_vec()
+}
+
+fn idempotency_draft_snapshot(
+    record: &IdempotencyResourceRow,
+) -> Result<PostDraft, PublisherRepositoryError> {
+    let body = record
+        .response_body
+        .clone()
+        .ok_or(PublisherRepositoryError::IncompleteIdempotencyRecord)?;
+    Ok(serde_json::from_value(body)?)
 }
 
 fn hash_uuid(hasher: &mut Sha256, value: Uuid) {
@@ -1052,7 +1153,8 @@ async fn load_publication_schedule(
     let row = sqlx::query_as::<_, PublicationScheduleRow>(
         r#"
         SELECT id, post_draft_id, status, publish_at, not_before, not_after,
-               priority, cooldown_override, idempotency_key, created_at, updated_at
+               priority, cooldown_override, idempotency_scope, idempotency_key,
+               created_at, updated_at
         FROM publication_schedules
         WHERE id = $1
         FOR UPDATE
@@ -1217,12 +1319,15 @@ pub enum PublisherRepositoryError {
     PublishedPostConflict(Uuid),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("publisher response serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
 
 #[derive(Debug, FromRow)]
 struct IdempotencyResourceRow {
     request_hash: Vec<u8>,
     resource_id: Option<Uuid>,
+    response_body: Option<Value>,
 }
 
 #[derive(Debug, FromRow)]
@@ -1347,6 +1452,8 @@ struct PublicationScheduleRow {
     not_after: Option<OffsetDateTime>,
     priority: i32,
     cooldown_override: Option<bool>,
+    #[allow(dead_code)]
+    idempotency_scope: String,
     idempotency_key: String,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
@@ -1354,18 +1461,32 @@ struct PublicationScheduleRow {
 
 impl PublicationScheduleRow {
     fn into_publication_schedule(self) -> Result<PublicationSchedule, PublisherRepositoryError> {
+        let Self {
+            id,
+            post_draft_id,
+            status,
+            publish_at,
+            not_before,
+            not_after,
+            priority,
+            cooldown_override,
+            idempotency_scope: _,
+            idempotency_key,
+            created_at,
+            updated_at,
+        } = self;
         Ok(PublicationSchedule {
-            id: self.id,
-            post_draft_id: self.post_draft_id,
-            status: parse_enum("publication_schedules.status", &self.status)?,
-            publish_at: self.publish_at,
-            not_before: self.not_before,
-            not_after: self.not_after,
-            priority: self.priority,
-            cooldown_override: self.cooldown_override,
-            idempotency_key: self.idempotency_key,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
+            id,
+            post_draft_id,
+            status: parse_enum("publication_schedules.status", &status)?,
+            publish_at,
+            not_before,
+            not_after,
+            priority,
+            cooldown_override,
+            idempotency_key,
+            created_at,
+            updated_at,
         })
     }
 }
