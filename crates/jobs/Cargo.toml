@@ -8,7 +8,7 @@ rust-version.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-sooqa-media = { path = "../media" }
+sooqa-inbox = { path = "../inbox" }
 thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true

@@ -1,32 +1,60 @@
 # sooqa
 
-sooqa is a self-hosted Telegram media inbox, catalogue, deduplication engine,
-and publishing queue. It is intended for a single administrator first, with a
-durable always-on backend and an optional Windows capture companion.
+sooqa is a self-hosted Telegram media inbox and durable media-processing
+pipeline for a single administrator. It is a modular monolith: PostgreSQL is
+the source of truth, and workers advance durable jobs outside database
+transactions.
 
-The product and engineering source of truth is [docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md).
-The repository is being built through focused vertical increments. PostgreSQL
-backed ingest, library, media primitives, and the first Telegram adapter are
-already present; URL ingest through the bot, media storage, and publication are
-still later slices.
+## Current implementation
+
+The repository currently provides:
+
+- an OpenAPI-described HTTP Inbox API for creating and reading ingest requests;
+- scoped bearer-token authentication with SHA-256 token hashes;
+- PostgreSQL-backed idempotency, ingest state, job attempts, leases, and
+  stale-lease recovery;
+- direct HTTP and yt-dlp media adapters, ffprobe inspection, ffmpeg
+  normalization, image normalization, hashing, and duplicate primitives;
+- a Telegram long-polling adapter for admin URL/media submission and a durable
+  Telegram storage-upload intent flow;
+- an explicit storage-intent reconciliation CLI for ambiguous Telegram
+  uploads.
+
+The composed worker currently registers `probe_asset` and, when configured,
+`upload_storage_asset`. Source inspection, downloading, normalization,
+library finalization, and publishing remain separate boundaries until their
+handlers are composed into the production workflow.
+
+Active documentation is the authority for current behavior:
+
+- [Architecture](docs/architecture.md)
+- [Development and testing](docs/development.md)
+- [Operations](docs/operations.md)
+- [Security](docs/security.md)
+- [OpenAPI contract](docs/openapi.yaml)
+- [ADRs](docs/adr/)
+
+The original roadmap specification is retained as
+[historical reference](docs/reference/PROJECT_SPEC.md); its future phases are
+not an implementation status report.
 
 ## Development
 
-The pinned toolchain is Rust 1.97.1. Run the local quality gate with:
+The pinned toolchain is Rust 1.97.1. Run the local gate with:
 
 ```bash
 just check
 ```
 
-The equivalent Cargo commands are:
+Useful focused commands:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
+just openapi-validate
+just test-integration       # requires PostgreSQL
+just test-media             # requires ffmpeg and ffprobe
 ```
 
-To inspect the workspace applications:
+The applications are:
 
 ```bash
 cargo run -p sooqa-server
@@ -34,62 +62,48 @@ cargo run -p sooqa-worker
 cargo run -p sooqa-companion
 ```
 
-These binaries are intentionally minimal until their respective roadmap slices
-are implemented.
-
-## Repository shape
-
-- `apps/` contains executable applications.
-- `crates/` contains the modular-monolith library boundaries.
-- `docs/` contains the specification, architecture notes, and ADRs.
-- `userscripts/` will contain browser capture helpers.
-
-The project uses Apache-2.0. See [LICENSE](LICENSE) and
-[ADR 0006](docs/adr/0006-license.md).
-
-## Configuration check
-
-The server, worker, and companion accept a TOML configuration file and
-environment-variable overrides. Start from config.example.toml.
-
-    cargo run -p sooqa-server -- --config config.toml --check-config
-    cargo run -p sooqa-worker -- --config config.toml --check-config
-    cargo run -p sooqa-companion -- --config config.toml --check-config
-
-Use SOOQA_CONFIG_FILE when you do not want to repeat --config. Environment
-variables take precedence over TOML values. Configuration summaries redact
-secret values. To enable the current Telegram adapter, configure
-`SOOQA_TELEGRAM_BOT_TOKEN` and `SOOQA_TELEGRAM_ADMIN_USER_IDS`; see
-[operations.md](docs/operations.md) for the startup sequence.
+`apps/` contains executable processes. `crates/` contains the modular-monolith
+boundaries: configuration/runtime, Inbox, Library, Publisher, Jobs, Media,
+Telegram, Persistence, API, and test support.
 
 ## PostgreSQL
 
-On macOS, Docker Desktop is not required. Colima provides the Docker-compatible
-engine used by the commands below:
+Docker Desktop is not required on macOS. Colima supplies a Docker-compatible
+engine:
 
-    brew install colima
-    colima start --runtime docker --cpu 2 --memory 4 --disk 30
-    docker context use colima
+```bash
+brew install colima
+colima start --runtime docker --cpu 2 --memory 4 --disk 30
+docker context use colima
+docker compose up -d postgres
+```
 
-If the `colima` context does not exist, register its socket once:
+Apply forward-only migrations:
 
-    docker context create colima --docker host=unix://$HOME/.colima/default/docker.sock
-    docker context use colima
+```bash
+DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa \
+  cargo run -p sooqa-server -- migrate
+```
 
-Confirm the active runtime with `docker context show`; it should print
-`colima`. Stop it when finished with `colima stop`.
+The development password must not be reused in production. See
+[operations.md](docs/operations.md) for worker, Telegram, and reconciliation
+startup details.
 
-Start the development database with Docker Compose:
+## Configuration
 
-    docker compose up -d postgres
+Start from [config.example.toml](config.example.toml). TOML values can be
+overridden by environment variables; secrets belong in the environment.
+Check the effective redacted configuration with:
 
-Apply the forward-only migrations:
+```bash
+cargo run -p sooqa-server -- --config config.toml --check-config
+cargo run -p sooqa-worker -- --config config.toml --check-config
+```
 
-    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo run -p sooqa-server -- migrate
+The server and worker must share `media.work_root`. The current production
+worker preflights only binaries required by its registered handlers; the
+default probe handler requires `ffprobe`. The image in `Dockerfile` also
+contains `ffmpeg` and `yt-dlp` for handlers added later.
 
-Run the PostgreSQL integration test after the database is healthy:
-
-    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --test postgres -- --ignored
-
-The development password is intentionally simple and must not be reused in
-production.
+The project is licensed under Apache-2.0. See [LICENSE](LICENSE) and
+[ADR 0006](docs/adr/0006-license.md).

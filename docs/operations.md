@@ -1,92 +1,84 @@
 # Operations
 
-The development Compose file provides PostgreSQL. Production deployment and
-database backup remain deployment-specific, but the first Telegram runtime is
-now available behind explicit configuration.
+## Database
 
-## Local container runtime
+The database is the durable source of truth. Apply forward-only migrations
+before starting the server or worker:
 
-Docker Desktop is optional on macOS. Colima supplies the Docker-compatible
-engine without a Docker account:
+```bash
+DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa \
+  cargo run -p sooqa-server -- migrate
+```
 
-    brew install colima
-    colima start --runtime docker
-    docker context use colima
+Migration 0009 adds storage reservation ownership/expiry, media digest checks,
+canonical-asset triggers, and job lease/attempt invariants. Deploy the
+migration before deploying code that relies on those columns.
 
-Verify the selected engine with `docker context show`, then use the normal
-Compose commands. Stop the VM with `colima stop` when it is not needed.
+## Worker
 
-The B1 migration command is:
+Start the worker with the same `DATABASE_URL` and `media.work_root` used by the
+server:
 
-    DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa cargo run -p sooqa-server -- migrate
+```bash
+DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa \
+  cargo run -p sooqa-worker
+```
 
-The migration set now includes the initial Library tables for content items,
-media assets, source records, tags, and storage objects. Apply migrations with
-the same command after upgrading the application; migrations are forward-only.
-The E2 migration also adds general SHA-256 lookup and canonical-asset
-uniqueness indexes.
+The worker discovers its registered job capabilities and preflights only the
+external binaries those handlers need. The current composed probe handler
+needs `ffprobe`; ffmpeg and yt-dlp are not required until a handler uses them.
+The worker also creates and writes a small check file in the work root before
+polling. The supplied container image installs ffmpeg, ffprobe, and yt-dlp and
+creates a writable `/var/lib/sooqa/work` for the non-root `sooqa` user.
 
-After migrations are applied, the worker can be started with:
+A running job has a bounded lease and heartbeat. On startup and periodically,
+the worker returns expired running jobs to the queue. A graceful shutdown
+requeues the active job immediately. If a worker loses its lease, it stops
+before acknowledging the job; inspect the job and attempt rows when
+diagnosing a crash or database outage.
 
-    DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa cargo run -p sooqa-worker
+## Telegram
 
-The worker's non-secret media executable paths can be configured in TOML:
+Configure the token, positive administrator IDs, API endpoint, and optional
+storage channel:
 
-    [media]
-    work_root = "/var/lib/sooqa/work"
-    ffmpeg_path = "ffmpeg"
-    ffprobe_path = "ffprobe"
-    ytdlp_path = "yt-dlp"
-    ytdlp_format = "bestvideo*+bestaudio/best"
+```bash
+SOOQA_TELEGRAM_BOT_TOKEN=123456:secret
+SOOQA_TELEGRAM_ADMIN_USER_IDS=123456789
+SOOQA_TELEGRAM_API_BASE_URL=https://api.telegram.org
+SOOQA_TELEGRAM_MAX_DOWNLOAD_BYTES=2147483648
+SOOQA_TELEGRAM_STORAGE_CHAT_ID=-1001234567890
+```
 
-The server and worker must mount the same `media.work_root`. The equivalent
-environment overrides are `SOOQA_MEDIA_WORK_ROOT`,
-`SOOQA_MEDIA_FFMPEG_PATH`,
-`SOOQA_MEDIA_FFPROBE_PATH`, `SOOQA_MEDIA_YTDLP_PATH`, and
-`SOOQA_MEDIA_YTDLP_FORMAT`. On normal startup,
-the worker logs the detected version of each required binary and exits before
-database connection if a binary is unavailable. The server does not require
-these media tools. The worker polls durably stored jobs, executes registered
-handlers including the configured Telegram storage upload handler, records
-outcomes, and stops gracefully on SIGTERM or Ctrl-C.
+The server starts polling only when the token is configured. The Bot API cloud
+endpoint has a 20 MiB upstream limit; a Local Bot API Server can be selected by
+changing `SOOQA_TELEGRAM_API_BASE_URL`, but the application byte ceiling still
+applies. Telegram downloads are staged in the shared work root and cleaned up
+on errors.
 
-## Telegram bot
+## Storage intent recovery
 
-Apply migrations before starting a configured bot; migration `0008` creates
-the durable `telegram_update_receipts` table:
+An upload intent is `pending` while the worker owns a short reservation. If the
+external Telegram result is uncertain, the intent becomes `unknown` and is
+kept durable. An expired pending reservation is also converted to `unknown`
+before another attempt can observe it. The normal upload path will not guess
+whether Telegram created a message.
 
-    DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa cargo run -p sooqa-server -- migrate
+Inspect and reconcile intents with:
 
-Configure the bot token as a secret and provide the administrator's Telegram
-user ID:
+```bash
+cargo run -p sooqa-server -- storage-intents list
+cargo run -p sooqa-server -- storage-intents mark-unknown <intent-id>
+cargo run -p sooqa-server -- storage-intents reset <intent-id> --confirm
+cargo run -p sooqa-server -- storage-intents attach <intent-id> <asset-id> <chat-id> <message-id> <media-kind> <file-id> <file-unique-id>
+```
 
-    SOOQA_TELEGRAM_BOT_TOKEN=123456:secret
-    SOOQA_TELEGRAM_ADMIN_USER_IDS=123456789
-    SOOQA_TELEGRAM_API_BASE_URL=https://api.telegram.org
-    SOOQA_TELEGRAM_POLL_TIMEOUT_SECONDS=30
-    SOOQA_TELEGRAM_STORAGE_CHAT_ID=-1001234567890
+Use `attach` when the Telegram message exists. Use `reset --confirm` only when
+the operator has verified that the external upload did not create an object;
+the reset deletes the idempotency record so a fresh attempt can be reserved.
 
-The server starts polling alongside the HTTP API only when the bot token is
-configured. It ignores group messages, rejects non-admin private users with a
-generic response, and supports `/start`, `/help`, `/add`, and `/status` for
-configured admins. `/add <url>` and a bare single-URL message create the same
-durable Inbox request as the HTTP API; the response includes its request ID
-and status. Update receipts are retained as durable deduplication records.
-Failed API or Inbox calls release their claim immediately. Photo, video,
-animation, audio, and recognizable document messages are downloaded into the
-shared media workspace and create a durable Telegram ingest request plus a
-`probe_asset` job. The worker validates that workspace and probes the file with
-ffprobe before recording probe metadata. The standard cloud Bot API rejects files over 20 MiB before
-download; configure a Local Bot API Server in `SOOQA_TELEGRAM_API_BASE_URL`
-when larger downloads are required. Unsupported documents are rejected with a
-warning. Media probing/normalization orchestration and channel publication
-remain later slices.
+## Logs and secrets
 
-For H3 storage, make the bot an administrator of a private storage channel and
-set `SOOQA_TELEGRAM_STORAGE_CHAT_ID` to its negative chat ID. The server checks
-that chat during Telegram startup. Upload intents are durable in
-`idempotency_records`; pending or ambiguous intents are retained and must be
-reconciled before retrying. They are not automatically reclaimed because a
-long-running Telegram request could still be in flight. The worker enables the
-upload job only when the Telegram token and storage chat are configured;
-canonical-asset recording creates the durable upload job.
+Configuration summaries redact secrets. Do not put bot tokens, database URLs,
+or bearer tokens in logs or committed TOML. The default development database
+password is for local use only.

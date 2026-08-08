@@ -6,7 +6,7 @@ use sooqa_library::{
     ExactDuplicateResolution, LibraryCursor, LibraryItemDetail, LibraryItemSummary,
     LibrarySearchPage, LibrarySearchQuery, MediaAsset, NewContentItem, NewDuplicateCandidate,
     NewMediaAsset, NewSourceRecord, NewSourceRecordDraft, NewStorageObject, NewTag, SourceRecord,
-    StorageObject, StorageUploadReservation, StorageUploadStore, Tag,
+    StorageObject, StorageUploadIntent, StorageUploadReservation, StorageUploadStore, Tag,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
@@ -21,6 +21,117 @@ pub struct LibraryRepository {
 impl LibraryRepository {
     pub(crate) fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn list_storage_upload_intents(
+        &self,
+    ) -> Result<Vec<StorageUploadIntent>, LibraryRepositoryError> {
+        let rows = sqlx::query_as::<_, StorageUploadIntentListingRow>(
+            r#"
+            SELECT id, idempotency_key, response_body, resource_id, created_at,
+                   reservation_expires_at
+            FROM idempotency_records
+            WHERE scope = $1
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )
+        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(StorageUploadIntentListingRow::into_intent).collect()
+    }
+
+    pub async fn mark_storage_upload_intent_unknown(
+        &self,
+        intent_id: Uuid,
+    ) -> Result<(), LibraryRepositoryError> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE idempotency_records
+            SET response_body = '{"state":"unknown"}'::jsonb,
+                reservation_owner = NULL,
+                reservation_expires_at = NULL
+            WHERE id = $1
+              AND scope = $2
+              AND resource_id IS NULL
+              AND response_body->>'state' IN ('pending', 'unknown')
+            "#,
+        )
+        .bind(intent_id)
+        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(LibraryRepositoryError::StorageUploadIntentMissing(intent_id));
+        }
+        Ok(())
+    }
+
+    pub async fn reset_storage_upload_intent(
+        &self,
+        intent_id: Uuid,
+    ) -> Result<(), LibraryRepositoryError> {
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM idempotency_records
+            WHERE id = $1
+              AND scope = $2
+              AND resource_id IS NULL
+              AND response_body->>'state' = 'unknown'
+            "#,
+        )
+        .bind(intent_id)
+        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
+        .execute(&self.pool)
+        .await?;
+        if deleted.rows_affected() != 1 {
+            return Err(LibraryRepositoryError::StorageUploadIntentMissing(intent_id));
+        }
+        Ok(())
+    }
+
+    pub async fn attach_storage_upload(
+        &self,
+        intent_id: Uuid,
+        object: NewStorageObject,
+    ) -> Result<StorageObject, LibraryRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let storage_object = insert_storage_object(&mut transaction, &object).await?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE idempotency_records
+            SET resource_id = $2,
+                response_status = $3,
+                response_body = $4,
+                reservation_owner = NULL,
+                reservation_expires_at = NULL
+            WHERE id = $1
+              AND scope = $5
+              AND resource_id IS NULL
+              AND response_body->>'state' = 'unknown'
+            "#,
+        )
+        .bind(intent_id)
+        .bind(storage_object.id)
+        .bind(STORAGE_UPLOAD_COMPLETED_STATUS)
+        .bind(json!({ "id": storage_object.id, "status": storage_object.status.as_str() }))
+        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(LibraryRepositoryError::StorageUploadIntentMissing(intent_id));
+        }
+        let updated_asset =
+            sqlx::query("UPDATE media_assets SET storage_state = 'uploaded' WHERE id = $1")
+                .bind(object.asset_id)
+                .execute(&mut *transaction)
+                .await?;
+        if updated_asset.rows_affected() != 1 {
+            return Err(LibraryRepositoryError::ResourceMissing(object.asset_id));
+        }
+        transaction.commit().await?;
+        Ok(storage_object)
     }
 
     pub async fn upsert_duplicate_candidate(
@@ -997,6 +1108,35 @@ impl LibraryRepository {
 const STORAGE_UPLOAD_IDEMPOTENCY_SCOPE: &str = "storage:upload";
 const STORAGE_UPLOAD_COMPLETED_STATUS: i32 = 201;
 
+async fn insert_storage_object(
+    transaction: &mut Transaction<'_, Postgres>,
+    object: &NewStorageObject,
+) -> Result<StorageObject, LibraryRepositoryError> {
+    let row = sqlx::query_as::<_, StorageObjectRow>(
+        r#"
+        INSERT INTO storage_objects (
+            asset_id, provider, storage_chat_id, storage_message_id,
+            telegram_file_id, telegram_file_unique_id, media_kind
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING
+            id, asset_id, provider, storage_chat_id, storage_message_id,
+            telegram_file_id, telegram_file_unique_id, media_kind,
+            stored_at, verified_at, status
+        "#,
+    )
+    .bind(object.asset_id)
+    .bind(&object.provider)
+    .bind(object.storage_chat_id)
+    .bind(object.storage_message_id)
+    .bind(&object.telegram_file_id)
+    .bind(&object.telegram_file_unique_id)
+    .bind(object.media_kind.as_str())
+    .fetch_one(&mut **transaction)
+    .await?;
+    row.into_storage_object()
+}
+
 #[async_trait::async_trait]
 impl StorageUploadStore for LibraryRepository {
     type Error = LibraryRepositoryError;
@@ -1044,18 +1184,35 @@ impl StorageUploadStore for LibraryRepository {
         request_hash: &[u8],
     ) -> Result<StorageUploadReservation, Self::Error> {
         let mut transaction = self.pool.begin().await?;
-        let inserted = sqlx::query_scalar::<_, Uuid>(
+        sqlx::query(
+            r#"
+            UPDATE idempotency_records
+            SET response_body = '{"state":"unknown"}'::jsonb,
+                reservation_owner = NULL,
+                reservation_expires_at = NULL
+            WHERE scope = $1
+              AND resource_id IS NULL
+              AND response_body->>'state' = 'pending'
+              AND reservation_expires_at IS NOT NULL
+              AND reservation_expires_at <= now()
+            "#,
+        )
+        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
+        .execute(&mut *transaction)
+        .await?;
+
+        let inserted = sqlx::query_as::<_, (Uuid, Uuid)>(
             r#"
             INSERT INTO idempotency_records (
                 scope, idempotency_key, request_hash, resource_type,
-                response_body
+                response_body, reservation_owner, reservation_expires_at
             )
             VALUES (
                 $1, $2, $3, 'storage_object',
-                '{"state":"pending"}'::jsonb
+                '{"state":"pending"}'::jsonb, gen_random_uuid(), now() + interval '10 minutes'
             )
             ON CONFLICT (scope, idempotency_key) DO NOTHING
-            RETURNING id
+            RETURNING id, reservation_owner
             "#,
         )
         .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
@@ -1064,14 +1221,15 @@ impl StorageUploadStore for LibraryRepository {
         .fetch_optional(&mut *transaction)
         .await?;
 
-        if let Some(intent_id) = inserted {
+        if let Some((intent_id, owner_token)) = inserted {
             transaction.commit().await?;
-            return Ok(StorageUploadReservation::Reserved { intent_id });
+            return Ok(StorageUploadReservation::Reserved { intent_id, owner_token });
         }
 
         let existing = sqlx::query_as::<_, StorageUploadIntentRow>(
             r#"
-            SELECT request_hash, resource_id, response_body
+            SELECT request_hash, resource_id, response_body,
+                   reservation_owner, reservation_expires_at
             FROM idempotency_records
             WHERE scope = $1 AND idempotency_key = $2
             FOR UPDATE
@@ -1123,6 +1281,7 @@ impl StorageUploadStore for LibraryRepository {
     async fn complete_storage_upload(
         &self,
         intent_id: Uuid,
+        owner_token: Uuid,
         object: NewStorageObject,
     ) -> Result<StorageObject, Self::Error> {
         let mut transaction = self.pool.begin().await?;
@@ -1157,15 +1316,17 @@ impl StorageUploadStore for LibraryRepository {
                 response_status = $4,
                 response_body = $3
             WHERE id = $1
+              AND reservation_owner = $5
               AND resource_id IS NULL
               AND response_status IS NULL
-              AND response_body->>'state' IN ('pending', 'unknown')
+              AND response_body->>'state' = 'pending'
             "#,
         )
         .bind(intent_id)
         .bind(storage_object.id)
         .bind(json!({ "id": storage_object.id, "status": storage_object.status.as_str() }))
         .bind(STORAGE_UPLOAD_COMPLETED_STATUS)
+        .bind(owner_token)
         .execute(&mut *transaction)
         .await?;
         if updated_intent.rows_affected() != 1 {
@@ -1185,25 +1346,37 @@ impl StorageUploadStore for LibraryRepository {
         Ok(storage_object)
     }
 
-    async fn release_storage_upload(&self, intent_id: Uuid) -> Result<(), Self::Error> {
+    async fn release_storage_upload(
+        &self,
+        intent_id: Uuid,
+        owner_token: Uuid,
+    ) -> Result<(), Self::Error> {
         sqlx::query(
-            "DELETE FROM idempotency_records WHERE id = $1 AND resource_id IS NULL AND response_status IS NULL AND response_body->>'state' = 'pending'",
+            "DELETE FROM idempotency_records WHERE id = $1 AND reservation_owner = $2 AND resource_id IS NULL AND response_status IS NULL AND response_body->>'state' = 'pending'",
         )
             .bind(intent_id)
+            .bind(owner_token)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    async fn mark_storage_upload_unknown(&self, intent_id: Uuid) -> Result<(), Self::Error> {
+    async fn mark_storage_upload_unknown(
+        &self,
+        intent_id: Uuid,
+        owner_token: Uuid,
+    ) -> Result<(), Self::Error> {
         sqlx::query(
             r#"
             UPDATE idempotency_records
-            SET response_body = '{"state":"unknown"}'::jsonb
-            WHERE id = $1 AND resource_id IS NULL
+            SET response_body = '{"state":"unknown"}'::jsonb,
+                reservation_owner = NULL,
+                reservation_expires_at = NULL
+            WHERE id = $1 AND reservation_owner = $2 AND resource_id IS NULL
             "#,
         )
         .bind(intent_id)
+        .bind(owner_token)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1716,6 +1889,40 @@ struct StorageUploadIntentRow {
     request_hash: Vec<u8>,
     resource_id: Option<Uuid>,
     response_body: Option<Value>,
+    #[sqlx(rename = "reservation_owner")]
+    _reservation_owner: Option<Uuid>,
+    #[sqlx(rename = "reservation_expires_at")]
+    _reservation_expires_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, FromRow)]
+struct StorageUploadIntentListingRow {
+    id: Uuid,
+    idempotency_key: String,
+    response_body: Option<Value>,
+    resource_id: Option<Uuid>,
+    created_at: OffsetDateTime,
+    reservation_expires_at: Option<OffsetDateTime>,
+}
+
+impl StorageUploadIntentListingRow {
+    fn into_intent(self) -> Result<StorageUploadIntent, LibraryRepositoryError> {
+        let state = self
+            .response_body
+            .as_ref()
+            .and_then(|body| body.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        Ok(StorageUploadIntent {
+            id: self.id,
+            idempotency_key: self.idempotency_key,
+            state,
+            resource_id: self.resource_id,
+            created_at: self.created_at,
+            reservation_expires_at: self.reservation_expires_at,
+        })
+    }
 }
 
 #[derive(Debug, FromRow)]

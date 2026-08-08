@@ -682,9 +682,19 @@ pub struct NewStorageObject {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum StorageUploadReservation {
-    Reserved { intent_id: Uuid },
+    Reserved { intent_id: Uuid, owner_token: Uuid },
     Reused(StorageObject),
     InProgress,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StorageUploadIntent {
+    pub id: Uuid,
+    pub idempotency_key: String,
+    pub state: String,
+    pub resource_id: Option<Uuid>,
+    pub created_at: OffsetDateTime,
+    pub reservation_expires_at: Option<OffsetDateTime>,
 }
 
 #[async_trait]
@@ -711,15 +721,24 @@ pub trait StorageUploadStore: Clone + Send + Sync + 'static {
     async fn complete_storage_upload(
         &self,
         intent_id: Uuid,
+        owner_token: Uuid,
         object: NewStorageObject,
     ) -> Result<StorageObject, Self::Error>;
 
-    async fn release_storage_upload(&self, intent_id: Uuid) -> Result<(), Self::Error>;
+    async fn release_storage_upload(
+        &self,
+        intent_id: Uuid,
+        owner_token: Uuid,
+    ) -> Result<(), Self::Error>;
 
     /// Preserve an intent after an external request whose outcome is unknown.
     /// A later reconciliation can complete the same intent with the returned
     /// Telegram message reference instead of sending another message.
-    async fn mark_storage_upload_unknown(&self, intent_id: Uuid) -> Result<(), Self::Error>;
+    async fn mark_storage_upload_unknown(
+        &self,
+        intent_id: Uuid,
+        owner_token: Uuid,
+    ) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]

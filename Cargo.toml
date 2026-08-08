@@ -6,7 +6,6 @@ members = [
     "apps/companion",
     "crates/config",
     "crates/runtime",
-    "crates/kernel",
     "crates/inbox",
     "crates/library",
     "crates/publisher",

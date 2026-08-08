@@ -3,11 +3,15 @@
 ## Mission
 
 Build sooqa, the self-hosted Telegram media pipeline described in
-`docs/PROJECT_SPEC.md`, through small, reviewable increments.
+the current repository documentation, through small, reviewable increments.
+The former product specification is retained as docs/reference/PROJECT_SPEC.md
+for historical roadmap context.
 
 ## Before coding
 
-1. Read `docs/PROJECT_SPEC.md` and relevant ADRs.
+1. Read README.md, the relevant active document in docs/, and relevant ADRs.
+   Consult docs/reference/PROJECT_SPEC.md only for historical product and
+   roadmap context.
 2. Inspect the current branch and working tree.
 3. Restate the exact scope and acceptance criteria in the working plan.
 4. Do not implement future roadmap scope speculatively.
@@ -21,6 +25,8 @@ Build sooqa, the self-hosted Telegram media pipeline described in
 - External commands use argument arrays, never a shell.
 - Externally retryable commands require idempotency semantics.
 - Keep the single-admin MVP simple without making future boundaries impossible.
+- Treat code and tests as the final authority when active documentation and
+  historical roadmap text differ.
 
 ## Commands
 

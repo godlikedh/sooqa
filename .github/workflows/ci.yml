@@ -87,5 +87,30 @@ jobs:
           DATABASE_URL: postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa
         run: |
           cargo test -p sooqa-persistence --tests -- --ignored
+          cargo test -p sooqa-api --test ingest -- --ignored
           cargo test -p sooqa-api --test library -- --ignored
           cargo test -p sooqa-worker --test worker -- --ignored
+          cargo test -p sooqa-worker --test inspection -- --ignored
+
+  media:
+    name: Media integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-1.97.1
+
+      - name: Install media tools
+        run: sudo apt-get update && sudo apt-get install --yes ffmpeg
+
+      - name: Run media integration tests
+        run: cargo test -p sooqa-media --lib -- --ignored

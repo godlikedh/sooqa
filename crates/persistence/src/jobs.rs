@@ -50,8 +50,11 @@ impl JobRepository {
         &self,
         worker_id: &str,
         lease_duration: Duration,
+        capabilities: &[JobType],
     ) -> Result<Option<Job>, JobRepositoryError> {
         let lease_seconds = lease_seconds(lease_duration)?;
+        let capabilities =
+            capabilities.iter().map(|job_type| job_type.as_str().to_owned()).collect::<Vec<_>>();
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query_as::<_, JobRow>(
             r#"
@@ -60,6 +63,7 @@ impl JobRepository {
                 FROM jobs
                 WHERE status IN ('queued', 'retry_wait')
                   AND available_at <= now()
+                  AND job_type = ANY($3::text[])
                 ORDER BY priority DESC, available_at ASC, created_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -81,6 +85,7 @@ impl JobRepository {
         )
         .bind(worker_id)
         .bind(lease_seconds)
+        .bind(&capabilities)
         .fetch_optional(&mut *transaction)
         .await?;
 

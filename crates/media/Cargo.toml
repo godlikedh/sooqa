@@ -13,6 +13,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sooqa-inbox = { path = "../inbox" }
 time.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

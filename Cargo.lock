@@ -2088,15 +2088,11 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sooqa-media",
+ "sooqa-inbox",
  "thiserror",
  "time",
  "uuid",
 ]
-
-[[package]]
-name = "sooqa-kernel"
-version = "0.1.0"
 
 [[package]]
 name = "sooqa-library"
@@ -2121,6 +2117,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sooqa-inbox",
  "thiserror",
  "time",
  "tokio",
@@ -2171,12 +2168,14 @@ dependencies = [
  "sooqa-api",
  "sooqa-config",
  "sooqa-inbox",
+ "sooqa-library",
  "sooqa-persistence",
  "sooqa-runtime",
  "sooqa-telegram",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2202,6 +2201,7 @@ name = "sooqa-test-support"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "sooqa-inbox",
  "sooqa-media",
 ]
 

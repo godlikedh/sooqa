@@ -3,18 +3,20 @@
 use std::error::Error;
 
 use axum::Router;
-use sooqa_config::{AppConfig, AppRole, CliCommand, CliOptions, ConfigError};
+use sooqa_config::{AppConfig, AppRole, CliCommand, CliOptions, ConfigError, StorageIntentCommand};
 use sooqa_inbox::{
     IngestSubmission, IngestSubmissionInput, IngestValidationError, SubmittedVia,
     TelegramSubmissionInput,
 };
+use sooqa_library::{MediaKind, NewStorageObject};
 use sooqa_persistence::InboxRepository;
 use sooqa_persistence::{TelegramRepository, TelegramRepositoryError};
 use sooqa_telegram::{
-    IngestAccepted, IngestService, MediaIngestCommand, TelegramRuntime, UpdateClaim,
-    UpdateClaimResult, UpdateStore, UrlIngestCommand,
+    IngestAccepted, IngestService, MediaIngestCommand, TELEGRAM_STORAGE_PROVIDER, TelegramRuntime,
+    UpdateClaim, UpdateClaimResult, UpdateStore, UrlIngestCommand,
 };
 use tokio::net::TcpListener;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() {
@@ -33,7 +35,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    if options.command == Some(CliCommand::Migrate) {
+    if let Some(command) = options.command {
         let database_url = config
             .secrets
             .database_url
@@ -44,8 +46,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
             config.database.max_connections,
         )
         .await?;
-        database.migrate().await?;
-        println!("sooqa-server: database migrations applied");
+        match command {
+            CliCommand::Migrate => {
+                database.migrate().await?;
+                println!("sooqa-server: database migrations applied");
+            }
+            CliCommand::StorageIntents(command) => {
+                run_storage_intent_command(&database, command).await?;
+            }
+        }
         return Ok(());
     }
 
@@ -79,7 +88,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             config.telegram.storage_chat_id,
             DatabaseIngestService { repository: database.inbox() },
         )?
-        .with_media_work_root(config.media.work_root.clone());
+        .with_media_work_root(config.media.work_root.clone())
+        .with_max_download_bytes(config.telegram.max_download_bytes);
         tracing::info!(api_base_url = %config.telegram.api_base_url, "Telegram bot polling enabled");
         tokio::select! {
             result = server => result?,
@@ -91,6 +101,81 @@ async fn run() -> Result<(), Box<dyn Error>> {
     tracing::info!(role = %config.role, "sooqa server stopped");
 
     Ok(())
+}
+
+async fn run_storage_intent_command(
+    database: &sooqa_persistence::Database,
+    command: StorageIntentCommand,
+) -> Result<(), Box<dyn Error>> {
+    match command {
+        StorageIntentCommand::List => {
+            println!("id\tstate\tidempotency_key\tresource_id\tcreated_at\treservation_expires_at");
+            for intent in database.library().list_storage_upload_intents().await? {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    intent.id,
+                    intent.state,
+                    intent.idempotency_key,
+                    intent.resource_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
+                    intent.created_at,
+                    intent
+                        .reservation_expires_at
+                        .map_or_else(|| "-".to_owned(), |expires_at| expires_at.to_string()),
+                );
+            }
+        }
+        StorageIntentCommand::MarkUnknown { intent_id } => {
+            let intent_id = parse_uuid("intent-id", &intent_id)?;
+            database.library().mark_storage_upload_intent_unknown(intent_id).await?;
+            println!("sooqa-server: storage upload intent {intent_id} marked unknown");
+        }
+        StorageIntentCommand::Reset { intent_id } => {
+            let intent_id = parse_uuid("intent-id", &intent_id)?;
+            database.library().reset_storage_upload_intent(intent_id).await?;
+            println!("sooqa-server: storage upload intent {intent_id} reset");
+        }
+        StorageIntentCommand::Attach {
+            intent_id,
+            asset_id,
+            storage_chat_id,
+            storage_message_id,
+            media_kind,
+            telegram_file_id,
+            telegram_file_unique_id,
+        } => {
+            let intent_id = parse_uuid("intent-id", &intent_id)?;
+            let asset_id = parse_uuid("asset-id", &asset_id)?;
+            let storage_chat_id = parse_i64("storage-chat-id", &storage_chat_id)?;
+            let storage_message_id = parse_i64("storage-message-id", &storage_message_id)?;
+            let media_kind = MediaKind::try_from(media_kind.as_str())
+                .map_err(|value| format!("invalid media-kind {value:?}"))?;
+            let object = database
+                .library()
+                .attach_storage_upload(
+                    intent_id,
+                    NewStorageObject {
+                        asset_id,
+                        provider: TELEGRAM_STORAGE_PROVIDER.to_owned(),
+                        storage_chat_id,
+                        storage_message_id,
+                        telegram_file_id: Some(telegram_file_id),
+                        telegram_file_unique_id: Some(telegram_file_unique_id),
+                        media_kind,
+                    },
+                )
+                .await?;
+            println!("sooqa-server: storage upload intent {intent_id} attached as {}", object.id);
+        }
+    }
+    Ok(())
+}
+
+fn parse_uuid(name: &str, value: &str) -> Result<Uuid, Box<dyn Error>> {
+    value.parse().map_err(|error| format!("{name} is not a UUID: {error}").into())
+}
+
+fn parse_i64(name: &str, value: &str) -> Result<i64, Box<dyn Error>> {
+    value.parse().map_err(|error| format!("{name} is not an integer: {error}").into())
 }
 
 #[derive(Clone)]

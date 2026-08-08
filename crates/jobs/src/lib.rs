@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use sooqa_media::SourceInspection;
+use sooqa_inbox::SourceInspection;
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;

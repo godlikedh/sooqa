@@ -1,6 +1,6 @@
 //! Ingest request and source submission boundaries for sooqa.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -8,6 +8,32 @@ use url::Url;
 use uuid::Uuid;
 
 const MAX_IDEMPOTENCY_KEY_LENGTH: usize = 255;
+
+/// Durable source metadata produced by an inspection adapter.
+///
+/// This schema belongs to the Inbox/job boundary. Media adapters produce it,
+/// but durable payloads should not depend on the infrastructure-heavy media
+/// crate for their serialized value types.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceMediaKind {
+    Video,
+    Image,
+    Audio,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceInspection {
+    pub adapter: String,
+    pub source_url: String,
+    pub resolved_url: Option<String>,
+    pub media_kind: SourceMediaKind,
+    pub mime_type: Option<String>,
+    pub content_length_bytes: Option<u64>,
+    pub title: Option<String>,
+    pub metadata: Value,
+}
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

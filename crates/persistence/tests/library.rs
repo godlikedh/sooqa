@@ -260,7 +260,7 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
         .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
         .await
         .expect("upload intent should be reserved");
-    let StorageUploadReservation::Reserved { intent_id } = reservation else {
+    let StorageUploadReservation::Reserved { intent_id, owner_token } = reservation else {
         panic!("first upload should reserve an intent");
     };
     assert_eq!(
@@ -271,7 +271,7 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
         StorageUploadReservation::InProgress
     );
     library
-        .mark_storage_upload_unknown(intent_id)
+        .mark_storage_upload_unknown(intent_id, owner_token)
         .await
         .expect("upload intent should be markable as unknown");
     assert_eq!(
@@ -283,7 +283,7 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
     );
 
     let stored = library
-        .complete_storage_upload(
+        .attach_storage_upload(
             intent_id,
             NewStorageObject {
                 asset_id: asset.id,
@@ -325,6 +325,66 @@ async fn storage_upload_intent_is_idempotent_and_marks_asset_uploaded() {
         .execute(database.pool())
         .await
         .expect("storage object should clean up");
+    clean_up_content(&database, content.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn storage_upload_intent_expiry_is_reconcilable_and_operator_reset_is_explicit() {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let library = database.library();
+    let content = library
+        .create_content_item(NewContentItem::new(ContentKind::Video))
+        .await
+        .expect("content item should be created");
+    let sha256 = vec![14; 32];
+    let asset = library
+        .create_media_asset(canonical_asset(content.id, sha256.clone()))
+        .await
+        .expect("asset should be created");
+    let idempotency_key = format!("telegram:storage:{}:expiry:v1", asset.id);
+    let reservation = library
+        .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+        .await
+        .expect("upload intent should be reserved");
+    let StorageUploadReservation::Reserved { intent_id, .. } = reservation else {
+        panic!("first upload should reserve an intent");
+    };
+    sqlx::query(
+        "UPDATE idempotency_records SET reservation_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(intent_id)
+    .execute(database.pool())
+    .await
+    .expect("test should expire the reservation");
+
+    assert_eq!(
+        library
+            .reserve_storage_upload(asset.id, "telegram", &idempotency_key, &sha256)
+            .await
+            .expect("expired reservation should remain visible"),
+        StorageUploadReservation::InProgress
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT response_body->>'state' FROM idempotency_records WHERE id = $1")
+            .bind(intent_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("intent state should be queryable");
+    assert_eq!(state, "unknown");
+    library
+        .mark_storage_upload_intent_unknown(intent_id)
+        .await
+        .expect("operator should be able to acknowledge the ambiguity");
+    library
+        .reset_storage_upload_intent(intent_id)
+        .await
+        .expect("operator reset should require an explicit action");
     clean_up_content(&database, content.id).await;
 }
 

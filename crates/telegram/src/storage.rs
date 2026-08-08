@@ -195,8 +195,10 @@ where
             )
             .await
             .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
-        let intent_id = match reservation {
-            StorageUploadReservation::Reserved { intent_id } => intent_id,
+        let (intent_id, owner_token) = match reservation {
+            StorageUploadReservation::Reserved { intent_id, owner_token } => {
+                (intent_id, owner_token)
+            }
             StorageUploadReservation::Reused(object) => {
                 return Ok(StorageUploadOutcome::Reused(object));
             }
@@ -213,14 +215,14 @@ where
             Ok(uploaded) => uploaded,
             Err(error) => {
                 if A::is_ambiguous_error(&error) {
-                    self.store.mark_storage_upload_unknown(intent_id).await.map_err(
+                    self.store.mark_storage_upload_unknown(intent_id, owner_token).await.map_err(
                         |mark_error| StorageUploadError::Persistence(Box::new(mark_error)),
                     )?;
                     return Err(StorageUploadError::AmbiguousApi(Box::new(error)));
                 }
-                self.store.release_storage_upload(intent_id).await.map_err(|release_error| {
-                    StorageUploadError::Persistence(Box::new(release_error))
-                })?;
+                self.store.release_storage_upload(intent_id, owner_token).await.map_err(
+                    |release_error| StorageUploadError::Persistence(Box::new(release_error)),
+                )?;
                 return Err(StorageUploadError::Api(Box::new(error)));
             }
         };
@@ -229,6 +231,7 @@ where
             .store
             .complete_storage_upload(
                 intent_id,
+                owner_token,
                 NewStorageObject {
                     asset_id: input.asset_id,
                     provider: TELEGRAM_STORAGE_PROVIDER.to_owned(),
@@ -244,7 +247,7 @@ where
             Ok(object) => object,
             Err(error) => {
                 self.store
-                    .mark_storage_upload_unknown(intent_id)
+                    .mark_storage_upload_unknown(intent_id, owner_token)
                     .await
                     .map_err(|mark_error| StorageUploadError::Persistence(Box::new(mark_error)))?;
                 return Err(StorageUploadError::Persistence(Box::new(error)));
@@ -476,12 +479,16 @@ mod tests {
                 return Ok(StorageUploadReservation::InProgress);
             }
             *reserved = true;
-            Ok(StorageUploadReservation::Reserved { intent_id: Uuid::from_u128(3) })
+            Ok(StorageUploadReservation::Reserved {
+                intent_id: Uuid::from_u128(3),
+                owner_token: Uuid::from_u128(5),
+            })
         }
 
         async fn complete_storage_upload(
             &self,
             _intent_id: Uuid,
+            _owner_token: Uuid,
             object: NewStorageObject,
         ) -> Result<StorageObject, Self::Error> {
             if *self.complete_fail.lock().expect("mock mutex should not be poisoned") {
@@ -504,12 +511,20 @@ mod tests {
             Ok(object)
         }
 
-        async fn release_storage_upload(&self, _intent_id: Uuid) -> Result<(), Self::Error> {
+        async fn release_storage_upload(
+            &self,
+            _intent_id: Uuid,
+            _owner_token: Uuid,
+        ) -> Result<(), Self::Error> {
             *self.released.lock().expect("mock mutex should not be poisoned") = true;
             Ok(())
         }
 
-        async fn mark_storage_upload_unknown(&self, _intent_id: Uuid) -> Result<(), Self::Error> {
+        async fn mark_storage_upload_unknown(
+            &self,
+            _intent_id: Uuid,
+            _owner_token: Uuid,
+        ) -> Result<(), Self::Error> {
             *self.unknown.lock().expect("mock mutex should not be poisoned") = true;
             Ok(())
         }

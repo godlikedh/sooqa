@@ -6,7 +6,8 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use sooqa_media::{DownloadError, SourceDownloader, SourceInput, SourceInspection};
+use sooqa_inbox::SourceInspection;
+use sooqa_media::{DownloadError, SourceDownloader, SourceInput};
 
 #[derive(Clone)]
 pub struct FakeSourceDownloader {

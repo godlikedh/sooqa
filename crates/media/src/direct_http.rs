@@ -14,6 +14,7 @@ use reqwest::{
 use serde_json::json;
 use tokio::{fs::File, io::AsyncWriteExt, net::lookup_host};
 use url::{Host, Url};
+use uuid::Uuid;
 
 use crate::{
     DownloadError, DownloadLimits, DownloadedSource, SourceDownloader, SourceInput,
@@ -268,20 +269,34 @@ impl SourceDownloader for DirectHttpDownloader {
         }
 
         let mime_type = content_type(&response);
-        let file = File::create(destination).await.map_err(|error| {
-            DownloadError::terminal(
-                "destination_io",
-                format!("could not create destination: {error}"),
-            )
-        })?;
+        let temporary = destination.with_file_name(format!(".sooqa-http-{}.tmp", Uuid::new_v4()));
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await
+            .map_err(|error| {
+                DownloadError::terminal(
+                    "destination_io",
+                    format!("could not reserve temporary destination: {error}"),
+                )
+            })?;
         let result = stream_to_file(response, file, limits.max_bytes).await;
         let bytes = match result {
             Ok(bytes) => bytes,
             Err(error) => {
-                let _ = tokio::fs::remove_file(destination).await;
+                let _ = tokio::fs::remove_file(&temporary).await;
                 return Err(error);
             }
         };
+        if let Err(error) = tokio::fs::hard_link(&temporary, destination).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(DownloadError::terminal(
+                "destination_io",
+                format!("could not publish downloaded source: {error}"),
+            ));
+        }
+        let _ = tokio::fs::remove_file(&temporary).await;
 
         Ok(DownloadedSource { path: PathBuf::from(destination), bytes, mime_type })
     }
