@@ -22,15 +22,16 @@ The repository currently provides:
 
 The composed worker registers `inspect_source` with the SSRF-hardened direct
 HTTP adapter, `download_source` into the shared media workspace, `probe_asset`,
-`normalize_asset`, `compute_fingerprint`, and, when configured,
+`normalize_asset`, `compute_fingerprint`, `check_similarity`, and, when configured,
 `upload_storage_asset`.
 The yt-dlp adapter remains available behind the media boundary but is not yet
 enabled in the production worker because its subprocess egress needs an
 equivalent SSRF boundary. Normalization records a canonical video or static
 image artifact (plus an image thumbnail) and queues `finalize_ingest`;
 finalization creates or reuses the canonical library rows, fingerprints videos
-using the existing ingest JSON metadata, and leaves storage upload/publishing
-as separate boundaries.
+using the existing ingest JSON metadata, scores them against completed videos,
+and writes duplicate candidates using the existing schema. Storage upload and
+publishing remain separate boundaries.
 
 Active documentation is the authority for current behavior:
 

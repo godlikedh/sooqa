@@ -312,6 +312,10 @@ impl NewJob {
         Self::new(JobCommand::ComputeFingerprint(IngestJobPayload { ingest_request_id }))
     }
 
+    pub fn check_similarity(ingest_request_id: Uuid) -> Self {
+        Self::new(JobCommand::CheckSimilarity(IngestJobPayload { ingest_request_id }))
+    }
+
     pub fn finalize_ingest(ingest_request_id: Uuid) -> Self {
         Self::new(JobCommand::FinalizeIngest(IngestJobPayload { ingest_request_id }))
     }

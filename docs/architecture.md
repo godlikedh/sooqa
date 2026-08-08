@@ -92,13 +92,19 @@ reuse the canonical content item, asset, source record, and (for images)
 thumbnail asset, then enters `fingerprinting` and queues the typed
 `compute_fingerprint` job. The video handler extracts the versioned
 `frame_dhash_v1` fingerprint from the canonical normalized video in the
-isolated workspace and stores it in the existing ingest JSON metadata before
-completing the request; images skip the video-only stage and complete normally.
-This metadata placement is an interim schema-compatible composition until the
-planned fingerprint repository slice. The existing storage-upload job remains
-queued for a capable Telegram worker. Audio, animation, and unknown media
-remain terminal `unsupported_media_kind` cases until their dedicated
-normalization paths are implemented.
+isolated workspace and stores it in the existing ingest JSON metadata. Videos
+then enter `similarity_check` and queue the typed `check_similarity` job. That
+handler decodes the persisted fingerprint at the boundary, compares it with
+fingerprints from completed video content, and upserts scored evidence into
+the existing `duplicate_candidates` table before completing the request.
+Images skip the video-only stages and complete normally. This metadata
+placement is an interim schema-compatible composition until the planned
+fingerprint repository slice. Similarity thresholds are currently supplied as
+the typed `SimilarityConfig` default by the worker composition; a separate
+configuration slice can expose them without changing the persistence schema.
+The existing storage-upload job remains queued for a capable Telegram worker.
+Audio, animation, and unknown media remain terminal `unsupported_media_kind`
+cases until their dedicated normalization paths are implemented.
 
 Storage uploads use an idempotency record as a durable intent bound to the
 asset, job, provider, storage chat, and upload generation. A reservation has
@@ -138,7 +144,8 @@ includes all three tools and creates a writable `/var/lib/sooqa/work`.
 ## State of the pipeline
 
 Implemented primitives and boundaries do not imply an end-to-end publisher.
-The remaining composition work is similarity candidate generation, review-facing
-library actions, and Telegram publication. The historical roadmap in
+The current ingest path reaches scored duplicate candidates for videos and
+normalizes images into the Library. The remaining composition work is
+review-facing library actions and Telegram publication. The historical roadmap in
 `docs/reference/PROJECT_SPEC.md` is useful context but is not the authority for
 those claims.

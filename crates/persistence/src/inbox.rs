@@ -523,6 +523,7 @@ impl InboxRepository {
             return Ok(request);
         }
 
+        let should_check_similarity = fingerprint.is_some();
         if let Some(fingerprint) = fingerprint {
             if let Some(object) = request.original_input.as_object_mut() {
                 object.insert("fingerprint".to_owned(), fingerprint);
@@ -533,10 +534,15 @@ impl InboxRepository {
                 });
             }
         }
-        request.transition_to(IngestStatus::Completed)?;
+        let next_status = if should_check_similarity {
+            IngestStatus::SimilarityCheck
+        } else {
+            IngestStatus::Completed
+        };
+        request.transition_to(next_status)?;
         request.error_code = None;
         request.error_message = None;
-        request.completed_at = Some(OffsetDateTime::now_utc());
+        request.completed_at = (!should_check_similarity).then(OffsetDateTime::now_utc);
         request.updated_at = OffsetDateTime::now_utc();
         sqlx::query(
             "UPDATE ingest_requests SET original_input = $2, updated_at = $3 WHERE id = $1",
@@ -547,8 +553,86 @@ impl InboxRepository {
         .execute(&mut *transaction)
         .await?;
         update_ingest_state(&mut transaction, &request).await?;
+        if should_check_similarity {
+            insert_similarity_job(&mut transaction, &request).await?;
+        }
         transaction.commit().await?;
         Ok(request)
+    }
+
+    pub async fn begin_ingest_similarity(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+    ) -> Result<IngestSimilarityStart, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        let start = if !lock_current_job_attempt(&mut transaction, attempt).await? {
+            IngestSimilarityStart::AlreadyAdvanced(request)
+        } else {
+            match request.status {
+                IngestStatus::SimilarityCheck => IngestSimilarityStart::Ready(request),
+                IngestStatus::FailedRetryable => {
+                    request.transition_to(IngestStatus::SimilarityCheck)?;
+                    request.error_code = None;
+                    request.error_message = None;
+                    request.completed_at = None;
+                    request.updated_at = OffsetDateTime::now_utc();
+                    update_ingest_state(&mut transaction, &request).await?;
+                    IngestSimilarityStart::Ready(request)
+                }
+                _ => IngestSimilarityStart::AlreadyAdvanced(request),
+            }
+        };
+        transaction.commit().await?;
+        Ok(start)
+    }
+
+    pub async fn complete_ingest_similarity(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        if request.status != IngestStatus::SimilarityCheck
+            || !lock_current_job_attempt(&mut transaction, attempt).await?
+        {
+            transaction.commit().await?;
+            return Ok(request);
+        }
+
+        request.transition_to(IngestStatus::Storing)?;
+        request.transition_to(IngestStatus::Completed)?;
+        request.error_code = None;
+        request.error_message = None;
+        request.completed_at = Some(OffsetDateTime::now_utc());
+        request.updated_at = OffsetDateTime::now_utc();
+        update_ingest_state(&mut transaction, &request).await?;
+        transaction.commit().await?;
+        Ok(request)
+    }
+
+    pub async fn fail_ingest_similarity(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+        status: IngestStatus,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        self.fail_ingest_step(
+            id,
+            status,
+            error_code,
+            error_message,
+            IngestFailureGuard {
+                ignore_completed_download: false,
+                attempt: Some(attempt),
+                expected_status: Some(IngestStatus::SimilarityCheck),
+            },
+        )
+        .await
     }
 
     pub async fn fail_ingest_fingerprint(
@@ -821,6 +905,12 @@ pub enum IngestFingerprintStart {
     AlreadyAdvanced(IngestRequest),
 }
 
+#[derive(Debug, Clone)]
+pub enum IngestSimilarityStart {
+    Ready(IngestRequest),
+    AlreadyAdvanced(IngestRequest),
+}
+
 struct IngestFailureGuard<'a> {
     ignore_completed_download: bool,
     attempt: Option<&'a JobAttempt>,
@@ -989,6 +1079,26 @@ async fn insert_fingerprint_job(
     .bind(job.job_type().as_str())
     .bind(job.payload_json())
     .bind(format!("ingest:{}:compute_fingerprint:v1", request.id))
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn insert_similarity_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &IngestRequest,
+) -> Result<(), sqlx::Error> {
+    let job = NewJob::check_similarity(request.id);
+    sqlx::query(
+        r#"
+        INSERT INTO jobs (job_type, payload_json, idempotency_key)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+        "#,
+    )
+    .bind(job.job_type().as_str())
+    .bind(job.payload_json())
+    .bind(format!("ingest:{}:check_similarity:v1", request.id))
     .execute(&mut **transaction)
     .await?;
     Ok(())

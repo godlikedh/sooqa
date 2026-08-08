@@ -21,9 +21,52 @@ pub struct LibraryRepository {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredVideoFingerprint {
+    pub content_item_id: Uuid,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub audio_codec: Option<String>,
+    pub fingerprint: Value,
+}
+
 impl LibraryRepository {
     pub(crate) fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn list_stored_video_fingerprints(
+        &self,
+        exclude_content_item_id: Uuid,
+        algorithm_version: &str,
+    ) -> Result<Vec<StoredVideoFingerprint>, LibraryRepositoryError> {
+        let rows = sqlx::query_as::<_, StoredVideoFingerprintRow>(
+            r#"
+            SELECT DISTINCT ON (ci.id)
+                ci.id AS content_item_id,
+                ma.width,
+                ma.height,
+                ma.audio_codec,
+                ir.original_input->'fingerprint' AS fingerprint
+            FROM content_items ci
+            JOIN media_assets ma
+              ON ma.id = ci.canonical_asset_id
+             AND ma.role = 'canonical'
+             AND ma.media_kind = 'video'
+            JOIN source_records sr ON sr.content_item_id = ci.id
+            JOIN ingest_requests ir ON ir.id = sr.ingest_request_id
+            WHERE ci.kind = 'video'
+              AND ci.id <> $1
+              AND ir.status = 'completed'
+              AND ir.original_input->'fingerprint'->>'version' = $2
+            ORDER BY ci.id, ir.updated_at DESC, sr.retrieved_at DESC
+            "#,
+        )
+        .bind(exclude_content_item_id)
+        .bind(algorithm_version)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(StoredVideoFingerprintRow::into_stored).collect())
     }
 
     pub async fn list_storage_upload_intents(
@@ -2417,6 +2460,27 @@ struct StorageUploadAttachmentRow {
 impl StorageUploadAttachmentRow {
     fn state(&self) -> Option<&str> {
         self.response_body.as_ref().and_then(|body| body.get("state")).and_then(Value::as_str)
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct StoredVideoFingerprintRow {
+    content_item_id: Uuid,
+    width: Option<i32>,
+    height: Option<i32>,
+    audio_codec: Option<String>,
+    fingerprint: Value,
+}
+
+impl StoredVideoFingerprintRow {
+    fn into_stored(self) -> StoredVideoFingerprint {
+        StoredVideoFingerprint {
+            content_item_id: self.content_item_id,
+            width: self.width,
+            height: self.height,
+            audio_codec: self.audio_codec,
+            fingerprint: self.fingerprint,
+        }
     }
 }
 

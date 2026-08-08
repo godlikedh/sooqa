@@ -15,12 +15,12 @@ use sooqa_jobs::{Job, JobType, NewJob};
 use sooqa_media::{
     CanonicalImageProfile, CanonicalVideoProfile, CommandError, ExternalCommand,
     ExternalCommandOutput, ExternalCommandRunner, FfmpegExecutor, FfprobeAdapter, FrameExtractor,
-    ImageNormalizer, MediaWorkspace, NormalizationPlanner, WorkspaceArea,
+    ImageNormalizer, MediaWorkspace, NormalizationPlanner, SimilarityConfig, WorkspaceArea,
 };
 use sooqa_persistence::Database;
 use sooqa_worker::{
-    HandlerFuture, HandlerRegistry, Worker, compute_fingerprint_handler, finalize_ingest_handler,
-    normalize_asset_handler, probe_asset_handler,
+    HandlerFuture, HandlerRegistry, Worker, check_similarity_handler, compute_fingerprint_handler,
+    finalize_ingest_handler, normalize_asset_handler, probe_asset_handler,
 };
 use tokio::{
     sync::{Mutex, Notify, oneshot},
@@ -784,6 +784,23 @@ async fn normalize_handler_executes_ffmpeg_and_enqueues_finalize() {
         .complete(fingerprint_job.id, "worker-h5-fingerprint")
         .await
         .expect("fingerprint job should complete");
+    let similarity_job = database
+        .jobs()
+        .claim_next("worker-h5-similarity", Duration::from_secs(30), &[JobType::CheckSimilarity])
+        .await
+        .expect("similarity job should be claimable")
+        .expect("similarity job should exist");
+    let similarity_handler =
+        check_similarity_handler(database.inbox(), database.library(), SimilarityConfig::default());
+    similarity_handler(similarity_job.clone()).await.expect("similarity job should succeed");
+    similarity_handler(similarity_job.clone())
+        .await
+        .expect("similarity replay should be idempotent");
+    database
+        .jobs()
+        .complete(similarity_job.id, "worker-h5-similarity")
+        .await
+        .expect("similarity job should complete");
 
     let (status, original_input): (String, serde_json::Value) =
         sqlx::query_as("SELECT status, original_input FROM ingest_requests WHERE id = $1")
@@ -940,6 +957,233 @@ async fn normalize_handler_executes_ffmpeg_and_enqueues_finalize() {
         .expect("Telegram ingest should be cleaned up");
     workspace.cleanup().await.expect("workspace should be cleaned");
     tokio::fs::remove_dir_all(work_root).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
+async fn check_similarity_handler_creates_and_replays_duplicate_candidate() {
+    let _test_guard = integration_test_lock().await;
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+
+    let prefix = format!("h7-similarity-{}", Uuid::new_v4());
+    let prior_request_id = Uuid::new_v4();
+    let current_request_id = Uuid::new_v4();
+    let prior_content_id = Uuid::new_v4();
+    let current_content_id = Uuid::new_v4();
+    let prior_asset_id = Uuid::new_v4();
+    let current_asset_id = Uuid::new_v4();
+
+    let fingerprint = serde_json::json!({
+        "version": "frame_dhash_v1",
+        "duration_ms": 1_000,
+        "frames": [
+            {"timestamp_ms": 500, "ratio_bps": 500, "hash": 81985529216486895_u64},
+            {"timestamp_ms": 1_500, "ratio_bps": 1_500, "hash": 81985529216486895_u64},
+        ]
+    });
+    let normalization = |asset_id: Uuid| {
+        serde_json::json!({
+            "local_work_path": format!("/var/lib/sooqa/work/jobs/{asset_id}/normalized/canonical.mp4"),
+            "file_size_bytes": 8,
+            "sha256": "0101010101010101010101010101010101010101010101010101010101010101",
+            "media_kind": "video",
+            "mime_type": "video/mp4",
+            "container": "mp4",
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "width": 320,
+            "height": 240,
+            "duration_ms": 1_000,
+            "bit_rate": 100_000
+        })
+    };
+    let prior_input = serde_json::json!({
+        "normalization": normalization(prior_asset_id),
+        "finalization": {
+            "content_item_id": prior_content_id,
+            "canonical_asset_id": prior_asset_id
+        },
+        "fingerprint": fingerprint.clone()
+    });
+    let current_input = serde_json::json!({
+        "normalization": normalization(current_asset_id),
+        "finalization": {
+            "content_item_id": current_content_id,
+            "canonical_asset_id": current_asset_id
+        },
+        "fingerprint": fingerprint
+    });
+
+    for (request_id, status, input, idempotency_key) in [
+        (prior_request_id, "completed", prior_input, format!("{prefix}-prior-request")),
+        (
+            current_request_id,
+            "similarity_check",
+            current_input,
+            format!("{prefix}-current-request"),
+        ),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO ingest_requests (
+                id, kind, status, submitted_via, original_input, source_url,
+                idempotency_key, completed_at
+            )
+            VALUES ($1, 'telegram_message', $2, 'telegram_bot', $3, $4, $5,
+                    CASE WHEN $2 = 'completed' THEN now() ELSE NULL END)
+            "#,
+        )
+        .bind(request_id)
+        .bind(status)
+        .bind(input)
+        .bind(format!("telegram://fixture/{request_id}"))
+        .bind(idempotency_key)
+        .execute(database.pool())
+        .await
+        .expect("similarity ingest fixture should be inserted");
+    }
+
+    sqlx::query("INSERT INTO content_items (id, kind) VALUES ($1, 'video'), ($2, 'video')")
+        .bind(prior_content_id)
+        .bind(current_content_id)
+        .execute(database.pool())
+        .await
+        .expect("similarity content fixtures should be inserted");
+    for (content_id, asset_id, sha256) in [
+        (prior_content_id, prior_asset_id, vec![1_u8; 32]),
+        (current_content_id, current_asset_id, vec![2_u8; 32]),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO media_assets (
+                id, content_item_id, role, media_kind, mime_type, container,
+                video_codec, audio_codec, width, height, duration_ms,
+                file_size_bytes, sha256, local_work_path, storage_state
+            )
+            VALUES ($1, $2, 'canonical', 'video', 'video/mp4', 'mp4',
+                    'h264', 'aac', 320, 240, 1000, 8, $3, $4, 'local')
+            "#,
+        )
+        .bind(asset_id)
+        .bind(content_id)
+        .bind(sha256)
+        .bind(format!("/var/lib/sooqa/work/jobs/{asset_id}/normalized/canonical.mp4"))
+        .execute(database.pool())
+        .await
+        .expect("similarity media fixture should be inserted");
+        sqlx::query("UPDATE content_items SET canonical_asset_id = $2 WHERE id = $1")
+            .bind(content_id)
+            .bind(asset_id)
+            .execute(database.pool())
+            .await
+            .expect("similarity canonical pointer should be set");
+    }
+    for (content_id, request_id, platform_id) in [
+        (prior_content_id, prior_request_id, format!("{prefix}-prior-source")),
+        (current_content_id, current_request_id, format!("{prefix}-current-source")),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO source_records (
+                content_item_id, ingest_request_id, source_type, platform,
+                platform_content_id, metadata_json
+            )
+            VALUES ($1, $2, 'telegram', 'telegram', $3, '{}'::jsonb)
+            "#,
+        )
+        .bind(content_id)
+        .bind(request_id)
+        .bind(platform_id)
+        .execute(database.pool())
+        .await
+        .expect("similarity source fixture should be inserted");
+    }
+
+    let job = database
+        .jobs()
+        .enqueue(
+            NewJob::check_similarity(current_request_id)
+                .idempotency_key(format!("{prefix}-similarity-job")),
+        )
+        .await
+        .expect("similarity job should be enqueued")
+        .clone();
+    let claimed_job = database
+        .jobs()
+        .claim_next("worker-h7-similarity", Duration::from_secs(30), &[JobType::CheckSimilarity])
+        .await
+        .expect("similarity job should be claimable")
+        .expect("similarity job should exist");
+    assert_eq!(claimed_job.id, job.id);
+
+    let handler =
+        check_similarity_handler(database.inbox(), database.library(), SimilarityConfig::default());
+    handler(claimed_job.clone()).await.expect("similarity job should succeed");
+    handler(claimed_job.clone()).await.expect("similarity replay should be idempotent");
+    database
+        .jobs()
+        .complete(claimed_job.id, "worker-h7-similarity")
+        .await
+        .expect("similarity job should complete");
+
+    let candidate = database
+        .library()
+        .find_duplicate_candidate(current_content_id, prior_content_id, "frame_dhash_v1")
+        .await
+        .expect("duplicate candidate should be queryable")
+        .expect("similar videos should produce a duplicate candidate");
+    assert_eq!(candidate.score_basis_points, 10_000);
+    assert_eq!(candidate.status.as_str(), "pending");
+    assert_eq!(candidate.evidence_json["algorithm_version"], "frame_dhash_v1");
+    assert_eq!(candidate.evidence_json["frame_distances"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM ingest_requests WHERE id = $1")
+            .bind(current_request_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("current ingest status should be queryable"),
+        "completed"
+    );
+
+    sqlx::query("DELETE FROM jobs WHERE idempotency_key LIKE $1")
+        .bind(format!("{prefix}%"))
+        .execute(database.pool())
+        .await
+        .expect("similarity jobs should clean up");
+    sqlx::query("DELETE FROM source_records WHERE content_item_id IN ($1, $2)")
+        .bind(prior_content_id)
+        .bind(current_content_id)
+        .execute(database.pool())
+        .await
+        .expect("similarity sources should clean up");
+    sqlx::query("UPDATE content_items SET canonical_asset_id = NULL WHERE id IN ($1, $2)")
+        .bind(prior_content_id)
+        .bind(current_content_id)
+        .execute(database.pool())
+        .await
+        .expect("similarity canonical pointers should clean up");
+    sqlx::query("DELETE FROM media_assets WHERE id IN ($1, $2)")
+        .bind(prior_asset_id)
+        .bind(current_asset_id)
+        .execute(database.pool())
+        .await
+        .expect("similarity assets should clean up");
+    sqlx::query("DELETE FROM content_items WHERE id IN ($1, $2)")
+        .bind(prior_content_id)
+        .bind(current_content_id)
+        .execute(database.pool())
+        .await
+        .expect("similarity content should clean up");
+    sqlx::query("DELETE FROM ingest_requests WHERE id IN ($1, $2)")
+        .bind(prior_request_id)
+        .bind(current_request_id)
+        .execute(database.pool())
+        .await
+        .expect("similarity ingests should clean up");
 }
 
 #[tokio::test]
