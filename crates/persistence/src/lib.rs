@@ -4,6 +4,7 @@ mod device_tokens;
 mod inbox;
 mod jobs;
 mod library;
+mod publisher;
 mod telegram;
 
 pub use device_tokens::{
@@ -16,6 +17,7 @@ pub use inbox::{
 };
 pub use jobs::{JobRepository, JobRepositoryError};
 pub use library::{LibraryRepository, LibraryRepositoryError, StoredVideoFingerprint};
+pub use publisher::{PublisherRepository, PublisherRepositoryError};
 pub use telegram::{
     TelegramRepository, TelegramRepositoryError, TelegramUpdateClaim, TelegramUpdateClaimResult,
     TelegramUpdateReceipt,
@@ -75,6 +77,10 @@ impl Database {
 
     pub fn library(&self) -> LibraryRepository {
         LibraryRepository::new(self.pool.clone())
+    }
+
+    pub fn publisher(&self) -> PublisherRepository {
+        PublisherRepository::new(self.pool.clone())
     }
 
     pub fn telegram(&self) -> TelegramRepository {

@@ -13,8 +13,15 @@ DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa \
 Migration 0009 adds storage reservation ownership/expiry, media digest checks,
 canonical-asset triggers, and job lease/attempt invariants. Migration 0010
 binds storage intents to their asset, job, provider, chat, and upload
-generation. Deploy both migrations before deploying code that relies on those
-columns.
+generation. Migration 0011 adds the Publisher target-channel, policy, draft,
+schedule, attempt, and published-post tables. Migration 0012 adds the default
+used by the running-attempt repository path while preserving upgrades from
+databases that already applied 0011. Migration 0013 adds ambiguous-publication
+state, one-running-attempt protection, and database-level asset/content
+ownership constraints. Deploy all forward migrations before deploying code
+that relies on those columns or tables. These Publisher tables are durable
+foundation only; the scheduler and Telegram publication handler are not
+enabled yet.
 
 ## Worker
 

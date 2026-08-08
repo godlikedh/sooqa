@@ -23,8 +23,10 @@ database and a configured media work root.
   only boundary that performs durable state changes.
 - `sooqa-api` owns HTTP routes, bearer-token scopes, stable errors, and request
   limits.
-- `sooqa-publisher` is reserved for the future publication boundary and is not
-  part of the current runtime.
+- `sooqa-publisher` owns publication domain types and state transitions for
+  target channels, channel policies, post drafts, schedules, attempts, and
+  published-post history. The Telegram publication handler is not composed
+  yet.
 
 `apps/server` composes HTTP, Telegram polling, and configuration.
 `apps/worker` composes registered job handlers and the durable worker loop.
@@ -120,6 +122,30 @@ creates a new upload generation with a new idempotency key. Attach accepts only
 Telegram result fields and derives the asset, provider, and media kind from
 the locked durable intent and canonical asset.
 
+## Publisher foundation
+
+The Publisher boundary now has durable state for the next composition slice:
+
+```mermaid
+flowchart LR
+    CONTENT[(Library content + assets)] --> DRAFT[Post draft]
+    CHANNEL[Target channel] --> POLICY[Channel policy]
+    DRAFT --> SCHEDULE[Publication schedule]
+    SCHEDULE --> ATTEMPT[Publication attempt history]
+    SCHEDULE --> POST[Published post history]
+```
+
+Persistence validates the draft's asset/content relationship, restricts draft
+and schedule state transitions, atomically moves a ready draft to scheduled,
+and preserves schedule creation idempotency by request key. Due schedules are
+ordered durably; publication attempts retain Telegram request keys and
+responses, and an ambiguous result moves the schedule out of the automatic
+retry queue until it is explicitly reconciled. Successful publication records
+the attempt, schedule, draft, and Telegram message history in one transaction.
+The remaining composition is the draft/schedule API, a scheduler, and a
+Telegram publication handler; no network publication happens in this
+foundation slice.
+
 ## Filesystem and subprocess safety
 
 Every media job gets a restrictive workspace under `media.work_root`; workspace
@@ -145,7 +171,8 @@ includes all three tools and creates a writable `/var/lib/sooqa/work`.
 
 Implemented primitives and boundaries do not imply an end-to-end publisher.
 The current ingest path reaches scored duplicate candidates for videos and
-normalizes images into the Library. The remaining composition work is
-review-facing library actions and Telegram publication. The historical roadmap in
+normalizes images into the Library. Publisher persistence is now ready for
+review-facing actions and scheduling; the remaining composition work is the
+Publisher API, scheduler, and Telegram publication. The historical roadmap in
 `docs/reference/PROJECT_SPEC.md` is useful context but is not the authority for
 those claims.

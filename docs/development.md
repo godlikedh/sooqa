@@ -35,10 +35,12 @@ just test-integration
 The `-- --ignored` part is intentional: Cargo uses the first `--` to stop
 parsing Cargo test options and passes `--ignored` to the test harness, which
 then runs tests marked `#[ignore]`. The integration recipe covers persistence,
-API ingest and library routes, worker behavior, source inspection, source
+API ingest and library routes, Publisher repositories, worker behavior, source
 download handoff, probe-to-normalize handoff, fake-runner normalization,
 canonical library finalization, video fingerprint extraction, similarity
-candidate generation, and the storage-upload job handoff.
+candidate generation, the storage-upload job handoff, and the Publisher
+schedule/attempt/history round trip, including concurrent idempotency,
+ambiguous-result reconciliation, and atomic publication completion.
 
 The current `teloxide` dependency graph also emits a known Rust
 future-incompatibility warning for the transitive `proc-macro-error2` crate
