@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use sooqa_media::SourceInspection;
+use sooqa_inbox::SourceInspection;
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -155,6 +155,13 @@ pub struct AssetJobPayload {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct StorageUploadAssetPayload {
+    pub asset_id: Uuid,
+    pub generation: i32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmptyJobPayload {}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -166,7 +173,7 @@ pub enum JobCommand {
     NormalizeAsset(IngestJobPayload),
     ComputeFingerprint(IngestJobPayload),
     CheckSimilarity(IngestJobPayload),
-    UploadStorageAsset(AssetJobPayload),
+    UploadStorageAsset(StorageUploadAssetPayload),
     FinalizeIngest(IngestJobPayload),
     PublishPost(PublishPostPayload),
     VerifyStorageObject(AssetJobPayload),
@@ -208,7 +215,9 @@ impl JobCommand {
             JobType::NormalizeAsset => decode!(IngestJobPayload, NormalizeAsset),
             JobType::ComputeFingerprint => decode!(IngestJobPayload, ComputeFingerprint),
             JobType::CheckSimilarity => decode!(IngestJobPayload, CheckSimilarity),
-            JobType::UploadStorageAsset => decode!(AssetJobPayload, UploadStorageAsset),
+            JobType::UploadStorageAsset => {
+                decode!(StorageUploadAssetPayload, UploadStorageAsset)
+            }
             JobType::FinalizeIngest => decode!(IngestJobPayload, FinalizeIngest),
             JobType::PublishPost => decode!(PublishPostPayload, PublishPost),
             JobType::VerifyStorageObject => decode!(AssetJobPayload, VerifyStorageObject),
@@ -281,7 +290,14 @@ impl NewJob {
     }
 
     pub fn upload_storage_asset(asset_id: Uuid) -> Self {
-        Self::new(JobCommand::UploadStorageAsset(AssetJobPayload { asset_id }))
+        Self::upload_storage_asset_generation(asset_id, 0)
+    }
+
+    pub fn upload_storage_asset_generation(asset_id: Uuid, generation: i32) -> Self {
+        Self::new(JobCommand::UploadStorageAsset(StorageUploadAssetPayload {
+            asset_id,
+            generation,
+        }))
     }
 
     pub fn probe_asset(ingest_request_id: Uuid) -> Self {

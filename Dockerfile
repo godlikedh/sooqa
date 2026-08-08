@@ -8,7 +8,9 @@ FROM debian:bookworm-slim
 
 RUN groupadd --system sooqa && useradd --system --gid sooqa sooqa \
     && apt-get update \
-    && apt-get install --no-install-recommends --yes ca-certificates \
+    && apt-get install --no-install-recommends --yes ca-certificates ffmpeg yt-dlp \
+    && mkdir -p /var/lib/sooqa/work \
+    && chown -R sooqa:sooqa /var/lib/sooqa \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/sooqa/target/release/sooqa-server /usr/local/bin/sooqa-server

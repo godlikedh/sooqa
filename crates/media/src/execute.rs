@@ -1,8 +1,15 @@
-use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
+use crate::publication::{TempArtifact, publish_or_reuse};
 use crate::{
     CommandError, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommandRunner, FfprobeAdapter, FileDigest,
     HashError, MediaProbe, MediaStreamKind, NormalizationPlan, ProbeError, sha256_file,
@@ -141,8 +148,39 @@ impl FfmpegExecutor {
     where
         F: Future<Output = ()> + Send,
     {
+        let output_path = plan.output().to_owned();
+        let temporary_path = temporary_output_path(&output_path);
+        let mut temporary = TempArtifact::reserve(temporary_path).await.map_err(|source| {
+            NormalizationExecutionError::TemporaryOutput { path: output_path.clone(), source }
+        })?;
+
+        let result = self.execute_inner(plan, temporary.path(), cancellation).await;
+        match result {
+            Ok((progress, probe, digest)) => {
+                publish_or_reuse(temporary.path(), &output_path).await.map_err(|error| {
+                    NormalizationExecutionError::OutputPublish {
+                        path: output_path.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
+                temporary.remove().await;
+                Ok(NormalizationResult { output_path, progress, probe, digest })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn execute_inner<F>(
+        &self,
+        plan: &NormalizationPlan,
+        output_path: &Path,
+        cancellation: F,
+    ) -> Result<(FfmpegProgress, MediaProbe, FileDigest), NormalizationExecutionError>
+    where
+        F: Future<Output = ()> + Send,
+    {
         let command = plan
-            .command_with_progress()
+            .command_with_progress_for_output(output_path)
             .timeout(self.timeout)
             .max_output_bytes(self.max_output_bytes);
         tokio::pin!(cancellation);
@@ -167,19 +205,28 @@ impl FfmpegExecutor {
             return Err(NormalizationExecutionError::ProgressDidNotEnd);
         }
 
-        let output_path = plan.output().to_owned();
-        let metadata = tokio::fs::metadata(&output_path).await.map_err(|source| {
-            NormalizationExecutionError::OutputFile { path: output_path.clone(), source }
+        let metadata = tokio::fs::metadata(output_path).await.map_err(|source| {
+            NormalizationExecutionError::OutputFile { path: output_path.to_owned(), source }
         })?;
         if !metadata.is_file() || metadata.len() == 0 {
-            return Err(NormalizationExecutionError::InvalidOutput { path: output_path });
+            return Err(NormalizationExecutionError::InvalidOutput {
+                path: output_path.to_owned(),
+            });
         }
 
-        let probe = self.ffprobe.probe(&output_path).await?;
+        let probe = self.ffprobe.probe(output_path).await?;
         validate_output_probe(&probe)?;
-        let digest = sha256_file(&output_path).await?;
-        Ok(NormalizationResult { output_path, progress, probe, digest })
+        let digest = sha256_file(output_path).await?;
+        Ok((progress, probe, digest))
     }
+}
+
+fn temporary_output_path(output: &Path) -> PathBuf {
+    let file_name = match output.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => format!(".sooqa-normalize-{}.{}", Uuid::new_v4(), extension),
+        None => format!(".sooqa-normalize-{}.tmp", Uuid::new_v4()),
+    };
+    output.with_file_name(file_name)
 }
 
 fn validate_output_probe(probe: &MediaProbe) -> Result<(), NormalizationExecutionError> {
@@ -236,6 +283,10 @@ pub enum NormalizationExecutionError {
     ProgressDidNotEnd,
     #[error("could not inspect normalized output {path}: {source}")]
     OutputFile { path: PathBuf, source: std::io::Error },
+    #[error("could not reserve temporary normalized output {path}: {source}")]
+    TemporaryOutput { path: PathBuf, source: std::io::Error },
+    #[error("could not publish normalized output {path}: {message}")]
+    OutputPublish { path: PathBuf, message: String },
     #[error("normalized output is missing or empty: {path}")]
     InvalidOutput { path: PathBuf },
     #[error("normalized output has an unsupported container: {format:?}")]
@@ -306,11 +357,25 @@ mod tests {
             command: ExternalCommand,
         ) -> Result<ExternalCommandOutput, CommandError> {
             self.commands.lock().expect("commands mutex should not be poisoned").push(command);
-            self.outputs
+            let output = self
+                .outputs
                 .lock()
                 .expect("outputs mutex should not be poisoned")
                 .pop_front()
-                .expect("test runner should have an output")
+                .expect("test runner should have an output")?;
+            let output_path = {
+                let commands = self.commands.lock().expect("commands mutex should not be poisoned");
+                let command = commands.last().expect("command should have been recorded");
+                command.args().iter().any(|argument| argument == "-progress").then(|| {
+                    PathBuf::from(command.args().last().expect("ffmpeg output should be present"))
+                })
+            };
+            if let Some(output_path) = output_path {
+                tokio::fs::write(output_path, b"canonical output")
+                    .await
+                    .expect("fake ffmpeg should write its output");
+            }
+            Ok(output)
         }
     }
 
@@ -391,10 +456,9 @@ mod tests {
     async fn executes_plan_probes_output_and_hashes_it() {
         let output_path =
             std::env::temp_dir().join(format!("sooqa-normalized-{}.mp4", uuid::Uuid::new_v4()));
-        tokio::fs::write(&output_path, b"canonical output")
-            .await
-            .expect("output should be writable");
         let runner = Arc::new(SequenceRunner::new(vec![
+            success(b"frame=25\nout_time_ms=1000000\nprogress=end\n"),
+            success(PROBE_JSON),
             success(b"frame=25\nout_time_ms=1000000\nprogress=end\n"),
             success(PROBE_JSON),
         ]));
@@ -420,7 +484,12 @@ mod tests {
         assert_eq!(result.progress.state, FfmpegProgressState::End);
         assert_eq!(result.probe.container_format.as_deref(), Some("mov,mp4,m4a,3gp,3g2,mj2"));
         assert_eq!(result.digest.bytes, b"canonical output".len() as u64);
-        assert_eq!(runner.commands.lock().expect("commands mutex should not be poisoned").len(), 2);
+        let replayed = executor
+            .execute(&plan, std::future::pending())
+            .await
+            .expect("retry should reuse the validated published output");
+        assert_eq!(replayed.digest, result.digest);
+        assert_eq!(runner.commands.lock().expect("commands mutex should not be poisoned").len(), 4);
         let ffmpeg_args = runner.commands.lock().expect("commands mutex should not be poisoned")[0]
             .args()
             .iter()
@@ -445,8 +514,9 @@ mod tests {
             Duration::from_secs(10),
             DEFAULT_MAX_OUTPUT_BYTES,
         );
-        let output =
-            std::env::temp_dir().join(format!("sooqa-cancel-{}.mp4", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("sooqa-cancel-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.expect("test root should be created");
+        let output = root.join("canonical.mp4");
         let plan = planner().plan("input.mp4", &output, &probe()).expect("plan should build");
 
         let error = executor
@@ -454,6 +524,16 @@ mod tests {
             .await
             .expect_err("cancellation should stop execution");
         assert!(matches!(error, NormalizationExecutionError::Cancelled));
+        assert!(!output.exists());
+        let mut entries = tokio::fs::read_dir(&root).await.expect("test root should be readable");
+        while let Some(entry) = entries.next_entry().await.expect("directory should be readable") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".sooqa-normalize-"),
+                "ffmpeg temporary output was left behind"
+            );
+        }
+        tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
     }
 
     #[tokio::test]
@@ -490,6 +570,7 @@ mod tests {
             error,
             NormalizationExecutionError::ProcessFailed { exit_code: Some(1), .. }
         ));
+        assert!(!output.exists());
     }
 
     #[tokio::test]

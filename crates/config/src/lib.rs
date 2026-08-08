@@ -21,6 +21,7 @@ const DEFAULT_YTDLP_FORMAT: &str = "bestvideo*+bestaudio/best";
 const DEFAULT_MEDIA_WORK_ROOT: &str = "/var/lib/sooqa/work";
 const DEFAULT_TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
 const DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_LEVEL: &str = "info";
 
@@ -31,9 +32,29 @@ pub enum AppRole {
     Companion,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CliCommand {
     Migrate,
+    StorageIntents(StorageIntentCommand),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum StorageIntentCommand {
+    List,
+    MarkUnknown {
+        intent_id: String,
+        force: bool,
+    },
+    Reset {
+        intent_id: String,
+    },
+    Attach {
+        intent_id: String,
+        storage_chat_id: String,
+        storage_message_id: String,
+        telegram_file_id: String,
+        telegram_file_unique_id: String,
+    },
 }
 
 impl fmt::Display for AppRole {
@@ -63,16 +84,19 @@ impl CliOptions {
         let mut check_config = false;
         let mut command = None;
         let mut config_path = None;
-        let mut arguments = arguments.into_iter();
+        let mut arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>().into_iter();
 
         while let Some(argument) = arguments.next() {
-            let argument = argument.into();
             match argument.as_str() {
                 "--check-config" => check_config = true,
                 "migrate" => command = Some(CliCommand::Migrate),
+                "storage-intents" => {
+                    command = Some(CliCommand::StorageIntents(parse_storage_intent_command(
+                        &mut arguments,
+                    )?));
+                }
                 "--config" => {
-                    let path =
-                        arguments.next().ok_or(ConfigError::MissingArgument("--config"))?.into();
+                    let path = arguments.next().ok_or(ConfigError::MissingArgument("--config"))?;
                     config_path = Some(PathBuf::from(path));
                 }
                 "--help" | "-h" => return Err(ConfigError::HelpRequested),
@@ -82,6 +106,60 @@ impl CliOptions {
 
         Ok(Self { check_config, command, config_path })
     }
+}
+
+fn parse_storage_intent_command(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<StorageIntentCommand, ConfigError> {
+    let subcommand =
+        arguments.next().ok_or(ConfigError::MissingArgument("storage-intents command"))?;
+    match subcommand.as_str() {
+        "list" => Ok(StorageIntentCommand::List),
+        "mark-unknown" => {
+            let intent_id =
+                next_storage_argument(arguments, "storage-intents mark-unknown intent-id")?;
+            let force = match arguments.next() {
+                None => false,
+                Some(option) if option == "--force" => {
+                    if arguments.next().as_deref() != Some("--confirm") {
+                        return Err(ConfigError::MissingArgument("--confirm"));
+                    }
+                    true
+                }
+                Some(unknown) => return Err(ConfigError::UnknownArgument(unknown)),
+            };
+            Ok(StorageIntentCommand::MarkUnknown { intent_id, force })
+        }
+        "reset" => {
+            let intent_id = next_storage_argument(arguments, "storage-intents reset intent-id")?;
+            match arguments.next().as_deref() {
+                Some("--confirm") => Ok(StorageIntentCommand::Reset { intent_id }),
+                Some(unknown) => Err(ConfigError::UnknownArgument(unknown.to_owned())),
+                None => Err(ConfigError::MissingArgument("--confirm")),
+            }
+        }
+        "attach" => Ok(StorageIntentCommand::Attach {
+            intent_id: next_storage_argument(arguments, "storage-intents attach intent-id")?,
+            storage_chat_id: next_storage_argument(arguments, "storage-intents attach chat-id")?,
+            storage_message_id: next_storage_argument(
+                arguments,
+                "storage-intents attach message-id",
+            )?,
+            telegram_file_id: next_storage_argument(arguments, "storage-intents attach file-id")?,
+            telegram_file_unique_id: next_storage_argument(
+                arguments,
+                "storage-intents attach file-unique-id",
+            )?,
+        }),
+        unknown => Err(ConfigError::UnknownArgument(unknown.to_owned())),
+    }
+}
+
+fn next_storage_argument(
+    arguments: &mut impl Iterator<Item = String>,
+    name: &'static str,
+) -> Result<String, ConfigError> {
+    arguments.next().ok_or(ConfigError::MissingArgument(name))
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -166,6 +244,7 @@ pub struct TelegramConfig {
     pub api_base_url: String,
     pub admin_user_ids: Vec<i64>,
     pub poll_timeout_seconds: u64,
+    pub max_download_bytes: u64,
     pub storage_chat_id: Option<i64>,
 }
 
@@ -302,6 +381,10 @@ impl AppConfig {
                     .telegram
                     .poll_timeout_seconds
                     .unwrap_or(DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS),
+                max_download_bytes: raw
+                    .telegram
+                    .max_download_bytes
+                    .unwrap_or(DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES),
                 storage_chat_id: raw.telegram.storage_chat_id,
             },
             observability: ObservabilityConfig { log_format, log_level },
@@ -314,7 +397,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.max_download_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -333,6 +416,7 @@ impl AppConfig {
             self.telegram.api_base_url,
             self.telegram.admin_user_ids.len(),
             self.telegram.poll_timeout_seconds,
+            self.telegram.max_download_bytes,
             self.telegram.storage_chat_id,
             self.observability.log_format,
             self.observability.log_level,
@@ -412,6 +496,13 @@ impl AppConfig {
                     reason: "expected a positive integer",
                 })?;
         }
+        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_MAX_DOWNLOAD_BYTES")? {
+            self.telegram.max_download_bytes =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_TELEGRAM_MAX_DOWNLOAD_BYTES".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
+        }
         if let Some(value) = optional_env_string("SOOQA_TELEGRAM_STORAGE_CHAT_ID")? {
             self.telegram.storage_chat_id =
                 Some(value.parse().map_err(|_| ConfigError::InvalidValue {
@@ -481,6 +572,12 @@ impl AppConfig {
         if self.telegram.poll_timeout_seconds == 0 {
             return Err(ConfigError::InvalidValue {
                 name: "telegram.poll_timeout_seconds".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.telegram.max_download_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.max_download_bytes".to_owned(),
                 reason: "must be greater than zero",
             });
         }
@@ -554,6 +651,7 @@ struct RawTelegramConfig {
     api_base_url: Option<String>,
     admin_user_ids: Vec<i64>,
     poll_timeout_seconds: Option<u64>,
+    max_download_bytes: Option<u64>,
     storage_chat_id: Option<i64>,
 }
 
@@ -774,6 +872,67 @@ mod tests {
     }
 
     #[test]
+    fn storage_intent_commands_parse_with_explicit_reset_confirmation() {
+        assert_eq!(
+            CliOptions::parse(["storage-intents", "list"])
+                .expect("list command should parse")
+                .command,
+            Some(CliCommand::StorageIntents(StorageIntentCommand::List))
+        );
+        assert_eq!(
+            CliOptions::parse(["storage-intents", "reset", "intent-id", "--confirm"])
+                .expect("reset command should parse")
+                .command,
+            Some(CliCommand::StorageIntents(StorageIntentCommand::Reset {
+                intent_id: "intent-id".to_owned(),
+            }))
+        );
+        assert!(CliOptions::parse(["storage-intents", "reset", "intent-id"]).is_err());
+    }
+
+    #[test]
+    fn storage_intent_commands_parse_force_and_typed_attach_arguments() {
+        assert_eq!(
+            CliOptions::parse([
+                "storage-intents",
+                "mark-unknown",
+                "intent-id",
+                "--force",
+                "--confirm",
+            ])
+            .expect("forced mark-unknown should parse")
+            .command,
+            Some(CliCommand::StorageIntents(StorageIntentCommand::MarkUnknown {
+                intent_id: "intent-id".to_owned(),
+                force: true,
+            }))
+        );
+        assert_eq!(
+            CliOptions::parse([
+                "storage-intents",
+                "attach",
+                "intent-id",
+                "-100123",
+                "789",
+                "file-id",
+                "unique-id",
+            ])
+            .expect("typed attach should parse")
+            .command,
+            Some(CliCommand::StorageIntents(StorageIntentCommand::Attach {
+                intent_id: "intent-id".to_owned(),
+                storage_chat_id: "-100123".to_owned(),
+                storage_message_id: "789".to_owned(),
+                telegram_file_id: "file-id".to_owned(),
+                telegram_file_unique_id: "unique-id".to_owned(),
+            }))
+        );
+        assert!(
+            CliOptions::parse(["storage-intents", "mark-unknown", "intent-id", "--force"]).is_err()
+        );
+    }
+
+    #[test]
     fn media_binary_paths_are_configurable() {
         let config = AppConfig::from_toml_str(
             AppRole::Worker,
@@ -802,6 +961,7 @@ mod tests {
         assert_eq!(config.telegram.api_base_url, "http://telegram-bot-api:8081");
         assert_eq!(config.telegram.admin_user_ids, vec![123456789]);
         assert_eq!(config.telegram.poll_timeout_seconds, 45);
+        assert_eq!(config.telegram.max_download_bytes, 2 * 1024 * 1024 * 1024);
         assert_eq!(config.telegram.storage_chat_id, Some(-1001234567890));
     }
 

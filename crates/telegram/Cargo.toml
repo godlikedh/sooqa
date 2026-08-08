@@ -12,6 +12,7 @@ sooqa-media = { path = "../media" }
 teloxide.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+time.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 uuid.workspace = true

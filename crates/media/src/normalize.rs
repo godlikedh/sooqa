@@ -158,8 +158,12 @@ impl NormalizationPlan {
     }
 
     pub fn command_with_progress(&self) -> ExternalCommand {
+        self.command_with_progress_for_output(&self.output)
+    }
+
+    pub fn command_with_progress_for_output(&self, output: impl AsRef<Path>) -> ExternalCommand {
         let args = self.command.args();
-        let Some(output) = args.last().cloned() else {
+        let Some(_) = args.last() else {
             return self.command.clone();
         };
         let mut command = ExternalCommand::new(self.command.program().to_owned())
@@ -168,7 +172,7 @@ impl NormalizationPlan {
         for arg in &args[..args.len() - 1] {
             command = command.arg(arg.clone());
         }
-        command.arg("-progress").arg("pipe:1").arg(output)
+        command.arg("-progress").arg("pipe:1").arg(output.as_ref().as_os_str())
     }
 
     pub fn output(&self) -> &Path {

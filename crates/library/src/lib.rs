@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -682,9 +683,43 @@ pub struct NewStorageObject {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum StorageUploadReservation {
-    Reserved { intent_id: Uuid },
+    Reserved { intent_id: Uuid, owner_token: Uuid },
     Reused(StorageObject),
-    InProgress,
+    InProgress { retry_at: Option<OffsetDateTime> },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StorageUploadIntent {
+    pub id: Uuid,
+    pub asset_id: Option<Uuid>,
+    pub job_id: Option<Uuid>,
+    pub generation: i32,
+    pub provider: Option<String>,
+    pub storage_chat_id: Option<i64>,
+    pub idempotency_key: String,
+    pub state: String,
+    pub resource_id: Option<Uuid>,
+    pub created_at: OffsetDateTime,
+    pub reservation_expires_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StorageUploadAttachment {
+    pub storage_chat_id: i64,
+    pub storage_message_id: i64,
+    pub telegram_file_id: Option<String>,
+    pub telegram_file_unique_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StorageUploadReservationRequest {
+    pub asset_id: Uuid,
+    pub provider: String,
+    pub idempotency_key: String,
+    pub request_hash: Vec<u8>,
+    pub job_id: Uuid,
+    pub generation: i32,
+    pub storage_chat_id: i64,
 }
 
 #[async_trait]
@@ -702,24 +737,37 @@ pub trait StorageUploadStore: Clone + Send + Sync + 'static {
 
     async fn reserve_storage_upload(
         &self,
-        asset_id: Uuid,
-        provider: &str,
-        idempotency_key: &str,
-        request_hash: &[u8],
+        request: StorageUploadReservationRequest,
     ) -> Result<StorageUploadReservation, Self::Error>;
+
+    async fn renew_storage_upload(
+        &self,
+        intent_id: Uuid,
+        owner_token: Uuid,
+        lease_duration: Duration,
+    ) -> Result<OffsetDateTime, Self::Error>;
 
     async fn complete_storage_upload(
         &self,
         intent_id: Uuid,
+        owner_token: Uuid,
         object: NewStorageObject,
     ) -> Result<StorageObject, Self::Error>;
 
-    async fn release_storage_upload(&self, intent_id: Uuid) -> Result<(), Self::Error>;
+    async fn release_storage_upload(
+        &self,
+        intent_id: Uuid,
+        owner_token: Uuid,
+    ) -> Result<(), Self::Error>;
 
     /// Preserve an intent after an external request whose outcome is unknown.
     /// A later reconciliation can complete the same intent with the returned
     /// Telegram message reference instead of sending another message.
-    async fn mark_storage_upload_unknown(&self, intent_id: Uuid) -> Result<(), Self::Error>;
+    async fn mark_storage_upload_unknown(
+        &self,
+        intent_id: Uuid,
+        owner_token: Uuid,
+    ) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]

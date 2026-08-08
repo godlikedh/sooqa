@@ -14,7 +14,9 @@ use reqwest::{
 use serde_json::json;
 use tokio::{fs::File, io::AsyncWriteExt, net::lookup_host};
 use url::{Host, Url};
+use uuid::Uuid;
 
+use crate::publication::{PublishOutcome, TempArtifact, publish_or_reuse};
 use crate::{
     DownloadError, DownloadLimits, DownloadedSource, SourceDownloader, SourceInput,
     SourceInspection, SourceMediaKind,
@@ -268,20 +270,45 @@ impl SourceDownloader for DirectHttpDownloader {
         }
 
         let mime_type = content_type(&response);
-        let file = File::create(destination).await.map_err(|error| {
+        let temporary = destination.with_file_name(format!(".sooqa-http-{}.tmp", Uuid::new_v4()));
+        let mut temporary = TempArtifact::reserve(temporary).await.map_err(|error| {
             DownloadError::terminal(
                 "destination_io",
-                format!("could not create destination: {error}"),
+                format!("could not reserve temporary destination: {error}"),
+            )
+        })?;
+        let file = File::options().write(true).open(temporary.path()).await.map_err(|error| {
+            DownloadError::terminal(
+                "destination_io",
+                format!("could not open temporary destination: {error}"),
             )
         })?;
         let result = stream_to_file(response, file, limits.max_bytes).await;
         let bytes = match result {
             Ok(bytes) => bytes,
             Err(error) => {
-                let _ = tokio::fs::remove_file(destination).await;
                 return Err(error);
             }
         };
+        let published = publish_or_reuse(temporary.path(), destination).await.map_err(|error| {
+            DownloadError::terminal(
+                "destination_io",
+                format!("could not publish downloaded source: {error}"),
+            )
+        })?;
+        let bytes = match published {
+            PublishOutcome::Published => bytes,
+            PublishOutcome::Reused => tokio::fs::metadata(destination)
+                .await
+                .map_err(|error| {
+                    DownloadError::terminal(
+                        "destination_io",
+                        format!("could not inspect reused source: {error}"),
+                    )
+                })?
+                .len(),
+        };
+        temporary.remove().await;
 
         Ok(DownloadedSource { path: PathBuf::from(destination), bytes, mime_type })
     }
@@ -588,7 +615,7 @@ mod tests {
     async fn inspects_and_streams_a_direct_media_response() {
         let body = b"\x00\x00\x00\x18ftypmp42media";
         let response = response("200 OK", "Content-Type: application/octet-stream\r\n", body);
-        let address = spawn_server(vec![response.clone(), response]).await;
+        let address = spawn_server(vec![response.clone(), response.clone(), response]).await;
         let limits =
             DownloadLimits { max_bytes: 1024, max_redirects: 2, timeout: Duration::from_secs(5) };
         let downloader =
@@ -612,6 +639,15 @@ mod tests {
             .expect("download should succeed");
         assert_eq!(downloaded.bytes, body.len() as u64);
         assert_eq!(tokio::fs::read(&destination).await.expect("download should be readable"), body);
+        let replayed = downloader
+            .download(&inspection, &destination, &limits)
+            .await
+            .expect("retry should reuse the validated published output");
+        assert_eq!(replayed.bytes, downloaded.bytes);
+        assert_eq!(
+            tokio::fs::read(&destination).await.expect("reused output should be readable"),
+            body
+        );
         tokio::fs::remove_file(destination).await.expect("test file should be removable");
     }
 
@@ -679,6 +715,59 @@ mod tests {
             matches!(error, DownloadError::Terminal { class, .. } if class == "source_too_large")
         );
         assert!(!destination.exists(), "partial downloads should be removed");
+    }
+
+    #[tokio::test]
+    async fn dropped_download_removes_the_http_temporary_artifact() {
+        let listener =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("test server should bind");
+        let address = listener.local_addr().expect("test server address should be available");
+        let server = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nContent-Type: video/mp4\r\n\r\npartial")
+                .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let root = std::env::temp_dir().join(format!("sooqa-direct-cancel-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.expect("test root should be created");
+        let destination = root.join("final.bin");
+        let limits = DownloadLimits {
+            max_bytes: 1024 * 1024,
+            max_redirects: 0,
+            timeout: Duration::from_secs(30),
+        };
+        let downloader = DirectHttpDownloader::with_resolver(
+            limits,
+            Arc::new(resolver_for((address.ip(), address.port()).into())),
+        );
+        let inspection = SourceInspection {
+            adapter: "direct_http".to_owned(),
+            source_url: format!("http://media.test:{}/cancel", address.port()),
+            resolved_url: None,
+            media_kind: SourceMediaKind::Video,
+            mime_type: Some("video/mp4".to_owned()),
+            content_length_bytes: None,
+            title: None,
+            metadata: serde_json::Value::Null,
+        };
+        let download =
+            tokio::spawn(
+                async move { downloader.download(&inspection, &destination, &limits).await },
+            );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        download.abort();
+        let _ = download.await;
+        server.abort();
+
+        let mut entries = tokio::fs::read_dir(&root).await.expect("test root should be readable");
+        while let Some(entry) = entries.next_entry().await.expect("directory should be readable") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.starts_with(".sooqa-http-"), "HTTP temporary output was left behind");
+        }
+        tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
     }
 
     #[test]

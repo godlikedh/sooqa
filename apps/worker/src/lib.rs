@@ -20,10 +20,15 @@ use sooqa_persistence::{
     AssetProbeStart, InboxRepository, InboxRepositoryError, JobRepository, JobRepositoryError,
     SourceInspectionStart,
 };
+use sooqa_telegram::StorageUploadError;
 use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramStorageApi};
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::time::sleep;
+use tokio::{
+    sync::{oneshot, watch},
+    task::JoinError,
+    time::sleep,
+};
 use tracing::{debug, info, warn};
 
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFailure>> + Send + 'static>>;
@@ -34,15 +39,29 @@ pub struct HandlerFailure {
     pub retryable: bool,
     pub class: String,
     pub message: String,
+    pub defer_until: Option<OffsetDateTime>,
 }
 
 impl HandlerFailure {
     pub fn retryable(class: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { retryable: true, class: class.into(), message: message.into() }
+        Self { retryable: true, class: class.into(), message: message.into(), defer_until: None }
     }
 
     pub fn permanent(class: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { retryable: false, class: class.into(), message: message.into() }
+        Self { retryable: false, class: class.into(), message: message.into(), defer_until: None }
+    }
+
+    pub fn defer(
+        class: impl Into<String>,
+        message: impl Into<String>,
+        available_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            retryable: true,
+            class: class.into(),
+            message: message.into(),
+            defer_until: Some(available_at),
+        }
     }
 }
 
@@ -65,6 +84,12 @@ impl HandlerRegistry {
 
     pub fn contains(&self, job_type: JobType) -> bool {
         self.handlers.contains_key(&job_type)
+    }
+
+    pub fn job_types(&self) -> Vec<JobType> {
+        let mut job_types = self.handlers.keys().copied().collect::<Vec<_>>();
+        job_types.sort_by_key(|job_type| job_type.as_str());
+        job_types
     }
 
     fn handler(&self, job_type: JobType) -> Option<HandlerFn> {
@@ -228,8 +253,8 @@ where
     A: TelegramStorageApi,
     S: StorageUploadStore,
 {
-    let asset_id = match &job.command {
-        JobCommand::UploadStorageAsset(payload) => payload.asset_id,
+    let (asset_id, generation) = match &job.command {
+        JobCommand::UploadStorageAsset(payload) => (payload.asset_id, payload.generation),
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -238,14 +263,24 @@ where
         }
     };
 
-    provider.upload(StorageUploadInput { asset_id }).await.map(|_| ()).map_err(|error| {
-        let message = error.to_string();
-        if error.is_retryable() && job.attempt_count < job.max_attempts {
-            HandlerFailure::retryable("storage_upload", message)
-        } else {
-            HandlerFailure::permanent("storage_upload", message)
-        }
-    })
+    provider
+        .upload(StorageUploadInput { asset_id, job_id: job.id, generation })
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            let message = error.to_string();
+            if let StorageUploadError::InProgress { retry_at: Some(retry_at) } = &error {
+                return HandlerFailure::defer("storage_upload_in_progress", message, *retry_at);
+            }
+            if matches!(error, StorageUploadError::InProgress { retry_at: None }) {
+                return HandlerFailure::permanent("storage_upload_unknown", message);
+            }
+            if error.is_retryable() && job.attempt_count < job.max_attempts {
+                HandlerFailure::retryable("storage_upload", message)
+            } else {
+                HandlerFailure::permanent("storage_upload", message)
+            }
+        })
 }
 
 async fn inspect_source(
@@ -391,6 +426,35 @@ impl Worker {
     where
         F: Future<Output = ()> + Send,
     {
+        let capabilities = self.registry.job_types();
+        let recovered = self.repository.recover_stale_leases().await?;
+        if recovered > 0 {
+            info!(worker_id = %self.worker_id, recovered, "recovered stale job leases before polling");
+        }
+
+        let (stop_recovery, recovery_signal) = watch::channel(false);
+        let recovery_repository = self.repository.clone();
+        let recovery_interval = recovery_interval(self.lease_duration);
+        let recovery_task = tokio::spawn(async move {
+            recover_stale_leases_periodically(
+                recovery_repository,
+                recovery_interval,
+                recovery_signal,
+            )
+            .await;
+        });
+        let result = self.run_loop(shutdown, &capabilities).await;
+        let _ = stop_recovery.send(true);
+        if let Err(error) = recovery_task.await {
+            warn!(?error, worker_id = %self.worker_id, "stale-lease recovery task stopped unexpectedly");
+        }
+        result
+    }
+
+    async fn run_loop<F>(&self, shutdown: F, capabilities: &[JobType]) -> Result<(), WorkerError>
+    where
+        F: Future<Output = ()> + Send,
+    {
         tokio::pin!(shutdown);
         info!(worker_id = %self.worker_id, "worker loop started");
 
@@ -399,7 +463,11 @@ impl Worker {
             debug!(worker_id = %self.worker_id, "polling for a job");
             let claimed = tokio::select! {
                 _ = &mut shutdown => break,
-                result = self.repository.claim_next(&self.worker_id, self.lease_duration) => result?,
+                result = self.repository.claim_next(
+                    &self.worker_id,
+                    self.lease_duration,
+                    capabilities,
+                ) => result?,
             };
 
             let Some(job) = claimed else {
@@ -426,8 +494,13 @@ impl Worker {
                 continue;
             };
 
-            let stop_after_shutdown = tokio::select! {
-                _ = &mut shutdown => {
+            let outcome = self.execute_handler(&job, handler, &mut shutdown).await?;
+            let stop_after_shutdown = match outcome {
+                HandlerRunOutcome::Completed(result) => {
+                    self.finish_job(&job, result).await?;
+                    false
+                }
+                HandlerRunOutcome::Shutdown => {
                     self.repository
                         .retry(
                             job.id,
@@ -440,10 +513,6 @@ impl Worker {
                     self.metrics.shutdown_requeued.fetch_add(1, Ordering::Relaxed);
                     true
                 }
-                result = handler(job.clone()) => {
-                    self.finish_job(&job, result).await?;
-                    false
-                }
             };
 
             if stop_after_shutdown {
@@ -453,6 +522,56 @@ impl Worker {
 
         info!(worker_id = %self.worker_id, "worker loop stopped");
         Ok(())
+    }
+
+    async fn execute_handler<F>(
+        &self,
+        job: &Job,
+        handler: HandlerFn,
+        shutdown: &mut std::pin::Pin<&mut F>,
+    ) -> Result<HandlerRunOutcome, WorkerError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        let (stop_heartbeat, heartbeat_signal) = oneshot::channel();
+        let heartbeat_repository = self.repository.clone();
+        let heartbeat_worker_id = self.worker_id.clone();
+        let heartbeat_job_id = job.id;
+        let heartbeat_lease_duration = self.lease_duration;
+        let mut heartbeat_task = tokio::spawn(async move {
+            heartbeat_loop(
+                heartbeat_repository,
+                heartbeat_job_id,
+                heartbeat_worker_id,
+                heartbeat_lease_duration,
+                heartbeat_signal,
+            )
+            .await
+        });
+        let handler_future = handler(job.clone());
+        tokio::pin!(handler_future);
+
+        tokio::select! {
+            _ = shutdown.as_mut() => {
+                let _ = stop_heartbeat.send(());
+                await_heartbeat(&mut heartbeat_task).await?;
+                Ok(HandlerRunOutcome::Shutdown)
+            }
+            result = &mut handler_future => {
+                let _ = stop_heartbeat.send(());
+                await_heartbeat(&mut heartbeat_task).await?;
+                Ok(HandlerRunOutcome::Completed(result))
+            }
+            result = &mut heartbeat_task => {
+                let result = result.map_err(map_heartbeat_join_error)?;
+                match result {
+                    Ok(()) => Err(WorkerError::HeartbeatTask(
+                        "heartbeat loop stopped while the handler was active".to_owned(),
+                    )),
+                    Err(error) => Err(WorkerError::Repository(error)),
+                }
+            }
+        }
     }
 
     async fn finish_job(
@@ -465,6 +584,18 @@ impl Worker {
                 self.repository.complete(job.id, &self.worker_id).await?;
                 self.metrics.succeeded.fetch_add(1, Ordering::Relaxed);
                 info!(worker_id = %self.worker_id, job_id = %job.id, "job completed");
+            }
+            Err(failure) if failure.defer_until.is_some() => {
+                self.repository
+                    .defer(
+                        job.id,
+                        &self.worker_id,
+                        failure.defer_until.expect("defer timestamp was checked"),
+                        &failure.class,
+                        &failure.message,
+                    )
+                    .await?;
+                info!(worker_id = %self.worker_id, job_id = %job.id, "job deferred until dependent lease expires");
             }
             Err(failure) if failure.retryable => {
                 let updated = self
@@ -505,6 +636,79 @@ pub enum WorkerError {
     InvalidLeaseDuration,
     #[error("job repository error: {0}")]
     Repository(#[from] JobRepositoryError),
+    #[error("worker heartbeat task failed: {0}")]
+    HeartbeatTask(String),
+}
+
+enum HandlerRunOutcome {
+    Completed(Result<(), HandlerFailure>),
+    Shutdown,
+}
+
+async fn heartbeat_loop(
+    repository: JobRepository,
+    job_id: uuid::Uuid,
+    worker_id: String,
+    lease_duration: Duration,
+    mut stop: oneshot::Receiver<()>,
+) -> Result<(), JobRepositoryError> {
+    let interval = heartbeat_interval(lease_duration);
+    loop {
+        tokio::select! {
+            _ = &mut stop => return Ok(()),
+            _ = sleep(interval) => {
+                repository.heartbeat(job_id, &worker_id, lease_duration).await?;
+            }
+        }
+    }
+}
+
+async fn await_heartbeat(
+    task: &mut tokio::task::JoinHandle<Result<(), JobRepositoryError>>,
+) -> Result<(), WorkerError> {
+    task.await.map_err(map_heartbeat_join_error)??;
+    Ok(())
+}
+
+fn map_heartbeat_join_error(error: JoinError) -> WorkerError {
+    WorkerError::HeartbeatTask(error.to_string())
+}
+
+async fn recover_stale_leases_periodically(
+    repository: JobRepository,
+    interval: Duration,
+    mut stop: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+            _ = sleep(interval) => {
+                match repository.recover_stale_leases().await {
+                    Ok(recovered) if recovered > 0 => {
+                        info!(recovered, "recovered stale job leases");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(?error, "periodic stale-lease recovery failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn heartbeat_interval(lease_duration: Duration) -> Duration {
+    let interval = lease_duration / 3;
+    if interval.is_zero() { Duration::from_millis(1) } else { interval }
+}
+
+fn recovery_interval(lease_duration: Duration) -> Duration {
+    let interval = lease_duration / 2;
+    if interval.is_zero() { Duration::from_millis(1) } else { interval }
 }
 
 fn validate_timing(poll_interval: Duration, lease_duration: Duration) -> Result<(), WorkerError> {

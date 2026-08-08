@@ -1,5 +1,10 @@
 # sooqa — product and engineering specification
 
+> Historical product and roadmap reference. Current behavior is defined by
+> README.md, the active documents in docs/, ADRs, and the code/tests.
+> Roadmap phases in this file are not evidence that a feature is implemented.
+> Baseline: 2026-08-06.
+
 > Working repository name: `sooqa`  
 > Document status: **implementation-ready draft**  
 > Intended audience: project owner, Codex CLI coding agent, reviewers, future contributors  

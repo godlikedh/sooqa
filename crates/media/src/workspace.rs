@@ -2,6 +2,7 @@ use std::{
     fs::{self, FileType},
     io,
     path::{Component, Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use serde::{Deserialize, Serialize};
@@ -204,6 +205,117 @@ impl MediaWorkspace {
             .map_err(|source| WorkspaceError::Io { path: self.root.clone(), source })?;
         Ok(())
     }
+
+    /// Remove only stale temporary artifacts from UUID-named job workspaces.
+    /// Live jobs are supplied by the database caller and are never scanned.
+    pub async fn scavenge_stale_artifacts(
+        work_root: impl AsRef<Path>,
+        max_age: Duration,
+        live_job_ids: &[Uuid],
+    ) -> Result<u64, WorkspaceError> {
+        let work_root = work_root.as_ref();
+        ensure_real_directory_sync(work_root)?;
+        let jobs_root = work_root.join("jobs");
+        match fs::symlink_metadata(&jobs_root) {
+            Ok(_) => ensure_real_directory_sync(&jobs_root)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(WorkspaceError::Io { path: jobs_root.clone(), source });
+            }
+        }
+        let mut jobs = match async_fs::read_dir(&jobs_root).await {
+            Ok(jobs) => jobs,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(WorkspaceError::Io { path: jobs_root, source });
+            }
+        };
+        let cutoff = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut removed = 0;
+
+        while let Some(entry) = jobs
+            .next_entry()
+            .await
+            .map_err(|source| WorkspaceError::Io { path: jobs_root.clone(), source })?
+        {
+            let job_id = match entry.file_name().to_str().and_then(|name| name.parse().ok()) {
+                Some(job_id) => job_id,
+                None => continue,
+            };
+            if live_job_ids.contains(&job_id) {
+                continue;
+            }
+            let job_root = entry.path();
+            let metadata = async_fs::symlink_metadata(&job_root)
+                .await
+                .map_err(|source| WorkspaceError::Io { path: job_root.clone(), source })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
+
+            for area in [
+                WorkspaceArea::Source,
+                WorkspaceArea::Normalized,
+                WorkspaceArea::Frames,
+                WorkspaceArea::Previews,
+                WorkspaceArea::Logs,
+            ] {
+                let area_path = job_root.join(area.directory_name());
+                match fs::symlink_metadata(&area_path) {
+                    Ok(metadata) => ensure_directory_metadata(
+                        &area_path,
+                        metadata.file_type(),
+                        metadata.is_dir(),
+                    )?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(source) => {
+                        return Err(WorkspaceError::Io { path: area_path.clone(), source });
+                    }
+                }
+                let mut files = match async_fs::read_dir(&area_path).await {
+                    Ok(files) => files,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(source) => {
+                        return Err(WorkspaceError::Io { path: area_path, source });
+                    }
+                };
+                while let Some(file) = files
+                    .next_entry()
+                    .await
+                    .map_err(|source| WorkspaceError::Io { path: area_path.clone(), source })?
+                {
+                    let name = file.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    if !is_temporary_artifact_name(name) {
+                        continue;
+                    }
+                    let metadata = async_fs::symlink_metadata(file.path())
+                        .await
+                        .map_err(|source| WorkspaceError::Io { path: file.path(), source })?;
+                    if metadata.file_type().is_symlink()
+                        || !metadata.is_file()
+                        || metadata.modified().ok().is_none_or(|modified| modified > cutoff)
+                    {
+                        continue;
+                    }
+                    async_fs::remove_file(file.path())
+                        .await
+                        .map_err(|source| WorkspaceError::Io { path: file.path(), source })?;
+                    removed += 1;
+                }
+            }
+        }
+
+        Ok(removed)
+    }
+}
+
+fn is_temporary_artifact_name(name: &str) -> bool {
+    name.starts_with(".sooqa-")
+        || name.starts_with(".part-")
+        || name.starts_with(".manifest-")
+        || name.contains(".tmp-")
+        || (name.starts_with('.') && name.ends_with(".png"))
 }
 
 #[derive(Debug, Error)]
@@ -336,6 +448,45 @@ mod tests {
         workspace.cleanup().await.expect("workspace should be cleaned");
         assert!(!workspace.root().exists());
         assert_eq!(async_fs::read(&outside).await.expect("outside file should remain"), b"keep me");
+        async_fs::remove_dir_all(work_root).await.expect("test root should be removed");
+    }
+
+    #[tokio::test]
+    async fn scavenger_removes_old_job_artifacts_but_keeps_live_jobs() {
+        let work_root = test_root();
+        let stale_job = Uuid::new_v4();
+        let live_job = Uuid::new_v4();
+        let stale_workspace = MediaWorkspace::create(&work_root, stale_job)
+            .await
+            .expect("stale workspace should be created");
+        let live_workspace = MediaWorkspace::create(&work_root, live_job)
+            .await
+            .expect("live workspace should be created");
+        let stale_path = stale_workspace
+            .path(WorkspaceArea::Source, ".sooqa-http-old.tmp")
+            .expect("stale artifact path should be safe");
+        let live_path = live_workspace
+            .path(WorkspaceArea::Source, ".sooqa-ytdlp-live.tmp")
+            .expect("live artifact path should be safe");
+        async_fs::write(&stale_path, b"stale").await.expect("stale artifact should be written");
+        async_fs::write(&live_path, b"live").await.expect("live artifact should be written");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale_path)
+            .expect("stale artifact should open")
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .expect("stale artifact timestamp should update");
+
+        let removed =
+            MediaWorkspace::scavenge_stale_artifacts(&work_root, Duration::ZERO, &[live_job])
+                .await
+                .expect("scavenger should succeed");
+        assert_eq!(removed, 1);
+        assert!(!stale_path.exists());
+        assert!(live_path.exists());
+
+        stale_workspace.cleanup().await.expect("stale workspace should clean up");
+        live_workspace.cleanup().await.expect("live workspace should clean up");
         async_fs::remove_dir_all(work_root).await.expect("test root should be removed");
     }
 

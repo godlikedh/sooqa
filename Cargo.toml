@@ -6,7 +6,6 @@ members = [
     "apps/companion",
     "crates/config",
     "crates/runtime",
-    "crates/kernel",
     "crates/inbox",
     "crates/library",
     "crates/publisher",
@@ -28,6 +27,7 @@ rust-version = "1.97.1"
 async-trait = "0.1"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+nix = { version = "0.30", default-features = false, features = ["process", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

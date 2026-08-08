@@ -1,7 +1,10 @@
 use std::{env, sync::Arc, time::Duration};
 
-use sooqa_inbox::{IngestStatus, IngestSubmission, IngestSubmissionInput, SubmittedVia};
-use sooqa_media::{SourceInspection, SourceMediaKind};
+use sooqa_inbox::{
+    IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection, SourceMediaKind,
+    SubmittedVia,
+};
+use sooqa_jobs::JobType;
 use sooqa_persistence::Database;
 use sooqa_test_support::FakeSourceDownloader;
 use sooqa_worker::inspect_source_handler;
@@ -69,7 +72,7 @@ async fn inspect_source_uses_fake_adapter_and_advances_durably() {
 
     let job = database
         .jobs()
-        .claim_next("worker-c3-test", Duration::from_secs(30))
+        .claim_next("worker-c3-test", Duration::from_secs(30), &[JobType::InspectSource])
         .await
         .expect("inspect job should be claimable")
         .expect("inspect job should exist");

@@ -5,7 +5,9 @@ use std::{
     error::Error,
     io,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -36,6 +38,7 @@ pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorizat
 pub const STATUS_RESPONSE: &str = "sooqa is online.";
 pub const UNAUTHORIZED_RESPONSE: &str = "This bot is restricted to its configured administrator.";
 pub const ADD_USAGE_RESPONSE: &str = "Send one http(s) URL after /add, or send a bare URL.";
+pub const DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 const DEFAULT_MEDIA_WORK_ROOT_NAME: &str = "sooqa-telegram-work";
 const RESPONSE_RATE_LIMIT: Duration = Duration::from_secs(1);
@@ -231,6 +234,7 @@ pub struct TelegramService<A, S, I = ()> {
     admin_user_ids: Arc<BTreeSet<i64>>,
     response_limiter: Arc<Mutex<HashMap<RateLimitKey, Instant>>>,
     media_work_root: PathBuf,
+    max_download_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -252,6 +256,7 @@ where
             admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
             response_limiter: Arc::new(Mutex::new(HashMap::new())),
             media_work_root: default_media_work_root(),
+            max_download_bytes: DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES,
         }
     }
 }
@@ -275,11 +280,17 @@ where
             admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
             response_limiter: Arc::new(Mutex::new(HashMap::new())),
             media_work_root: default_media_work_root(),
+            max_download_bytes: DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES,
         }
     }
 
     pub fn with_media_work_root(mut self, media_work_root: impl Into<PathBuf>) -> Self {
         self.media_work_root = media_work_root.into();
+        self
+    }
+
+    pub fn with_max_download_bytes(mut self, max_download_bytes: u64) -> Self {
+        self.max_download_bytes = max_download_bytes;
         self
     }
 
@@ -422,6 +433,19 @@ where
                 mime_type,
                 file_name,
             } => {
+                if file_size.map(u64::from).is_some_and(|size| size > self.max_download_bytes) {
+                    let response = format!(
+                        "⚠️ Telegram file exceeds the configured download limit of {} bytes",
+                        self.max_download_bytes
+                    );
+                    if !self.allow_response(message.user_id, message.chat_id) {
+                        self.complete(claim).await?;
+                        return Ok(HandleOutcome::RateLimited);
+                    }
+                    self.send_and_complete(claim, message.chat_id, &response, rate_limit_key)
+                        .await?;
+                    return Ok(HandleOutcome::MediaRejected);
+                }
                 let user_id = message.user_id.expect("authorized Telegram messages have a user ID");
                 let Some(ingest_service) = self.ingest_service.as_ref() else {
                     self.release(claim).await?;
@@ -778,6 +802,7 @@ impl CallbackData {
 pub struct TeloxideApi {
     bot: Bot,
     cloud_download_limit_bytes: Option<u64>,
+    max_download_bytes: u64,
 }
 
 impl TeloxideApi {
@@ -812,7 +837,13 @@ impl TeloxideApi {
         Ok(Self {
             bot: Bot::with_client(token, client).set_api_url(api_base_url),
             cloud_download_limit_bytes,
+            max_download_bytes: DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES,
         })
+    }
+
+    pub fn with_max_download_bytes(mut self, max_download_bytes: u64) -> Self {
+        self.max_download_bytes = max_download_bytes;
+        self
     }
 
     fn bot(&self) -> Bot {
@@ -856,9 +887,11 @@ impl TelegramApi for TeloxideApi {
             .await
             .map_err(TelegramApiError::Api)?;
         let size = u64::from(file.meta.size);
-        if let Some(limit) = self.cloud_download_limit_bytes
-            && size > limit
-        {
+        let limit =
+            self.cloud_download_limit_bytes.map_or(self.max_download_bytes, |cloud_limit| {
+                cloud_limit.min(self.max_download_bytes)
+            });
+        if size > limit {
             return Err(TelegramApiError::DownloadLimit { size, limit });
         }
         let temporary =
@@ -869,19 +902,96 @@ impl TelegramApi for TeloxideApi {
             .open(&temporary)
             .await
             .map_err(TelegramApiError::Io)?;
-        if let Err(error) =
-            teloxide::net::Download::download_file(&self.bot(), &file.path, &mut output).await
-        {
+        let (download_result, exceeded, written) = {
+            let mut limited_output = LimitedWriter::new(&mut output, limit);
+            let download_result = teloxide::net::Download::download_file(
+                &self.bot(),
+                &file.path,
+                &mut limited_output,
+            )
+            .await;
+            (download_result, limited_output.exceeded(), limited_output.written())
+        };
+        if exceeded {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(TelegramApiError::DownloadLimit { size: written.saturating_add(1), limit });
+        }
+        if let Err(error) = download_result {
             let _ = tokio::fs::remove_file(&temporary).await;
             return Err(TelegramApiError::Download(error));
         }
-        tokio::io::AsyncWriteExt::flush(&mut output).await.map_err(TelegramApiError::Io)?;
+        if let Err(error) = tokio::io::AsyncWriteExt::flush(&mut output).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(TelegramApiError::Io(error));
+        }
         drop(output);
+        let actual_size = match tokio::fs::metadata(&temporary).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(TelegramApiError::Io(error));
+            }
+        };
+        if actual_size > limit {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(TelegramApiError::DownloadLimit { size: actual_size, limit });
+        }
         if let Err(error) = tokio::fs::rename(&temporary, destination).await {
             let _ = tokio::fs::remove_file(&temporary).await;
             return Err(TelegramApiError::Io(error));
         }
         Ok(())
+    }
+}
+
+struct LimitedWriter<'a> {
+    inner: &'a mut tokio::fs::File,
+    limit: u64,
+    written: u64,
+    exceeded: bool,
+}
+
+impl<'a> LimitedWriter<'a> {
+    fn new(inner: &'a mut tokio::fs::File, limit: u64) -> Self {
+        Self { inner, limit, written: 0, exceeded: false }
+    }
+
+    fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+
+    fn written(&self) -> u64 {
+        self.written
+    }
+}
+
+impl tokio::io::AsyncWrite for LimitedWriter<'_> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let remaining = self.limit.saturating_sub(self.written);
+        if buffer.len() as u64 > remaining {
+            self.exceeded = true;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Telegram download exceeds the configured limit",
+            )));
+        }
+        let result = Pin::new(&mut *self.inner).poll_write(context, buffer);
+        if let Poll::Ready(Ok(written)) = result {
+            self.written = self.written.saturating_add(written as u64);
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(context)
     }
 }
 
@@ -914,6 +1024,13 @@ where
 
     pub fn with_media_work_root(mut self, media_work_root: impl Into<PathBuf>) -> Self {
         self.service = self.service.with_media_work_root(media_work_root);
+        self
+    }
+
+    pub fn with_max_download_bytes(mut self, max_download_bytes: u64) -> Self {
+        self.api = self.api.with_max_download_bytes(max_download_bytes);
+        self.service.api = self.api.clone();
+        self.service = self.service.with_max_download_bytes(max_download_bytes);
         self
     }
 
@@ -1395,6 +1512,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advertised_media_size_is_rejected_before_workspace_or_download() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        let service =
+            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone())
+                .with_max_download_bytes(1024);
+        let message = IncomingMessage {
+            update_id: 111,
+            message_id: 199,
+            user_id: Some(123),
+            chat_id: 42,
+            is_private: true,
+            text: None,
+            caption: None,
+            media: Some(TelegramMedia::Supported {
+                media_kind: MediaKind::Video,
+                file_id: "too-large".to_owned(),
+                file_unique_id: "too-large-unique".to_owned(),
+                file_size: Some(1025),
+                mime_type: Some("video/webm".to_owned()),
+                file_name: Some("large.webm".to_owned()),
+            }),
+        };
+
+        assert_eq!(service.handle_message(message).await.unwrap(), HandleOutcome::MediaRejected);
+        assert!(ingest.media_commands.lock().unwrap().is_empty());
+        assert!(api.downloads.lock().unwrap().is_empty());
+        assert!(api.messages.lock().unwrap()[0].1.contains("1024 bytes"));
+    }
+
+    #[tokio::test]
     async fn unsupported_telegram_document_is_rejected_without_download() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
@@ -1599,11 +1747,13 @@ mod tests {
             TeloxideApi::new("test-token", "https://api.telegram.org", Duration::from_secs(1))
                 .expect("cloud Bot API URL should be accepted");
         assert_eq!(cloud.cloud_download_limit_bytes, Some(20 * 1024 * 1024));
+        assert_eq!(cloud.max_download_bytes, DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES);
 
         let local =
             TeloxideApi::new("test-token", "http://telegram-bot-api:8081", Duration::from_secs(1))
                 .expect("Local Bot API URL should be accepted");
         assert_eq!(local.cloud_download_limit_bytes, None);
+        assert_eq!(local.max_download_bytes, DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES);
     }
 
     #[test]

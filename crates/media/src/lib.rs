@@ -7,7 +7,6 @@ use std::{
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -20,6 +19,7 @@ mod fingerprint;
 mod hashing;
 mod image_normalize;
 mod normalize;
+mod publication;
 mod similarity;
 mod workspace;
 mod ytdlp;
@@ -57,6 +57,7 @@ pub use similarity::{
     SimilarityEvidence, SimilarityResult, SimilarityThresholds, VideoSimilarityInput,
     compare_videos,
 };
+pub use sooqa_inbox::{SourceInspection, SourceMediaKind};
 pub use workspace::{
     ManifestEntry, MediaWorkspace, WorkspaceArea, WorkspaceError, WorkspaceManifest,
 };
@@ -67,27 +68,6 @@ pub struct SourceInput {
     pub ingest_request_id: Uuid,
     pub source_url: String,
     pub page_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceMediaKind {
-    Video,
-    Image,
-    Audio,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SourceInspection {
-    pub adapter: String,
-    pub source_url: String,
-    pub resolved_url: Option<String>,
-    pub media_kind: SourceMediaKind,
-    pub mime_type: Option<String>,
-    pub content_length_bytes: Option<u64>,
-    pub title: Option<String>,
-    pub metadata: Value,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

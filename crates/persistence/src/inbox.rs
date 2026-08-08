@@ -1,9 +1,9 @@
 use serde_json::json;
+use sooqa_inbox::SourceInspection;
 use sooqa_inbox::{
     IngestKind, IngestRequest, IngestStateError, IngestStatus, IngestSubmission, SubmittedVia,
 };
 use sooqa_jobs::NewJob;
-use sooqa_media::SourceInspection;
 use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -150,6 +150,17 @@ impl InboxRepository {
                 AssetProbeStart::Ready(request)
             }
             IngestStatus::Probing => AssetProbeStart::Ready(request),
+            IngestStatus::FailedRetryable => {
+                request.transition_to(IngestStatus::Queued)?;
+                request.transition_to(IngestStatus::Downloading)?;
+                request.transition_to(IngestStatus::Probing)?;
+                request.error_code = None;
+                request.error_message = None;
+                request.completed_at = None;
+                request.updated_at = OffsetDateTime::now_utc();
+                update_ingest_state(&mut transaction, &request).await?;
+                AssetProbeStart::Ready(request)
+            }
             _ => AssetProbeStart::AlreadyAdvanced(request),
         };
         transaction.commit().await?;

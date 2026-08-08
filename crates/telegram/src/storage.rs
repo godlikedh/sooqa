@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use sooqa_library::{
-    MediaKind, NewStorageObject, StorageObject, StorageUploadReservation, StorageUploadStore,
+    MediaKind, NewStorageObject, StorageObject, StorageUploadReservation,
+    StorageUploadReservationRequest, StorageUploadStore,
 };
 use sooqa_media::sha256_file;
 use teloxide::{
@@ -20,6 +21,8 @@ pub const TELEGRAM_STORAGE_PROVIDER: &str = "telegram";
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StorageUploadInput {
     pub asset_id: Uuid,
+    pub job_id: Uuid,
+    pub generation: i32,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -89,8 +92,8 @@ pub enum StorageUploadError {
     Hash(#[source] sooqa_media::HashError),
     #[error("canonical asset hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
-    #[error("storage upload is already in progress or requires reconciliation for this asset")]
-    InProgress,
+    #[error("storage upload is already in progress until {retry_at:?}")]
+    InProgress { retry_at: Option<time::OffsetDateTime> },
     #[error("storage persistence failed: {0}")]
     Persistence(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Telegram storage API failed: {0}")]
@@ -103,7 +106,7 @@ impl StorageUploadError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::InProgress | Self::Persistence(_) | Self::Api(_) | Self::AmbiguousApi(_)
+            Self::InProgress { .. } | Self::Persistence(_) | Self::Api(_) | Self::AmbiguousApi(_)
         )
     }
 }
@@ -114,6 +117,9 @@ pub struct StorageUploadProvider<A, S> {
     store: S,
     storage_chat_id: i64,
 }
+
+const STORAGE_UPLOAD_LEASE_DURATION: Duration = Duration::from_secs(600);
+const STORAGE_UPLOAD_RENEW_INTERVAL: Duration = Duration::from_secs(60);
 
 impl<A, S> StorageUploadProvider<A, S>
 where
@@ -184,23 +190,31 @@ where
             return Ok(StorageUploadOutcome::Reused(object));
         }
 
-        let idempotency_key = format!("telegram:storage:{}:v1", input.asset_id);
+        let idempotency_key =
+            format!("asset:{}:upload_storage:v1:{}", input.asset_id, input.generation);
         let reservation = self
             .store
-            .reserve_storage_upload(
-                input.asset_id,
-                TELEGRAM_STORAGE_PROVIDER,
-                &idempotency_key,
-                &expected_sha256_bytes,
-            )
+            .reserve_storage_upload(StorageUploadReservationRequest {
+                asset_id: input.asset_id,
+                provider: TELEGRAM_STORAGE_PROVIDER.to_owned(),
+                idempotency_key,
+                request_hash: expected_sha256_bytes,
+                job_id: input.job_id,
+                generation: input.generation,
+                storage_chat_id: self.storage_chat_id,
+            })
             .await
             .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
-        let intent_id = match reservation {
-            StorageUploadReservation::Reserved { intent_id } => intent_id,
+        let (intent_id, owner_token) = match reservation {
+            StorageUploadReservation::Reserved { intent_id, owner_token } => {
+                (intent_id, owner_token)
+            }
             StorageUploadReservation::Reused(object) => {
                 return Ok(StorageUploadOutcome::Reused(object));
             }
-            StorageUploadReservation::InProgress => return Err(StorageUploadError::InProgress),
+            StorageUploadReservation::InProgress { retry_at } => {
+                return Err(StorageUploadError::InProgress { retry_at });
+            }
         };
 
         let request = StorageUploadRequest {
@@ -209,18 +223,36 @@ where
             local_work_path,
             caption: storage_caption(input.asset_id, asset.content_item_id, &expected_sha256),
         };
-        let uploaded = match self.api.upload_media(request).await {
+        let mut upload = Box::pin(self.api.upload_media(request));
+        let mut renewal = tokio::time::interval(STORAGE_UPLOAD_RENEW_INTERVAL);
+        renewal.tick().await;
+        let uploaded = loop {
+            tokio::select! {
+                result = &mut upload => break result,
+                _ = renewal.tick() => {
+                    self.store
+                        .renew_storage_upload(
+                            intent_id,
+                            owner_token,
+                            STORAGE_UPLOAD_LEASE_DURATION,
+                        )
+                        .await
+                        .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
+                }
+            }
+        };
+        let uploaded = match uploaded {
             Ok(uploaded) => uploaded,
             Err(error) => {
                 if A::is_ambiguous_error(&error) {
-                    self.store.mark_storage_upload_unknown(intent_id).await.map_err(
+                    self.store.mark_storage_upload_unknown(intent_id, owner_token).await.map_err(
                         |mark_error| StorageUploadError::Persistence(Box::new(mark_error)),
                     )?;
                     return Err(StorageUploadError::AmbiguousApi(Box::new(error)));
                 }
-                self.store.release_storage_upload(intent_id).await.map_err(|release_error| {
-                    StorageUploadError::Persistence(Box::new(release_error))
-                })?;
+                self.store.release_storage_upload(intent_id, owner_token).await.map_err(
+                    |release_error| StorageUploadError::Persistence(Box::new(release_error)),
+                )?;
                 return Err(StorageUploadError::Api(Box::new(error)));
             }
         };
@@ -229,6 +261,7 @@ where
             .store
             .complete_storage_upload(
                 intent_id,
+                owner_token,
                 NewStorageObject {
                     asset_id: input.asset_id,
                     provider: TELEGRAM_STORAGE_PROVIDER.to_owned(),
@@ -244,7 +277,7 @@ where
             Ok(object) => object,
             Err(error) => {
                 self.store
-                    .mark_storage_upload_unknown(intent_id)
+                    .mark_storage_upload_unknown(intent_id, owner_token)
                     .await
                     .map_err(|mark_error| StorageUploadError::Persistence(Box::new(mark_error)))?;
                 return Err(StorageUploadError::Persistence(Box::new(error)));
@@ -466,22 +499,23 @@ mod tests {
 
         async fn reserve_storage_upload(
             &self,
-            _asset_id: Uuid,
-            _provider: &str,
-            _idempotency_key: &str,
-            _request_hash: &[u8],
+            _request: StorageUploadReservationRequest,
         ) -> Result<StorageUploadReservation, Self::Error> {
             let mut reserved = self.reserved.lock().expect("mock mutex should not be poisoned");
             if *reserved {
-                return Ok(StorageUploadReservation::InProgress);
+                return Ok(StorageUploadReservation::InProgress { retry_at: None });
             }
             *reserved = true;
-            Ok(StorageUploadReservation::Reserved { intent_id: Uuid::from_u128(3) })
+            Ok(StorageUploadReservation::Reserved {
+                intent_id: Uuid::from_u128(3),
+                owner_token: Uuid::from_u128(5),
+            })
         }
 
         async fn complete_storage_upload(
             &self,
             _intent_id: Uuid,
+            _owner_token: Uuid,
             object: NewStorageObject,
         ) -> Result<StorageObject, Self::Error> {
             if *self.complete_fail.lock().expect("mock mutex should not be poisoned") {
@@ -504,19 +538,40 @@ mod tests {
             Ok(object)
         }
 
-        async fn release_storage_upload(&self, _intent_id: Uuid) -> Result<(), Self::Error> {
+        async fn release_storage_upload(
+            &self,
+            _intent_id: Uuid,
+            _owner_token: Uuid,
+        ) -> Result<(), Self::Error> {
             *self.released.lock().expect("mock mutex should not be poisoned") = true;
             Ok(())
         }
 
-        async fn mark_storage_upload_unknown(&self, _intent_id: Uuid) -> Result<(), Self::Error> {
+        async fn mark_storage_upload_unknown(
+            &self,
+            _intent_id: Uuid,
+            _owner_token: Uuid,
+        ) -> Result<(), Self::Error> {
             *self.unknown.lock().expect("mock mutex should not be poisoned") = true;
             Ok(())
+        }
+
+        async fn renew_storage_upload(
+            &self,
+            _intent_id: Uuid,
+            _owner_token: Uuid,
+            _lease_duration: std::time::Duration,
+        ) -> Result<time::OffsetDateTime, Self::Error> {
+            Ok(time::OffsetDateTime::now_utc())
         }
     }
 
     fn input() -> StorageUploadInput {
-        StorageUploadInput { asset_id: Uuid::from_u128(1) }
+        StorageUploadInput {
+            asset_id: Uuid::from_u128(1),
+            job_id: Uuid::from_u128(2),
+            generation: 0,
+        }
     }
 
     fn canonical_asset(path: &std::path::Path, sha256: Vec<u8>) -> MediaAsset {

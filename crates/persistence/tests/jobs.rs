@@ -1,6 +1,6 @@
 use std::env;
 
-use sooqa_jobs::{JobStatus, NewJob};
+use sooqa_jobs::{JobStatus, JobType, NewJob};
 use sooqa_persistence::Database;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -29,8 +29,16 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
     let jobs_a = jobs.clone();
     let jobs_b = jobs.clone();
     let (left, right) = tokio::join!(
-        jobs_a.claim_next("worker-a", std::time::Duration::from_secs(30)),
-        jobs_b.claim_next("worker-b", std::time::Duration::from_secs(30)),
+        jobs_a.claim_next(
+            "worker-a",
+            std::time::Duration::from_secs(30),
+            &[JobType::InspectSource]
+        ),
+        jobs_b.claim_next(
+            "worker-b",
+            std::time::Duration::from_secs(30),
+            &[JobType::InspectSource]
+        ),
     );
     let left = left.expect("first claim should succeed");
     let right = right.expect("second claim should succeed");
@@ -65,7 +73,7 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
     assert_eq!(retried.status, JobStatus::RetryWait);
 
     let claimed_again = jobs
-        .claim_next("worker-c", std::time::Duration::from_secs(30))
+        .claim_next("worker-c", std::time::Duration::from_secs(30), &[JobType::InspectSource])
         .await
         .expect("retry claim should succeed")
         .expect("retried job should be claimable");
@@ -74,6 +82,47 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
 
     let completed = jobs.complete(claimed_again.id, "worker-c").await.expect("job should complete");
     assert_eq!(completed.status, JobStatus::Succeeded);
+
+    let unsupported = jobs
+        .enqueue(
+            NewJob::inspect_source(Uuid::new_v4())
+                .with_priority(1_000)
+                .idempotency_key(format!("b2-capability-inspect-{}", Uuid::new_v4())),
+        )
+        .await
+        .expect("unsupported job should enqueue");
+    let supported = jobs
+        .enqueue(
+            NewJob::cleanup_workspace()
+                .with_priority(900)
+                .idempotency_key(format!("b2-capability-cleanup-{}", Uuid::new_v4())),
+        )
+        .await
+        .expect("supported job should enqueue");
+    let claimed_supported = jobs
+        .claim_next(
+            "worker-capability",
+            std::time::Duration::from_secs(30),
+            &[JobType::CleanupWorkspace],
+        )
+        .await
+        .expect("capability claim should succeed")
+        .expect("supported job should be claimable");
+    assert_eq!(claimed_supported.id, supported.id);
+    jobs.complete(supported.id, "worker-capability").await.expect("supported job should complete");
+    let claimed_unsupported = jobs
+        .claim_next(
+            "worker-capability-inspect",
+            std::time::Duration::from_secs(30),
+            &[JobType::InspectSource],
+        )
+        .await
+        .expect("unsupported job should become claimable")
+        .expect("unsupported job should remain queued");
+    assert_eq!(claimed_unsupported.id, unsupported.id);
+    jobs.complete(unsupported.id, "worker-capability-inspect")
+        .await
+        .expect("unsupported job should complete when its capability is enabled");
 
     let second_key = format!("b2-stale-{}", Uuid::new_v4());
     let second = jobs
@@ -86,7 +135,11 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
         .await
         .expect("stale job should enqueue");
     let stale_claim = jobs
-        .claim_next("worker-stale", std::time::Duration::from_secs(30))
+        .claim_next(
+            "worker-stale",
+            std::time::Duration::from_secs(30),
+            &[JobType::CleanupWorkspace],
+        )
         .await
         .expect("stale job should claim");
     assert_eq!(stale_claim.expect("stale job should be present").id, second.id);
@@ -99,7 +152,11 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
 
     assert!(jobs.recover_stale_leases().await.expect("stale jobs should recover") >= 1);
     let recovered = jobs
-        .claim_next("worker-recovered", std::time::Duration::from_secs(30))
+        .claim_next(
+            "worker-recovered",
+            std::time::Duration::from_secs(30),
+            &[JobType::CleanupWorkspace],
+        )
         .await
         .expect("recovered job should claim")
         .expect("recovered job should be available");
@@ -113,7 +170,7 @@ async fn job_repository_claims_concurrently_and_recovers_leases() {
         .await
         .expect("failed job should enqueue");
     let failed_claim = jobs
-        .claim_next("worker-fail", std::time::Duration::from_secs(30))
+        .claim_next("worker-fail", std::time::Duration::from_secs(30), &[JobType::PublishPost])
         .await
         .expect("failed job should claim")
         .expect("failed job should be available");

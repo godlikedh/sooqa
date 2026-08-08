@@ -6,6 +6,11 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(unix)]
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -88,14 +93,19 @@ pub struct ProcessCommandRunner;
 impl ExternalCommandRunner for ProcessCommandRunner {
     async fn run(&self, command: ExternalCommand) -> Result<ExternalCommandOutput, CommandError> {
         let program = command.program().to_owned();
-        let mut child = Command::new(command.program())
+        let mut process = Command::new(command.program());
+        process
             .args(command.args())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        process.process_group(0);
+        let mut child = process
             .kill_on_drop(true)
             .spawn()
             .map_err(|source| CommandError::Spawn { program: program.clone(), source })?;
+        let mut group_cleanup = ProcessGroupCleanup::new(child.id());
 
         let stdout = child
             .stdout
@@ -129,14 +139,15 @@ impl ExternalCommandRunner for ProcessCommandRunner {
         let (stdout, stderr, status) = match timeout(command.timeout_duration(), execution).await {
             Ok(result) => result?,
             Err(_) => {
-                let _ = child.kill().await;
-                let _ = timeout(Duration::from_secs(1), child.wait()).await;
+                terminate_process_group(&mut child).await;
+                group_cleanup.disarm();
                 return Err(CommandError::TimedOut {
                     program,
                     timeout: command.timeout_duration(),
                 });
             }
         };
+        group_cleanup.disarm();
 
         Ok(ExternalCommandOutput {
             success: status.success(),
@@ -147,6 +158,89 @@ impl ExternalCommandRunner for ProcessCommandRunner {
             stderr_truncated: stderr.truncated,
         })
     }
+}
+
+#[cfg(unix)]
+struct ProcessGroupCleanup {
+    process_group_id: Option<u32>,
+}
+
+#[cfg(not(unix))]
+struct ProcessGroupCleanup;
+
+impl ProcessGroupCleanup {
+    fn new(process_id: Option<u32>) -> Self {
+        #[cfg(unix)]
+        {
+            Self { process_group_id: process_id }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = process_id;
+            Self
+        }
+    }
+
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.process_group_id = None;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupCleanup {
+    fn drop(&mut self) {
+        if let Some(process_group_id) = self.process_group_id.take() {
+            kill_process_group_sync(process_group_id, "-KILL");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for ProcessGroupCleanup {
+    fn drop(&mut self) {}
+}
+
+#[cfg(unix)]
+async fn terminate_process_group(child: &mut tokio::process::Child) {
+    if let Some(process_group_id) = child.id() {
+        let _ = signal_process_group(process_group_id, "-TERM").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = signal_process_group(process_group_id, "-KILL").await;
+    }
+    let _ = child.kill().await;
+    let _ = timeout(Duration::from_secs(1), child.wait()).await;
+}
+
+#[cfg(not(unix))]
+async fn terminate_process_group(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = timeout(Duration::from_secs(1), child.wait()).await;
+}
+
+#[cfg(unix)]
+async fn signal_process_group(process_group_id: u32, signal: &str) -> std::io::Result<()> {
+    kill_group(process_group_id, signal)
+}
+
+#[cfg(unix)]
+fn kill_process_group_sync(process_group_id: u32, signal: &str) {
+    let _ = kill_group(process_group_id, signal);
+}
+
+#[cfg(unix)]
+fn kill_group(process_group_id: u32, signal: &str) -> std::io::Result<()> {
+    let process_group_id = i32::try_from(process_group_id)
+        .map_err(|_| std::io::Error::other("process ID does not fit in a POSIX PID"))?;
+    let signal = match signal {
+        "-TERM" => Signal::SIGTERM,
+        "-KILL" => Signal::SIGKILL,
+        _ => return Err(std::io::Error::other("unsupported process-group signal")),
+    };
+    kill(Pid::from_raw(-process_group_id), signal)
+        .map_err(|error| std::io::Error::from_raw_os_error(error as i32))
 }
 
 #[derive(Debug, Error)]
@@ -239,5 +333,35 @@ mod tests {
 
         let error = ProcessCommandRunner.run(command).await.expect_err("command should time out");
         assert!(error.is_timeout());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_runner_terminates_descendants_in_the_owned_group() {
+        use std::process::Stdio;
+
+        let pid_file =
+            std::env::temp_dir().join(format!("sooqa-child-pid-{}", uuid::Uuid::new_v4()));
+        let command = ExternalCommand::new("/bin/sh")
+            // The shell is only a test fixture: production commands still use
+            // argument arrays and never invoke a shell.
+            .arg("-c")
+            .arg("sleep 5 & echo $! > \"$1\"; wait")
+            .arg("sooqa-process-group-test")
+            .arg(pid_file.to_string_lossy().into_owned())
+            .timeout(Duration::from_millis(200));
+
+        let error = ProcessCommandRunner.run(command).await.expect_err("command should time out");
+        assert!(error.is_timeout());
+        let child_pid =
+            tokio::fs::read_to_string(&pid_file).await.expect("child should have written its PID");
+        let status = std::process::Command::new("/bin/kill")
+            .arg("-0")
+            .arg(child_pid.trim())
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill probe should run");
+        assert!(!status.success(), "descendant process should have been terminated");
+        tokio::fs::remove_file(pid_file).await.expect("PID fixture should be removed");
     }
 }

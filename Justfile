@@ -11,6 +11,9 @@ fmt-check:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
+future-incompat:
+    cargo check --workspace --all-targets --future-incompat-report
+
 test:
     cargo test --workspace --all-targets
 
@@ -25,8 +28,13 @@ db-migrate:
 
 test-integration:
     DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-persistence --tests -- --ignored
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-api --test ingest -- --ignored
     DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-api --test library -- --ignored
     DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-worker --test worker -- --ignored
+    DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa cargo test -p sooqa-worker --test inspection -- --ignored
+
+test-media:
+    cargo test -p sooqa-media --lib -- --ignored
 
 openapi-validate:
     sh tools/openapi-validate.sh
@@ -34,4 +42,4 @@ openapi-validate:
 openapi-generate:
     sh tools/openapi-generate.sh
 
-check: fmt-check lint test
+check: fmt-check future-incompat lint test
