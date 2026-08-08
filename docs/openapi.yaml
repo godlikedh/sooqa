@@ -10,16 +10,22 @@ servers:
   - url: /
 tags:
   - name: health
+    description: Process liveness.
   - name: ingest
+    description: Durable media ingestion requests.
   - name: media
+    description: Normalized media catalogue operations.
   - name: channels
+    description: Configured Telegram publication targets.
   - name: posts
+    description: Intended posts and publication scheduling.
 paths:
   /health/live:
     get:
       tags: [health]
       operationId: getLiveHealth
       summary: Check liveness
+      security: []
       responses:
         '200':
           description: The process is alive.
@@ -27,6 +33,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
+        '400':
+          description: The health request was malformed.
   /api/v1/ingest-requests:
     post:
       tags: [ingest]
@@ -84,7 +92,12 @@ paths:
         - { name: q, in: query, schema: { type: string } }
         - { name: tags, in: query, description: Comma-separated normalized tags., schema: { type: string } }
         - { name: kind, in: query, schema: { $ref: '#/components/schemas/MediaKind' } }
-        - { name: status, in: query, schema: { $ref: '#/components/schemas/MediaStatus', default: active } }
+        - name: status
+          in: query
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/MediaStatus'
+            default: active
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
         - { name: cursor, in: query, schema: { type: string } }
       responses:
