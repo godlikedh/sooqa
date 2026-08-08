@@ -2,7 +2,9 @@
 
 use std::{
     collections::HashMap,
+    fs,
     future::Future,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc,
@@ -11,14 +13,16 @@ use std::{
     time::Duration,
 };
 
-use sooqa_inbox::IngestStatus;
+use sooqa_inbox::{IngestKind, IngestStatus, SourceDownload};
 use sooqa_jobs::{Job, JobCommand, JobStatus, JobType};
 use sooqa_library::StorageUploadStore;
-use sooqa_media::{FfprobeAdapter, MediaWorkspace, WorkspaceArea, WorkspaceError};
-use sooqa_media::{SourceDownloader, SourceInput};
+use sooqa_media::{
+    ArtifactPublicationError, DownloadError, DownloadLimits, DownloadedSource, FfprobeAdapter,
+    MediaWorkspace, SourceDownloader, SourceInput, WorkspaceArea, WorkspaceError, publish_artifact,
+};
 use sooqa_persistence::{
     AssetProbeStart, InboxRepository, InboxRepositoryError, JobRepository, JobRepositoryError,
-    SourceInspectionStart,
+    SourceDownloadStart, SourceInspectionStart,
 };
 use sooqa_telegram::StorageUploadError;
 use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramStorageApi};
@@ -30,9 +34,30 @@ use tokio::{
     time::sleep,
 };
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFailure>> + Send + 'static>>;
 pub type HandlerFn = Arc<dyn Fn(Job) -> HandlerFuture + Send + Sync>;
+
+struct DownloadAttemptArtifact {
+    path: PathBuf,
+}
+
+impl DownloadAttemptArtifact {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for DownloadAttemptArtifact {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct HandlerFailure {
@@ -108,6 +133,23 @@ pub fn inspect_source_handler(
     })
 }
 
+pub fn download_source_handler(
+    inbox: InboxRepository,
+    work_root: impl Into<PathBuf>,
+    downloader: Arc<dyn SourceDownloader>,
+    limits: DownloadLimits,
+) -> HandlerFn {
+    let work_root = work_root.into();
+    Arc::new(move |job| {
+        let inbox = inbox.clone();
+        let work_root = work_root.clone();
+        let downloader = Arc::clone(&downloader);
+        Box::pin(async move {
+            download_source(&inbox, &work_root, downloader.as_ref(), &limits, job).await
+        })
+    })
+}
+
 pub fn upload_storage_asset_handler<A, S>(provider: StorageUploadProvider<A, S>) -> HandlerFn
 where
     A: TelegramStorageApi,
@@ -154,22 +196,27 @@ async fn probe_asset(
         Ok(AssetProbeStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
     };
-    let workspace_id = match request.original_input["telegram_workspace_id"]
-        .as_str()
-        .and_then(|value| value.parse().ok())
-    {
-        Some(workspace_id) => workspace_id,
-        None => {
-            return fail_probe(
-                inbox,
-                ingest_request_id,
-                HandlerFailure::permanent(
-                    "invalid_ingest_state",
-                    "Telegram ingest request has no valid workspace ID",
-                ),
-            )
-            .await;
-        }
+    let (workspace_id, input_name) = if request.kind == IngestKind::Url {
+        (request.id, "source.bin")
+    } else {
+        let workspace_id = match request.original_input["telegram_workspace_id"]
+            .as_str()
+            .and_then(|value| value.parse().ok())
+        {
+            Some(workspace_id) => workspace_id,
+            None => {
+                return fail_probe(
+                    inbox,
+                    ingest_request_id,
+                    HandlerFailure::permanent(
+                        "invalid_ingest_state",
+                        "Telegram ingest request has no valid workspace ID",
+                    ),
+                )
+                .await;
+            }
+        };
+        (workspace_id, "telegram-input.bin")
     };
     let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
         Ok(workspace) => workspace,
@@ -180,7 +227,7 @@ async fn probe_asset(
     if let Err(error) = workspace.validate() {
         return fail_probe(inbox, ingest_request_id, map_workspace_error(error)).await;
     }
-    let input_path = match workspace.path(WorkspaceArea::Source, "telegram-input.bin") {
+    let input_path = match workspace.path(WorkspaceArea::Source, input_name) {
         Ok(path) => path,
         Err(error) => {
             return fail_probe(inbox, ingest_request_id, map_workspace_error(error)).await;
@@ -336,12 +383,234 @@ async fn inspect_source(
     Ok(())
 }
 
+async fn download_source(
+    inbox: &InboxRepository,
+    work_root: &Path,
+    downloader: &dyn SourceDownloader,
+    limits: &DownloadLimits,
+    job: Job,
+) -> Result<(), HandlerFailure> {
+    let (ingest_request_id, inspection) = match &job.command {
+        JobCommand::DownloadSource(payload) => {
+            (payload.ingest_request_id, payload.inspection.clone())
+        }
+        _ => {
+            return Err(HandlerFailure::permanent(
+                "invalid_payload",
+                "download_source handler received a different job command",
+            ));
+        }
+    };
+    let job_attempt = job.attempt().ok_or_else(|| {
+        HandlerFailure::permanent(
+            "invalid_job_state",
+            "download_source handler requires a running job lease",
+        )
+    })?;
+
+    match inbox.begin_source_download(ingest_request_id, &job_attempt).await {
+        Ok(SourceDownloadStart::Ready(_)) => {}
+        Ok(SourceDownloadStart::AlreadyAdvanced(_)) => return Ok(()),
+        Err(error) => return Err(map_inbox_error(error)),
+    }
+
+    let workspace = match MediaWorkspace::create(work_root, ingest_request_id).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return fail_download(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_workspace_error(error),
+            )
+            .await;
+        }
+    };
+    if let Err(error) = workspace.validate() {
+        return fail_download(inbox, ingest_request_id, &job_attempt, map_workspace_error(error))
+            .await;
+    }
+    let source_path = match workspace.path(WorkspaceArea::Source, "source.bin") {
+        Ok(path) => path,
+        Err(error) => {
+            return fail_download(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_workspace_error(error),
+            )
+            .await;
+        }
+    };
+    let attempt_path = match workspace
+        .path(WorkspaceArea::Source, &format!(".sooqa-source-{}.tmp", Uuid::new_v4()))
+    {
+        Ok(path) => path,
+        Err(error) => {
+            return fail_download(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_workspace_error(error),
+            )
+            .await;
+        }
+    };
+    let attempt = DownloadAttemptArtifact::new(attempt_path);
+
+    let downloaded = match downloader.download(&inspection, attempt.path(), limits).await {
+        Ok(downloaded) => downloaded,
+        Err(error) => {
+            let terminal = !error.is_retryable() || job.attempt_count >= job.max_attempts;
+            let failure = download_failure(error, terminal);
+            return fail_download(inbox, ingest_request_id, &job_attempt, failure).await;
+        }
+    };
+
+    if let Err(failure) = validate_downloaded_source(&workspace, attempt.path(), &downloaded).await
+    {
+        return fail_download(inbox, ingest_request_id, &job_attempt, failure).await;
+    }
+    let downloaded = match publish_artifact(attempt.path(), &source_path).await {
+        Ok(()) => {
+            let published =
+                match read_source_artifact(&workspace, &source_path, downloaded.mime_type.clone())
+                    .await
+                {
+                    Ok(published) => published,
+                    Err(failure) => {
+                        return fail_download(inbox, ingest_request_id, &job_attempt, failure)
+                            .await;
+                    }
+                };
+            if published.bytes != downloaded.bytes {
+                return fail_download(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    HandlerFailure::permanent(
+                        "download_artifact",
+                        "published source size does not match adapter metadata",
+                    ),
+                )
+                .await;
+            }
+            published
+        }
+        Err(ArtifactPublicationError::DestinationConflict) => {
+            match read_source_artifact(&workspace, &source_path, downloaded.mime_type.clone()).await
+            {
+                Ok(published) => published,
+                Err(failure) => {
+                    return fail_download(inbox, ingest_request_id, &job_attempt, failure).await;
+                }
+            }
+        }
+        Err(error) => {
+            return fail_download(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent("download_artifact", error.to_string()),
+            )
+            .await;
+        }
+    };
+
+    inbox
+        .complete_source_download(
+            ingest_request_id,
+            &job_attempt,
+            SourceDownload { bytes: downloaded.bytes, mime_type: downloaded.mime_type },
+        )
+        .await
+        .map_err(map_inbox_error)?;
+    Ok(())
+}
+
+fn download_failure(error: DownloadError, terminal: bool) -> HandlerFailure {
+    let class = error.class().to_owned();
+    let message = error.to_string();
+    if terminal {
+        HandlerFailure::permanent(class, message)
+    } else {
+        HandlerFailure::retryable(class, message)
+    }
+}
+
+async fn validate_downloaded_source(
+    workspace: &MediaWorkspace,
+    source_path: &Path,
+    downloaded: &DownloadedSource,
+) -> Result<(), HandlerFailure> {
+    workspace.validate().map_err(map_workspace_error)?;
+    if downloaded.path != source_path {
+        return Err(HandlerFailure::permanent(
+            "download_artifact",
+            "source downloader returned a path outside the requested workspace destination",
+        ));
+    }
+    let stored = read_source_artifact(workspace, source_path, downloaded.mime_type.clone()).await?;
+    if stored.bytes != downloaded.bytes {
+        return Err(HandlerFailure::permanent(
+            "download_artifact",
+            "downloaded source size does not match adapter metadata",
+        ));
+    }
+    Ok(())
+}
+
+async fn read_source_artifact(
+    workspace: &MediaWorkspace,
+    source_path: &Path,
+    mime_type: Option<String>,
+) -> Result<DownloadedSource, HandlerFailure> {
+    workspace.validate().map_err(map_workspace_error)?;
+    let metadata = tokio::fs::symlink_metadata(source_path).await.map_err(|error| {
+        HandlerFailure::permanent(
+            "download_artifact",
+            format!("downloaded source is not accessible: {error}"),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(HandlerFailure::permanent(
+            "download_artifact",
+            "downloaded source is not a regular file",
+        ));
+    }
+    Ok(DownloadedSource { path: source_path.to_owned(), bytes: metadata.len(), mime_type })
+}
+
+async fn fail_download(
+    inbox: &InboxRepository,
+    ingest_request_id: uuid::Uuid,
+    job_attempt: &sooqa_jobs::JobAttempt,
+    failure: HandlerFailure,
+) -> Result<(), HandlerFailure> {
+    let status = if failure.retryable {
+        IngestStatus::FailedRetryable
+    } else {
+        IngestStatus::FailedTerminal
+    };
+    inbox
+        .fail_source_download(
+            ingest_request_id,
+            job_attempt,
+            status,
+            &failure.class,
+            &failure.message,
+        )
+        .await
+        .map_err(map_inbox_error)?;
+    Err(failure)
+}
+
 fn map_inbox_error(error: InboxRepositoryError) -> HandlerFailure {
     let message = error.to_string();
     match error {
         InboxRepositoryError::ResourceMissing(_)
         | InboxRepositoryError::MissingSourceUrl(_)
-        | InboxRepositoryError::InvalidSourceInspectionFailureStatus(_)
+        | InboxRepositoryError::InvalidFailureStatus(_)
         | InboxRepositoryError::InvalidStateTransition(_)
         | InboxRepositoryError::UnknownIngestKind(_)
         | InboxRepositoryError::UnknownIngestStatus(_)

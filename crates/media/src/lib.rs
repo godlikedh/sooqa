@@ -109,6 +109,32 @@ pub trait SourceDownloader: Send + Sync {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum ArtifactPublicationError {
+    #[error("media artifact destination already contains different content")]
+    DestinationConflict,
+    #[error("media artifact publication failed: {0}")]
+    Failed(String),
+}
+
+/// Publishes a completed artifact into a workspace without overwriting a
+/// different existing file. Identical content is safely reused, which makes
+/// lease-expiry retries converge on one destination.
+pub async fn publish_artifact(
+    temporary: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> Result<(), ArtifactPublicationError> {
+    publication::publish_or_reuse(temporary.as_ref(), destination.as_ref())
+        .await
+        .map(|_| ())
+        .map_err(|error| match error {
+            publication::PublishError::DestinationConflict(_) => {
+                ArtifactPublicationError::DestinationConflict
+            }
+            error => ArtifactPublicationError::Failed(error.to_string()),
+        })
+}
+
 /// Selects the direct HTTP adapter for recognizable media responses and, when
 /// configured, uses yt-dlp for page-like URLs or upstream responses that
 /// direct HTTP cannot handle. The selected adapter is recorded in

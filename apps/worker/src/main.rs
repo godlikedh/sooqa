@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
 use sooqa_worker::{
-    HandlerRegistry, Worker, inspect_source_handler, probe_asset_handler,
+    HandlerRegistry, Worker, download_source_handler, inspect_source_handler, probe_asset_handler,
     upload_storage_asset_handler,
 };
 
@@ -46,9 +46,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let source_downloader: Arc<dyn SourceDownloader> = Arc::new(
         SourceDownloaderRouter::direct_only(Arc::new(DirectHttpDownloader::new(download_limits))),
     );
-    let inspect_handler = inspect_source_handler(database.inbox(), source_downloader);
+    let inspect_handler = inspect_source_handler(database.inbox(), Arc::clone(&source_downloader));
     handlers.register(JobType::InspectSource, move |job| inspect_handler(job));
     tracing::info!("source inspection handler enabled (direct HTTP only)");
+    let download_handler = download_source_handler(
+        database.inbox(),
+        config.media.work_root.clone(),
+        source_downloader,
+        download_limits,
+    );
+    handlers.register(JobType::DownloadSource, move |job| download_handler(job));
+    tracing::info!("source download handler enabled");
     let probe_handler = probe_asset_handler(
         database.inbox(),
         config.media.work_root.clone(),

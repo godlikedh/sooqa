@@ -1,9 +1,9 @@
 use serde_json::json;
-use sooqa_inbox::SourceInspection;
 use sooqa_inbox::{
-    IngestKind, IngestRequest, IngestStateError, IngestStatus, IngestSubmission, SubmittedVia,
+    IngestKind, IngestRequest, IngestStateError, IngestStatus, IngestSubmission, SourceDownload,
+    SourceInspection, SubmittedVia,
 };
-use sooqa_jobs::NewJob;
+use sooqa_jobs::{JobAttempt, NewJob};
 use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -149,6 +149,15 @@ impl InboxRepository {
                 update_ingest_state(&mut transaction, &request).await?;
                 AssetProbeStart::Ready(request)
             }
+            IngestStatus::Downloading => {
+                request.transition_to(IngestStatus::Probing)?;
+                request.error_code = None;
+                request.error_message = None;
+                request.completed_at = None;
+                request.updated_at = OffsetDateTime::now_utc();
+                update_ingest_state(&mut transaction, &request).await?;
+                AssetProbeStart::Ready(request)
+            }
             IngestStatus::Probing => AssetProbeStart::Ready(request),
             IngestStatus::FailedRetryable => {
                 request.transition_to(IngestStatus::Queued)?;
@@ -162,6 +171,37 @@ impl InboxRepository {
                 AssetProbeStart::Ready(request)
             }
             _ => AssetProbeStart::AlreadyAdvanced(request),
+        };
+        transaction.commit().await?;
+        Ok(start)
+    }
+
+    pub async fn begin_source_download(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+    ) -> Result<SourceDownloadStart, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        let start = if request.original_input.get("download").is_some()
+            || !lock_current_job_attempt(&mut transaction, attempt).await?
+        {
+            SourceDownloadStart::AlreadyAdvanced(request)
+        } else {
+            match request.status {
+                IngestStatus::Downloading => SourceDownloadStart::Ready(request),
+                IngestStatus::FailedRetryable => {
+                    request.transition_to(IngestStatus::Queued)?;
+                    request.transition_to(IngestStatus::Downloading)?;
+                    request.error_code = None;
+                    request.error_message = None;
+                    request.completed_at = None;
+                    request.updated_at = OffsetDateTime::now_utc();
+                    update_ingest_state(&mut transaction, &request).await?;
+                    SourceDownloadStart::Ready(request)
+                }
+                _ => SourceDownloadStart::AlreadyAdvanced(request),
+            }
         };
         transaction.commit().await?;
         Ok(start)
@@ -233,6 +273,60 @@ impl InboxRepository {
         Ok(request)
     }
 
+    pub async fn complete_source_download(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+        download: SourceDownload,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        if request.status != IngestStatus::Downloading
+            || request.original_input.get("download").is_some()
+            || !lock_current_job_attempt(&mut transaction, attempt).await?
+        {
+            transaction.commit().await?;
+            return Ok(request);
+        }
+
+        let download = serde_json::to_value(download).expect("source download is serializable");
+        if let Some(object) = request.original_input.as_object_mut() {
+            object.insert("download".to_owned(), download);
+        } else {
+            request.original_input =
+                json!({ "source": request.original_input, "download": download });
+        }
+        request.error_code = None;
+        request.error_message = None;
+        request.updated_at = OffsetDateTime::now_utc();
+        sqlx::query(
+            "UPDATE ingest_requests SET original_input = $2, error_code = $3, error_message = $4, updated_at = $5 WHERE id = $1",
+        )
+        .bind(request.id)
+        .bind(&request.original_input)
+        .bind(&request.error_code)
+        .bind(&request.error_message)
+        .bind(request.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+
+        insert_probe_job(&mut transaction, &request).await?;
+
+        transaction.commit().await?;
+        Ok(request)
+    }
+
+    pub async fn fail_source_download(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+        status: IngestStatus,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
+        self.fail_ingest_step(id, status, error_code, error_message, true, Some(attempt)).await
+    }
+
     pub async fn fail_source_inspection(
         &self,
         id: Uuid,
@@ -240,11 +334,7 @@ impl InboxRepository {
         error_code: &str,
         error_message: &str,
     ) -> Result<IngestRequest, InboxRepositoryError> {
-        if !matches!(status, IngestStatus::FailedRetryable | IngestStatus::FailedTerminal) {
-            return Err(InboxRepositoryError::InvalidSourceInspectionFailureStatus(status));
-        }
-
-        self.fail_asset_probe(id, status, error_code, error_message).await
+        self.fail_ingest_step(id, status, error_code, error_message, false, None).await
     }
 
     pub async fn fail_asset_probe(
@@ -254,12 +344,34 @@ impl InboxRepository {
         error_code: &str,
         error_message: &str,
     ) -> Result<IngestRequest, InboxRepositoryError> {
+        self.fail_ingest_step(id, status, error_code, error_message, false, None).await
+    }
+
+    async fn fail_ingest_step(
+        &self,
+        id: Uuid,
+        status: IngestStatus,
+        error_code: &str,
+        error_message: &str,
+        ignore_completed_download: bool,
+        attempt: Option<&JobAttempt>,
+    ) -> Result<IngestRequest, InboxRepositoryError> {
         if !matches!(status, IngestStatus::FailedRetryable | IngestStatus::FailedTerminal) {
-            return Err(InboxRepositoryError::InvalidSourceInspectionFailureStatus(status));
+            return Err(InboxRepositoryError::InvalidFailureStatus(status));
         }
 
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
+        if ignore_completed_download && request.original_input.get("download").is_some() {
+            transaction.commit().await?;
+            return Ok(request);
+        }
+        if let Some(attempt) = attempt
+            && !lock_current_job_attempt(&mut transaction, attempt).await?
+        {
+            transaction.commit().await?;
+            return Ok(request);
+        }
         if request.status.is_terminal() {
             transaction.commit().await?;
             return Ok(request);
@@ -279,6 +391,12 @@ impl InboxRepository {
 
 #[derive(Debug, Clone)]
 pub enum SourceInspectionStart {
+    Ready(IngestRequest),
+    AlreadyAdvanced(IngestRequest),
+}
+
+#[derive(Debug, Clone)]
+pub enum SourceDownloadStart {
     Ready(IngestRequest),
     AlreadyAdvanced(IngestRequest),
 }
@@ -385,6 +503,7 @@ async fn insert_probe_job(
         r#"
         INSERT INTO jobs (job_type, payload_json, idempotency_key)
         VALUES ($1, $2, $3)
+        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
         "#,
     )
     .bind(job.job_type().as_str())
@@ -415,6 +534,30 @@ async fn load_request(
     .ok_or(InboxRepositoryError::ResourceMissing(id))?;
 
     row.into_request()
+}
+
+async fn lock_current_job_attempt(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    attempt: &JobAttempt,
+) -> Result<bool, sqlx::Error> {
+    let current_job = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id
+        FROM jobs
+        WHERE id = $1
+          AND status = 'running'
+          AND attempt_count = $2
+          AND lease_owner = $3
+          AND lease_expires_at > now()
+        FOR UPDATE
+        "#,
+    )
+    .bind(attempt.job_id)
+    .bind(attempt.attempt_number)
+    .bind(&attempt.lease_owner)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(current_job.is_some())
 }
 
 #[derive(Debug, FromRow)]
@@ -487,8 +630,8 @@ pub enum InboxRepositoryError {
     UnknownIngestStatus(String),
     #[error("unknown submission source in database: {0}")]
     UnknownSubmittedVia(String),
-    #[error("invalid source inspection failure status: {0:?}")]
-    InvalidSourceInspectionFailureStatus(IngestStatus),
+    #[error("invalid ingest failure status: {0:?}")]
+    InvalidFailureStatus(IngestStatus),
     #[error("invalid ingest state transition: {0}")]
     InvalidStateTransition(#[from] IngestStateError),
     #[error("database operation failed: {0}")]

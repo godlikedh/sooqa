@@ -381,6 +381,24 @@ impl Job {
     pub fn job_type(&self) -> JobType {
         self.command.job_type()
     }
+
+    pub fn attempt(&self) -> Option<JobAttempt> {
+        if self.status != JobStatus::Running || self.attempt_count <= 0 {
+            return None;
+        }
+        self.lease_owner.clone().map(|lease_owner| JobAttempt {
+            job_id: self.id,
+            attempt_number: self.attempt_count,
+            lease_owner,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct JobAttempt {
+    pub job_id: JobId,
+    pub attempt_number: i32,
+    pub lease_owner: String,
 }
 
 #[cfg(test)]

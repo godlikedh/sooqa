@@ -62,16 +62,19 @@ durable state before or after external work using idempotent repository
 operations; no PostgreSQL transaction remains open while Telegram, ffprobe,
 ffmpeg, or yt-dlp is running.
 
-## Current Telegram paths
+## Current ingest paths
 
 URL messages call the Inbox service and create a durable `inspect_source` job.
 The production worker registers that handler with a direct-only router:
 recognizable media responses stay on the SSRF-hardened direct HTTP adapter,
-while page-like responses are rejected as unsupported. The yt-dlp adapter is
-implemented behind the media boundary but is not enabled in the production
-worker until its subprocess egress has an equivalent SSRF boundary. The
-selected adapter is retained in the typed inspection payload for the later
-download job.
+while page-like responses are rejected as unsupported. The resulting
+`download_source` job writes `source.bin` into the deterministic ingest
+workspace, records typed download metadata in the existing ingest request, and
+enqueues the existing `probe_asset` job. Download completion and failure are
+fenced to the current durable job lease attempt, so a stale worker cannot
+overwrite a newer attempt's state. The yt-dlp adapter is implemented
+behind the media boundary but is not enabled in the production worker until
+its subprocess egress has an equivalent SSRF boundary.
 Media messages are downloaded into a per-update workspace, then create a
 Telegram ingest request and `probe_asset` job. The probe handler validates the
 shared workspace and uses ffprobe before recording typed probe metadata.
@@ -114,7 +117,7 @@ image includes all three tools and creates a writable `/var/lib/sooqa/work`.
 ## State of the pipeline
 
 Implemented primitives and boundaries do not imply an end-to-end publisher.
-The remaining composition work is download execution, normalization/finalization,
-review-facing library actions, and Telegram publication. The historical roadmap in
+The remaining composition work is normalization/finalization, review-facing
+library actions, and Telegram publication. The historical roadmap in
 `docs/reference/PROJECT_SPEC.md` is useful context but is not the authority for
 those claims.
