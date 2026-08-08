@@ -6,6 +6,9 @@ All notable changes to sooqa will be documented here.
 
 ### Added
 
+- Composed production URL source inspection with the SSRF-hardened direct HTTP
+  adapter; kept yt-dlp available behind its media boundary pending subprocess
+  egress isolation.
 - Bootstrapped the Rust 2024 workspace and application/crate layout.
 - Added formatting, linting, testing, and GitHub CI foundations.
 - Added typed TOML/environment configuration, redacted summaries, structured

@@ -50,7 +50,10 @@ proc-macro-error2 v2.0.1
     └── teloxide v0.17.0
 ```
 
-Media integration tests that need locally installed binaries are separate:
+The production worker uses direct HTTP for URL inspection, so it does not need
+an external binary for that path. The yt-dlp adapter is tested separately and
+is not enabled in the worker until its subprocess egress is isolated. Media
+integration tests that need locally installed binaries are separate:
 
 ```bash
 just test-media
