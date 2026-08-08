@@ -209,6 +209,16 @@ impl JobRepository {
         let job = row.into_job()?;
         let attempt_status = if job.status == JobStatus::Failed { "failed" } else { "retry_wait" };
 
+        if job.status == JobStatus::Failed {
+            mark_exhausted_fingerprint_request(
+                &mut transaction,
+                fingerprint_request_id(&job),
+                Some(error_class),
+                Some(error_message),
+            )
+            .await?;
+        }
+
         finish_attempt(
             &mut transaction,
             &job,
@@ -319,6 +329,14 @@ impl JobRepository {
         .ok_or(JobRepositoryError::LeaseLost)?;
         let job = row.into_job()?;
 
+        mark_exhausted_fingerprint_request(
+            &mut transaction,
+            fingerprint_request_id(&job),
+            Some(error_class),
+            Some(error_message),
+        )
+        .await?;
+
         finish_attempt(&mut transaction, &job, "failed", Some(error_class), Some(error_message))
             .await?;
         transaction.commit().await?;
@@ -329,7 +347,7 @@ impl JobRepository {
         let mut transaction = self.pool.begin().await?;
         let stale_jobs = sqlx::query_as::<_, StaleJobRow>(
             r#"
-            SELECT id, attempt_count, max_attempts
+            SELECT id, job_type, payload_json, attempt_count, max_attempts
             FROM jobs
             WHERE status = 'running'
               AND lease_expires_at IS NOT NULL
@@ -380,6 +398,15 @@ impl JobRepository {
             .bind(stale_job.attempt_count)
             .execute(&mut *transaction)
             .await?;
+            if status == "failed" && stale_job.job_type == "compute_fingerprint" {
+                mark_exhausted_fingerprint_request(
+                    &mut transaction,
+                    stale_job.fingerprint_request_id(),
+                    Some("fingerprint_job_exhausted"),
+                    Some("fingerprint job lease expired after its retry budget was exhausted"),
+                )
+                .await?;
+            }
         }
 
         transaction.commit().await?;
@@ -482,8 +509,55 @@ impl JobRow {
 #[derive(Debug, FromRow)]
 struct StaleJobRow {
     id: Uuid,
+    job_type: String,
+    payload_json: serde_json::Value,
     attempt_count: i32,
     max_attempts: i32,
+}
+
+impl StaleJobRow {
+    fn fingerprint_request_id(&self) -> Option<Uuid> {
+        (self.job_type == "compute_fingerprint")
+            .then(|| self.payload_json.get("ingest_request_id"))
+            .flatten()
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse().ok())
+    }
+}
+
+fn fingerprint_request_id(job: &Job) -> Option<Uuid> {
+    match &job.command {
+        JobCommand::ComputeFingerprint(payload) => Some(payload.ingest_request_id),
+        _ => None,
+    }
+}
+
+async fn mark_exhausted_fingerprint_request(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request_id: Option<Uuid>,
+    error_class: Option<&str>,
+    error_message: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let Some(request_id) = request_id else {
+        return Ok(());
+    };
+    sqlx::query(
+        r#"
+        UPDATE ingest_requests
+        SET status = 'failed_terminal',
+            error_code = COALESCE($2, 'fingerprint_job_exhausted'),
+            error_message = COALESCE($3, 'fingerprint job exhausted its retry budget'),
+            completed_at = now(),
+            updated_at = now()
+        WHERE id = $1 AND status IN ('fingerprinting', 'failed_retryable')
+        "#,
+    )
+    .bind(request_id)
+    .bind(error_class)
+    .bind(error_message)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, Error)]

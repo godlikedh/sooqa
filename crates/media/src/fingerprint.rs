@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     CommandError, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommand, ExternalCommandRunner, MediaProbe,
-    MediaWorkspace, WorkspaceArea, WorkspaceError,
+    MediaWorkspace, WorkspaceArea, WorkspaceError, sha256_bytes,
 };
 
 const FRAME_RATIOS_BPS: [u16; 7] = [500, 1500, 3000, 5000, 7000, 8500, 9500];
@@ -148,6 +148,23 @@ impl FrameExtractor {
         input_name: &str,
         duration_ms: u64,
     ) -> Result<FrameExtractionResult, FrameExtractionError> {
+        self.extract_from_area_with_cache_key(workspace, area, input_name, input_name, duration_ms)
+            .await
+    }
+
+    /// Extract frames using a cache key bound to the canonical input identity.
+    ///
+    /// The key and duration are hashed into the frame names so a replay cannot
+    /// reuse valid frames produced for a different normalized asset or sampling
+    /// duration in the same workspace.
+    pub async fn extract_from_area_with_cache_key(
+        &self,
+        workspace: &MediaWorkspace,
+        area: WorkspaceArea,
+        input_name: &str,
+        cache_key: &str,
+        duration_ms: u64,
+    ) -> Result<FrameExtractionResult, FrameExtractionError> {
         if duration_ms == 0 {
             return Err(FrameExtractionError::InvalidDuration);
         }
@@ -159,11 +176,12 @@ impl FrameExtractor {
         if input_metadata.file_type().is_symlink() || !input_metadata.is_file() {
             return Err(FrameExtractionError::InputNotFile { path: input_path });
         }
+        let frame_cache_key = sha256_bytes(format!("{cache_key}:{duration_ms}").as_bytes()).sha256;
         let timestamps = select_fingerprint_timestamps(duration_ms);
         let mut frame_paths = Vec::with_capacity(timestamps.len());
 
         for (index, timestamp) in timestamps.iter().enumerate() {
-            let frame_name = format!("frame-dhash-v1-{index:02}.png");
+            let frame_name = format!("frame-dhash-v1-{frame_cache_key}-{index:02}.png");
             let output_path = match workspace.path(WorkspaceArea::Frames, &frame_name) {
                 Ok(path) => path,
                 Err(error) => return Err(error.into()),

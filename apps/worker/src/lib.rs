@@ -1008,7 +1008,13 @@ async fn compute_fingerprint(
         .await;
     }
     let result = match extractor
-        .extract_from_area(&workspace, WorkspaceArea::Normalized, "canonical.mp4", duration_ms)
+        .extract_from_area_with_cache_key(
+            &workspace,
+            WorkspaceArea::Normalized,
+            "canonical.mp4",
+            &normalization.sha256,
+            duration_ms,
+        )
         .await
     {
         Ok(result) => result,
