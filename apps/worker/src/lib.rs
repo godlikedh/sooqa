@@ -19,19 +19,23 @@ use sooqa_inbox::{
 };
 use sooqa_jobs::{Job, JobCommand, JobStatus, JobType};
 use sooqa_library::{
-    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem, NewMediaAssetDraft,
-    NewSourceRecordDraft, SourceType, StorageState, StorageUploadStore,
+    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem,
+    NewDuplicateCandidate, NewMediaAssetDraft, NewSourceRecordDraft, SourceType, StorageState,
+    StorageUploadStore,
 };
 use sooqa_media::{
     ArtifactPublicationError, DownloadError, DownloadLimits, DownloadedSource, FfmpegExecutor,
-    FfprobeAdapter, FrameExtractionError, FrameExtractor, ImageNormalizer, MediaProbe,
-    MediaStreamKind, MediaWorkspace, NormalizationExecutionError, NormalizationPlanner,
-    SourceDownloader, SourceInput, WorkspaceArea, WorkspaceError, publish_artifact,
+    FfprobeAdapter, FingerprintVersion, FrameExtractionError, FrameExtractor, ImageNormalizer,
+    MediaProbe, MediaStreamKind, MediaWorkspace, NormalizationExecutionError, NormalizationPlanner,
+    SimilarityClassification, SimilarityConfig, SimilarityError, SourceDownloader, SourceInput,
+    VideoFingerprint, VideoSimilarityInput, WorkspaceArea, WorkspaceError, compare_videos,
+    publish_artifact,
 };
 use sooqa_persistence::{
     AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
-    IngestFinalizationStart, IngestFingerprintStart, JobRepository, JobRepositoryError,
-    LibraryRepository, LibraryRepositoryError, SourceDownloadStart, SourceInspectionStart,
+    IngestFinalizationStart, IngestFingerprintStart, IngestSimilarityStart, JobRepository,
+    JobRepositoryError, LibraryRepository, LibraryRepositoryError, SourceDownloadStart,
+    SourceInspectionStart, StoredVideoFingerprint,
 };
 use sooqa_telegram::StorageUploadError;
 use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramStorageApi};
@@ -222,6 +226,18 @@ pub fn compute_fingerprint_handler(
         let work_root = work_root.clone();
         let extractor = extractor.clone();
         Box::pin(async move { compute_fingerprint(&inbox, &work_root, &extractor, job).await })
+    })
+}
+
+pub fn check_similarity_handler(
+    inbox: InboxRepository,
+    library: LibraryRepository,
+    config: SimilarityConfig,
+) -> HandlerFn {
+    Arc::new(move |job| {
+        let inbox = inbox.clone();
+        let library = library.clone();
+        Box::pin(async move { check_similarity(&inbox, &library, config, job).await })
     })
 }
 
@@ -1035,6 +1051,264 @@ async fn compute_fingerprint(
         .await
         .map_err(map_inbox_error)?;
     Ok(())
+}
+
+async fn check_similarity(
+    inbox: &InboxRepository,
+    library: &LibraryRepository,
+    config: SimilarityConfig,
+    job: Job,
+) -> Result<(), HandlerFailure> {
+    let ingest_request_id = match &job.command {
+        JobCommand::CheckSimilarity(payload) => payload.ingest_request_id,
+        _ => {
+            return Err(HandlerFailure::permanent(
+                "invalid_payload",
+                "check_similarity handler received a different job command",
+            ));
+        }
+    };
+    let job_attempt = job.attempt().ok_or_else(|| {
+        HandlerFailure::permanent(
+            "invalid_job_state",
+            "check_similarity handler requires a running job lease",
+        )
+    })?;
+    let request = match inbox.begin_ingest_similarity(ingest_request_id, &job_attempt).await {
+        Ok(IngestSimilarityStart::Ready(request)) => request,
+        Ok(IngestSimilarityStart::AlreadyAdvanced(_)) => return Ok(()),
+        Err(error) => return Err(map_inbox_error(error)),
+    };
+    let input = match similarity_input(&request) {
+        Ok(input) => input,
+        Err(failure) => {
+            return fail_similarity(inbox, ingest_request_id, &job_attempt, failure).await;
+        }
+    };
+    let stored = match library
+        .list_stored_video_fingerprints(
+            input.content_item_id,
+            FingerprintVersion::FrameDHashV1.as_str(),
+        )
+        .await
+    {
+        Ok(stored) => stored,
+        Err(error) => {
+            return fail_similarity(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_library_error(error),
+            )
+            .await;
+        }
+    };
+    for candidate in stored {
+        let fingerprint =
+            match serde_json::from_value::<VideoFingerprint>(candidate.fingerprint.clone()) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    return fail_similarity(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    HandlerFailure::permanent(
+                        "invalid_similarity_state",
+                        format!(
+                            "stored fingerprint for content item {} could not be decoded: {error}",
+                            candidate.content_item_id
+                        ),
+                    ),
+                )
+                .await;
+                }
+            };
+        let result = match compare_videos(
+            VideoSimilarityInput {
+                fingerprint: &input.fingerprint,
+                aspect_ratio: input.aspect_ratio,
+                has_audio: input.has_audio,
+            },
+            VideoSimilarityInput {
+                fingerprint: &fingerprint,
+                aspect_ratio: stored_aspect_ratio(&candidate),
+                has_audio: Some(candidate.audio_codec.is_some()),
+            },
+            config,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                return fail_similarity(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    map_similarity_error(error),
+                )
+                .await;
+            }
+        };
+        if !matches!(
+            result.classification,
+            SimilarityClassification::LikelyDuplicate | SimilarityClassification::PossibleDuplicate
+        ) {
+            continue;
+        }
+        let evidence_json = serde_json::to_value(&result.evidence)
+            .expect("similarity evidence should be serializable");
+        if let Err(error) = library
+            .upsert_duplicate_candidate(NewDuplicateCandidate {
+                left_content_item_id: input.content_item_id,
+                right_content_item_id: candidate.content_item_id,
+                algorithm_version: result.evidence.algorithm_version.as_str().to_owned(),
+                score_basis_points: result.score_basis_points(),
+                evidence_json,
+            })
+            .await
+        {
+            return fail_similarity(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_library_error(error),
+            )
+            .await;
+        }
+    }
+    inbox
+        .complete_ingest_similarity(ingest_request_id, &job_attempt)
+        .await
+        .map_err(map_inbox_error)?;
+    Ok(())
+}
+
+struct SimilarityInput {
+    content_item_id: uuid::Uuid,
+    fingerprint: VideoFingerprint,
+    aspect_ratio: Option<f64>,
+    has_audio: Option<bool>,
+}
+
+fn similarity_input(
+    request: &sooqa_inbox::IngestRequest,
+) -> Result<SimilarityInput, HandlerFailure> {
+    let normalization = request
+        .original_input
+        .get("normalization")
+        .cloned()
+        .ok_or_else(|| {
+            HandlerFailure::permanent(
+                "invalid_similarity_state",
+                "ingest request has no stored normalization metadata",
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_value::<AssetNormalization>(value).map_err(|error| {
+                HandlerFailure::permanent(
+                    "invalid_similarity_state",
+                    format!("stored normalization metadata could not be decoded: {error}"),
+                )
+            })
+        })?;
+    if normalization.media_kind != SourceMediaKind::Video {
+        return Err(HandlerFailure::permanent(
+            "invalid_similarity_state",
+            "similarity input is not a video normalization",
+        ));
+    }
+    let finalization = request
+        .original_input
+        .get("finalization")
+        .cloned()
+        .ok_or_else(|| {
+            HandlerFailure::permanent(
+                "invalid_similarity_state",
+                "ingest request has no stored finalization metadata",
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_value::<IngestFinalization>(value).map_err(|error| {
+                HandlerFailure::permanent(
+                    "invalid_similarity_state",
+                    format!("stored finalization metadata could not be decoded: {error}"),
+                )
+            })
+        })?;
+    let fingerprint = request
+        .original_input
+        .get("fingerprint")
+        .cloned()
+        .ok_or_else(|| {
+            HandlerFailure::permanent(
+                "invalid_similarity_state",
+                "ingest request has no stored fingerprint metadata",
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_value::<VideoFingerprint>(value).map_err(|error| {
+                HandlerFailure::permanent(
+                    "invalid_similarity_state",
+                    format!("stored fingerprint metadata could not be decoded: {error}"),
+                )
+            })
+        })?;
+    Ok(SimilarityInput {
+        content_item_id: finalization.content_item_id,
+        fingerprint,
+        aspect_ratio: normalization_aspect_ratio(&normalization)?,
+        has_audio: Some(normalization.audio_codec.is_some()),
+    })
+}
+
+fn normalization_aspect_ratio(
+    normalization: &AssetNormalization,
+) -> Result<Option<f64>, HandlerFailure> {
+    match (normalization.width, normalization.height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            Ok(Some(f64::from(width) / f64::from(height)))
+        }
+        (None, None) => Ok(None),
+        _ => Err(HandlerFailure::permanent(
+            "invalid_similarity_state",
+            "video normalization has invalid dimensions",
+        )),
+    }
+}
+
+fn stored_aspect_ratio(candidate: &StoredVideoFingerprint) -> Option<f64> {
+    match (candidate.width, candidate.height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            Some(f64::from(width) / f64::from(height))
+        }
+        _ => None,
+    }
+}
+
+fn map_similarity_error(error: SimilarityError) -> HandlerFailure {
+    HandlerFailure::permanent("similarity_failed", error.to_string())
+}
+
+async fn fail_similarity(
+    inbox: &InboxRepository,
+    ingest_request_id: uuid::Uuid,
+    job_attempt: &sooqa_jobs::JobAttempt,
+    failure: HandlerFailure,
+) -> Result<(), HandlerFailure> {
+    let status = if failure.retryable {
+        IngestStatus::FailedRetryable
+    } else {
+        IngestStatus::FailedTerminal
+    };
+    inbox
+        .fail_ingest_similarity(
+            ingest_request_id,
+            job_attempt,
+            status,
+            &failure.class,
+            &failure.message,
+        )
+        .await
+        .map_err(map_inbox_error)?;
+    Err(failure)
 }
 
 fn map_fingerprint_error(job: &Job, error: FrameExtractionError) -> HandlerFailure {

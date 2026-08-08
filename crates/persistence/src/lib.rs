@@ -11,11 +11,11 @@ pub use device_tokens::{
 };
 pub use inbox::{
     AssetNormalizationStart, AssetProbeStart, CreateIngestResult, InboxRepository,
-    InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart, SourceDownloadStart,
-    SourceInspectionStart,
+    InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart, IngestSimilarityStart,
+    SourceDownloadStart, SourceInspectionStart,
 };
 pub use jobs::{JobRepository, JobRepositoryError};
-pub use library::{LibraryRepository, LibraryRepositoryError};
+pub use library::{LibraryRepository, LibraryRepositoryError, StoredVideoFingerprint};
 pub use telegram::{
     TelegramRepository, TelegramRepositoryError, TelegramUpdateClaim, TelegramUpdateClaimResult,
     TelegramUpdateReceipt,

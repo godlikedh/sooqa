@@ -37,7 +37,8 @@ parsing Cargo test options and passes `--ignored` to the test harness, which
 then runs tests marked `#[ignore]`. The integration recipe covers persistence,
 API ingest and library routes, worker behavior, source inspection, source
 download handoff, probe-to-normalize handoff, fake-runner normalization,
-canonical library finalization, and the storage-upload job handoff.
+canonical library finalization, video fingerprint extraction, similarity
+candidate generation, and the storage-upload job handoff.
 
 The current `teloxide` dependency graph also emits a known Rust
 future-incompatibility warning for the transitive `proc-macro-error2` crate
@@ -75,11 +76,14 @@ thumbnail assets. Telegram documents with missing or generic metadata are
 downloaded for probing; explicitly unsupported document metadata is rejected
 at the adapter boundary. Finalization uses the existing ingest JSON metadata
 to queue the versioned `frame_dhash_v1` video fingerprint job without a schema
-migration. Videos persist their fingerprint after frame extraction; images skip
-the video-only stage and complete normally. Audio,
-animation, and unknown media are intentionally recorded by probing and then
-fail terminally with `unsupported_media_kind` until their normalization paths
-are added.
+migration. Videos persist their fingerprint after frame extraction, compare it
+with completed Library videos, and persist candidate evidence in
+`duplicate_candidates`; images skip the video-only stage and complete normally.
+The worker currently composes `SimilarityConfig::default()` (`0.90` likely,
+`0.75` possible) until similarity thresholds receive their own configuration
+slice. Audio, animation, and unknown media are intentionally recorded by
+probing and then fail terminally with `unsupported_media_kind` until their
+normalization paths are added.
 
 ## Telegram adapter
 

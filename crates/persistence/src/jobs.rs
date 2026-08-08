@@ -210,9 +210,9 @@ impl JobRepository {
         let attempt_status = if job.status == JobStatus::Failed { "failed" } else { "retry_wait" };
 
         if job.status == JobStatus::Failed {
-            mark_exhausted_fingerprint_request(
+            mark_exhausted_ingest_job(
                 &mut transaction,
-                fingerprint_request_id(&job),
+                ingest_request_id_for_job(&job),
                 Some(error_class),
                 Some(error_message),
             )
@@ -329,9 +329,9 @@ impl JobRepository {
         .ok_or(JobRepositoryError::LeaseLost)?;
         let job = row.into_job()?;
 
-        mark_exhausted_fingerprint_request(
+        mark_exhausted_ingest_job(
             &mut transaction,
-            fingerprint_request_id(&job),
+            ingest_request_id_for_job(&job),
             Some(error_class),
             Some(error_message),
         )
@@ -398,12 +398,25 @@ impl JobRepository {
             .bind(stale_job.attempt_count)
             .execute(&mut *transaction)
             .await?;
-            if status == "failed" && stale_job.job_type == "compute_fingerprint" {
-                mark_exhausted_fingerprint_request(
+            if status == "failed"
+                && matches!(stale_job.job_type.as_str(), "compute_fingerprint" | "check_similarity")
+            {
+                let (error_class, error_message) = if stale_job.job_type == "compute_fingerprint" {
+                    (
+                        "fingerprint_job_exhausted",
+                        "fingerprint job lease expired after its retry budget was exhausted",
+                    )
+                } else {
+                    (
+                        "similarity_job_exhausted",
+                        "similarity job lease expired after its retry budget was exhausted",
+                    )
+                };
+                mark_exhausted_ingest_job(
                     &mut transaction,
-                    stale_job.fingerprint_request_id(),
-                    Some("fingerprint_job_exhausted"),
-                    Some("fingerprint job lease expired after its retry budget was exhausted"),
+                    stale_job.ingest_request_id(),
+                    Some(error_class),
+                    Some(error_message),
                 )
                 .await?;
             }
@@ -516,8 +529,8 @@ struct StaleJobRow {
 }
 
 impl StaleJobRow {
-    fn fingerprint_request_id(&self) -> Option<Uuid> {
-        (self.job_type == "compute_fingerprint")
+    fn ingest_request_id(&self) -> Option<Uuid> {
+        matches!(self.job_type.as_str(), "compute_fingerprint" | "check_similarity")
             .then(|| self.payload_json.get("ingest_request_id"))
             .flatten()
             .and_then(serde_json::Value::as_str)
@@ -525,14 +538,16 @@ impl StaleJobRow {
     }
 }
 
-fn fingerprint_request_id(job: &Job) -> Option<Uuid> {
+fn ingest_request_id_for_job(job: &Job) -> Option<Uuid> {
     match &job.command {
-        JobCommand::ComputeFingerprint(payload) => Some(payload.ingest_request_id),
+        JobCommand::ComputeFingerprint(payload) | JobCommand::CheckSimilarity(payload) => {
+            Some(payload.ingest_request_id)
+        }
         _ => None,
     }
 }
 
-async fn mark_exhausted_fingerprint_request(
+async fn mark_exhausted_ingest_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request_id: Option<Uuid>,
     error_class: Option<&str>,
@@ -545,11 +560,11 @@ async fn mark_exhausted_fingerprint_request(
         r#"
         UPDATE ingest_requests
         SET status = 'failed_terminal',
-            error_code = COALESCE($2, 'fingerprint_job_exhausted'),
-            error_message = COALESCE($3, 'fingerprint job exhausted its retry budget'),
+            error_code = COALESCE($2, 'ingest_job_exhausted'),
+            error_message = COALESCE($3, 'ingest job exhausted its retry budget'),
             completed_at = now(),
             updated_at = now()
-        WHERE id = $1 AND status IN ('fingerprinting', 'failed_retryable')
+        WHERE id = $1 AND status IN ('fingerprinting', 'similarity_check', 'failed_retryable')
         "#,
     )
     .bind(request_id)
