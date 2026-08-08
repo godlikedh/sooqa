@@ -3,14 +3,17 @@
 ## Mission
 
 Build sooqa, the self-hosted Telegram media pipeline described in
-the current repository documentation, through small, reviewable increments.
-The former product specification is retained as docs/reference/PROJECT_SPEC.md
-for historical roadmap context.
+`docs/product.md`, through small, reviewable increments. The five-table
+persistence reset in issue #43 and ADR 0009 is the active target architecture;
+the former product specification is retained as
+`docs/reference/PROJECT_SPEC.md` for historical roadmap context only.
 
 ## Before coding
 
-1. Read README.md, the relevant active document in docs/, and relevant ADRs.
-   Consult docs/reference/PROJECT_SPEC.md only for historical product and
+1. Read `docs/product.md`, README.md, the relevant active document in `docs/`,
+   and relevant ADRs. During the issue #43 reset, `docs/product.md` and
+   ADR 0009 are authoritative over legacy code and stale active prose.
+   Consult `docs/reference/PROJECT_SPEC.md` only for historical product and
    roadmap context.
 2. Inspect the current branch and working tree.
 3. Restate the exact scope and acceptance criteria in the working plan.
@@ -27,6 +30,11 @@ for historical roadmap context.
 - Keep the single-admin MVP simple without making future boundaries impossible.
 - Treat code and tests as the final authority when active documentation and
   historical roadmap text differ.
+- The issue #43 reset has no compatibility requirement: do not add data-copy
+  SQL, compatibility views, old-name aliases, dual writes, or fallback
+  readers for the discarded schema.
+- Never reset or delete a local Docker volume automatically. Destructive
+  database reset commands must be documented for the owner to run explicitly.
 
 ## Commands
 
