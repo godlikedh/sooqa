@@ -183,6 +183,7 @@ async fn unsupported_image_format_does_not_enqueue_static_normalization() {
         ("filename-webp", None, Some("photo.webp"), "webp", false),
         ("mismatched-mime", Some("image/png"), None, "webp", false),
         ("supported-mismatch", Some("image/jpeg"), Some("photo.jpg"), "png", true),
+        ("declared-image-probed-video", Some("image/png"), Some("photo.png"), "webm", true),
     ] {
         let created = database
             .inbox()

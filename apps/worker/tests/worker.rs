@@ -910,7 +910,7 @@ async fn normalize_handler_composes_image_canonical_and_thumbnail_assets() {
             "file_size": 10,
             "mime_type": "image/png",
             "local_work_path": input_path,
-            "media_kind": "image",
+            "media_kind": "video",
         }),
         supplied_caption: Some("image caption".to_owned()),
         idempotency_key: Some(format!("{}request", key_prefix)),

@@ -229,14 +229,26 @@ impl InboxRepository {
             transaction.commit().await?;
             return Ok(request);
         }
-        let media_kind = request_media_kind(&request);
+        let declared_media_kind = request_media_kind(&request);
+        let detected_media_kind = probed_media_kind(&probe);
+        let media_kind = detected_media_kind.or(declared_media_kind);
         let probed_format = probed_image_format(&probe);
         let unsupported_image_format = media_kind == Some(SourceMediaKind::Image)
             && !request_image_format_is_supported(&request, &probe);
         if let Some(object) = request.original_input.as_object_mut() {
             object.insert("probe".to_owned(), probe);
+            if let Some(media_kind) = detected_media_kind {
+                object.insert(
+                    "probed_media_kind".to_owned(),
+                    serde_json::to_value(media_kind).expect("source media kind is serializable"),
+                );
+            }
         } else {
-            request.original_input = json!({ "source": request.original_input, "probe": probe });
+            request.original_input = json!({
+                "source": request.original_input,
+                "probe": probe,
+                "probed_media_kind": detected_media_kind,
+            });
         }
         request.updated_at = OffsetDateTime::now_utc();
         sqlx::query(
@@ -854,6 +866,11 @@ async fn insert_finalize_job(
 }
 
 fn request_media_kind(request: &IngestRequest) -> Option<SourceMediaKind> {
+    if let Some(value) = request.original_input.get("probed_media_kind")
+        && let Ok(media_kind) = serde_json::from_value(value.clone())
+    {
+        return Some(media_kind);
+    }
     let value = if request.kind == IngestKind::Url {
         request.original_input.get("download")?.get("media_kind")?
     } else {
@@ -950,6 +967,54 @@ fn probed_image_format(probe: &serde_json::Value) -> ImageFormatKind {
         }
     }
     ImageFormatKind::Unknown
+}
+
+fn probed_media_kind(probe: &serde_json::Value) -> Option<SourceMediaKind> {
+    let container = probe.get("container_format").and_then(serde_json::Value::as_str);
+    let codecs = probe
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|stream| stream.get("kind").and_then(serde_json::Value::as_str) == Some("video"))
+        .filter_map(|stream| stream.get("codec").and_then(serde_json::Value::as_str));
+    let codecs = codecs.collect::<Vec<_>>();
+    let container = container.map(str::to_ascii_lowercase);
+    let is_gif = container.as_deref().is_some_and(|value| value.contains("gif"))
+        || codecs.iter().any(|value| value.to_ascii_lowercase().contains("gif"));
+    if is_gif {
+        return Some(SourceMediaKind::Animation);
+    }
+
+    let is_image_container = container.as_deref().is_some_and(|value| {
+        ["image2", "png", "jpeg", "jpg", "webp", "avif", "mjpeg"]
+            .iter()
+            .any(|format| value.contains(format))
+    });
+    let is_image_codec = codecs
+        .iter()
+        .any(|value| ["png", "webp"].iter().any(|format| value.eq_ignore_ascii_case(format)))
+        || (container.is_none() && codecs.iter().any(|value| value.eq_ignore_ascii_case("mjpeg")));
+    if is_image_container || is_image_codec {
+        return Some(SourceMediaKind::Image);
+    }
+
+    let streams = probe.get("streams").and_then(serde_json::Value::as_array);
+    if streams.is_some_and(|streams| {
+        streams
+            .iter()
+            .any(|stream| stream.get("kind").and_then(serde_json::Value::as_str) == Some("video"))
+    }) {
+        return Some(SourceMediaKind::Video);
+    }
+    if streams.is_some_and(|streams| {
+        streams
+            .iter()
+            .any(|stream| stream.get("kind").and_then(serde_json::Value::as_str) == Some("audio"))
+    }) {
+        return Some(SourceMediaKind::Audio);
+    }
+    None
 }
 
 async fn load_request(

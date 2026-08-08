@@ -681,6 +681,57 @@ async fn exact_duplicate_resolution_reuses_content_and_attaches_new_sources() {
 
 #[tokio::test]
 #[ignore = "requires a running PostgreSQL instance"]
+async fn exact_duplicate_resolution_ignores_thumbnail_hashes() {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
+    let database =
+        Database::connect(&database_url, 10).await.expect("database should be reachable");
+    database.migrate().await.expect("migrations should succeed");
+    let library = database.library();
+    let canonical_url = format!("https://library.test/thumbnail-dedup/{}", Uuid::new_v4());
+    let duplicate_url = format!("https://library.test/thumbnail-dedup/{}", Uuid::new_v4());
+    let created = library
+        .resolve_exact_duplicate(exact_duplicate_request(vec![16; 32], &canonical_url))
+        .await
+        .expect("canonical content should be created");
+    library
+        .record_thumbnail_asset(
+            created.content_item.id,
+            NewMediaAsset {
+                content_item_id: created.content_item.id,
+                role: AssetRole::Thumbnail,
+                media_kind: MediaKind::Video,
+                mime_type: Some("image/jpeg".to_owned()),
+                container: Some("jpeg".to_owned()),
+                video_codec: None,
+                audio_codec: None,
+                width: Some(320),
+                height: Some(180),
+                duration_ms: None,
+                bit_rate: None,
+                file_size_bytes: Some(12),
+                sha256: Some(vec![17; 32]),
+                local_work_path: Some("/var/lib/sooqa/work/test/thumbnail.jpg".to_owned()),
+                storage_state: StorageState::Local,
+            },
+        )
+        .await
+        .expect("thumbnail should be recorded");
+
+    let resolved = library
+        .resolve_exact_duplicate(exact_duplicate_request(vec![17; 32], &duplicate_url))
+        .await
+        .expect("thumbnail hash should not resolve as canonical content");
+    assert!(resolved.content_created);
+    assert_ne!(resolved.content_item.id, created.content_item.id);
+    assert_eq!(resolved.canonical_asset.role, AssetRole::Canonical);
+
+    clean_up_content(&database, resolved.content_item.id).await;
+    clean_up_content(&database, created.content_item.id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running PostgreSQL instance"]
 async fn exact_duplicate_resolution_checks_platform_identity_before_hash() {
     let database_url =
         env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");

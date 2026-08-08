@@ -566,7 +566,7 @@ impl LibraryRepository {
             });
         }
 
-        if let Some(asset) = find_media_asset_by_sha256(
+        if let Some(asset) = find_canonical_asset_by_sha256(
             &mut transaction,
             request.asset.sha256.as_deref().expect("validated SHA-256 must exist"),
         )
@@ -614,7 +614,7 @@ impl LibraryRepository {
         .await?;
 
         let Some(asset_row) = asset_row else {
-            let asset = find_media_asset_by_sha256(
+            let asset = find_canonical_asset_by_sha256(
                 &mut transaction,
                 request.asset.sha256.as_deref().expect("validated SHA-256 must exist"),
             )
@@ -2014,27 +2014,6 @@ async fn upsert_tag_in_transaction(
     .bind(new_tag.normalized_name)
     .bind(new_tag.display_name)
     .fetch_one(&mut **transaction)
-    .await?)
-}
-
-async fn find_media_asset_by_sha256(
-    transaction: &mut Transaction<'_, Postgres>,
-    sha256: &[u8],
-) -> Result<Option<MediaAssetRow>, LibraryRepositoryError> {
-    Ok(sqlx::query_as::<_, MediaAssetRow>(
-        r#"
-        SELECT
-            id, content_item_id, role, media_kind, mime_type, container,
-            video_codec, audio_codec, width, height, duration_ms, bit_rate,
-            file_size_bytes, sha256, local_work_path, storage_state, created_at
-        FROM media_assets
-        WHERE sha256 = $1
-        ORDER BY (role = 'canonical') DESC, created_at ASC, id ASC
-        LIMIT 1
-        "#,
-    )
-    .bind(sha256)
-    .fetch_optional(&mut **transaction)
     .await?)
 }
 

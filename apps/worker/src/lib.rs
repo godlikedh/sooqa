@@ -369,7 +369,36 @@ async fn normalize_asset(
         Ok(AssetNormalizationStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
     };
-    let media_kind = match request_media_kind(&request) {
+    let probe = match request.original_input.get("probe").cloned() {
+        Some(probe) => match serde_json::from_value::<MediaProbe>(probe) {
+            Ok(probe) => probe,
+            Err(error) => {
+                return fail_normalization(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    HandlerFailure::permanent(
+                        "invalid_ingest_state",
+                        format!("stored media probe could not be decoded: {error}"),
+                    ),
+                )
+                .await;
+            }
+        },
+        None => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent(
+                    "invalid_ingest_state",
+                    "ingest request has no stored media probe",
+                ),
+            )
+            .await;
+        }
+    };
+    let media_kind = match probe_media_kind(&probe).or_else(|| request_media_kind(&request)) {
         Some(media_kind) => media_kind,
         None => {
             return fail_normalization(
@@ -407,35 +436,6 @@ async fn normalize_asset(
         )
         .await;
     }
-    let probe = match request.original_input.get("probe").cloned() {
-        Some(probe) => match serde_json::from_value::<MediaProbe>(probe) {
-            Ok(probe) => probe,
-            Err(error) => {
-                return fail_normalization(
-                    inbox,
-                    ingest_request_id,
-                    &job_attempt,
-                    HandlerFailure::permanent(
-                        "invalid_ingest_state",
-                        format!("stored media probe could not be decoded: {error}"),
-                    ),
-                )
-                .await;
-            }
-        },
-        None => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                HandlerFailure::permanent(
-                    "invalid_ingest_state",
-                    "ingest request has no stored media probe",
-                ),
-            )
-            .await;
-        }
-    };
     let (workspace_id, input_name) = match workspace_input(&request) {
         Ok(value) => value,
         Err(failure) => {
@@ -599,12 +599,53 @@ fn normalization_error_is_retryable(error: &NormalizationExecutionError) -> bool
 }
 
 fn request_media_kind(request: &sooqa_inbox::IngestRequest) -> Option<SourceMediaKind> {
+    if let Some(value) = request.original_input.get("probed_media_kind")
+        && let Ok(media_kind) = serde_json::from_value(value.clone())
+    {
+        return Some(media_kind);
+    }
     let value = if request.kind == IngestKind::Url {
         request.original_input.get("download")?.get("media_kind")?
     } else {
         request.original_input.get("media_kind")?
     };
     serde_json::from_value(value.clone()).ok()
+}
+
+fn probe_media_kind(probe: &MediaProbe) -> Option<SourceMediaKind> {
+    let container = probe.container_format.as_deref().map(str::to_ascii_lowercase);
+    let video_streams = probe
+        .streams
+        .iter()
+        .filter(|stream| matches!(&stream.kind, MediaStreamKind::Video))
+        .collect::<Vec<_>>();
+    let codecs =
+        video_streams.iter().filter_map(|stream| stream.codec.as_deref()).collect::<Vec<_>>();
+    let is_gif = container.as_deref().is_some_and(|value| value.contains("gif"))
+        || codecs.iter().any(|value| value.to_ascii_lowercase().contains("gif"));
+    if is_gif {
+        return Some(SourceMediaKind::Animation);
+    }
+
+    let is_image_container = container.as_deref().is_some_and(|value| {
+        ["image2", "png", "jpeg", "jpg", "webp", "avif", "mjpeg"]
+            .iter()
+            .any(|format| value.contains(format))
+    });
+    let is_image_codec = codecs
+        .iter()
+        .any(|value| ["png", "webp"].iter().any(|format| value.eq_ignore_ascii_case(format)))
+        || (container.is_none() && codecs.iter().any(|value| value.eq_ignore_ascii_case("mjpeg")));
+    if is_image_container || is_image_codec {
+        return Some(SourceMediaKind::Image);
+    }
+    if !video_streams.is_empty() {
+        return Some(SourceMediaKind::Video);
+    }
+    if probe.streams.iter().any(|stream| matches!(&stream.kind, MediaStreamKind::Audio)) {
+        return Some(SourceMediaKind::Audio);
+    }
+    None
 }
 
 fn workspace_input(

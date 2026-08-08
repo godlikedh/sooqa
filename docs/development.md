@@ -70,7 +70,9 @@ For images, the probed format is authoritative; MIME type and safe filename
 metadata are only fallbacks when probing cannot identify the format. Image
 normalization reuses existing outputs only when their encoded bytes match the
 current input and profile. Image finalization records both canonical and
-thumbnail assets. Audio,
+thumbnail assets. Telegram documents with missing or generic metadata are
+downloaded for probing; explicitly unsupported document metadata is rejected
+at the adapter boundary. Audio,
 animation, and unknown media are intentionally recorded by probing and then
 fail terminally with `unsupported_media_kind` until their normalization paths
 are added.

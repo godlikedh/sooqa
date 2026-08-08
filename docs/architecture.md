@@ -78,7 +78,11 @@ its subprocess egress has an equivalent SSRF boundary.
 Media messages are downloaded into a per-update workspace, then create a
 Telegram ingest request and `probe_asset` job. The probe handler validates the
 shared workspace and uses ffprobe before recording typed probe metadata and
-atomically enqueuing the existing `normalize_asset` job. The normalization
+atomically enqueuing the existing `normalize_asset` job. Probe-derived media
+kind is authoritative when it is identifiable; Telegram MIME type and
+filename are hints used only when probing is inconclusive. Documents with
+missing or generic Telegram metadata are still admitted to probing, while
+explicitly unsupported documents are rejected before download. The normalization
 handler dispatches from the typed source media kind. Videos use the canonical
 ffmpeg profile, output validation, and SHA-256 hashing; images use the existing
 bounded JPEG/PNG normalizer, which also creates a thumbnail. Both paths record
