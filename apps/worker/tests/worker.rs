@@ -72,6 +72,23 @@ impl ExternalCommandRunner for FakeProbeRunner {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FakeImageProbeRunner;
+
+#[async_trait]
+impl ExternalCommandRunner for FakeImageProbeRunner {
+    async fn run(&self, _command: ExternalCommand) -> Result<ExternalCommandOutput, CommandError> {
+        Ok(ExternalCommandOutput {
+            success: true,
+            exit_code: Some(0),
+            stdout: br#"{"format":{"format_name":"png_pipe","size":"10"},"streams":[{"index":0,"codec_type":"video","codec_name":"png","width":400,"height":200}]}"#.to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        })
+    }
+}
+
 #[derive(Clone)]
 struct RetryProbeRunner {
     calls: Arc<AtomicUsize>,
@@ -923,7 +940,7 @@ async fn normalize_handler_composes_image_canonical_and_thumbnail_assets() {
             "ffprobe",
             Duration::from_secs(1),
             4096,
-            Arc::new(FakeProbeRunner),
+            Arc::new(FakeImageProbeRunner),
         ),
     );
     probe_handler(probe_job.clone()).await.expect("image probe should succeed");
