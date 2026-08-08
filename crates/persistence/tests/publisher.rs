@@ -149,21 +149,32 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
     let schedule = first.expect("publication schedule should be created");
     let replay = second.expect("concurrent schedule request should replay");
     assert_eq!(replay.id, schedule.id);
+    assert_eq!(schedule.publish_at.nanosecond() % 1_000, 0);
     let replay = database
         .publisher()
         .create_publication_schedule(schedule_request(&schedule, &key_prefix))
         .await
         .expect("same schedule request should replay after commit");
     assert_eq!(replay.id, schedule.id);
-    assert_eq!(
+    let due = database
+        .publisher()
+        .list_due_publication_schedules(time::OffsetDateTime::now_utc(), 10)
+        .await
+        .expect("due schedules should load");
+    assert_eq!(due.iter().filter(|item| item.id == schedule.id).count(), 1);
+    assert!(matches!(
         database
             .publisher()
-            .list_due_publication_schedules(time::OffsetDateTime::now_utc(), 10)
-            .await
-            .expect("due schedules should load")
-            .len(),
-        1
-    );
+            .transition_publication_schedule(
+                schedule.id,
+                sooqa_publisher::PublicationScheduleStatus::Publishing,
+            )
+            .await,
+        Err(sooqa_persistence::PublisherRepositoryError::ManagedScheduleTransitionRequired {
+            id,
+            target: sooqa_publisher::PublicationScheduleStatus::Publishing,
+        }) if id == schedule.id
+    ));
 
     let cancelled_draft = database
         .publisher()
@@ -300,6 +311,19 @@ async fn publisher_repositories_round_trip_schedule_attempt_and_history() {
         )
         .await
         .expect("explicit reconciliation should requeue the schedule");
+    assert!(matches!(
+        database
+            .publisher()
+            .transition_publication_schedule(
+                schedule.id,
+                sooqa_publisher::PublicationScheduleStatus::Publishing,
+            )
+            .await,
+        Err(sooqa_persistence::PublisherRepositoryError::ManagedScheduleTransitionRequired {
+            id,
+            target: sooqa_publisher::PublicationScheduleStatus::Publishing,
+        }) if id == schedule.id
+    ));
     let attempt = database
         .publisher()
         .start_publication_attempt(schedule.id, Some(format!("{key_prefix}-telegram-retry")))

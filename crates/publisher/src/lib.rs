@@ -348,6 +348,14 @@ impl NewPublicationSchedule {
     }
 
     pub fn validate(&self) -> Result<(), PublisherValidationError> {
+        if self.idempotency_key.trim().is_empty() {
+            return Err(PublisherValidationError::EmptyIdempotencyKey);
+        }
+        if self.idempotency_key.chars().count() > MAX_IDEMPOTENCY_KEY_LENGTH {
+            return Err(PublisherValidationError::IdempotencyKeyTooLong {
+                max: MAX_IDEMPOTENCY_KEY_LENGTH,
+            });
+        }
         if let (Some(not_before), Some(not_after)) = (self.not_before, self.not_after)
             && not_before > not_after
         {
@@ -571,6 +579,10 @@ mod tests {
         schedule.not_before = Some(now + time::Duration::seconds(10));
         schedule.not_after = Some(now);
         assert_eq!(schedule.validate(), Err(PublisherValidationError::InvalidScheduleWindow));
+        schedule.not_before = None;
+        schedule.not_after = None;
+        schedule.idempotency_key = " ".to_owned();
+        assert_eq!(schedule.validate(), Err(PublisherValidationError::EmptyIdempotencyKey));
         assert!(matches!(
             NewPublicationSchedule::try_new(Uuid::now_v7(), now, " "),
             Err(PublisherValidationError::EmptyIdempotencyKey)

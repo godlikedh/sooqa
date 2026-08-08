@@ -277,6 +277,7 @@ impl PublisherRepository {
             publish_at: truncate_to_microseconds(schedule.publish_at),
             not_before: schedule.not_before.map(truncate_to_microseconds),
             not_after: schedule.not_after.map(truncate_to_microseconds),
+            idempotency_key: schedule.idempotency_key.trim().to_owned(),
             ..schedule
         };
         schedule.validate()?;
@@ -448,7 +449,10 @@ impl PublisherRepository {
         let mut transaction = self.pool.begin().await?;
         let mut schedule = load_publication_schedule(&mut transaction, id).await?;
         if schedule.status == PublicationScheduleStatus::Publishing
-            || target == PublicationScheduleStatus::Published
+            || matches!(
+                target,
+                PublicationScheduleStatus::Publishing | PublicationScheduleStatus::Published
+            )
         {
             return Err(PublisherRepositoryError::ManagedScheduleTransitionRequired { id, target });
         }
