@@ -124,8 +124,9 @@ candidates, and runs bounded Rust alignment before inserting media. The lock
 does not cover download, ffmpeg, filesystem, HTTP, or Telegram work. Images,
 animations, and audio skip the video path and use exact SHA resolution. No
 storage job is enqueued for `duplicate_pending`; force-save sets the durable
-override before resuming normalization/fingerprinting. Network and subprocess
-work never runs while an identity transaction is open. Stage metadata is
+override, reconstructs URL/Telegram source artifacts when necessary, and then
+resumes normalization/fingerprinting. Network and subprocess work never runs
+while an identity transaction is open. Stage metadata is
 bounded JSON input metadata; it is decoded into typed Rust structs at the
 handler boundary. Storage completion/failure is applied by `media_id`, and
 attach/reset/mark-unknown reconcile the linked ingest rows.
@@ -135,8 +136,11 @@ and current queue-job success atomically. Final-attempt recovery therefore
 fails an owning ingest only when that success transaction never committed.
 
 A queue claim creates a fresh owner, expiry, and fencing token. Heartbeats and
-completion/retry/failure updates require all three. Expired leases return to
-`queued` (or become `failed` after the attempt limit). A final expired attempt
+completion/retry/failure updates require all three. The video identity
+finalizer also revalidates the live lease inside its media/evidence/storage
+transaction, so a stale worker can neither insert media nor leave duplicate
+evidence or an upload job behind. Expired leases return to `queued` (or become
+`failed` after the attempt limit). A final expired attempt
 also marks its owning ingest terminal with an explicit lease-expired error;
 an expired storage upload becomes `storage_unknown` unless the media row is
 already `ready`. `run_at` is the retry and scheduling clock; there is no

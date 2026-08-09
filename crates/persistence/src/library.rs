@@ -319,7 +319,26 @@ impl LibraryRepository {
         config: SequenceAlignmentConfig,
         force_save: bool,
     ) -> Result<VideoIdentityOutcome, LibraryRepositoryError> {
-        validate_media_ingest(&ingest)?;
+        let mut transaction = self.pool.begin().await?;
+        let outcome = Self::resolve_video_identity_in_transaction(
+            &mut transaction,
+            &ingest,
+            Some(fingerprint),
+            config,
+            force_save,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(outcome)
+    }
+    pub(crate) async fn resolve_video_identity_in_transaction(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ingest: &MediaIngest,
+        fingerprint: Option<&VideoSequenceFingerprint>,
+        config: SequenceAlignmentConfig,
+        force_save: bool,
+    ) -> Result<VideoIdentityOutcome, LibraryRepositoryError> {
+        validate_media_ingest(ingest)?;
         if ingest.metadata.kind != MediaKind::Video {
             return Err(LibraryRepositoryError::InvalidVideoIdentityKind);
         }
@@ -329,21 +348,25 @@ impl LibraryRepository {
         let sha256 =
             ingest.metadata.sha256.as_deref().ok_or(LibraryRepositoryError::MissingSha256)?;
         let fingerprint_data = fingerprint
-            .encode()
-            .map_err(|error| LibraryRepositoryError::InvalidFingerprint(error.to_string()))?;
-        let search_tokens = fingerprint.search_tokens();
+            .map(|fingerprint| {
+                fingerprint
+                    .encode()
+                    .map_err(|error| LibraryRepositoryError::InvalidFingerprint(error.to_string()))
+            })
+            .transpose()?;
+        let search_tokens =
+            fingerprint.map(VideoSequenceFingerprint::search_tokens).unwrap_or_default();
         let source_value = source_to_value(&ingest.source);
-        let mut transaction = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(VIDEO_IDENTITY_ADVISORY_LOCK)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?;
 
         if let Some(row) = sqlx::query_as::<_, MediaRow>(
             "SELECT * FROM media WHERE canonical_sha256 = $1 FOR UPDATE",
         )
         .bind(sha256)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?
         {
             let merged_tags = merge_tags(&row.tags, &ingest.tags);
@@ -356,15 +379,17 @@ impl LibraryRepository {
             .bind(&ingest.media.description)
             .bind(ingest.source.normalized_url.clone().or(ingest.source.original_url.clone()))
             .bind(merge_missing_source_metadata(&row.source_metadata, &source_value))
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?;
-            transaction.commit().await?;
             return Ok(VideoIdentityOutcome::ExactDuplicate { media_id: row.id });
         }
 
+        let fingerprint = fingerprint.ok_or(LibraryRepositoryError::MissingFingerprint)?;
+        let fingerprint_data = fingerprint_data
+            .expect("a non-exact video identity outcome requires encoded fingerprint data");
         if !force_save {
             let candidates = fetch_video_fingerprint_candidates(
-                &mut transaction,
+                transaction,
                 fingerprint.version.as_str(),
                 &search_tokens,
             )
@@ -415,7 +440,6 @@ impl LibraryRepository {
                         max: MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES,
                     });
                 }
-                transaction.commit().await?;
                 return Ok(VideoIdentityOutcome::DuplicatePending { evidence });
             }
         }
@@ -454,11 +478,10 @@ impl LibraryRepository {
         .bind(to_i64(ingest.metadata.bit_rate, "bit_rate")?)
         .bind(to_i64(ingest.metadata.file_size_bytes, "file_size_bytes")?)
         .bind(&ingest.metadata.local_work_path)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
         if let Some(row) = inserted {
             let media_id = row.id;
-            transaction.commit().await?;
             return Ok(VideoIdentityOutcome::NewMedia { media_id });
         }
 
@@ -466,9 +489,8 @@ impl LibraryRepository {
             "SELECT id FROM media WHERE canonical_sha256 = $1 FOR UPDATE",
         )
         .bind(sha256)
-        .fetch_one(&mut *transaction)
+        .fetch_one(&mut **transaction)
         .await?;
-        transaction.commit().await?;
         Ok(VideoIdentityOutcome::ExactDuplicate { media_id })
     }
 
@@ -483,32 +505,11 @@ impl LibraryRepository {
         validate_media_ingest(ingest)?;
         let sha256 =
             ingest.metadata.sha256.as_deref().ok_or(LibraryRepositoryError::MissingSha256)?;
-        let source_value = source_to_value(&ingest.source);
-        let mut transaction = self.pool.begin().await?;
-        let Some(row) = sqlx::query_as::<_, MediaRow>(
-            "SELECT * FROM media WHERE canonical_sha256 = $1 FOR UPDATE",
-        )
-        .bind(sha256)
-        .fetch_optional(&mut *transaction)
-        .await?
-        else {
-            transaction.commit().await?;
-            return Ok(None);
-        };
-        let merged_tags = merge_tags(&row.tags, &ingest.tags);
-        sqlx::query(
-            "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = COALESCE(description, $4), source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1",
-        )
-        .bind(row.id)
-        .bind(merged_tags)
-        .bind(&ingest.media.title)
-        .bind(&ingest.media.description)
-        .bind(ingest.source.normalized_url.clone().or(ingest.source.original_url.clone()))
-        .bind(merge_missing_source_metadata(&row.source_metadata, &source_value))
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-        Ok(Some(row.id))
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM media WHERE canonical_sha256 = $1")
+            .bind(sha256)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn record_media_metadata(
@@ -1319,6 +1320,8 @@ pub enum LibraryRepositoryError {
     InvalidLimit { value: u32 },
     #[error("media SHA-256 is required")]
     MissingSha256,
+    #[error("video identity requires a fingerprint when the exact SHA is absent")]
+    MissingFingerprint,
     #[error("media SHA-256 must contain 32 bytes, got {actual}")]
     InvalidSha256Length { actual: usize },
     #[error("media {0} has an invalid kind")]

@@ -409,10 +409,13 @@ pub enum SequenceAlignmentError {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::Path, process::Command, time::Duration};
+
     use image::{DynamicImage, ImageBuffer, Rgb};
+    use uuid::Uuid;
 
     use super::*;
-    use crate::VideoSequenceSample;
+    use crate::{FrameExtractor, MediaWorkspace, VideoSequenceSample, WorkspaceArea};
 
     fn sample(seed: u64) -> VideoSequenceSample {
         VideoSequenceSample {
@@ -541,5 +544,274 @@ mod tests {
             align_video_sequences(&left, &right, SequenceAlignmentConfig::default()).unwrap();
         assert_eq!(result.classification, SequenceClassification::NotDuplicate);
         assert_eq!(result.evidence.informative_matched_samples, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg; calibrates the active extractor against generated media"]
+    async fn generated_media_identity_acceptance_matrix() {
+        let root = std::env::temp_dir().join(format!("sooqa-media-acceptance-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.expect("fixture root should be creatable");
+
+        let reference_workspace = MediaWorkspace::create(&root, Uuid::new_v4())
+            .await
+            .expect("reference workspace should be creatable");
+        let reference_path = reference_workspace
+            .path(WorkspaceArea::Normalized, "canonical.mp4")
+            .expect("reference path should be safe");
+        render_reference(&reference_path);
+
+        let extractor = FrameExtractor::new("ffmpeg", Duration::from_secs(30));
+        let reference = extractor
+            .extract_video_sequence_from_area_with_cache_key(
+                &reference_workspace,
+                WorkspaceArea::Normalized,
+                "canonical.mp4",
+                "reference",
+                8_000,
+            )
+            .await
+            .expect("reference should be fingerprintable");
+
+        let cases = [
+            ("ordinary_reencode_bitrate_resolution", 8_000, true),
+            ("black_prefix", 9_000, true),
+            ("short_prefix_suffix_trim", 7_000, true),
+            ("unrelated_similar_shape", 8_000, false),
+            ("black", 8_000, false),
+            ("static", 8_000, false),
+            ("repetitive", 8_000, false),
+            ("contained_clip", 2_000, false),
+            ("very_short", 750, false),
+            ("no_audio", 8_000, true),
+        ];
+
+        for (name, duration_ms, expected_strong) in cases {
+            let workspace = MediaWorkspace::create(&root, Uuid::new_v4())
+                .await
+                .expect("case workspace should be creatable");
+            let path = workspace
+                .path(WorkspaceArea::Normalized, "canonical.mp4")
+                .expect("case path should be safe");
+            render_case(name, &path, &reference_path);
+            let fingerprint = extractor
+                .extract_video_sequence_from_area_with_cache_key(
+                    &workspace,
+                    WorkspaceArea::Normalized,
+                    "canonical.mp4",
+                    name,
+                    duration_ms,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{name} should be fingerprintable: {error}"));
+            let alignment =
+                align_video_sequences(&reference, &fingerprint, SequenceAlignmentConfig::default())
+                    .unwrap_or_else(|error| panic!("{name} should be comparable: {error}"));
+            println!(
+                "{name}: {:?}, incoming={}bps candidate={}bps informative={} run={} score={}",
+                alignment.classification,
+                alignment.evidence.incoming_coverage_bps,
+                alignment.evidence.candidate_coverage_bps,
+                alignment.evidence.informative_matched_samples,
+                alignment.evidence.longest_temporally_consistent_run,
+                alignment.evidence.score_bps,
+            );
+            if expected_strong {
+                assert_eq!(
+                    alignment.classification,
+                    SequenceClassification::StrongDuplicate,
+                    "{name} should be accepted as a strong duplicate",
+                );
+            } else {
+                assert_ne!(
+                    alignment.classification,
+                    SequenceClassification::StrongDuplicate,
+                    "{name} should not be accepted as a strong duplicate",
+                );
+            }
+        }
+
+        tokio::fs::remove_dir_all(root).await.expect("fixture root should be removable");
+    }
+
+    fn render_reference(path: &Path) {
+        run_ffmpeg([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-t",
+            "8",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            path.to_str().expect("fixture path should be UTF-8"),
+        ]);
+    }
+
+    fn render_case(name: &str, path: &Path, reference: &Path) {
+        let output = path.to_str().expect("fixture path should be UTF-8");
+        let reference = reference.to_str().expect("fixture path should be UTF-8");
+        match name {
+            "ordinary_reencode_bitrate_resolution" => run_ffmpeg([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                reference,
+                "-vf",
+                "scale=640:480",
+                "-map",
+                "0:v:0",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-b:v",
+                "350k",
+                "-pix_fmt",
+                "yuv420p",
+                output,
+            ]),
+            "black_prefix" => run_ffmpeg([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=320x240:r=24:d=1",
+                "-i",
+                reference,
+                "-filter_complex",
+                "[0:v:0][1:v:0]concat=n=2:v=1:a=0[v]",
+                "-map",
+                "[v]",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                output,
+            ]),
+            "short_prefix_suffix_trim" => render_trimmed(reference, output, "0.5", "7"),
+            "unrelated_similar_shape" => render_lavfi("testsrc=size=320x240:rate=24", output, "8"),
+            "black" => render_lavfi("color=c=black:s=320x240:r=24", output, "8"),
+            "static" => render_lavfi("color=c=blue:s=320x240:r=24", output, "8"),
+            "repetitive" => render_lavfi("smptebars=size=320x240:rate=24", output, "8"),
+            "contained_clip" => render_trimmed(reference, output, "3", "2"),
+            "very_short" => render_trimmed(reference, output, "3", "0.75"),
+            "no_audio" => run_ffmpeg([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                reference,
+                "-map",
+                "0:v:0",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                output,
+            ]),
+            _ => panic!("unknown media fixture {name}"),
+        }
+    }
+
+    fn render_lavfi(filter: &str, output: &str, duration: &str) {
+        run_ffmpeg([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            filter,
+            "-t",
+            duration,
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            output,
+        ]);
+    }
+
+    fn render_trimmed(reference: &str, output: &str, start: &str, duration: &str) {
+        run_ffmpeg([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            start,
+            "-i",
+            reference,
+            "-t",
+            duration,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            output,
+        ]);
+    }
+
+    fn run_ffmpeg<const N: usize>(args: [&str; N]) {
+        let output = Command::new("ffmpeg")
+            .args(args)
+            .output()
+            .expect("ffmpeg should be installed for media acceptance tests");
+        assert!(
+            output.status.success(),
+            "ffmpeg fixture command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

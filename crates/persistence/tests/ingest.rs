@@ -6,7 +6,10 @@ use sooqa_inbox::{
     SubmittedVia,
 };
 use sooqa_jobs::{JobStatus, JobType};
-use sooqa_library::VideoIdentityOutcome;
+use sooqa_library::{
+    MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
+};
+use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint, VideoSequenceSample};
 use sooqa_persistence::{Database, InboxRepositoryError, SourceInspectionStart};
 use uuid::Uuid;
 
@@ -199,15 +202,37 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent() {
     .execute(database.pool())
     .await
     .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'succeeded', completed_at = now() WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",
+    )
+        .bind(ingest.ingest.id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
 
-    let resumed = database.inbox().force_save(ingest.ingest.id).await.unwrap();
-    assert!(resumed.resumed);
-    assert_eq!(resumed.ingest.status, IngestStatus::Normalizing);
+    let inbox = database.inbox();
+    let (left, right) =
+        tokio::join!(inbox.force_save(ingest.ingest.id), inbox.force_save(ingest.ingest.id),);
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_ne!(left.resumed, right.resumed);
+    let resumed = if left.resumed { left } else { right };
+    assert_eq!(resumed.ingest.status, IngestStatus::Queued);
     assert!(resumed.ingest.force_save);
     assert!(resumed.ingest.duplicate_evidence.is_none());
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM queue.jobs WHERE kind = 'normalize_asset' AND payload->>'ingest_id' = $1",
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",
+        )
+        .bind(ingest.ingest.id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'inspect_source' AND state = 'queued' AND payload->>'ingest_id' = $1",
         )
         .bind(ingest.ingest.id.to_string())
         .fetch_one(database.pool())
@@ -219,7 +244,7 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent() {
     let replay = database.inbox().force_save(ingest.ingest.id).await.unwrap();
     assert!(!replay.resumed);
     assert_eq!(replay.ingest.id, resumed.ingest.id);
-    assert_eq!(replay.ingest.status, IngestStatus::Normalizing);
+    assert_eq!(replay.ingest.status, IngestStatus::Queued);
 
     sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
         .bind(ingest.ingest.id.to_string())
@@ -235,7 +260,7 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent() {
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
-async fn video_identity_completion_persists_duplicate_pending_and_fences_job() {
+async fn stale_video_identity_finalizer_cannot_mutate_after_lease_recovery() {
     let database = database().await;
     let ingest = database
         .inbox()
@@ -278,34 +303,105 @@ async fn video_identity_completion_persists_duplicate_pending_and_fences_job() {
         .unwrap()
         .expect("fingerprint job should be claimable");
     assert_eq!(claimed.id, job.id);
-    let attempt = claimed.lease().unwrap();
-    let completed = database
+    let stale_attempt = claimed.lease().unwrap();
+    // Model extraction having completed before the worker discovers its lease expired.
+    let media_ingest = test_video_ingest(ingest.ingest.id, vec![91_u8; 32]);
+    let fingerprint = test_video_sequence(0x1234_5678_9abc_def0);
+    sqlx::query(
+        "UPDATE queue.jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1",
+    )
+    .bind(claimed.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    database.jobs().recover_stale_leases().await.unwrap();
+
+    let stale_result = database
         .inbox()
-        .complete_video_identity(
+        .finalize_video_identity(
             ingest.ingest.id,
-            &attempt,
-            VideoIdentityOutcome::DuplicatePending {
-                evidence: sooqa_library::VideoDuplicateEvidence {
-                    algorithm_version: "video_sequence_v1".to_owned(),
-                    matches: Vec::new(),
-                },
-            },
+            &stale_attempt,
+            media_ingest.clone(),
+            Some(&fingerprint),
+            SequenceAlignmentConfig::default(),
         )
         .await
         .unwrap();
-    assert_eq!(completed.status, IngestStatus::DuplicatePending);
-    assert!(completed.duplicate_evidence.is_some());
+    assert_eq!(stale_result.status, IngestStatus::Fingerprinting);
+    assert!(stale_result.media_id.is_none());
+    assert!(stale_result.duplicate_evidence.is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM media WHERE canonical_sha256 = $1")
+            .bind(vec![91_u8; 32])
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' IN (SELECT id::text FROM media WHERE canonical_sha256 = $1)",
+        )
+        .bind(vec![91_u8; 32])
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        0
+    );
+
+    let winner = database
+        .jobs()
+        .claim_next(
+            "winner-worker",
+            std::time::Duration::from_secs(30),
+            &[JobType::ComputeFingerprint],
+        )
+        .await
+        .unwrap()
+        .expect("recovered fingerprint job should be claimable");
+    let winner_attempt = winner.lease().unwrap();
+    let completed = database
+        .inbox()
+        .finalize_video_identity(
+            ingest.ingest.id,
+            &winner_attempt,
+            media_ingest,
+            Some(&fingerprint),
+            SequenceAlignmentConfig::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status, IngestStatus::Storing);
+    let media_id = completed.media_id.expect("winner should reserve media");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM media WHERE canonical_sha256 = $1")
+            .bind(vec![91_u8; 32])
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' = $1",
+        )
+        .bind(media_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        1
+    );
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
-            .bind(claimed.id)
+            .bind(winner.id)
             .fetch_one(database.pool())
             .await
             .unwrap(),
         JobStatus::Succeeded.as_str()
     );
 
-    sqlx::query("DELETE FROM queue.jobs WHERE id = $1")
-        .bind(claimed.id)
+    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
+        .bind(ingest.ingest.id.to_string())
         .execute(database.pool())
         .await
         .unwrap();
@@ -314,4 +410,72 @@ async fn video_identity_completion_persists_duplicate_pending_and_fences_job() {
         .execute(database.pool())
         .await
         .unwrap();
+    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'media_id' = $1")
+        .bind(media_id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM media WHERE id = $1")
+        .bind(media_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+}
+
+fn test_video_ingest(ingest_id: Uuid, sha256: Vec<u8>) -> MediaIngest {
+    MediaIngest {
+        media: NewMedia {
+            kind: MediaKind::Video,
+            title: Some("stale-finalizer-test".to_owned()),
+            description: None,
+            notes: None,
+        },
+        metadata: MediaMetadata {
+            kind: MediaKind::Video,
+            mime_type: Some("video/mp4".to_owned()),
+            container: Some("mp4".to_owned()),
+            video_codec: Some("h264".to_owned()),
+            audio_codec: None,
+            width: Some(320),
+            height: Some(240),
+            duration_ms: Some(4_000),
+            bit_rate: Some(100_000),
+            file_size_bytes: Some(1_024),
+            sha256: Some(sha256),
+            local_work_path: Some(format!("/tmp/{ingest_id}.mp4")),
+        },
+        source: MediaSourceInput {
+            ingest_id: Some(ingest_id),
+            kind: SourceKind::DirectUrl,
+            original_url: Some("https://example.test/stale-finalizer.mp4".to_owned()),
+            normalized_url: Some("https://example.test/stale-finalizer.mp4".to_owned()),
+            platform: None,
+            platform_content_id: None,
+            author_name: None,
+            title: None,
+            description: None,
+            published_at: None,
+            metadata: json!({"test": "stale-finalizer"}),
+        },
+        tags: Vec::new(),
+    }
+}
+
+fn test_video_sequence(seed: u64) -> VideoSequenceFingerprint {
+    VideoSequenceFingerprint::new(
+        4_000,
+        500,
+        (0..8)
+            .map(|index| VideoSequenceSample {
+                phash: seed.wrapping_add(index),
+                dhash: seed.rotate_left(index as u32),
+                mean_luma: 80 + index as u8,
+                mean_chroma_u: -10,
+                mean_chroma_v: 12,
+                information_bps: 3_000,
+                transition_bps: if index != 0 { 1_000 } else { 0 },
+            })
+            .collect(),
+    )
+    .unwrap()
 }

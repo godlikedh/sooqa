@@ -1,3 +1,4 @@
+use crate::library::LibraryRepositoryError;
 use serde_json::json;
 use sooqa_inbox::{
     AssetNormalization, Ingest, IngestFinalization, IngestKind, IngestStateError, IngestStatus,
@@ -5,8 +6,10 @@ use sooqa_inbox::{
 };
 use sooqa_jobs::{JobAttempt, NewJob};
 use sooqa_library::{
-    MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, VideoIdentityOutcome,
+    MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, MediaIngest,
+    VideoIdentityOutcome,
 };
+use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint};
 use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -309,7 +312,7 @@ impl InboxRepository {
         request.completed_at = None;
         request.updated_at = OffsetDateTime::now_utc();
         update_ingest_state(&mut transaction, &request).await?;
-        insert_normalize_job(&mut transaction, &request, false).await?;
+        insert_normalize_job(&mut transaction, &request, request.force_save).await?;
         succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
@@ -527,11 +530,13 @@ impl InboxRepository {
         Ok(start)
     }
 
-    pub async fn complete_video_identity(
+    pub async fn finalize_video_identity(
         &self,
         id: Uuid,
         attempt: &JobAttempt,
-        outcome: VideoIdentityOutcome,
+        ingest: MediaIngest,
+        fingerprint: Option<&VideoSequenceFingerprint>,
+        config: SequenceAlignmentConfig,
     ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
@@ -542,6 +547,14 @@ impl InboxRepository {
             return Ok(request);
         }
 
+        let outcome = crate::library::LibraryRepository::resolve_video_identity_in_transaction(
+            &mut transaction,
+            &ingest,
+            fingerprint,
+            config,
+            request.force_save,
+        )
+        .await?;
         match outcome {
             VideoIdentityOutcome::DuplicatePending { evidence } => {
                 if evidence.matches.len() > MAX_VIDEO_DUPLICATE_MATCHES {
@@ -584,16 +597,25 @@ impl InboxRepository {
             IngestStatus::DuplicatePending => {
                 request.force_save = true;
                 request.duplicate_evidence = None;
-                request.transition_to(IngestStatus::Normalizing)?;
+                clear_pipeline_artifacts(&mut request);
+                request.transition_to(IngestStatus::Queued)?;
                 request.error_code = None;
                 request.error_message = None;
                 request.completed_at = None;
                 request.updated_at = OffsetDateTime::now_utc();
                 update_ingest_state(&mut transaction, &request).await?;
-                insert_normalize_job(&mut transaction, &request, true).await?;
+                match request.kind {
+                    IngestKind::Url => insert_inspect_job(&mut transaction, &request).await?,
+                    IngestKind::TelegramMessage | IngestKind::Upload => {
+                        insert_probe_job(&mut transaction, &request).await?
+                    }
+                }
                 resumed = true;
             }
-            IngestStatus::Normalizing
+            IngestStatus::Queued
+            | IngestStatus::Downloading
+            | IngestStatus::Probing
+            | IngestStatus::Normalizing
             | IngestStatus::Fingerprinting
             | IngestStatus::Storing
             | IngestStatus::Completed
@@ -721,7 +743,7 @@ impl InboxRepository {
         )
         .bind(job.job_type().as_str())
         .bind(job.payload_json())
-        .bind(format!("ingest:{id}:download_source:v1"))
+        .bind(stage_dedupe_key(&request, &format!("ingest:{id}:download_source:v1")))
         .execute(&mut *transaction)
         .await?;
 
@@ -1043,7 +1065,7 @@ async fn insert_inspect_job(
     insert_job(
         transaction,
         NewJob::inspect_source(request.id),
-        format!("ingest:{}:inspect_source:v1", request.id),
+        stage_dedupe_key(request, &format!("ingest:{}:inspect_source:v1", request.id)),
     )
     .await
 }
@@ -1055,7 +1077,7 @@ async fn insert_probe_job(
     insert_job(
         transaction,
         NewJob::probe_asset(request.id),
-        format!("ingest:{}:probe_asset:v1", request.id),
+        stage_dedupe_key(request, &format!("ingest:{}:probe_asset:v1", request.id)),
     )
     .await
 }
@@ -1089,11 +1111,11 @@ async fn insert_normalize_job(
     insert_job(
         transaction,
         NewJob::normalize_asset(request.id),
-        format!(
-            "ingest:{}:normalize_asset:v1:{}",
-            request.id,
-            if force_save { "force_save" } else { "initial" }
-        ),
+        if force_save {
+            format!("ingest:{}:normalize_asset:v1:force_save", request.id)
+        } else {
+            format!("ingest:{}:normalize_asset:v1", request.id)
+        },
     )
     .await
 }
@@ -1105,7 +1127,7 @@ async fn insert_finalize_job(
     insert_job(
         transaction,
         NewJob::finalize_ingest(request.id),
-        format!("ingest:{}:finalize_ingest:v1", request.id),
+        stage_dedupe_key(request, &format!("ingest:{}:finalize_ingest:v1", request.id)),
     )
     .await
 }
@@ -1118,13 +1140,25 @@ async fn insert_fingerprint_job(
     insert_job(
         transaction,
         NewJob::compute_fingerprint(request.id),
-        format!(
-            "ingest:{}:compute_fingerprint:v2:{}",
-            request.id,
-            if force_save { "force_save" } else { "initial" }
-        ),
+        if force_save {
+            format!("ingest:{}:compute_fingerprint:v2:force_save", request.id)
+        } else {
+            format!("ingest:{}:compute_fingerprint:v2", request.id)
+        },
     )
     .await
+}
+
+fn stage_dedupe_key(request: &Ingest, initial_key: &str) -> String {
+    if request.force_save { format!("{initial_key}:force_save") } else { initial_key.to_owned() }
+}
+
+fn clear_pipeline_artifacts(request: &mut Ingest) {
+    if let Some(object) = request.original_input.as_object_mut() {
+        for key in ["download", "probe", "probed_media_kind", "normalization", "finalization"] {
+            object.remove(key);
+        }
+    }
 }
 
 fn request_media_kind(request: &Ingest) -> Option<SourceMediaKind> {
@@ -1323,7 +1357,7 @@ async fn lock_current_job_attempt(
           AND attempt_count = $2
           AND lease_owner = $3
           AND lease_token = $4
-          AND lease_expires_at > now()
+          AND lease_expires_at > clock_timestamp()
         FOR UPDATE
         "#,
     )
@@ -1351,7 +1385,7 @@ async fn succeed_current_job_attempt(
           AND attempt_count = $2
           AND lease_owner = $3
           AND lease_token = $4
-          AND lease_expires_at > now()
+          AND lease_expires_at > clock_timestamp()
         "#,
     )
     .bind(attempt.job_id)
@@ -1462,4 +1496,6 @@ pub enum InboxRepositoryError {
     Database(#[from] sqlx::Error),
     #[error("serialization operation failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("library identity operation failed: {0}")]
+    Library(#[from] LibraryRepositoryError),
 }

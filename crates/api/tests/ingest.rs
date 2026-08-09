@@ -78,6 +78,13 @@ async fn force_save_is_authenticated_idempotent_and_durable() {
     .execute(database.pool())
     .await
     .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'succeeded', completed_at = now() WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",
+    )
+        .bind(ingest.ingest.id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
 
     let response = app
         .clone()
@@ -108,9 +115,19 @@ async fn force_save_is_authenticated_idempotent_and_durable() {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["status"], "normalizing");
+    assert_eq!(body["status"], "queued");
     assert_eq!(body["force_save"], true);
     assert!(body["duplicate_evidence"].is_null());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'inspect_source' AND state = 'queued' AND payload->>'ingest_id' = $1",
+        )
+        .bind(ingest.ingest.id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        1
+    );
 
     let response = app
         .oneshot(
@@ -127,7 +144,7 @@ async fn force_save_is_authenticated_idempotent_and_durable() {
     let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["id"], ingest.ingest.id.to_string());
-    assert_eq!(body["status"], "normalizing");
+    assert_eq!(body["status"], "queued");
 
     sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
         .bind(ingest.ingest.id.to_string())

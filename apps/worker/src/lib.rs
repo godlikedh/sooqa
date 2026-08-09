@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use sooqa_inbox::{
     AssetNormalization, AssetThumbnailNormalization, IngestFinalization, IngestKind, IngestStatus,
     SourceDownload, SourceMediaKind,
@@ -35,7 +36,7 @@ use sooqa_persistence::{
     LibraryRepository, LibraryRepositoryError, SourceDownloadStart, SourceInspectionStart,
 };
 use sooqa_telegram::StorageUploadError;
-use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramStorageApi};
+use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramApi, TelegramStorageApi};
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::{
@@ -48,6 +49,24 @@ use uuid::Uuid;
 
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFailure>> + Send + 'static>>;
 pub type HandlerFn = Arc<dyn Fn(Job) -> HandlerFuture + Send + Sync>;
+
+#[async_trait]
+pub trait TelegramSourceDownloader: Send + Sync {
+    async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), HandlerFailure>;
+}
+
+#[async_trait]
+impl TelegramSourceDownloader for sooqa_telegram::TeloxideApi {
+    async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), HandlerFailure> {
+        TelegramApi::download_file(self, file_id, destination).await.map_err(|error| {
+            if <sooqa_telegram::TeloxideApi as TelegramApi>::is_retryable_error(&error) {
+                HandlerFailure::retryable("telegram_source_download", error.to_string())
+            } else {
+                HandlerFailure::permanent("telegram_source_download", error.to_string())
+            }
+        })
+    }
+}
 
 struct DownloadAttemptArtifact {
     path: PathBuf,
@@ -180,12 +199,24 @@ pub fn probe_asset_handler(
     work_root: impl Into<std::path::PathBuf>,
     ffprobe: FfprobeAdapter,
 ) -> HandlerFn {
+    probe_asset_handler_with_telegram_source(inbox, work_root, ffprobe, None)
+}
+
+pub fn probe_asset_handler_with_telegram_source(
+    inbox: InboxRepository,
+    work_root: impl Into<std::path::PathBuf>,
+    ffprobe: FfprobeAdapter,
+    telegram_source: Option<Arc<dyn TelegramSourceDownloader>>,
+) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
         let work_root = work_root.clone();
         let ffprobe = ffprobe.clone();
-        Box::pin(async move { probe_asset(&inbox, &work_root, &ffprobe, job).await })
+        let telegram_source = telegram_source.clone();
+        Box::pin(async move {
+            probe_asset(&inbox, &work_root, &ffprobe, telegram_source.as_deref(), job).await
+        })
     })
 }
 
@@ -238,6 +269,7 @@ async fn probe_asset(
     inbox: &InboxRepository,
     work_root: &std::path::Path,
     ffprobe: &FfprobeAdapter,
+    telegram_source: Option<&dyn TelegramSourceDownloader>,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
@@ -303,6 +335,19 @@ async fn probe_asset(
         }
     };
 
+    if request.kind == IngestKind::TelegramMessage
+        && !source_artifact_exists(&input_path).await?
+        && let Err(failure) = ensure_telegram_source(&workspace, &request, telegram_source).await
+    {
+        let terminal = !failure.retryable || job.attempt_count >= job.max_attempts;
+        let failure = if terminal {
+            HandlerFailure::permanent(failure.class, failure.message)
+        } else {
+            failure
+        };
+        return fail_probe(inbox, ingest_request_id, &job_attempt, failure).await;
+    }
+
     let probe = match ffprobe.probe(&input_path).await {
         Ok(probe) => probe,
         Err(error) => {
@@ -344,6 +389,79 @@ async fn probe_asset(
 
 fn map_workspace_error(error: WorkspaceError) -> HandlerFailure {
     HandlerFailure::permanent("workspace_error", error.to_string())
+}
+
+async fn source_artifact_exists(path: &Path) -> Result<bool, HandlerFailure> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(HandlerFailure::permanent(
+                "source_reconstruction",
+                format!("could not inspect source artifact: {error}"),
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(HandlerFailure::permanent(
+            "source_reconstruction",
+            "source artifact is a symlink",
+        ));
+    }
+    Ok(metadata.is_file() && metadata.len() > 0)
+}
+
+async fn ensure_telegram_source(
+    workspace: &MediaWorkspace,
+    request: &sooqa_inbox::Ingest,
+    telegram_source: Option<&dyn TelegramSourceDownloader>,
+) -> Result<(), HandlerFailure> {
+    let file_id = request
+        .original_input
+        .get("telegram_file_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|file_id| !file_id.is_empty())
+        .ok_or_else(|| {
+            HandlerFailure::permanent(
+                "source_reconstruction",
+                "Telegram ingest has no durable file ID",
+            )
+        })?;
+    let telegram_source = telegram_source.ok_or_else(|| {
+        HandlerFailure::permanent(
+            "source_reconstruction",
+            "Telegram source reconstruction is not configured in this worker",
+        )
+    })?;
+    let source_path =
+        workspace.path(WorkspaceArea::Source, "telegram-input.bin").map_err(map_workspace_error)?;
+    let temporary_path = workspace
+        .path(WorkspaceArea::Source, &format!(".sooqa-telegram-source-{}.tmp", Uuid::new_v4()))
+        .map_err(map_workspace_error)?;
+    let temporary = DownloadAttemptArtifact::new(temporary_path);
+    telegram_source.download_file(file_id, temporary.path()).await?;
+    let downloaded = read_source_artifact(workspace, temporary.path(), None).await?;
+    if downloaded.bytes == 0 {
+        return Err(HandlerFailure::permanent(
+            "source_reconstruction",
+            "Telegram source reconstruction produced an empty file",
+        ));
+    }
+    match publish_artifact(temporary.path(), &source_path).await {
+        Ok(()) | Err(ArtifactPublicationError::DestinationConflict) => {
+            let existing = read_source_artifact(workspace, &source_path, None).await?;
+            if existing.bytes == 0 {
+                return Err(HandlerFailure::permanent(
+                    "source_reconstruction",
+                    "Telegram source artifact is empty after reconstruction",
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(HandlerFailure::permanent("source_reconstruction", error.to_string()));
+        }
+    }
+    Ok(())
 }
 
 async fn fail_probe(
@@ -1061,8 +1179,8 @@ async fn compute_fingerprint(
         source: source_record_for_request(&request),
         tags: request.supplied_tags.clone(),
     };
-    let exact_media_id = match library.resolve_exact_sha(&media_ingest).await {
-        Ok(media_id) => media_id,
+    let exact_media_exists = match library.resolve_exact_sha(&media_ingest).await {
+        Ok(media_id) => media_id.is_some(),
         Err(error) => {
             return fail_fingerprint(
                 inbox,
@@ -1073,42 +1191,44 @@ async fn compute_fingerprint(
             .await;
         }
     };
-    if let Some(media_id) = exact_media_id {
-        inbox
-            .complete_video_identity(
-                ingest_request_id,
-                &job_attempt,
-                sooqa_library::VideoIdentityOutcome::ExactDuplicate { media_id },
-            )
-            .await
-            .map_err(map_inbox_error)?;
-        return Ok(());
-    }
 
-    let duration_ms = match normalization.duration_ms {
-        Some(duration_ms) if duration_ms > 0 => duration_ms,
-        _ => {
-            return fail_fingerprint(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                HandlerFailure::permanent(
-                    "invalid_ingest_state",
-                    "video normalization has no valid canonical duration",
-                ),
-            )
-            .await;
-        }
-    };
-    let workspace_id = match workspace_input(&request) {
-        Ok((workspace_id, _)) => workspace_id,
-        Err(failure) => {
-            return fail_fingerprint(inbox, ingest_request_id, &job_attempt, failure).await;
-        }
-    };
-    let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
-        Ok(workspace) => workspace,
-        Err(error) => {
+    let fingerprint = if exact_media_exists {
+        None
+    } else {
+        let duration_ms = match normalization.duration_ms {
+            Some(duration_ms) if duration_ms > 0 => duration_ms,
+            _ => {
+                return fail_fingerprint(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    HandlerFailure::permanent(
+                        "invalid_ingest_state",
+                        "video normalization has no valid canonical duration",
+                    ),
+                )
+                .await;
+            }
+        };
+        let workspace_id = match workspace_input(&request) {
+            Ok((workspace_id, _)) => workspace_id,
+            Err(failure) => {
+                return fail_fingerprint(inbox, ingest_request_id, &job_attempt, failure).await;
+            }
+        };
+        let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return fail_fingerprint(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    map_workspace_error(error),
+                )
+                .await;
+            }
+        };
+        if let Err(error) = workspace.validate() {
             return fail_fingerprint(
                 inbox,
                 ingest_request_id,
@@ -1117,59 +1237,37 @@ async fn compute_fingerprint(
             )
             .await;
         }
+        match extractor
+            .extract_video_sequence_from_area_with_cache_key(
+                &workspace,
+                WorkspaceArea::Normalized,
+                "canonical.mp4",
+                &normalization.sha256,
+                duration_ms,
+            )
+            .await
+        {
+            Ok(result) => Some(result),
+            Err(error) => {
+                return fail_fingerprint(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    map_fingerprint_error(&job, error),
+                )
+                .await;
+            }
+        }
     };
-    if let Err(error) = workspace.validate() {
-        return fail_fingerprint(
-            inbox,
+
+    inbox
+        .finalize_video_identity(
             ingest_request_id,
             &job_attempt,
-            map_workspace_error(error),
-        )
-        .await;
-    }
-    let fingerprint = match extractor
-        .extract_video_sequence_from_area_with_cache_key(
-            &workspace,
-            WorkspaceArea::Normalized,
-            "canonical.mp4",
-            &normalization.sha256,
-            duration_ms,
-        )
-        .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            return fail_fingerprint(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                map_fingerprint_error(&job, error),
-            )
-            .await;
-        }
-    };
-    let outcome = match library
-        .resolve_video_identity(
             media_ingest,
-            &fingerprint,
+            fingerprint.as_ref(),
             SequenceAlignmentConfig::default(),
-            request.force_save,
         )
-        .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return fail_fingerprint(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                map_library_error(error),
-            )
-            .await;
-        }
-    };
-    inbox
-        .complete_video_identity(ingest_request_id, &job_attempt, outcome)
         .await
         .map_err(map_inbox_error)?;
     Ok(())
@@ -1747,6 +1845,7 @@ async fn fail_download(
 fn map_inbox_error(error: InboxRepositoryError) -> HandlerFailure {
     let message = error.to_string();
     match error {
+        InboxRepositoryError::Library(error) => map_library_error(error),
         InboxRepositoryError::ResourceMissing(_)
         | InboxRepositoryError::MissingSourceUrl(_)
         | InboxRepositoryError::InvalidFailureStatus(_)

@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
 use sooqa_worker::{
-    HandlerRegistry, Worker, compute_fingerprint_handler, download_source_handler,
-    finalize_ingest_handler, inspect_source_handler, normalize_asset_handler, probe_asset_handler,
+    HandlerRegistry, TelegramSourceDownloader, Worker, compute_fingerprint_handler,
+    download_source_handler, finalize_ingest_handler, inspect_source_handler,
+    normalize_asset_handler, probe_asset_handler_with_telegram_source,
     upload_storage_asset_handler,
 };
 
@@ -49,6 +50,20 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let source_downloader: Arc<dyn SourceDownloader> = Arc::new(
         SourceDownloaderRouter::direct_only(Arc::new(DirectHttpDownloader::new(download_limits))),
     );
+    let telegram_api =
+        match config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured()) {
+            Some(token) => Some(
+                TeloxideApi::new(
+                    token.expose_secret(),
+                    &config.telegram.api_base_url,
+                    Duration::from_secs(config.telegram.poll_timeout_seconds),
+                )?
+                .with_max_download_bytes(config.telegram.max_download_bytes),
+            ),
+            None => None,
+        };
+    let telegram_source =
+        telegram_api.clone().map(|api| Arc::new(api) as Arc<dyn TelegramSourceDownloader>);
     let inspect_handler = inspect_source_handler(database.inbox(), Arc::clone(&source_downloader));
     handlers.register(JobType::InspectSource, move |job| inspect_handler(job));
     tracing::info!("source inspection handler enabled (direct HTTP only)");
@@ -60,10 +75,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     handlers.register(JobType::DownloadSource, move |job| download_handler(job));
     tracing::info!("source download handler enabled");
-    let probe_handler = probe_asset_handler(
+    let probe_handler = probe_asset_handler_with_telegram_source(
         database.inbox(),
         config.media.work_root.clone(),
         FfprobeAdapter::new(config.media.ffprobe_path.clone(), Duration::from_secs(30)),
+        telegram_source,
     );
     handlers.register(JobType::ProbeAsset, move |job| probe_handler(job));
     tracing::info!("Telegram and upload ingest probe job handler enabled");
@@ -96,17 +112,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let finalize_handler = finalize_ingest_handler(database.inbox(), database.library());
     handlers.register(JobType::FinalizeIngest, move |job| finalize_handler(job));
     tracing::info!("ingest finalization handler enabled");
-    match (
-        config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured()),
-        config.telegram.storage_chat_id,
-    ) {
-        (Some(token), Some(storage_chat_id)) => {
-            let api = TeloxideApi::new(
-                token.expose_secret(),
-                &config.telegram.api_base_url,
-                Duration::from_secs(config.telegram.poll_timeout_seconds),
-            )?
-            .with_max_download_bytes(config.telegram.max_download_bytes);
+    match (telegram_api, config.telegram.storage_chat_id) {
+        (Some(api), Some(storage_chat_id)) => {
             let provider = StorageUploadProvider::new(api, database.library(), storage_chat_id)?;
             provider.verify_storage_chat().await?;
             let storage_handler = upload_storage_asset_handler(database.inbox(), provider);
