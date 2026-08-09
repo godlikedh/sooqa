@@ -3,6 +3,9 @@ use thiserror::Error;
 
 const MAX_DISTANCE_BPS: i32 = 10_000;
 const INFORMATIVE_DISTANCE_LIMIT_BPS: u16 = 3_500;
+const MATCH_BASE_WEIGHT_BPS: u32 = 4_600;
+const MATCH_INFORMATION_WEIGHT_BPS: u32 = 5_400;
+const MATCH_INFORMATION_SPAN_BPS: u32 = 9_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SequenceAlignmentConfig {
@@ -302,7 +305,17 @@ fn classify(
 fn pair_score(left: VideoSequenceSample, right: VideoSequenceSample) -> i32 {
     let distance = pair_distance_bps(left, right);
     let information = u32::from(left.information_bps.min(right.information_bps));
-    let weight_bps = 1_000_u32.saturating_add(information.saturating_mul(9_000) / 10_000);
+    let weight_bps = if information
+        < u32::from(crate::video_sequence::VIDEO_SEQUENCE_INFO_THRESHOLD_BPS)
+    {
+        0
+    } else {
+        MATCH_BASE_WEIGHT_BPS
+            + information
+                .saturating_sub(u32::from(crate::video_sequence::VIDEO_SEQUENCE_INFO_THRESHOLD_BPS))
+                .saturating_mul(MATCH_INFORMATION_WEIGHT_BPS)
+                / MATCH_INFORMATION_SPAN_BPS
+    };
     (u32::from(MAX_DISTANCE_BPS as u16 - distance).saturating_mul(weight_bps).saturating_div(10_000)
         as i32)
         - 4_500
@@ -396,6 +409,8 @@ pub enum SequenceAlignmentError {
 
 #[cfg(test)]
 mod tests {
+    use image::{DynamicImage, ImageBuffer, Rgb};
+
     use super::*;
     use crate::{FingerprintVersion, VideoSequenceSample};
 
@@ -416,6 +431,35 @@ mod tests {
             .expect("test sequence should be valid")
     }
 
+    fn feature_images(seeds: &[u8], transpose: bool) -> Vec<DynamicImage> {
+        seeds
+            .iter()
+            .map(|seed| {
+                DynamicImage::ImageRgb8(ImageBuffer::from_fn(64, 64, |x, y| {
+                    let x = x as u16;
+                    let y = y as u16;
+                    let (horizontal, vertical) = if transpose { (y, x) } else { (x, y) };
+                    let seed = u16::from(*seed);
+                    Rgb([
+                        (horizontal * 3 + seed * 5) as u8,
+                        (vertical * 2 + seed * 3 + 40) as u8,
+                        (80 + seed * 2) as u8,
+                    ])
+                }))
+            })
+            .collect()
+    }
+
+    fn feature_sequence(seeds: &[u8], transpose: bool) -> VideoSequenceFingerprint {
+        let images = feature_images(seeds, transpose);
+        VideoSequenceFingerprint::from_images(seeds.len() as u64 * 500, 500, &images)
+            .expect("feature images should produce a sequence")
+    }
+
+    fn black_image() -> DynamicImage {
+        DynamicImage::ImageRgb8(ImageBuffer::from_pixel(64, 64, Rgb([0, 0, 0])))
+    }
+
     #[test]
     fn alignment_accepts_a_short_blank_prefix() {
         let incoming = sequence(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 5_000);
@@ -427,6 +471,51 @@ mod tests {
         assert_eq!(result.evidence.aligned_offset_ms, 1_000);
         assert!(result.evidence.incoming_coverage_bps >= 9_000);
         assert!(result.evidence.candidate_coverage_bps >= 8_000);
+    }
+
+    #[test]
+    fn extracted_features_align_with_themselves_and_a_blank_prefix() {
+        let seeds = (0_u8..10).collect::<Vec<_>>();
+        let incoming = feature_sequence(&seeds, false);
+        assert!(incoming.samples.iter().all(|sample| {
+            sample.information_bps >= crate::video_sequence::VIDEO_SEQUENCE_INFO_THRESHOLD_BPS
+        }));
+
+        let same = align_video_sequences(&incoming, &incoming, SequenceAlignmentConfig::default())
+            .expect("a fingerprint should align with itself");
+        assert_eq!(same.classification, SequenceClassification::StrongDuplicate);
+
+        let mut prefixed_images = vec![black_image(), black_image()];
+        prefixed_images.extend(feature_images(&seeds, false));
+        let prefixed = VideoSequenceFingerprint::from_images(6_000, 500, &prefixed_images)
+            .expect("prefixed feature images should produce a sequence");
+        let result =
+            align_video_sequences(&incoming, &prefixed, SequenceAlignmentConfig::default())
+                .expect("a blank prefix should still align");
+        assert_eq!(result.classification, SequenceClassification::StrongDuplicate);
+        assert_eq!(result.evidence.aligned_offset_ms, 1_000);
+    }
+
+    #[test]
+    fn extracted_unrelated_and_low_information_sequences_are_not_strong() {
+        let seeds = (0_u8..10).collect::<Vec<_>>();
+        let incoming = feature_sequence(&seeds, false);
+        let unrelated = feature_sequence(&seeds, true);
+        let unrelated_result =
+            align_video_sequences(&incoming, &unrelated, SequenceAlignmentConfig::default())
+                .expect("unrelated feature sequences should be comparable");
+        assert_ne!(unrelated_result.classification, SequenceClassification::StrongDuplicate);
+
+        let black_images = (0..10).map(|_| black_image()).collect::<Vec<_>>();
+        let low_information = VideoSequenceFingerprint::from_images(5_000, 500, &black_images)
+            .expect("black images should produce a sequence");
+        let low_information_result = align_video_sequences(
+            &low_information,
+            &low_information,
+            SequenceAlignmentConfig::default(),
+        )
+        .expect("low-information sequences should be comparable");
+        assert_ne!(low_information_result.classification, SequenceClassification::StrongDuplicate);
     }
 
     #[test]

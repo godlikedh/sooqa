@@ -46,9 +46,11 @@ Each fixed-width sample contains:
 
 The pHash uses the 8x8 low-frequency coefficients of a 32x32 grayscale image
 and compares all 64 coefficients with the deterministic median.
-The dHash uses nine evenly spaced horizontal samples across each of eight
-rows. Low-information samples are retained in the authoritative blob but are
-not selected as search anchors and receive little alignment weight.
+The dHash uses rows `floor(y * 31 / 7)` for `y = 0..7`; within each row it
+compares horizontal positions `floor(x * 31 / 8)` and
+`floor((x + 1) * 31 / 8)` for `x = 0..7`. Low-information samples are
+retained in the authoritative blob but are not selected as search anchors and
+receive little alignment weight.
 
 ### Binary representation
 
@@ -103,7 +105,11 @@ sequences. A full pair of 2,048-sample inputs uses at most 4,200,000 DP cells.
 It can leave prefixes/suffixes unmatched and represent short gaps,
 which provides constant-offset tolerance without a duration hard filter. Pair
 distance combines pHash and dHash Hamming distance with luma/chroma distance.
-Low-information pairs are down-weighted and do not count as informative
+Low-information pairs below the 1,000-bps information threshold receive a
+non-positive local-match score. At or above the threshold, the match weight is
+`4,600 + (information - 1,000) * 5,400 / 9,000` bps before the distance
+penalty, so real extracted features contribute positive evidence while black
+frames cannot create a path. Low-information pairs do not count as informative
 matches. The default strong-duplicate thresholds are:
 
 - at least 70% coverage in both directions;

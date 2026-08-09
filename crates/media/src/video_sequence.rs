@@ -13,6 +13,7 @@ pub const VIDEO_SEQUENCE_MAX_ANCHORS: usize = 128;
 pub const VIDEO_SEQUENCE_MAX_TOKENS: usize = 1_024;
 pub const VIDEO_SEQUENCE_INFO_THRESHOLD_BPS: u16 = 1_000;
 
+const MAX_SCORE_BPS: u16 = 10_000;
 const HEADER_BYTES: usize = 24;
 const SAMPLE_BYTES: usize = 23;
 const FEATURE_WIDTH: u32 = 32;
@@ -50,6 +51,7 @@ impl VideoSequenceFingerprint {
         samples: Vec<VideoSequenceSample>,
     ) -> Result<Self, VideoSequenceError> {
         validate_grid(duration_ms, interval_ms, samples.len())?;
+        validate_samples(&samples)?;
         Ok(Self { version: FingerprintVersion::VideoSequenceV1, duration_ms, interval_ms, samples })
     }
 
@@ -74,6 +76,7 @@ impl VideoSequenceFingerprint {
             return Err(VideoSequenceError::UnsupportedAlgorithm(self.version));
         }
         validate_grid(self.duration_ms, self.interval_ms, self.samples.len())?;
+        validate_samples(&self.samples)?;
         let mut encoded = Vec::with_capacity(HEADER_BYTES + self.samples.len() * SAMPLE_BYTES);
         encoded.extend_from_slice(&VIDEO_SEQUENCE_MAGIC);
         encoded.extend_from_slice(&VIDEO_SEQUENCE_CODEC_V1.to_le_bytes());
@@ -265,6 +268,23 @@ fn validate_grid(
     Ok(())
 }
 
+fn validate_samples(samples: &[VideoSequenceSample]) -> Result<(), VideoSequenceError> {
+    if let Some(first) = samples.first()
+        && first.transition_bps != 0
+    {
+        return Err(VideoSequenceError::InvalidFirstTransition(first.transition_bps));
+    }
+    for sample in samples {
+        if sample.information_bps > MAX_SCORE_BPS {
+            return Err(VideoSequenceError::InvalidInformationScore(sample.information_bps));
+        }
+        if sample.transition_bps > MAX_SCORE_BPS {
+            return Err(VideoSequenceError::InvalidTransitionScore(sample.transition_bps));
+        }
+    }
+    Ok(())
+}
+
 fn read_u8(encoded: &[u8], offset: &mut usize) -> Result<u8, VideoSequenceError> {
     let value = *encoded.get(*offset).ok_or(VideoSequenceError::Truncated)?;
     *offset += 1;
@@ -375,11 +395,12 @@ fn transition_score(previous: &[u8], current: &[u8]) -> u16 {
 fn dhash_v1(luma_values: &[u8]) -> u64 {
     let mut hash = 0_u64;
     for y in 0..8 {
+        let row = y * 31 / 7;
         for x in 0..8 {
             let left_x = x * 31 / 8;
             let right_x = (x + 1) * 31 / 8;
-            let left = luma_values[y * 32 + left_x];
-            let right = luma_values[y * 32 + right_x];
+            let left = luma_values[row * 32 + left_x];
+            let right = luma_values[row * 32 + right_x];
             if left < right {
                 hash |= 1_u64 << (y * 8 + x);
             }
@@ -452,6 +473,12 @@ pub enum VideoSequenceError {
     InvalidReservedHeader,
     #[error("video sequence blob has trailing bytes")]
     TrailingBytes,
+    #[error("video sequence information score is invalid: {0}")]
+    InvalidInformationScore(u16),
+    #[error("video sequence transition score is invalid: {0}")]
+    InvalidTransitionScore(u16),
+    #[error("video sequence first transition score must be zero, got {0}")]
+    InvalidFirstTransition(u16),
 }
 
 #[cfg(test)]
@@ -515,6 +542,21 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn dhash_samples_the_lower_part_of_the_frame() {
+        let left = DynamicImage::ImageRgb8(ImageBuffer::from_fn(32, 32, |x, y| {
+            let value = if y < 8 { 128 } else { x * 8 } as u8;
+            Rgb([value, value, value])
+        }));
+        let right = DynamicImage::ImageRgb8(ImageBuffer::from_fn(32, 32, |x, y| {
+            let value = if y < 8 { 128 } else { 255 - x * 8 } as u8;
+            Rgb([value, value, value])
+        }));
+        let left = VideoSequenceFingerprint::from_images(500, 500, &[left]).unwrap();
+        let right = VideoSequenceFingerprint::from_images(500, 500, &[right]).unwrap();
+        assert_ne!(left.samples[0].dhash, right.samples[0].dhash);
     }
 
     #[test]
@@ -589,6 +631,53 @@ mod tests {
         assert_eq!(
             VideoSequenceFingerprint::new(1_000, 500, vec![sample(1, 2_000)]),
             Err(VideoSequenceError::InvalidTimestampGrid)
+        );
+    }
+
+    #[test]
+    fn codec_rejects_semantically_invalid_sample_scores() {
+        let valid = VideoSequenceFingerprint::new(500, 500, vec![sample(1, MAX_SCORE_BPS)])
+            .expect("the score boundary should be valid");
+        assert!(valid.encode().is_ok());
+
+        assert_eq!(
+            VideoSequenceFingerprint::new(500, 500, vec![sample(1, MAX_SCORE_BPS + 1)]),
+            Err(VideoSequenceError::InvalidInformationScore(MAX_SCORE_BPS + 1))
+        );
+
+        let mut invalid_first_transition = sample(1, 2_000);
+        invalid_first_transition.transition_bps = 1;
+        assert_eq!(
+            VideoSequenceFingerprint::new(500, 500, vec![invalid_first_transition]),
+            Err(VideoSequenceError::InvalidFirstTransition(1))
+        );
+
+        let mut invalid_transition = vec![sample(1, 2_000), sample(2, 2_000)];
+        invalid_transition[1].transition_bps = MAX_SCORE_BPS + 1;
+        assert_eq!(
+            VideoSequenceFingerprint::new(1_000, 500, invalid_transition),
+            Err(VideoSequenceError::InvalidTransitionScore(MAX_SCORE_BPS + 1))
+        );
+
+        let mut invalid_public_field = valid.clone();
+        invalid_public_field.samples[0].information_bps = MAX_SCORE_BPS + 1;
+        assert_eq!(
+            invalid_public_field.encode(),
+            Err(VideoSequenceError::InvalidInformationScore(MAX_SCORE_BPS + 1))
+        );
+
+        let mut invalid_encoded_score = valid.encode().unwrap();
+        invalid_encoded_score[43..45].copy_from_slice(&(MAX_SCORE_BPS + 1).to_le_bytes());
+        assert_eq!(
+            VideoSequenceFingerprint::decode(&invalid_encoded_score),
+            Err(VideoSequenceError::InvalidInformationScore(MAX_SCORE_BPS + 1))
+        );
+
+        let mut invalid_encoded_transition = valid.encode().unwrap();
+        invalid_encoded_transition[45..47].copy_from_slice(&1_u16.to_le_bytes());
+        assert_eq!(
+            VideoSequenceFingerprint::decode(&invalid_encoded_transition),
+            Err(VideoSequenceError::InvalidFirstTransition(1))
         );
     }
 
