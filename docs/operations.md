@@ -43,10 +43,10 @@ generation is started. The existing CLI names remain available for this
 operator workflow:
 
 ```bash
-cargo run -p sooqa-server -- storage-intents list
-cargo run -p sooqa-server -- storage-intents mark-unknown <media-id>
-cargo run -p sooqa-server -- storage-intents reset <media-id> --confirm
-cargo run -p sooqa-server -- storage-intents attach <media-id> <chat-id> <message-id> <file-id> <file-unique-id>
+cargo run -p sooqa-server -- storage list
+cargo run -p sooqa-server -- storage mark-unknown <media-id>
+cargo run -p sooqa-server -- storage reset <media-id> --confirm
+cargo run -p sooqa-server -- storage attach <media-id> <generation> <chat-id> <message-id> <file-id> <file-unique-id>
 ```
 
 ## Secrets and logs

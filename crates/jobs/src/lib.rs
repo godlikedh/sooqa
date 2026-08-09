@@ -13,7 +13,6 @@ pub type JobId = Uuid;
 
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum JobType {
-    ProcessIngest,
     InspectSource,
     DownloadSource,
     ProbeAsset,
@@ -21,7 +20,6 @@ pub enum JobType {
     ComputeFingerprint,
     CheckSimilarity,
     FinalizeIngest,
-    UploadStorage,
     UploadStorageAsset,
     PublishPost,
     CleanupWorkspace,
@@ -31,7 +29,6 @@ pub enum JobType {
 impl JobType {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::ProcessIngest => "process_ingest",
             Self::InspectSource => "inspect_source",
             Self::DownloadSource => "download_source",
             Self::ProbeAsset => "probe_asset",
@@ -39,7 +36,6 @@ impl JobType {
             Self::ComputeFingerprint => "compute_fingerprint",
             Self::CheckSimilarity => "check_similarity",
             Self::FinalizeIngest => "finalize_ingest",
-            Self::UploadStorage => "upload_storage",
             Self::UploadStorageAsset => "upload_storage_asset",
             Self::PublishPost => "publish_post",
             Self::CleanupWorkspace => "cleanup_workspace",
@@ -59,7 +55,6 @@ impl TryFrom<&str> for JobType {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
-            "process_ingest" => Ok(Self::ProcessIngest),
             "inspect_source" => Ok(Self::InspectSource),
             "download_source" => Ok(Self::DownloadSource),
             "probe_asset" => Ok(Self::ProbeAsset),
@@ -67,7 +62,6 @@ impl TryFrom<&str> for JobType {
             "compute_fingerprint" => Ok(Self::ComputeFingerprint),
             "check_similarity" => Ok(Self::CheckSimilarity),
             "finalize_ingest" => Ok(Self::FinalizeIngest),
-            "upload_storage" => Ok(Self::UploadStorage),
             "upload_storage_asset" => Ok(Self::UploadStorageAsset),
             "publish_post" => Ok(Self::PublishPost),
             "cleanup_workspace" => Ok(Self::CleanupWorkspace),
@@ -121,12 +115,6 @@ impl TryFrom<&str> for JobStatus {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProcessIngestPayload {
-    pub ingest_id: Uuid,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct InspectSourcePayload {
     pub ingest_id: Uuid,
 }
@@ -163,7 +151,6 @@ pub struct EmptyJobPayload {}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum JobCommand {
-    ProcessIngest(ProcessIngestPayload),
     InspectSource(InspectSourcePayload),
     DownloadSource(DownloadSourcePayload),
     ProbeAsset(IngestJobPayload),
@@ -171,7 +158,6 @@ pub enum JobCommand {
     ComputeFingerprint(IngestJobPayload),
     CheckSimilarity(IngestJobPayload),
     FinalizeIngest(IngestJobPayload),
-    UploadStorage(MediaJobPayload),
     UploadStorageAsset(MediaJobPayload),
     PublishPost(PublishPostPayload),
     CleanupWorkspace(EmptyJobPayload),
@@ -181,7 +167,6 @@ pub enum JobCommand {
 impl JobCommand {
     pub const fn job_type(&self) -> JobType {
         match self {
-            Self::ProcessIngest(_) => JobType::ProcessIngest,
             Self::InspectSource(_) => JobType::InspectSource,
             Self::DownloadSource(_) => JobType::DownloadSource,
             Self::ProbeAsset(_) => JobType::ProbeAsset,
@@ -189,7 +174,6 @@ impl JobCommand {
             Self::ComputeFingerprint(_) => JobType::ComputeFingerprint,
             Self::CheckSimilarity(_) => JobType::CheckSimilarity,
             Self::FinalizeIngest(_) => JobType::FinalizeIngest,
-            Self::UploadStorage(_) => JobType::UploadStorage,
             Self::UploadStorageAsset(_) => JobType::UploadStorageAsset,
             Self::PublishPost(_) => JobType::PublishPost,
             Self::CleanupWorkspace(_) => JobType::CleanupWorkspace,
@@ -204,7 +188,6 @@ impl JobCommand {
             };
         }
         match job_type {
-            JobType::ProcessIngest => decode!(ProcessIngestPayload, ProcessIngest),
             JobType::InspectSource => decode!(InspectSourcePayload, InspectSource),
             JobType::DownloadSource => decode!(DownloadSourcePayload, DownloadSource),
             JobType::ProbeAsset => decode!(IngestJobPayload, ProbeAsset),
@@ -212,7 +195,6 @@ impl JobCommand {
             JobType::ComputeFingerprint => decode!(IngestJobPayload, ComputeFingerprint),
             JobType::CheckSimilarity => decode!(IngestJobPayload, CheckSimilarity),
             JobType::FinalizeIngest => decode!(IngestJobPayload, FinalizeIngest),
-            JobType::UploadStorage => decode!(MediaJobPayload, UploadStorage),
             JobType::UploadStorageAsset => decode!(MediaJobPayload, UploadStorageAsset),
             JobType::PublishPost => decode!(PublishPostPayload, PublishPost),
             JobType::CleanupWorkspace => decode!(EmptyJobPayload, CleanupWorkspace),
@@ -222,7 +204,6 @@ impl JobCommand {
 
     pub fn payload_json(&self) -> Value {
         match self {
-            Self::ProcessIngest(payload) => serde_json::to_value(payload),
             Self::InspectSource(payload) => serde_json::to_value(payload),
             Self::DownloadSource(payload) => serde_json::to_value(payload),
             Self::ProbeAsset(payload) => serde_json::to_value(payload),
@@ -230,7 +211,6 @@ impl JobCommand {
             Self::ComputeFingerprint(payload) => serde_json::to_value(payload),
             Self::CheckSimilarity(payload) => serde_json::to_value(payload),
             Self::FinalizeIngest(payload) => serde_json::to_value(payload),
-            Self::UploadStorage(payload) => serde_json::to_value(payload),
             Self::UploadStorageAsset(payload) => serde_json::to_value(payload),
             Self::PublishPost(payload) => serde_json::to_value(payload),
             Self::CleanupWorkspace(payload) => serde_json::to_value(payload),
@@ -268,10 +248,6 @@ impl NewJob {
         Self { command, priority: 0, run_at: None, max_attempts: 5, dedupe_key: None }
     }
 
-    pub fn process_ingest(ingest_id: Uuid) -> Self {
-        Self::new(JobCommand::ProcessIngest(ProcessIngestPayload { ingest_id }))
-    }
-
     pub fn inspect_source(ingest_id: Uuid) -> Self {
         Self::new(JobCommand::InspectSource(InspectSourcePayload { ingest_id }))
     }
@@ -282,10 +258,6 @@ impl NewJob {
 
     pub fn publish_post(post_id: Uuid) -> Self {
         Self::new(JobCommand::PublishPost(PublishPostPayload { post_id }))
-    }
-
-    pub fn upload_storage(media_id: Uuid) -> Self {
-        Self::new(JobCommand::UploadStorage(MediaJobPayload { media_id, generation: 0 }))
     }
 
     pub fn upload_storage_asset(asset_id: Uuid) -> Self {
@@ -435,11 +407,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn typed_process_payload_round_trips() {
+    fn typed_inspection_payload_round_trips() {
         let ingest_id = Uuid::new_v4();
-        let job = NewJob::process_ingest(ingest_id);
+        let job = NewJob::inspect_source(ingest_id);
         let command = JobCommand::from_payload(job.job_type(), job.payload_json()).unwrap();
-        assert_eq!(command, JobCommand::ProcessIngest(ProcessIngestPayload { ingest_id }));
+        assert_eq!(command, JobCommand::InspectSource(InspectSourcePayload { ingest_id }));
     }
 
     #[test]
@@ -453,6 +425,6 @@ mod tests {
     #[test]
     fn retry_wait_is_represented_by_run_at_and_queued_state() {
         assert_eq!(JobStatus::Queued.as_str(), "queued");
-        assert_eq!(JobType::ProcessIngest.as_str(), "process_ingest");
+        assert_eq!(JobType::InspectSource.as_str(), "inspect_source");
     }
 }

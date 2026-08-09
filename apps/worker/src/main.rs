@@ -113,7 +113,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .with_max_download_bytes(config.telegram.max_download_bytes);
             let provider = StorageUploadProvider::new(api, database.library(), storage_chat_id)?;
             provider.verify_storage_chat().await?;
-            let storage_handler = upload_storage_asset_handler(provider);
+            let storage_handler = upload_storage_asset_handler(database.inbox(), provider);
             handlers.register(JobType::UploadStorageAsset, move |job| storage_handler(job));
             tracing::info!(storage_chat_id, "Telegram storage upload job handler enabled");
         }

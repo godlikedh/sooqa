@@ -57,6 +57,7 @@ impl JobRepository {
                 FROM queue.jobs
                 WHERE state = 'queued'
                   AND run_at <= now()
+                  AND attempt_count < max_attempts
                   AND kind = ANY($3::text[])
                 ORDER BY priority DESC, run_at ASC, created_at ASC
                 FOR UPDATE SKIP LOCKED
@@ -182,9 +183,12 @@ impl JobRepository {
         let row = sqlx::query_as::<_, JobRow>(
             r#"
             UPDATE queue.jobs
-            SET state = 'queued', run_at = $4, lease_token = NULL, lease_owner = NULL,
+            SET state = CASE WHEN attempt_count >= max_attempts THEN 'failed' ELSE 'queued' END,
+                run_at = $4, lease_token = NULL, lease_owner = NULL,
                 lease_expires_at = NULL, last_heartbeat_at = NULL,
-                error_class = $5, error_message = $6, updated_at = now()
+                error_class = $5, error_message = $6,
+                completed_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
+                updated_at = now()
             WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
             RETURNING id, kind, payload, state, priority, run_at, attempt_count,
                       max_attempts, lease_token, lease_owner, lease_expires_at,
@@ -258,81 +262,6 @@ impl JobRepository {
             .fetch_all(&self.pool)
             .await?)
     }
-
-    // These worker-era wrappers are deliberately owner-checked. New code uses
-    // the lease-token methods above; keeping the narrow wrappers makes the
-    // migration of handlers mechanical without weakening the database fence.
-    pub async fn heartbeat(
-        &self,
-        job_id: Uuid,
-        worker_id: &str,
-        duration: Duration,
-    ) -> Result<Job, JobRepositoryError> {
-        let lease = self.current_lease(job_id, worker_id).await?;
-        self.heartbeat_lease(&lease, duration).await
-    }
-
-    pub async fn complete(&self, job_id: Uuid, worker_id: &str) -> Result<Job, JobRepositoryError> {
-        let lease = self.current_lease(job_id, worker_id).await?;
-        self.complete_lease(&lease).await
-    }
-
-    pub async fn retry(
-        &self,
-        job_id: Uuid,
-        worker_id: &str,
-        run_at: OffsetDateTime,
-        class: &str,
-        message: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        let lease = self.current_lease(job_id, worker_id).await?;
-        self.retry_lease(&lease, run_at, class, message).await
-    }
-
-    pub async fn defer(
-        &self,
-        job_id: Uuid,
-        worker_id: &str,
-        run_at: OffsetDateTime,
-        class: &str,
-        message: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        let lease = self.current_lease(job_id, worker_id).await?;
-        self.defer_lease(&lease, run_at, class, message).await
-    }
-
-    pub async fn fail(
-        &self,
-        job_id: Uuid,
-        worker_id: &str,
-        class: &str,
-        message: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        let lease = self.current_lease(job_id, worker_id).await?;
-        self.fail_lease(&lease, class, message).await
-    }
-
-    async fn current_lease(
-        &self,
-        job_id: Uuid,
-        worker_id: &str,
-    ) -> Result<JobLease, JobRepositoryError> {
-        let row = sqlx::query_as::<_, LeaseRow>(
-            "SELECT id, attempt_count, lease_owner, lease_token FROM queue.jobs WHERE id = $1 AND state = 'running' AND lease_owner = $2",
-        )
-        .bind(job_id)
-        .bind(worker_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(JobRepositoryError::LeaseLost)?;
-        Ok(JobLease {
-            job_id: row.id,
-            attempt_number: row.attempt_count,
-            worker_id: row.lease_owner.clone(),
-            lease_owner: row.lease_owner,
-            lease_token: row.lease_token.ok_or(JobRepositoryError::LeaseLost)?,
-        })
-    }
 }
 
 fn lease_seconds(duration: Duration) -> Result<f64, JobRepositoryError> {
@@ -391,14 +320,6 @@ impl JobRow {
             completed_at: self.completed_at,
         })
     }
-}
-
-#[derive(Debug, FromRow)]
-struct LeaseRow {
-    id: Uuid,
-    attempt_count: i32,
-    lease_owner: String,
-    lease_token: Option<Uuid>,
 }
 
 #[derive(Debug, Error)]

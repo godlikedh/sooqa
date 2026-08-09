@@ -1,7 +1,8 @@
 use std::env;
 
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
-use sooqa_persistence::{Database, InboxRepositoryError};
+use sooqa_jobs::JobType;
+use sooqa_persistence::{Database, InboxRepositoryError, SourceInspectionStart};
 use uuid::Uuid;
 
 async fn database() -> Database {
@@ -25,7 +26,7 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts() {
         .unwrap();
     let replay =
         database.inbox().create_ingest(IngestSubmission::try_new(input).unwrap()).await.unwrap();
-    assert_eq!(first.request.id, replay.request.id);
+    assert_eq!(first.ingest.id, replay.ingest.id);
     assert!(!replay.created);
 
     let mut conflicting =
@@ -37,13 +38,38 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts() {
         .await
         .unwrap_err();
     assert!(matches!(error, InboxRepositoryError::IdempotencyConflict { .. }));
+    let claimed = database
+        .jobs()
+        .claim_next(
+            "stale-inspection-worker",
+            std::time::Duration::from_secs(30),
+            &[JobType::InspectSource],
+        )
+        .await
+        .unwrap()
+        .expect("inspect job should be claimable");
+    let stale_attempt = claimed.lease().expect("claimed job should have a lease");
+    database
+        .jobs()
+        .retry_lease(
+            &stale_attempt,
+            time::OffsetDateTime::now_utc(),
+            "test_retry",
+            "simulated retry",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        database.inbox().begin_source_inspection(first.ingest.id, &stale_attempt).await.unwrap(),
+        SourceInspectionStart::AlreadyAdvanced(_)
+    ));
     sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(first.request.id.to_string())
+        .bind(first.ingest.id.to_string())
         .execute(database.pool())
         .await
         .unwrap();
     sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(first.request.id)
+        .bind(first.ingest.id)
         .execute(database.pool())
         .await
         .unwrap();

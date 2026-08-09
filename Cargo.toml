@@ -25,6 +25,8 @@ rust-version = "1.97.1"
 
 [workspace.dependencies]
 async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono-tz = "0.10"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 nix = { version = "0.30", default-features = false, features = ["process", "signal"] }

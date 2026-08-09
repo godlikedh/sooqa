@@ -35,10 +35,10 @@ paths:
                 $ref: '#/components/schemas/HealthResponse'
         '400':
           description: The health request was malformed.
-  /api/v1/ingest-requests:
+  /api/v1/ingests:
     post:
       tags: [ingest]
-      operationId: createIngestRequest
+      operationId: createIngest
       summary: Submit a URL for durable ingestion
       security:
         - bearerAuth: []
@@ -62,10 +62,10 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/ingest-requests/{id}:
+  /api/v1/ingests/{id}:
     get:
       tags: [ingest]
-      operationId: getIngestRequest
+      operationId: getIngest
       summary: Read ingest progress
       security:
         - bearerAuth: []
@@ -273,8 +273,6 @@ paths:
       summary: Create an intended post
       security:
         - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -355,7 +353,7 @@ paths:
           description: Post queued and publish job enqueued.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ScheduleResponse' }
+              schema: { $ref: '#/components/schemas/Post' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -376,7 +374,7 @@ paths:
           description: Post queued for immediate publication.
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/ScheduleResponse' }
+              schema: { $ref: '#/components/schemas/Post' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -556,8 +554,8 @@ components:
       type: object
       additionalProperties: false
       properties:
-        preferred_title: { type: string, nullable: true }
-        editorial_description: { type: string, nullable: true }
+        title: { type: string, nullable: true }
+        description: { type: string, nullable: true }
         notes: { type: string, nullable: true }
         expected_updated_at: { type: string, format: date-time, nullable: true }
     TagRequest:
@@ -568,9 +566,8 @@ components:
         tag: { type: string, minLength: 1 }
     Tag:
       type: object
-      required: [id, normalized_name, display_name, created_at]
+      required: [normalized_name, display_name, created_at]
       properties:
-        id: { type: string, format: uuid }
         normalized_name: { type: string }
         display_name: { type: string }
         created_at: { type: string, format: date-time }
@@ -581,16 +578,24 @@ components:
       properties:
         name: { type: string, minLength: 1, maxLength: 128 }
         telegram_chat_id: { type: integer, format: int64, description: Negative Telegram chat ID. }
+        time_zone: { type: string, default: UTC }
+        window_start: { type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$' }
+        window_end: { type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$' }
+        interval_minutes: { type: integer, minimum: 1, default: 30 }
         default_parse_mode: { type: string, enum: [HTML, MarkdownV2], nullable: true }
         default_disable_notification: { type: boolean, default: false }
     Channel:
       type: object
-      required: [id, name, telegram_chat_id, is_enabled, default_disable_notification, created_at, updated_at]
+      required: [id, name, telegram_chat_id, is_enabled, time_zone, window_start, window_end, interval_minutes, default_disable_notification, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
         telegram_chat_id: { type: integer, format: int64 }
         is_enabled: { type: boolean }
+        time_zone: { type: string }
+        window_start: { type: string }
+        window_end: { type: string }
+        interval_minutes: { type: integer, minimum: 1 }
         default_parse_mode: { type: string, nullable: true }
         default_disable_notification: { type: boolean }
         created_at: { type: string, format: date-time }
@@ -615,42 +620,25 @@ components:
       properties:
         caption: { type: string, nullable: true, maxLength: 1024 }
         parse_mode: { type: string, enum: [HTML, MarkdownV2], nullable: true }
-        status: { type: string, enum: [editing, ready, cancelled] }
+        disable_notification: { type: boolean }
         expected_updated_at: { type: string, format: date-time, nullable: true }
     Post:
       type: object
-      required: [id, media_id, channel_id, status, created_at, updated_at]
+      required: [id, media_id, channel_id, disable_notification, status, scheduled_at, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         media_id: { type: string, format: uuid }
         channel_id: { type: string, format: uuid }
         caption: { type: string, nullable: true }
         parse_mode: { type: string, nullable: true }
-        status: { type: string, enum: [editing, ready, scheduled, published, cancelled] }
+        disable_notification: { type: boolean }
+        status: { type: string, enum: [draft, queued, sending, published, unknown, failed, cancelled] }
+        scheduled_at: { type: string, format: date-time }
+        cadence_slot_at: { type: string, format: date-time, nullable: true }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
     ScheduleRequest:
       type: object
-      required: [publish_at]
       additionalProperties: false
       properties:
-        publish_at: { type: string, format: date-time }
-        not_before: { type: string, format: date-time, nullable: true }
-        not_after: { type: string, format: date-time, nullable: true }
-        priority: { type: integer, default: 0 }
-        cooldown_override: { type: boolean, nullable: true }
-    ScheduleResponse:
-      type: object
-      required: [id, post_id, status, publish_at, idempotency_key, created_at, updated_at]
-      properties:
-        id: { type: string, format: uuid }
-        post_id: { type: string, format: uuid }
-        status: { type: string, enum: [pending, queued, publishing, published, failed, unknown, cancelled] }
-        publish_at: { type: string, format: date-time }
-        not_before: { type: string, format: date-time, nullable: true }
-        not_after: { type: string, format: date-time, nullable: true }
-        priority: { type: integer }
-        cooldown_override: { type: boolean, nullable: true }
-        idempotency_key: { type: string }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
+        publish_at: { type: string, format: date-time, nullable: true }

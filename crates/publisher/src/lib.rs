@@ -1,20 +1,23 @@
-//! Draft, schedule, policy, and publication boundaries for sooqa.
+//! Channel and post aggregates for the Publisher boundary.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, Time};
 use uuid::Uuid;
 
 const MAX_CHANNEL_NAME_LENGTH: usize = 128;
-const MAX_IDEMPOTENCY_KEY_LENGTH: usize = 255;
+const MAX_REQUEST_KEY_LENGTH: usize = 255;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TargetChannel {
+pub struct Channel {
     pub id: Uuid,
     pub name: String,
     pub telegram_chat_id: i64,
     pub is_enabled: bool,
+    pub time_zone: String,
+    pub window_start: Time,
+    pub window_end: Time,
+    pub interval_minutes: i32,
     pub default_parse_mode: Option<String>,
     pub default_disable_notification: bool,
     pub created_at: OffsetDateTime,
@@ -22,510 +25,229 @@ pub struct TargetChannel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewTargetChannel {
+pub struct NewChannel {
     pub name: String,
     pub telegram_chat_id: i64,
+    pub time_zone: String,
+    pub window_start: Time,
+    pub window_end: Time,
+    pub interval_minutes: i32,
     pub default_parse_mode: Option<String>,
     pub default_disable_notification: bool,
 }
 
-impl NewTargetChannel {
+impl NewChannel {
     pub fn try_new(
         name: impl Into<String>,
         telegram_chat_id: i64,
-    ) -> Result<Self, TargetChannelValidationError> {
+    ) -> Result<Self, ChannelValidationError> {
         let name = name.into().trim().to_owned();
         if name.is_empty() {
-            return Err(TargetChannelValidationError::EmptyName);
+            return Err(ChannelValidationError::EmptyName);
         }
         if name.chars().count() > MAX_CHANNEL_NAME_LENGTH {
-            return Err(TargetChannelValidationError::NameTooLong { max: MAX_CHANNEL_NAME_LENGTH });
+            return Err(ChannelValidationError::NameTooLong { max: MAX_CHANNEL_NAME_LENGTH });
         }
         if telegram_chat_id >= 0 {
-            return Err(TargetChannelValidationError::InvalidTelegramChatId(telegram_chat_id));
+            return Err(ChannelValidationError::InvalidTelegramChatId(telegram_chat_id));
         }
         Ok(Self {
             name,
             telegram_chat_id,
+            time_zone: "UTC".to_owned(),
+            window_start: Time::from_hms(8, 0, 0).expect("valid default window"),
+            window_end: Time::from_hms(22, 0, 0).expect("valid default window"),
+            interval_minutes: 30,
             default_parse_mode: None,
             default_disable_notification: false,
         })
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum TargetChannelValidationError {
-    #[error("target channel name must not be empty")]
-    EmptyName,
-    #[error("target channel name must be at most {max} characters")]
-    NameTooLong { max: usize },
-    #[error("Telegram target chat ID must be negative, got {0}")]
-    InvalidTelegramChatId(i64),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CooldownViolation {
-    Warn,
-    Block,
-    Allow,
-}
-
-impl CooldownViolation {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Warn => "warn",
-            Self::Block => "block",
-            Self::Allow => "allow",
+    pub fn validate(&self) -> Result<(), ChannelValidationError> {
+        if self.time_zone.trim().is_empty() {
+            return Err(ChannelValidationError::EmptyTimeZone);
         }
-    }
-}
-
-impl TryFrom<&str> for CooldownViolation {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "warn" => Ok(Self::Warn),
-            "block" => Ok(Self::Block),
-            "allow" => Ok(Self::Allow),
-            unknown => Err(unknown.to_owned()),
+        if self.time_zone.parse::<chrono_tz::Tz>().is_err() {
+            return Err(ChannelValidationError::InvalidTimeZone);
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChannelPolicy {
-    pub target_channel_id: Uuid,
-    pub minimum_post_interval_seconds: u64,
-    pub same_content_cooldown_seconds: u64,
-    pub similar_content_cooldown_seconds: u64,
-    pub similarity_threshold: f64,
-    pub on_cooldown_violation: CooldownViolation,
-    pub allowed_windows_json: Value,
-    pub max_posts_per_day: Option<u32>,
-    pub jitter_seconds: u64,
-    pub updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct NewChannelPolicy {
-    pub target_channel_id: Uuid,
-    pub minimum_post_interval_seconds: u64,
-    pub same_content_cooldown_seconds: u64,
-    pub similar_content_cooldown_seconds: u64,
-    pub similarity_threshold: f64,
-    pub on_cooldown_violation: CooldownViolation,
-    pub allowed_windows_json: Value,
-    pub max_posts_per_day: Option<u32>,
-    pub jitter_seconds: u64,
-}
-
-impl NewChannelPolicy {
-    pub fn default_for(target_channel_id: Uuid) -> Self {
-        Self {
-            target_channel_id,
-            minimum_post_interval_seconds: 0,
-            same_content_cooldown_seconds: 0,
-            similar_content_cooldown_seconds: 0,
-            similarity_threshold: 0.75,
-            on_cooldown_violation: CooldownViolation::Warn,
-            allowed_windows_json: Value::Array(Vec::new()),
-            max_posts_per_day: None,
-            jitter_seconds: 0,
+        if self.window_start >= self.window_end {
+            return Err(ChannelValidationError::InvalidWindow);
         }
-    }
-
-    pub fn validate(&self) -> Result<(), PublisherValidationError> {
-        if !self.similarity_threshold.is_finite()
-            || !(0.0..=1.0).contains(&self.similarity_threshold)
+        if self.interval_minutes <= 0 {
+            return Err(ChannelValidationError::InvalidInterval);
+        }
+        if self
+            .default_parse_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "HTML" | "MarkdownV2"))
         {
-            return Err(PublisherValidationError::InvalidSimilarityThreshold(
-                self.similarity_threshold,
-            ));
-        }
-        if self.max_posts_per_day == Some(0) {
-            return Err(PublisherValidationError::InvalidDailyLimit);
+            return Err(ChannelValidationError::InvalidParseMode);
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Error)]
+pub enum ChannelValidationError {
+    #[error("channel name must not be empty")]
+    EmptyName,
+    #[error("channel name must be at most {max} characters")]
+    NameTooLong { max: usize },
+    #[error("Telegram channel chat ID must be negative, got {0}")]
+    InvalidTelegramChatId(i64),
+    #[error("channel time zone must not be empty")]
+    EmptyTimeZone,
+    #[error("channel time zone is invalid")]
+    InvalidTimeZone,
+    #[error("channel publication window is invalid")]
+    InvalidWindow,
+    #[error("channel interval must be greater than zero")]
+    InvalidInterval,
+    #[error("channel default parse mode is invalid")]
+    InvalidParseMode,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PostDraftStatus {
-    Editing,
-    Ready,
-    Scheduled,
+pub enum PostState {
+    Draft,
+    Queued,
+    Sending,
     Published,
+    Unknown,
+    Failed,
     Cancelled,
 }
 
-impl PostDraftStatus {
+impl PostState {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Editing => "editing",
-            Self::Ready => "ready",
-            Self::Scheduled => "scheduled",
+            Self::Draft => "draft",
+            Self::Queued => "queued",
+            Self::Sending => "sending",
             Self::Published => "published",
+            Self::Unknown => "unknown",
+            Self::Failed => "failed",
             Self::Cancelled => "cancelled",
         }
     }
 
-    pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Published | Self::Cancelled)
+    pub const fn is_live_or_fenced(self) -> bool {
+        matches!(self, Self::Sending | Self::Published | Self::Unknown)
     }
 
-    pub fn can_transition_to(self, target: Self) -> bool {
-        if self == target {
-            return true;
-        }
-        matches!(
-            (self, target),
-            (Self::Editing, Self::Ready | Self::Cancelled)
-                | (Self::Ready, Self::Editing | Self::Scheduled | Self::Cancelled)
-                | (Self::Scheduled, Self::Published | Self::Cancelled)
-        )
+    pub const fn is_editable(self) -> bool {
+        matches!(self, Self::Draft)
     }
 }
 
-impl TryFrom<&str> for PostDraftStatus {
+impl TryFrom<&str> for PostState {
     type Error = String;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
-            "editing" => Ok(Self::Editing),
-            "ready" => Ok(Self::Ready),
-            "scheduled" => Ok(Self::Scheduled),
+            "draft" => Ok(Self::Draft),
+            "queued" => Ok(Self::Queued),
+            "sending" => Ok(Self::Sending),
             "published" => Ok(Self::Published),
+            "unknown" => Ok(Self::Unknown),
+            "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
             unknown => Err(unknown.to_owned()),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PostDraft {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Post {
     pub id: Uuid,
-    pub content_item_id: Uuid,
-    pub asset_id: Uuid,
-    pub target_channel_id: Uuid,
+    pub media_id: Uuid,
+    pub channel_id: Uuid,
     pub caption: Option<String>,
     pub parse_mode: Option<String>,
-    pub status: PostDraftStatus,
+    pub disable_notification: bool,
+    pub state: PostState,
+    pub scheduled_at: OffsetDateTime,
+    pub cadence_slot_at: Option<OffsetDateTime>,
+    pub send_generation: i32,
+    pub send_token: Option<Uuid>,
+    pub send_started_at: Option<OffsetDateTime>,
+    pub telegram_message_id: Option<i64>,
+    pub published_at: Option<OffsetDateTime>,
+    pub error_class: Option<String>,
+    pub error_message: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewPostDraft {
-    pub content_item_id: Uuid,
-    pub asset_id: Uuid,
-    pub target_channel_id: Uuid,
+pub struct NewPost {
+    pub media_id: Uuid,
+    pub channel_id: Uuid,
     pub caption: Option<String>,
     pub parse_mode: Option<String>,
+    pub disable_notification: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PostDraftUpdate {
+pub struct PostUpdate {
     pub caption: Option<Option<String>>,
     pub parse_mode: Option<Option<String>>,
-    pub status: Option<PostDraftStatus>,
+    pub disable_notification: Option<bool>,
     pub expected_updated_at: Option<OffsetDateTime>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PublicationScheduleStatus {
-    Pending,
-    Queued,
-    Publishing,
-    Published,
-    Failed,
-    Unknown,
-    Cancelled,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostSchedule {
+    pub post_id: Uuid,
+    pub requested_at: OffsetDateTime,
+    pub request_key: String,
 }
 
-impl PublicationScheduleStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Queued => "queued",
-            Self::Publishing => "publishing",
-            Self::Published => "published",
-            Self::Failed => "failed",
-            Self::Unknown => "unknown",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Published | Self::Cancelled)
-    }
-
-    pub fn can_transition_to(self, target: Self) -> bool {
-        if self == target {
-            return true;
-        }
-        matches!(
-            (self, target),
-            (Self::Pending, Self::Queued | Self::Publishing | Self::Cancelled)
-                | (Self::Queued, Self::Publishing | Self::Cancelled)
-                | (Self::Publishing, Self::Published | Self::Failed | Self::Unknown)
-                | (Self::Failed, Self::Queued | Self::Cancelled)
-                | (Self::Unknown, Self::Queued | Self::Cancelled)
-        )
-    }
-}
-
-impl TryFrom<&str> for PublicationScheduleStatus {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "queued" => Ok(Self::Queued),
-            "publishing" => Ok(Self::Publishing),
-            "published" => Ok(Self::Published),
-            "failed" => Ok(Self::Failed),
-            "unknown" => Ok(Self::Unknown),
-            "cancelled" => Ok(Self::Cancelled),
-            unknown => Err(unknown.to_owned()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PublicationSchedule {
-    pub id: Uuid,
-    pub post_draft_id: Uuid,
-    pub status: PublicationScheduleStatus,
-    pub publish_at: OffsetDateTime,
-    pub not_before: Option<OffsetDateTime>,
-    pub not_after: Option<OffsetDateTime>,
-    pub priority: i32,
-    pub cooldown_override: Option<bool>,
-    pub idempotency_key: String,
-    pub created_at: OffsetDateTime,
-    pub updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PublicationScheduleScope {
-    Schedule,
-    PublishNow,
-}
-
-impl PublicationScheduleScope {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Schedule => "schedule",
-            Self::PublishNow => "publish_now",
-        }
+impl PostSchedule {
+    pub fn try_new(
+        post_id: Uuid,
+        requested_at: OffsetDateTime,
+        request_key: impl Into<String>,
+    ) -> Result<Self, PublisherValidationError> {
+        let request_key = normalize_request_key(request_key.into())?;
+        Ok(Self { post_id, requested_at, request_key })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewPublicationSchedule {
-    pub post_draft_id: Uuid,
-    pub publish_at: OffsetDateTime,
-    pub not_before: Option<OffsetDateTime>,
-    pub not_after: Option<OffsetDateTime>,
-    pub priority: i32,
-    pub cooldown_override: Option<bool>,
-    pub idempotency_key: String,
+pub struct PublishClaim {
+    pub post: Post,
+    pub channel_chat_id: i64,
 }
 
-impl NewPublicationSchedule {
-    pub fn try_new(
-        post_draft_id: Uuid,
-        publish_at: OffsetDateTime,
-        idempotency_key: impl Into<String>,
-    ) -> Result<Self, PublisherValidationError> {
-        let idempotency_key = idempotency_key.into().trim().to_owned();
-        if idempotency_key.is_empty() {
-            return Err(PublisherValidationError::EmptyIdempotencyKey);
-        }
-        if idempotency_key.chars().count() > MAX_IDEMPOTENCY_KEY_LENGTH {
-            return Err(PublisherValidationError::IdempotencyKeyTooLong {
-                max: MAX_IDEMPOTENCY_KEY_LENGTH,
-            });
-        }
-        Ok(Self {
-            post_draft_id,
-            publish_at,
-            not_before: None,
-            not_after: None,
-            priority: 0,
-            cooldown_override: None,
-            idempotency_key,
-        })
-    }
-
-    pub fn validate(&self) -> Result<(), PublisherValidationError> {
-        if self.idempotency_key.trim().is_empty() {
-            return Err(PublisherValidationError::EmptyIdempotencyKey);
-        }
-        if self.idempotency_key.chars().count() > MAX_IDEMPOTENCY_KEY_LENGTH {
-            return Err(PublisherValidationError::IdempotencyKeyTooLong {
-                max: MAX_IDEMPOTENCY_KEY_LENGTH,
-            });
-        }
-        if let (Some(not_before), Some(not_after)) = (self.not_before, self.not_after)
-            && not_before > not_after
-        {
-            return Err(PublisherValidationError::InvalidScheduleWindow);
-        }
-        Ok(())
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedMessage {
+    pub post: Post,
+    pub channel_chat_id: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PublicationAttemptStatus {
-    Running,
-    Succeeded,
-    Failed,
-    Unknown,
-}
-
-impl PublicationAttemptStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-impl TryFrom<&str> for PublicationAttemptStatus {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "running" => Ok(Self::Running),
-            "succeeded" => Ok(Self::Succeeded),
-            "failed" => Ok(Self::Failed),
-            "unknown" => Ok(Self::Unknown),
-            unknown => Err(unknown.to_owned()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PublicationAttempt {
-    pub id: Uuid,
-    pub publication_schedule_id: Uuid,
-    pub attempt_number: i32,
-    pub status: PublicationAttemptStatus,
-    pub started_at: OffsetDateTime,
-    pub finished_at: Option<OffsetDateTime>,
-    pub telegram_request_key: Option<String>,
-    pub error_class: Option<String>,
-    pub error_message: Option<String>,
-    pub response_json: Option<Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PublishedPost {
-    pub id: Uuid,
-    pub publication_schedule_id: Uuid,
-    pub content_item_id: Uuid,
-    pub asset_id: Uuid,
-    pub target_channel_id: Uuid,
-    pub telegram_chat_id: i64,
-    pub telegram_message_id: i64,
-    pub caption_snapshot: Option<String>,
-    pub published_at: OffsetDateTime,
-    pub status: PublishedPostStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PublicationCompletion {
-    pub attempt: PublicationAttempt,
-    pub published_post: PublishedPost,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PublishedPostStatus {
-    Active,
-    Edited,
-    Deleted,
-    Unknown,
-}
-
-impl PublishedPostStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Edited => "edited",
-            Self::Deleted => "deleted",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-impl TryFrom<&str> for PublishedPostStatus {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "active" => Ok(Self::Active),
-            "edited" => Ok(Self::Edited),
-            "deleted" => Ok(Self::Deleted),
-            "unknown" => Ok(Self::Unknown),
-            unknown => Err(unknown.to_owned()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PublisherValidationError {
-    #[error("publication idempotency key must not be empty")]
-    EmptyIdempotencyKey,
-    #[error("publication idempotency key must be at most {max} characters")]
-    IdempotencyKeyTooLong { max: usize },
-    #[error("publication schedule window is invalid")]
-    InvalidScheduleWindow,
-    #[error("daily publication limit must be greater than zero")]
-    InvalidDailyLimit,
-    #[error("similarity threshold must be between 0 and 1, got {0}")]
-    InvalidSimilarityThreshold(f64),
-    #[error("invalid {entity} status transition from {from} to {to}")]
-    InvalidStatusTransition { entity: &'static str, from: String, to: String },
+    #[error("publication request key must not be empty")]
+    EmptyRequestKey,
+    #[error("publication request key must be at most {max} characters")]
+    RequestKeyTooLong { max: usize },
+    #[error("caption must be at most {max} characters")]
+    CaptionTooLong { max: usize },
+    #[error("invalid parse mode")]
+    InvalidParseMode,
 }
 
-pub fn transition_post_draft_status(
-    current: PostDraftStatus,
-    target: PostDraftStatus,
-) -> Result<PostDraftStatus, PublisherValidationError> {
-    if current.can_transition_to(target) {
-        Ok(target)
-    } else {
-        Err(PublisherValidationError::InvalidStatusTransition {
-            entity: "post draft",
-            from: current.as_str().to_owned(),
-            to: target.as_str().to_owned(),
-        })
+pub fn normalize_request_key(value: String) -> Result<String, PublisherValidationError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Err(PublisherValidationError::EmptyRequestKey);
     }
-}
-
-pub fn transition_publication_schedule_status(
-    current: PublicationScheduleStatus,
-    target: PublicationScheduleStatus,
-) -> Result<PublicationScheduleStatus, PublisherValidationError> {
-    if current.can_transition_to(target) {
-        Ok(target)
-    } else {
-        Err(PublisherValidationError::InvalidStatusTransition {
-            entity: "publication schedule",
-            from: current.as_str().to_owned(),
-            to: target.as_str().to_owned(),
-        })
+    if value.chars().count() > MAX_REQUEST_KEY_LENGTH {
+        return Err(PublisherValidationError::RequestKeyTooLong { max: MAX_REQUEST_KEY_LENGTH });
     }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -533,87 +255,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_channel_normalizes_name_and_rejects_public_chat_ids() {
-        let channel = NewTargetChannel::try_new("  Main channel ", -100123).expect("valid channel");
-        assert_eq!(channel.name, "Main channel");
-        assert!(matches!(
-            NewTargetChannel::try_new("main", 123),
-            Err(TargetChannelValidationError::InvalidTelegramChatId(123))
-        ));
+    fn channel_defaults_include_cadence_policy() {
+        let channel = NewChannel::try_new(" Main ", -100123).expect("channel should be valid");
+        assert_eq!(channel.time_zone, "UTC");
+        assert_eq!(channel.interval_minutes, 30);
+        assert!(channel.window_start < channel.window_end);
     }
 
     #[test]
-    fn draft_and_schedule_state_machines_allow_only_intended_transitions() {
-        assert_eq!(
-            transition_post_draft_status(PostDraftStatus::Ready, PostDraftStatus::Scheduled)
-                .expect("ready draft should schedule"),
-            PostDraftStatus::Scheduled
-        );
-        assert!(
-            transition_post_draft_status(PostDraftStatus::Published, PostDraftStatus::Editing)
-                .is_err()
-        );
-        assert_eq!(
-            transition_publication_schedule_status(
-                PublicationScheduleStatus::Failed,
-                PublicationScheduleStatus::Queued,
-            )
-            .expect("failed publication should be retryable"),
-            PublicationScheduleStatus::Queued
-        );
-        assert!(
-            transition_publication_schedule_status(
-                PublicationScheduleStatus::Published,
-                PublicationScheduleStatus::Queued,
-            )
-            .is_err()
-        );
-        assert_eq!(
-            transition_publication_schedule_status(
-                PublicationScheduleStatus::Publishing,
-                PublicationScheduleStatus::Unknown,
-            )
-            .expect("ambiguous publication should be preserved"),
-            PublicationScheduleStatus::Unknown
-        );
-        assert!(
-            transition_publication_schedule_status(
-                PublicationScheduleStatus::Publishing,
-                PublicationScheduleStatus::Cancelled,
-            )
-            .is_err()
-        );
+    fn only_drafts_are_editable() {
+        assert!(PostState::Draft.is_editable());
+        assert!(!PostState::Queued.is_editable());
+        assert!(!PostState::Sending.is_editable());
+        assert!(!PostState::Unknown.is_editable());
     }
 
     #[test]
-    fn schedule_validation_rejects_bad_windows_and_keys() {
-        let now = OffsetDateTime::now_utc();
-        let mut schedule = NewPublicationSchedule::try_new(Uuid::now_v7(), now, " schedule-key ")
-            .expect("key should be normalized");
-        assert_eq!(schedule.idempotency_key, "schedule-key");
-        schedule.not_before = Some(now + time::Duration::seconds(10));
-        schedule.not_after = Some(now);
-        assert_eq!(schedule.validate(), Err(PublisherValidationError::InvalidScheduleWindow));
-        schedule.not_before = None;
-        schedule.not_after = None;
-        schedule.idempotency_key = " ".to_owned();
-        assert_eq!(schedule.validate(), Err(PublisherValidationError::EmptyIdempotencyKey));
+    fn schedule_keys_are_normalized_and_bounded() {
+        let schedule = PostSchedule::try_new(Uuid::now_v7(), OffsetDateTime::now_utc(), " key ")
+            .expect("key should be valid");
+        assert_eq!(schedule.request_key, "key");
         assert!(matches!(
-            NewPublicationSchedule::try_new(Uuid::now_v7(), now, " "),
-            Err(PublisherValidationError::EmptyIdempotencyKey)
+            PostSchedule::try_new(Uuid::now_v7(), OffsetDateTime::now_utc(), " "),
+            Err(PublisherValidationError::EmptyRequestKey)
         ));
-    }
-
-    #[test]
-    fn policy_validation_rejects_invalid_threshold_and_daily_limit() {
-        let mut policy = NewChannelPolicy::default_for(Uuid::now_v7());
-        policy.similarity_threshold = 1.1;
-        assert!(matches!(
-            policy.validate(),
-            Err(PublisherValidationError::InvalidSimilarityThreshold(_))
-        ));
-        policy.similarity_threshold = 0.75;
-        policy.max_posts_per_day = Some(0);
-        assert_eq!(policy.validate(), Err(PublisherValidationError::InvalidDailyLimit));
     }
 }

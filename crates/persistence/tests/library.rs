@@ -2,8 +2,7 @@ use std::env;
 
 use serde_json::json;
 use sooqa_library::{
-    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem, NewMediaAssetDraft,
-    NewSourceRecordDraft, NewTag, SourceType, StorageState,
+    MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, NewTag, SourceKind,
 };
 use sooqa_persistence::Database;
 
@@ -14,64 +13,87 @@ async fn database() -> Database {
     database
 }
 
+fn ingest(sha256: Vec<u8>, source: &str) -> MediaIngest {
+    MediaIngest {
+        media: NewMedia {
+            kind: MediaKind::Video,
+            title: Some("test".to_owned()),
+            description: None,
+            notes: None,
+        },
+        metadata: MediaMetadata {
+            kind: MediaKind::Video,
+            mime_type: Some("video/mp4".to_owned()),
+            container: Some("mp4".to_owned()),
+            video_codec: None,
+            audio_codec: None,
+            width: Some(1),
+            height: Some(1),
+            duration_ms: Some(1),
+            bit_rate: None,
+            file_size_bytes: Some(1),
+            sha256: Some(sha256),
+            local_work_path: Some("/tmp/test.mp4".to_owned()),
+        },
+        source: MediaSourceInput {
+            ingest_id: None,
+            kind: SourceKind::DirectUrl,
+            original_url: Some(source.to_owned()),
+            normalized_url: Some(source.to_owned()),
+            platform: None,
+            platform_content_id: None,
+            author_name: None,
+            title: None,
+            description: None,
+            published_at: None,
+            metadata: json!({"test": true}),
+        },
+        tags: vec!["rust".to_owned()],
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
-async fn normalized_media_row_contains_source_and_tags_without_child_tables() {
+async fn media_aggregate_contains_source_and_tags_without_child_tables() {
     let database = database().await;
-    let digest = vec![7_u8; 32];
     let resolution = database
         .library()
-        .resolve_exact_duplicate(ExactDuplicateRequest {
-            content_item: NewContentItem {
-                kind: ContentKind::Video,
-                preferred_title: Some("test".to_owned()),
-                editorial_description: None,
-                notes: None,
-            },
-            asset: NewMediaAssetDraft {
-                role: AssetRole::Canonical,
-                media_kind: MediaKind::Video,
-                mime_type: Some("video/mp4".to_owned()),
-                container: None,
-                video_codec: None,
-                audio_codec: None,
-                width: None,
-                height: None,
-                duration_ms: None,
-                bit_rate: None,
-                file_size_bytes: Some(1),
-                sha256: Some(digest),
-                local_work_path: Some("/tmp/test.mp4".to_owned()),
-                storage_state: StorageState::Local,
-            },
-            source: NewSourceRecordDraft {
-                ingest_request_id: None,
-                source_type: SourceType::DirectUrl,
-                original_url: Some("https://example.test/video".to_owned()),
-                normalized_url: Some("https://example.test/video".to_owned()),
-                platform: None,
-                platform_content_id: None,
-                author_name: None,
-                source_title: None,
-                source_description: None,
-                source_published_at: None,
-                metadata_json: json!({"test": true}),
-            },
-        })
+        .resolve_media(ingest(vec![7_u8; 32], "https://example.test/video"))
         .await
         .unwrap();
-    let tag = database
+    database
         .library()
-        .add_tag(resolution.content_item.id, NewTag::try_new("Rust").unwrap())
+        .add_tag(resolution.media.id, NewTag::try_new("Rust").unwrap())
         .await
         .unwrap();
-    assert_eq!(tag.normalized_name, "rust");
-    let item =
-        database.library().find_library_item(resolution.content_item.id).await.unwrap().unwrap();
-    assert_eq!(item.tags.len(), 1);
-    assert_eq!(item.sources.len(), 1);
+    let details =
+        database.library().find_media_details(resolution.media.id).await.unwrap().unwrap();
+    assert_eq!(details.tags.len(), 1);
+    assert!(details.source.is_some());
+    assert_eq!(details.media.storage_state.as_str(), "pending_storage");
     sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(resolution.content_item.id)
+        .bind(resolution.media.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn concurrent_same_sha_resolves_to_one_media_row() {
+    let database = database().await;
+    let digest = vec![8_u8; 32];
+    let left = ingest(digest.clone(), "https://example.test/left");
+    let right = ingest(digest, "https://example.test/right");
+    let repository = database.library();
+    let (left, right) =
+        tokio::join!(repository.resolve_media(left), repository.resolve_media(right));
+    let left = left.unwrap();
+    let right = right.unwrap();
+    assert_eq!(left.media.id, right.media.id);
+    assert!(left.media_created ^ right.media_created);
+    sqlx::query("DELETE FROM media WHERE id = $1")
+        .bind(left.media.id)
         .execute(database.pool())
         .await
         .unwrap();

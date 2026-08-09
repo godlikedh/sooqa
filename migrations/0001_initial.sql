@@ -6,7 +6,6 @@ CREATE SCHEMA queue;
 CREATE TABLE queue.jobs (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     kind text NOT NULL CHECK (kind IN (
-        'process_ingest',
         'inspect_source',
         'download_source',
         'probe_asset',
@@ -14,7 +13,6 @@ CREATE TABLE queue.jobs (
         'compute_fingerprint',
         'check_similarity',
         'finalize_ingest',
-        'upload_storage',
         'upload_storage_asset',
         'publish_post',
         'cleanup_workspace',
@@ -145,8 +143,7 @@ CREATE TABLE media (
 );
 
 CREATE UNIQUE INDEX media_canonical_sha256_idx
-    ON media (canonical_sha256)
-    WHERE canonical_sha256 IS NOT NULL;
+    ON media (canonical_sha256);
 CREATE INDEX media_tags_gin_idx ON media USING gin (tags);
 CREATE INDEX media_search_idx ON media (kind, storage_state, updated_at DESC);
 
@@ -173,6 +170,8 @@ CREATE TABLE posts (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     request_key text,
     request_hash bytea,
+    schedule_request_key text,
+    schedule_request_hash bytea,
     media_id uuid NOT NULL REFERENCES media(id),
     channel_id uuid NOT NULL REFERENCES channels(id),
     state text NOT NULL DEFAULT 'draft'
@@ -193,7 +192,7 @@ CREATE TABLE posts (
     updated_at timestamptz NOT NULL DEFAULT now(),
     CHECK (
         (state = 'sending' AND send_token IS NOT NULL AND send_started_at IS NOT NULL)
-        OR state <> 'sending'
+        OR (state <> 'sending' AND send_token IS NULL AND send_started_at IS NULL)
     ),
     CHECK (
         (state = 'published' AND telegram_message_id IS NOT NULL AND published_at IS NOT NULL)

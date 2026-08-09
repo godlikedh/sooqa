@@ -29,7 +29,7 @@ async fn api_authenticates_with_the_single_configured_bearer_secret() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/v1/ingest-requests")
+                .uri("/api/v1/ingests")
                 .header("content-type", "application/json")
                 .body(Body::from(json!({"url": "https://example.test"}).to_string()))
                 .unwrap(),
@@ -41,7 +41,7 @@ async fn api_authenticates_with_the_single_configured_bearer_secret() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/v1/ingest-requests")
+                .uri("/api/v1/ingests")
                 .header("content-type", "application/json")
                 .header("authorization", "Bearer test-api-token")
                 .header("idempotency-key", "api-test-key")

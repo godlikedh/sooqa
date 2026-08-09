@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sooqa_inbox::{
-    IngestRequest, IngestSubmission, IngestSubmissionInput, IngestValidationError, SubmittedVia,
+    Ingest, IngestSubmission, IngestSubmissionInput, IngestValidationError, SubmittedVia,
 };
 use sooqa_persistence::{
     InboxRepository, InboxRepositoryError, LibraryRepository, LibraryRepositoryError,
@@ -67,8 +67,8 @@ impl ApiState {
 pub fn router(settings: ApiSettings, state: ApiState) -> Router {
     let router = Router::new()
         .route("/health/live", get(health_live))
-        .route("/api/v1/ingest-requests", post(create_ingest))
-        .route("/api/v1/ingest-requests/{id}", get(get_ingest))
+        .route("/api/v1/ingests", post(create_ingest))
+        .route("/api/v1/ingests/{id}", get(get_ingest))
         .merge(library::routes())
         .merge(publisher::routes())
         .with_state(state);
@@ -140,9 +140,9 @@ async fn create_ingest(
     Ok((
         StatusCode::ACCEPTED,
         Json(IngestAcceptedResponse {
-            id: result.request.id,
-            status: result.request.status,
-            links: IngestLinks::for_id(result.request.id),
+            id: result.ingest.id,
+            status: result.ingest.status,
+            links: IngestLinks::for_id(result.ingest.id),
         }),
     ))
 }
@@ -162,7 +162,7 @@ async fn get_ingest(
             ApiError::not_found("ingest_not_found", "The ingest request was not found", &headers)
         })?;
 
-    Ok((StatusCode::OK, Json(IngestResponse::from_request(&request))))
+    Ok((StatusCode::OK, Json(IngestResponse::from_ingest(&request))))
 }
 
 async fn authorize(
@@ -283,14 +283,6 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
             "The request must contain at least one editable field",
             headers,
         ),
-        LibraryRepositoryError::InvalidState { operation, .. } => ApiError::conflict(
-            "invalid_media_state",
-            match operation {
-                "archive" => "The media item cannot be archived in its current state",
-                _ => "The media item cannot be changed in its current state",
-            },
-            headers,
-        ),
         LibraryRepositoryError::TagNotAttached => ApiError::not_found(
             "tag_not_attached",
             "The tag is not attached to the media item",
@@ -308,68 +300,47 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
 
 fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> ApiError {
     match error {
-        PublisherRepositoryError::TargetChannelMissing(_) => {
+        PublisherRepositoryError::ChannelMissing(_) => {
             ApiError::not_found("channel_not_found", "The channel was not found", headers)
         }
-        PublisherRepositoryError::TargetChannelDisabled(_) => {
+        PublisherRepositoryError::ChannelDisabled(_) => {
             ApiError::conflict("channel_disabled", "The channel is disabled", headers)
         }
-        PublisherRepositoryError::PostDraftMissing(_) => {
+        PublisherRepositoryError::PostMissing(_) => {
             ApiError::not_found("post_not_found", "The post was not found", headers)
         }
-        PublisherRepositoryError::ContentItemMissing(_) => {
+        PublisherRepositoryError::MediaMissing(_) => {
             ApiError::not_found("media_not_found", "The media item was not found", headers)
         }
-        PublisherRepositoryError::ContentItemNotPublishable { .. }
-        | PublisherRepositoryError::CanonicalAssetMismatch { .. }
-        | PublisherRepositoryError::AssetNotPublishable { .. } => ApiError::conflict(
+        PublisherRepositoryError::MediaNotReady { .. } => ApiError::conflict(
             "media_not_publishable",
             "The media item is not ready for publication",
             headers,
         ),
-        PublisherRepositoryError::ScheduleMissing(_) => {
-            ApiError::not_found("post_not_found", "The post was not found", headers)
-        }
-        PublisherRepositoryError::DraftNotReady { .. } => ApiError::conflict(
-            "post_not_ready",
-            "The post must be ready before it can be scheduled",
+        PublisherRepositoryError::PostNotEditable { .. }
+        | PublisherRepositoryError::PostCannotBeScheduled { .. }
+        | PublisherRepositoryError::PostNotClaimable { .. }
+        | PublisherRepositoryError::PublishLeaseLost(_)
+        | PublisherRepositoryError::PublishConflict(_)
+        | PublisherRepositoryError::InvalidPublishFailureState(_) => ApiError::conflict(
+            "invalid_publication_state",
+            "The post cannot be changed in its current state",
             headers,
         ),
         PublisherRepositoryError::OptimisticConflict(_) => {
             ApiError::conflict("post_changed", "The post changed since it was read", headers)
         }
-        PublisherRepositoryError::DraftIdempotencyConflict(_)
-        | PublisherRepositoryError::ScheduleIdempotencyConflict(_) => ApiError::conflict(
+        PublisherRepositoryError::RequestKeyConflict(_) => ApiError::conflict(
             "idempotency_conflict",
             "The Idempotency-Key payload conflicts with the original request",
             headers,
         ),
-        PublisherRepositoryError::InvalidScheduleState { .. }
-        | PublisherRepositoryError::ManagedScheduleTransitionRequired { .. } => ApiError::conflict(
-            "invalid_publication_state",
-            "The publication schedule cannot be changed in its current state",
-            headers,
-        ),
         PublisherRepositoryError::Validation(validation) => match validation {
-            sooqa_publisher::PublisherValidationError::EmptyIdempotencyKey
-            | sooqa_publisher::PublisherValidationError::IdempotencyKeyTooLong { .. } => {
+            sooqa_publisher::PublisherValidationError::EmptyRequestKey
+            | sooqa_publisher::PublisherValidationError::RequestKeyTooLong { .. } => {
                 ApiError::bad_request(
                     "invalid_idempotency_key",
                     "The Idempotency-Key header must be between 1 and 255 characters",
-                    headers,
-                )
-            }
-            sooqa_publisher::PublisherValidationError::InvalidScheduleWindow => {
-                ApiError::bad_request(
-                    "invalid_schedule_window",
-                    "The publication schedule window is invalid",
-                    headers,
-                )
-            }
-            sooqa_publisher::PublisherValidationError::InvalidStatusTransition { .. } => {
-                ApiError::conflict(
-                    "invalid_post_state",
-                    "The post cannot transition to the requested state",
                     headers,
                 )
             }
@@ -379,14 +350,9 @@ fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> 
                 headers,
             ),
         },
-        PublisherRepositoryError::InvalidLimit(_) => {
-            ApiError::bad_request("invalid_limit", "The limit must be between 1 and 100", headers)
+        PublisherRepositoryError::ChannelValidation(_) => {
+            ApiError::bad_request("invalid_channel", "The channel payload is invalid", headers)
         }
-        PublisherRepositoryError::AssetContentMismatch { .. } => ApiError::conflict(
-            "media_mismatch",
-            "The selected media does not match the post",
-            headers,
-        ),
         error => {
             error!(error = %error, "publisher API repository operation failed");
             ApiError::internal(headers)
@@ -436,7 +402,7 @@ struct IngestResponse {
 }
 
 impl IngestResponse {
-    fn from_request(request: &IngestRequest) -> Self {
+    fn from_ingest(request: &Ingest) -> Self {
         Self {
             id: request.id,
             kind: request.kind,
@@ -464,7 +430,7 @@ struct IngestLinks {
 
 impl IngestLinks {
     fn for_id(id: Uuid) -> Self {
-        Self { self_link: format!("/api/v1/ingest-requests/{id}") }
+        Self { self_link: format!("/api/v1/ingests/{id}") }
     }
 }
 

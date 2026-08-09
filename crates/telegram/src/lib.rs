@@ -21,6 +21,7 @@ use teloxide::{
     types::{ChatId, FileId, Message, Update, UpdateKind},
 };
 use thiserror::Error as ThisError;
+use time::OffsetDateTime;
 use tracing::warn;
 use url::Url;
 use uuid::Uuid;
@@ -231,6 +232,97 @@ pub trait UpdateStore: Clone + Send + Sync + 'static {
     async fn complete_update(&self, claim: UpdateClaim) -> Result<(), Self::Error>;
 
     async fn release_update(&self, claim: UpdateClaim) -> Result<(), Self::Error>;
+}
+
+/// Process-local Telegram update deduplication. This intentionally belongs to
+/// the Telegram adapter: it is only a delivery optimization, while business
+/// effects remain durable in the five application tables and queue jobs.
+#[derive(Clone, Default)]
+pub struct MemoryUpdateStore {
+    updates: Arc<Mutex<HashMap<i64, MemoryUpdate>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryUpdate {
+    claim_token: Option<Uuid>,
+    claimed_at: Option<OffsetDateTime>,
+    completed_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, ThisError)]
+pub enum MemoryUpdateStoreError {
+    #[error("Telegram update ID must be positive: {0}")]
+    InvalidUpdateId(i64),
+    #[error("Telegram update claim was lost: {0}")]
+    ClaimLost(i64),
+    #[error("Telegram update store lock was poisoned")]
+    LockPoisoned,
+}
+
+#[async_trait]
+impl UpdateStore for MemoryUpdateStore {
+    type Error = MemoryUpdateStoreError;
+
+    async fn claim_update(&self, update_id: i64) -> Result<UpdateClaimResult, Self::Error> {
+        if update_id <= 0 {
+            return Err(MemoryUpdateStoreError::InvalidUpdateId(update_id));
+        }
+        let mut updates = self.updates.lock().map_err(|_| MemoryUpdateStoreError::LockPoisoned)?;
+        let now = OffsetDateTime::now_utc();
+        if let Some(update) = updates.get_mut(&update_id) {
+            if update.completed_at.is_some() {
+                return Ok(UpdateClaimResult::Completed);
+            }
+            if update
+                .claimed_at
+                .is_some_and(|claimed_at| claimed_at > now - time::Duration::minutes(5))
+            {
+                return Ok(UpdateClaimResult::InProgress);
+            }
+            let claim_token = Uuid::now_v7();
+            update.claim_token = Some(claim_token);
+            update.claimed_at = Some(now);
+            return Ok(UpdateClaimResult::Claimed(UpdateClaim { update_id, claim_token }));
+        }
+
+        let claim_token = Uuid::now_v7();
+        updates.insert(
+            update_id,
+            MemoryUpdate {
+                claim_token: Some(claim_token),
+                claimed_at: Some(now),
+                completed_at: None,
+            },
+        );
+        Ok(UpdateClaimResult::Claimed(UpdateClaim { update_id, claim_token }))
+    }
+
+    async fn complete_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
+        let mut updates = self.updates.lock().map_err(|_| MemoryUpdateStoreError::LockPoisoned)?;
+        let update = updates
+            .get_mut(&claim.update_id)
+            .ok_or(MemoryUpdateStoreError::ClaimLost(claim.update_id))?;
+        if update.completed_at.is_some() || update.claim_token != Some(claim.claim_token) {
+            return Err(MemoryUpdateStoreError::ClaimLost(claim.update_id));
+        }
+        update.claim_token = None;
+        update.claimed_at = None;
+        update.completed_at = Some(OffsetDateTime::now_utc());
+        Ok(())
+    }
+
+    async fn release_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
+        let mut updates = self.updates.lock().map_err(|_| MemoryUpdateStoreError::LockPoisoned)?;
+        let update = updates
+            .get_mut(&claim.update_id)
+            .ok_or(MemoryUpdateStoreError::ClaimLost(claim.update_id))?;
+        if update.completed_at.is_some() || update.claim_token != Some(claim.claim_token) {
+            return Err(MemoryUpdateStoreError::ClaimLost(claim.update_id));
+        }
+        update.claim_token = None;
+        update.claimed_at = None;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -1950,5 +2042,23 @@ mod tests {
             None
         );
         assert_eq!(CallbackData::parse(&format!("{encoded}:extra")), None);
+    }
+
+    #[tokio::test]
+    async fn memory_update_store_fences_duplicate_delivery() {
+        let store = MemoryUpdateStore::default();
+        let claim = match store.claim_update(42).await.expect("claim should succeed") {
+            UpdateClaimResult::Claimed(claim) => claim,
+            other => panic!("unexpected claim result: {other:?}"),
+        };
+        assert!(matches!(
+            store.claim_update(42).await.expect("duplicate claim should succeed"),
+            UpdateClaimResult::InProgress
+        ));
+        store.complete_update(claim).await.expect("completion should succeed");
+        assert!(matches!(
+            store.claim_update(42).await.expect("completed claim should succeed"),
+            UpdateClaimResult::Completed
+        ));
     }
 }

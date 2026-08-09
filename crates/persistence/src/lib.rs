@@ -4,7 +4,6 @@ mod inbox;
 mod jobs;
 mod library;
 mod publisher;
-mod telegram;
 
 pub use inbox::{
     AssetNormalizationStart, AssetProbeStart, CreateIngestResult, InboxRepository,
@@ -13,14 +12,7 @@ pub use inbox::{
 };
 pub use jobs::{JobRepository, JobRepositoryError};
 pub use library::{LibraryRepository, LibraryRepositoryError, StoredVideoFingerprint};
-pub use publisher::{
-    CreatePostDraftResult, PublisherRepository, PublisherRepositoryError,
-    post_draft_create_request_hash, post_draft_update_request_hash,
-};
-pub use telegram::{
-    TelegramRepository, TelegramRepositoryError, TelegramUpdateClaim, TelegramUpdateClaimResult,
-    TelegramUpdateReceipt,
-};
+pub use publisher::{CreatePostResult, PublisherRepository, PublisherRepositoryError};
 
 use sooqa_config::SecretString;
 use sqlx::{
@@ -76,10 +68,6 @@ impl Database {
 
     pub fn publisher(&self) -> PublisherRepository {
         PublisherRepository::new(self.pool.clone())
-    }
-
-    pub fn telegram(&self) -> TelegramRepository {
-        TelegramRepository::new()
     }
 
     pub fn pool(&self) -> &PgPool {

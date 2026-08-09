@@ -56,10 +56,11 @@ run the documented destructive reset explicitly.
 - `queue.jobs` is the technical queue. It owns typed job payloads, `run_at`,
   bounded retries, leases, fencing tokens, dedupe keys, and current errors.
 
-The ingest workflow should normally advance through one durable
-`process_ingest` job. Independently scheduled work, especially
-`publish_post`, may remain separate when its job identity represents a real
-durable unit of work.
+The ingest workflow advances through durable, stage-specific jobs that
+reference the ingest row and are fenced by their queue lease. Each stage
+transition enqueues the next stage idempotently. Independently scheduled work,
+especially `publish_post`, may remain separate when its job identity
+represents a real durable unit of work.
 
 ### Idempotency and external effects
 
