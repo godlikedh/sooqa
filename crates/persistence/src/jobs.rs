@@ -135,9 +135,26 @@ impl JobRepository {
         .bind(&lease.worker_id)
         .bind(lease.lease_token)
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or(JobRepositoryError::LeaseLost)?;
-        row.into_job()
+        .await?;
+        if let Some(row) = row {
+            return row.into_job();
+        }
+
+        let already_succeeded = sqlx::query_as::<_, JobRow>(
+            r#"
+            SELECT id, kind, payload, state, priority, run_at, attempt_count,
+                   max_attempts, lease_token, lease_owner, lease_expires_at,
+                   last_heartbeat_at, error_class, error_message, dedupe_key,
+                   created_at, updated_at, completed_at
+            FROM queue.jobs
+            WHERE id = $1 AND state = 'succeeded' AND attempt_count = $2
+            "#,
+        )
+        .bind(lease.job_id)
+        .bind(lease.attempt_number)
+        .fetch_optional(&self.pool)
+        .await?;
+        already_succeeded.map(JobRow::into_job).transpose()?.ok_or(JobRepositoryError::LeaseLost)
     }
 
     pub async fn retry_lease(

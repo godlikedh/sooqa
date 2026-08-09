@@ -72,6 +72,11 @@ unknown also fails linked active ingests explicitly instead of leaving them
 waiting forever. Independently scheduled work such as `publish_post` and
 maintenance remains separate.
 
+For ingest stages, the product transition, successor enqueue, and current-job
+success are committed in one database transaction. Final-attempt lease recovery
+fails the owning ingest only when that atomic success transaction did not
+commit.
+
 Lease heartbeats and terminal job mutations require an unexpired lease. When a
 final attempt expires, recovery fails the owning ingest explicitly (or marks
 storage unknown for an upload job) so a crashed worker cannot strand the

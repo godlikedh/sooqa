@@ -2,9 +2,10 @@ use std::env;
 
 use serde_json::json;
 use sooqa_inbox::{
-    IngestFinalization, IngestStatus, IngestSubmission, IngestSubmissionInput, SubmittedVia,
+    IngestFinalization, IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection,
+    SourceMediaKind, SubmittedVia,
 };
-use sooqa_jobs::{JobType, NewJob};
+use sooqa_jobs::{JobStatus, JobType, NewJob};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
@@ -79,6 +80,102 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts() {
         .unwrap();
     sqlx::query("DELETE FROM ingests WHERE id = $1")
         .bind(first.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn source_inspection_completion_commits_job_success_with_transition() {
+    let database = database().await;
+    let ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/inspect-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET max_attempts = 1, priority = 2147483647 WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",
+    )
+    .bind(ingest.ingest.id.to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let claimed = database
+        .jobs()
+        .claim_next(
+            "inspect-success-worker",
+            std::time::Duration::from_secs(30),
+            &[JobType::InspectSource],
+        )
+        .await
+        .unwrap()
+        .expect("inspect job should be claimable");
+    let lease = claimed.lease().expect("claimed job should have a lease");
+    let completed = database
+        .inbox()
+        .complete_source_inspection(
+            ingest.ingest.id,
+            &lease,
+            SourceInspection {
+                adapter: "test".to_owned(),
+                source_url: "https://example.test/inspected.webm".to_owned(),
+                resolved_url: None,
+                media_kind: SourceMediaKind::Video,
+                mime_type: Some("video/webm".to_owned()),
+                content_length_bytes: Some(1),
+                title: None,
+                metadata: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status, IngestStatus::Downloading);
+
+    let job_state = sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+        .bind(claimed.id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(job_state, JobStatus::Succeeded.as_str());
+    let successor_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM queue.jobs WHERE kind = 'download_source' AND state = 'queued' AND payload->>'ingest_id' = $1",
+    )
+    .bind(ingest.ingest.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(successor_count, 1);
+
+    let acknowledged = database.jobs().complete_lease(&lease).await.unwrap();
+    assert_eq!(acknowledged.status, JobStatus::Succeeded);
+
+    database.jobs().recover_stale_leases().await.unwrap();
+    let request = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
+    assert_eq!(request.status, IngestStatus::Downloading);
+    let successor_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM queue.jobs WHERE kind = 'download_source' AND state = 'queued' AND payload->>'ingest_id' = $1",
+    )
+    .bind(ingest.ingest.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(successor_count, 1);
+
+    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
+        .bind(ingest.ingest.id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(ingest.ingest.id)
         .execute(database.pool())
         .await
         .unwrap();

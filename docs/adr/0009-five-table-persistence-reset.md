@@ -62,6 +62,11 @@ transition enqueues the next stage idempotently. Independently scheduled work,
 especially `publish_post`, may remain separate when its job identity
 represents a real durable unit of work.
 
+For every successful ingest stage, the ingest transition, successor enqueue,
+and success of the current queue job are one database transaction. Final-attempt
+lease recovery may mark the owning ingest failed only when that transaction did
+not commit; it must not overwrite a committed transition with a successor.
+
 ### Idempotency and external effects
 
 Delete the generic `idempotency_records` table and the Telegram update-receipt

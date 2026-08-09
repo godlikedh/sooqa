@@ -288,6 +288,7 @@ impl InboxRepository {
             request.completed_at = Some(OffsetDateTime::now_utc());
             request.updated_at = OffsetDateTime::now_utc();
             update_ingest_state(&mut transaction, &request).await?;
+            succeed_current_job_attempt(&mut transaction, attempt).await?;
             transaction.commit().await?;
             return Ok(request);
         }
@@ -299,6 +300,7 @@ impl InboxRepository {
         request.updated_at = OffsetDateTime::now_utc();
         update_ingest_state(&mut transaction, &request).await?;
         insert_normalize_job(&mut transaction, &request).await?;
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -374,6 +376,7 @@ impl InboxRepository {
         request.updated_at = OffsetDateTime::now_utc();
         update_ingest_state(&mut transaction, &request).await?;
         insert_finalize_job(&mut transaction, &request).await?;
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -474,6 +477,7 @@ impl InboxRepository {
         } else {
             advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
         }
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -548,6 +552,7 @@ impl InboxRepository {
                 request.media_id.ok_or(InboxRepositoryError::MissingMediaId(request.id))?;
             advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
         }
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -596,6 +601,7 @@ impl InboxRepository {
 
         let media_id = request.media_id.ok_or(InboxRepositoryError::MissingMediaId(request.id))?;
         advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -743,6 +749,7 @@ impl InboxRepository {
         .execute(&mut *transaction)
         .await?;
 
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -786,6 +793,7 @@ impl InboxRepository {
 
         insert_probe_job(&mut transaction, &request).await?;
 
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -1349,6 +1357,37 @@ async fn lock_current_job_attempt(
     Ok(current_job.is_some())
 }
 
+async fn succeed_current_job_attempt(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    attempt: &JobAttempt,
+) -> Result<(), InboxRepositoryError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE queue.jobs
+        SET state = 'succeeded', lease_token = NULL, lease_owner = NULL,
+            lease_expires_at = NULL, last_heartbeat_at = NULL,
+            completed_at = now(), updated_at = now()
+        WHERE id = $1
+          AND state = 'running'
+          AND attempt_count = $2
+          AND lease_owner = $3
+          AND lease_token = $4
+          AND lease_expires_at > now()
+        "#,
+    )
+    .bind(attempt.job_id)
+    .bind(attempt.attempt_number)
+    .bind(&attempt.lease_owner)
+    .bind(attempt.lease_token)
+    .execute(&mut **transaction)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(InboxRepositoryError::JobLeaseLost);
+    }
+    Ok(())
+}
+
 #[derive(Debug, FromRow)]
 struct IngestRow {
     id: Uuid,
@@ -1426,6 +1465,8 @@ pub enum InboxRepositoryError {
     InvalidFailureStatus(IngestStatus),
     #[error("invalid ingest state transition: {0}")]
     InvalidStateTransition(#[from] IngestStateError),
+    #[error("job lease was lost before ingest completion could be committed")]
+    JobLeaseLost,
     #[error("database operation failed: {0}")]
     Database(#[from] sqlx::Error),
 }

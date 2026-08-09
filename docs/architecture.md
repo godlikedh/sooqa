@@ -115,6 +115,10 @@ metadata is bounded JSON input metadata; it is decoded into typed Rust structs
 at the handler boundary. Storage completion/failure is applied by `media_id`,
 and attach/reset/mark-unknown reconcile the linked ingest rows.
 
+Each successful ingest stage commits its ingest transition, successor enqueue,
+and current queue-job success atomically. Final-attempt recovery therefore
+fails an owning ingest only when that success transaction never committed.
+
 A queue claim creates a fresh owner, expiry, and fencing token. Heartbeats and
 completion/retry/failure updates require all three. Expired leases return to
 `queued` (or become `failed` after the attempt limit). A final expired attempt
