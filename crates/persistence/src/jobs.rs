@@ -99,6 +99,7 @@ impl JobRepository {
             SET lease_expires_at = now() + ($3::double precision * interval '1 second'),
                 last_heartbeat_at = now(), updated_at = now()
             WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $4
+              AND lease_expires_at > now()
             RETURNING id, kind, payload, state, priority, run_at, attempt_count,
                       max_attempts, lease_token, lease_owner, lease_expires_at,
                       last_heartbeat_at, error_class, error_message, dedupe_key,
@@ -123,6 +124,7 @@ impl JobRepository {
                 lease_expires_at = NULL, last_heartbeat_at = NULL,
                 completed_at = now(), updated_at = now()
             WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
+              AND lease_expires_at > now()
             RETURNING id, kind, payload, state, priority, run_at, attempt_count,
                       max_attempts, lease_token, lease_owner, lease_expires_at,
                       last_heartbeat_at, error_class, error_message, dedupe_key,
@@ -155,6 +157,7 @@ impl JobRepository {
                 completed_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
                 updated_at = now()
             WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
+              AND lease_expires_at > now()
             RETURNING id, kind, payload, state, priority, run_at, attempt_count,
                       max_attempts, lease_token, lease_owner, lease_expires_at,
                       last_heartbeat_at, error_class, error_message, dedupe_key,
@@ -190,6 +193,7 @@ impl JobRepository {
                 completed_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
                 updated_at = now()
             WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
+              AND lease_expires_at > now()
             RETURNING id, kind, payload, state, priority, run_at, attempt_count,
                       max_attempts, lease_token, lease_owner, lease_expires_at,
                       last_heartbeat_at, error_class, error_message, dedupe_key,
@@ -221,6 +225,7 @@ impl JobRepository {
                 lease_expires_at = NULL, last_heartbeat_at = NULL,
                 error_class = $4, error_message = $5, completed_at = now(), updated_at = now()
             WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
+              AND lease_expires_at > now()
             RETURNING id, kind, payload, state, priority, run_at, attempt_count,
                       max_attempts, lease_token, lease_owner, lease_expires_at,
                       last_heartbeat_at, error_class, error_message, dedupe_key,
@@ -239,7 +244,8 @@ impl JobRepository {
     }
 
     pub async fn recover_stale_leases(&self) -> Result<u64, JobRepositoryError> {
-        let result = sqlx::query(
+        let mut transaction = self.pool.begin().await?;
+        let recovered = sqlx::query_as::<_, RecoveredJob>(
             r#"
             UPDATE queue.jobs
             SET state = CASE WHEN attempt_count >= max_attempts THEN 'failed' ELSE 'queued' END,
@@ -249,12 +255,19 @@ impl JobRepository {
                 error_message = COALESCE(error_message, 'job lease expired'),
                 completed_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
                 updated_at = now()
-            WHERE state = 'running' AND lease_expires_at < now()
+            WHERE state = 'running' AND lease_expires_at <= now()
+            RETURNING kind, payload, state, attempt_count, max_attempts
             "#,
         )
-        .execute(&self.pool)
+        .fetch_all(&mut *transaction)
         .await?;
-        Ok(result.rows_affected())
+        for job in &recovered {
+            if job.state == "failed" && job.attempt_count >= job.max_attempts {
+                reconcile_exhausted_job(&mut transaction, job).await?;
+            }
+        }
+        transaction.commit().await?;
+        Ok(recovered.len() as u64)
     }
 
     pub async fn live_job_ids(&self) -> Result<Vec<Uuid>, JobRepositoryError> {
@@ -291,6 +304,92 @@ struct JobRow {
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     completed_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, FromRow)]
+struct RecoveredJob {
+    kind: String,
+    payload: serde_json::Value,
+    state: String,
+    attempt_count: i32,
+    max_attempts: i32,
+}
+
+async fn reconcile_exhausted_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &RecoveredJob,
+) -> Result<(), sqlx::Error> {
+    let job_type = match JobType::try_from(job.kind.as_str()) {
+        Ok(job_type) => job_type,
+        Err(_) => return Ok(()),
+    };
+    let ingest_id = job
+        .payload
+        .get("ingest_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    if matches!(
+        job_type,
+        JobType::InspectSource
+            | JobType::DownloadSource
+            | JobType::ProbeAsset
+            | JobType::NormalizeAsset
+            | JobType::ComputeFingerprint
+            | JobType::CheckSimilarity
+            | JobType::FinalizeIngest
+    ) {
+        if let Some(ingest_id) = ingest_id {
+            sqlx::query(
+                "UPDATE ingests SET state = 'failed_terminal', error_code = 'job_lease_expired', error_message = 'job lease expired after the final attempt', completed_at = now(), updated_at = now() WHERE id = $1 AND state NOT IN ('completed', 'failed_terminal', 'cancelled')",
+            )
+            .bind(ingest_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        return Ok(());
+    }
+    if job_type != JobType::UploadStorageAsset {
+        return Ok(());
+    }
+    let Some(media_id) = job
+        .payload
+        .get("media_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+    else {
+        return Ok(());
+    };
+    let storage_state =
+        sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1 FOR UPDATE")
+            .bind(media_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+    match storage_state.as_deref() {
+        Some("ready") => {
+            sqlx::query(
+                "UPDATE ingests SET state = 'completed', error_code = NULL, error_message = NULL, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
+            )
+            .bind(media_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        Some(_) => {
+            sqlx::query(
+                "UPDATE media SET storage_state = 'storage_unknown', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1 AND storage_state <> 'ready'",
+            )
+            .bind(media_id)
+            .execute(&mut **transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE ingests SET state = 'failed_terminal', error_code = 'storage_unknown', error_message = 'storage job lease expired; external storage result requires reconciliation', completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state NOT IN ('failed_terminal') OR error_code IN ('storage_upload', 'storage_unknown'))",
+            )
+            .bind(media_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 impl JobRow {

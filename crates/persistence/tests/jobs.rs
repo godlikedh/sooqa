@@ -1,5 +1,6 @@
 use std::{env, time::Duration};
 
+use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
 use sooqa_jobs::{JobStatus, JobType, NewJob};
 use sooqa_persistence::Database;
 use time::OffsetDateTime;
@@ -84,4 +85,75 @@ async fn claim_retry_and_fencing_use_the_queue_jobs_row() {
         .execute(database.pool())
         .await
         .expect("bounded fixture should clean");
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn expired_final_attempt_reconciles_ingest_and_fences_all_mutations() {
+    let database = database().await;
+    let ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/expired-{}", uuid::Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let claimed = database
+        .jobs()
+        .claim_next("expired-worker", Duration::from_secs(30), &[JobType::InspectSource])
+        .await
+        .unwrap()
+        .expect("inspect job should be claimable");
+    let lease = claimed.lease().expect("claimed job should have a lease");
+    sqlx::query(
+        "UPDATE queue.jobs SET max_attempts = 1, lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(claimed.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert!(database.jobs().heartbeat_lease(&lease, Duration::from_secs(30)).await.is_err());
+    assert!(database.jobs().complete_lease(&lease).await.is_err());
+    assert!(
+        database
+            .jobs()
+            .retry_lease(&lease, OffsetDateTime::now_utc(), "stale", "stale")
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .jobs()
+            .defer_lease(&lease, OffsetDateTime::now_utc(), "stale", "stale")
+            .await
+            .is_err()
+    );
+    assert!(database.jobs().fail_lease(&lease, "stale", "stale").await.is_err());
+
+    assert_eq!(database.jobs().recover_stale_leases().await.unwrap(), 1);
+    let job_state = sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+        .bind(claimed.id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(job_state, "failed");
+    let request = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
+    assert_eq!(request.status.as_str(), "failed_terminal");
+    assert_eq!(request.error_code.as_deref(), Some("job_lease_expired"));
+
+    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
+        .bind(ingest.ingest.id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
 }

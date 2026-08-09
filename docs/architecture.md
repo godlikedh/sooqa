@@ -96,20 +96,32 @@ sequenceDiagram
     Worker->>Ingests: fenced state transition + next job
     Worker->>Media: exact SHA check / store normalized metadata
     Media-->>Worker: one media id
-    Worker->>Ingests: completed + media_id
+    Worker->>Ingests: finalization records media id
+    Worker->>Ingests: video fingerprint + similarity check
+    Ingests->>Queue: enqueue upload_storage_asset
+    Worker->>Media: upload only after media processing
+    Media-->>Worker: ready, failed, or storage_unknown
+    Worker->>Ingests: consume storage outcome by media_id
 ```
 
 The current worker keeps the existing direct-media stages while the persistence
 reset lands: source inspection, download, probe, normalization, finalization,
 and video fingerprinting are separate typed jobs. Each stage updates `ingests`
-and enqueues its successor in a short transaction. Network and subprocess work
-never runs while that transaction is open. Stage metadata is bounded JSON input
-metadata; it is decoded into typed Rust structs at the handler boundary.
+and enqueues its successor in a short transaction. For video, storage is not
+enqueued until fingerprinting and similarity checking have completed; this
+makes media-processing order explicit rather than racing storage against it.
+Network and subprocess work never runs while that transaction is open. Stage
+metadata is bounded JSON input metadata; it is decoded into typed Rust structs
+at the handler boundary. Storage completion/failure is applied by `media_id`,
+and attach/reset/mark-unknown reconcile the linked ingest rows.
 
 A queue claim creates a fresh owner, expiry, and fencing token. Heartbeats and
 completion/retry/failure updates require all three. Expired leases return to
-`queued` (or become `failed` after the attempt limit). `run_at` is the retry
-and scheduling clock; there is no separate retry-wait state.
+`queued` (or become `failed` after the attempt limit). A final expired attempt
+also marks its owning ingest terminal with an explicit lease-expired error;
+an expired storage upload becomes `storage_unknown` unless the media row is
+already `ready`. `run_at` is the retry and scheduling clock; there is no
+separate retry-wait state.
 
 ## Media and storage
 
@@ -119,7 +131,8 @@ PostgreSQL array with a GIN index. Source and adapter metadata lives in the
 bounded `source_metadata` JSON column. Telegram storage is an effect-local
 state machine on the same row: `pending_storage`, `ready`,
 `storage_unknown`, or `missing`, with generation/token fields for retries and
-ambiguous results.
+ambiguous results. Exact-SHA deduplication preserves the first source identity
+and only fills missing non-identity metadata from later observations.
 
 ## Publisher
 

@@ -255,14 +255,14 @@ impl LibraryRepository {
                 .await?;
                 let merged_tags = merge_tags(&row.tags, &ingest.tags);
                 let row = sqlx::query_as::<_, MediaRow>(
-                    "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = COALESCE(description, $4), source_url = COALESCE(source_url, $5), source_metadata = source_metadata || $6, updated_at = now() WHERE id = $1 RETURNING *",
+                    "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = COALESCE(description, $4), source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1 RETURNING *",
                 )
                 .bind(row.id)
                 .bind(merged_tags)
                 .bind(&ingest.media.title)
                 .bind(&ingest.media.description)
                 .bind(ingest.source.normalized_url.clone().or(ingest.source.original_url.clone()))
-                .bind(source_value)
+                .bind(merge_missing_source_metadata(&row.source_metadata, &source_value))
                 .fetch_one(&mut *transaction)
                 .await?;
                 (row, false)
@@ -373,19 +373,23 @@ impl LibraryRepository {
         id: Uuid,
         force: bool,
     ) -> Result<(), LibraryRepositoryError> {
-        let row = self.load(id).await?.ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
         if row.storage_token.is_some() && !force {
             return Err(LibraryRepositoryError::StorageUploadActive(id));
         }
-        let updated = sqlx::query(
+        sqlx::query(
             "UPDATE media SET storage_state = 'storage_unknown', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1",
         )
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
-        if updated.rows_affected() != 1 {
-            return Err(LibraryRepositoryError::ResourceMissing(id));
-        }
+        mark_linked_ingests_storage_unknown(&mut transaction, id).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -410,6 +414,7 @@ impl LibraryRepository {
         .bind(generation)
         .execute(&mut *transaction)
         .await?;
+        reopen_linked_ingests_for_storage(&mut transaction, id).await?;
         let job = NewJob::upload_storage_asset_generation(id, generation)
             .dedupe_key(format!("media:{id}:upload_storage:v1:{generation}"));
         sqlx::query(
@@ -433,6 +438,7 @@ impl LibraryRepository {
         attachment: StorageUploadAttachment,
     ) -> Result<StorageReceipt, LibraryRepositoryError> {
         validate_attachment(&attachment)?;
+        let mut transaction = self.pool.begin().await?;
         let row = sqlx::query_as::<_, MediaRow>(
             "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $3, telegram_storage_message_id = $4, telegram_file_id = $5, telegram_file_unique_id = $6, storage_token = NULL, storage_started_at = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_generation = $2 AND storage_state = 'storage_unknown' RETURNING *",
         )
@@ -442,9 +448,11 @@ impl LibraryRepository {
         .bind(attachment.storage_message_id)
         .bind(attachment.telegram_file_id)
         .bind(attachment.telegram_file_unique_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await?
         .ok_or(LibraryRepositoryError::StorageUploadNotUnknown(id))?;
+        complete_linked_ingests_for_storage(&mut transaction, id).await?;
+        transaction.commit().await?;
         row.into_storage_receipt()
     }
 
@@ -604,18 +612,60 @@ impl StorageUploadStore for LibraryRepository {
         media_id: Uuid,
         owner_token: Uuid,
     ) -> Result<(), Self::Error> {
+        let mut transaction = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE media SET storage_state = 'storage_unknown', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1 AND storage_token = $2 AND storage_state = 'pending_storage'",
         )
         .bind(media_id)
         .bind(owner_token)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if updated.rows_affected() != 1 {
             return Err(LibraryRepositoryError::StorageUploadLeaseLost(media_id));
         }
+        mark_linked_ingests_storage_unknown(&mut transaction, media_id).await?;
+        transaction.commit().await?;
         Ok(())
     }
+}
+
+async fn mark_linked_ingests_storage_unknown(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    media_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE ingests SET state = 'failed_terminal', error_code = 'storage_unknown', error_message = 'media storage requires explicit reconciliation', completed_at = now(), updated_at = now() WHERE media_id = $1 AND (state NOT IN ('cancelled', 'failed_terminal') OR error_code IN ('storage_upload', 'storage_unknown'))",
+    )
+    .bind(media_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn reopen_linked_ingests_for_storage(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    media_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE ingests SET state = 'storing', error_code = NULL, error_message = NULL, completed_at = NULL, updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state IN ('completed', 'storing') OR error_code IN ('storage_upload', 'storage_unknown'))",
+    )
+    .bind(media_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn complete_linked_ingests_for_storage(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    media_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE ingests SET state = 'completed', error_code = NULL, error_message = NULL, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
+    )
+    .bind(media_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 impl MediaRow {
@@ -757,6 +807,34 @@ fn source_to_value(source: &MediaSourceInput) -> Value {
         "retrieved_at": OffsetDateTime::now_utc().to_string(),
         "metadata": source.metadata,
     })
+}
+
+fn merge_missing_source_metadata(existing: &Value, incoming: &Value) -> Value {
+    match (existing, incoming) {
+        (Value::Object(existing), Value::Object(incoming)) => {
+            let mut merged = existing.clone();
+            for (key, incoming_value) in incoming {
+                match merged.get(key) {
+                    Some(existing_value)
+                        if existing_value.is_object() && incoming_value.is_object() =>
+                    {
+                        merged.insert(
+                            key.clone(),
+                            merge_missing_source_metadata(existing_value, incoming_value),
+                        );
+                    }
+                    Some(existing_value) if !existing_value.is_null() => {}
+                    Some(_) | None if !incoming_value.is_null() => {
+                        merged.insert(key.clone(), incoming_value.clone());
+                    }
+                    _ => {}
+                }
+            }
+            Value::Object(merged)
+        }
+        (Value::Null, incoming) => incoming.clone(),
+        (existing, _) => existing.clone(),
+    }
 }
 
 fn merge_tags(existing: &[String], incoming: &[String]) -> Vec<String> {

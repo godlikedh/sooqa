@@ -61,9 +61,21 @@ publication-history, or duplicate-candidate aggregates.
 
 The ingest process is the product state machine. It advances through durable,
 stage-specific jobs that reference the ingest row and are fenced by their
-queue lease; each stage transition enqueues the next stage idempotently.
-Independently scheduled work such as `publish_post` and maintenance remains
-separate.
+queue lease; each stage transition enqueues the next stage idempotently. Media
+storage is downstream of media finalization: video fingerprinting and
+similarity checking finish before the upload job is created. A storage result
+is consumed by `media_id`, so success and failure cannot be lost because an
+ingest has not reached `storing` yet. `storage_unknown` is an explicit
+reconciliation state: attach completes linked storage-waiting or storage-failed
+ingests, while reset opens them in a new storage generation. Marking an upload
+unknown also fails linked active ingests explicitly instead of leaving them
+waiting forever. Independently scheduled work such as `publish_post` and
+maintenance remains separate.
+
+Lease heartbeats and terminal job mutations require an unexpired lease. When a
+final attempt expires, recovery fails the owning ingest explicitly (or marks
+storage unknown for an upload job) so a crashed worker cannot strand the
+workflow.
 
 Post cadence slots are assigned when a post is queued. A `publish_post` job
 references the `posts` row, and one post row becomes the durable publication

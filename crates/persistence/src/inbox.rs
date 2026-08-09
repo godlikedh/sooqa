@@ -466,27 +466,13 @@ impl InboxRepository {
         .bind(request.updated_at)
         .execute(&mut *transaction)
         .await?;
-        insert_storage_job(&mut transaction, media_id).await?;
         if normalized_media_kind(&request) == Some(SourceMediaKind::Video) {
             request.transition_to(IngestStatus::Fingerprinting)?;
             request.completed_at = None;
             update_ingest_state(&mut transaction, &request).await?;
             insert_fingerprint_job(&mut transaction, &request).await?;
         } else {
-            let storage_ready = sqlx::query_scalar::<_, bool>(
-                "SELECT storage_state = 'ready' FROM media WHERE id = $1",
-            )
-            .bind(media_id)
-            .fetch_one(&mut *transaction)
-            .await?;
-            if storage_ready {
-                request.transition_to(IngestStatus::Completed)?;
-                request.completed_at = Some(OffsetDateTime::now_utc());
-            } else {
-                request.transition_to(IngestStatus::Storing)?;
-                request.completed_at = None;
-            }
-            update_ingest_state(&mut transaction, &request).await?;
+            advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
         }
         transaction.commit().await?;
         Ok(request)
@@ -549,37 +535,18 @@ impl InboxRepository {
                 });
             }
         }
-        let storage_ready = if should_check_similarity {
-            false
-        } else if let Some(media_id) = request.media_id {
-            sqlx::query_scalar::<_, bool>("SELECT storage_state = 'ready' FROM media WHERE id = $1")
-                .bind(media_id)
-                .fetch_one(&mut *transaction)
-                .await?
-        } else {
-            false
-        };
-        let next_status = if should_check_similarity {
-            IngestStatus::SimilarityCheck
-        } else if storage_ready {
-            IngestStatus::Completed
-        } else {
-            IngestStatus::Storing
-        };
-        request.transition_to(next_status)?;
-        request.error_code = None;
-        request.error_message = None;
-        request.completed_at = storage_ready.then(OffsetDateTime::now_utc);
-        request.updated_at = OffsetDateTime::now_utc();
-        sqlx::query("UPDATE ingests SET input_json = $2, updated_at = $3 WHERE id = $1")
-            .bind(request.id)
-            .bind(&request.original_input)
-            .bind(request.updated_at)
-            .execute(&mut *transaction)
-            .await?;
-        update_ingest_state(&mut transaction, &request).await?;
         if should_check_similarity {
+            request.transition_to(IngestStatus::SimilarityCheck)?;
+            request.error_code = None;
+            request.error_message = None;
+            request.completed_at = None;
+            request.updated_at = OffsetDateTime::now_utc();
+            update_ingest_state(&mut transaction, &request).await?;
             insert_similarity_job(&mut transaction, &request).await?;
+        } else {
+            let media_id =
+                request.media_id.ok_or(InboxRepositoryError::MissingMediaId(request.id))?;
+            advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
         }
         transaction.commit().await?;
         Ok(request)
@@ -627,23 +594,8 @@ impl InboxRepository {
             return Ok(request);
         }
 
-        request.transition_to(IngestStatus::Storing)?;
-        let storage_ready = if let Some(media_id) = request.media_id {
-            sqlx::query_scalar::<_, bool>("SELECT storage_state = 'ready' FROM media WHERE id = $1")
-                .bind(media_id)
-                .fetch_one(&mut *transaction)
-                .await?
-        } else {
-            false
-        };
-        if storage_ready {
-            request.transition_to(IngestStatus::Completed)?;
-        }
-        request.error_code = None;
-        request.error_message = None;
-        request.completed_at = storage_ready.then(OffsetDateTime::now_utc);
-        request.updated_at = OffsetDateTime::now_utc();
-        update_ingest_state(&mut transaction, &request).await?;
+        let media_id = request.media_id.ok_or(InboxRepositoryError::MissingMediaId(request.id))?;
+        advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -654,7 +606,7 @@ impl InboxRepository {
     ) -> Result<u64, InboxRepositoryError> {
         let now = OffsetDateTime::now_utc();
         let updated = sqlx::query(
-            "UPDATE ingests SET state = 'completed', completed_at = $2, error_code = NULL, error_message = NULL, updated_at = $2 WHERE media_id = $1 AND state = 'storing'",
+            "UPDATE ingests SET state = 'completed', completed_at = $2, error_code = NULL, error_message = NULL, updated_at = $2 WHERE media_id = $1 AND EXISTS (SELECT 1 FROM media WHERE id = $1 AND storage_state = 'ready') AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
         )
         .bind(media_id)
         .bind(now)
@@ -676,7 +628,7 @@ impl InboxRepository {
         let now = OffsetDateTime::now_utc();
         let completed_at = (status == IngestStatus::FailedTerminal).then_some(now);
         let updated = sqlx::query(
-            "UPDATE ingests SET state = $2, error_code = $3, error_message = $4, completed_at = $5, updated_at = $6 WHERE media_id = $1 AND state = 'storing'",
+            "UPDATE ingests SET state = $2, error_code = $3, error_message = $4, completed_at = $5, updated_at = $6 WHERE media_id = $1 AND (state = 'storing' OR (state = 'failed_retryable' AND error_code = 'storage_upload'))",
         )
         .bind(media_id)
         .bind(status.as_str())
@@ -1030,6 +982,47 @@ async fn update_ingest_state(
     .bind(request.completed_at)
     .execute(&mut **transaction)
     .await?;
+    Ok(())
+}
+
+async fn advance_after_media_processing(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &mut Ingest,
+    media_id: Uuid,
+) -> Result<(), InboxRepositoryError> {
+    let storage_state =
+        sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1")
+            .bind(media_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or(InboxRepositoryError::MissingMediaId(request.id))?;
+
+    request.media_id = Some(media_id);
+    request.error_code = None;
+    request.error_message = None;
+    request.completed_at = None;
+    match storage_state.as_str() {
+        "ready" => {
+            request.transition_to(IngestStatus::Completed)?;
+            request.completed_at = Some(OffsetDateTime::now_utc());
+        }
+        "pending_storage" => {
+            request.transition_to(IngestStatus::Storing)?;
+            insert_storage_job(transaction, media_id).await?;
+        }
+        "storage_unknown" | "missing" => {
+            request.transition_to(IngestStatus::FailedTerminal)?;
+            request.error_code = Some("storage_unknown".to_owned());
+            request.error_message = Some(
+                "media storage requires explicit reconciliation before ingest can complete"
+                    .to_owned(),
+            );
+            request.completed_at = Some(OffsetDateTime::now_utc());
+        }
+        state => return Err(InboxRepositoryError::UnknownStorageState(state.to_owned())),
+    }
+    request.updated_at = OffsetDateTime::now_utc();
+    update_ingest_state(transaction, request).await?;
     Ok(())
 }
 
@@ -1419,6 +1412,10 @@ pub enum InboxRepositoryError {
     ResourceMissing(Uuid),
     #[error("ingest request {0} has no source URL")]
     MissingSourceUrl(Uuid),
+    #[error("ingest {0} has no media ID")]
+    MissingMediaId(Uuid),
+    #[error("media has an invalid storage state: {0}")]
+    UnknownStorageState(String),
     #[error("unknown ingest kind in database: {0}")]
     UnknownIngestKind(String),
     #[error("unknown ingest status in database: {0}")]

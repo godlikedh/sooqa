@@ -26,7 +26,10 @@ DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa cargo run -p sooqa-worker
 
 The worker claims `queue.jobs`, renews leases, and recovers expired claims at
 startup and periodically. A job's `run_at` controls retry and publication
-availability. Inspect the row and its lease token when diagnosing a crash.
+availability. Every heartbeat or terminal mutation must use an unexpired lease.
+If the final lease expires, recovery marks the owning ingest terminal instead
+of leaving it in an intermediate state. Inspect the row and its lease token
+when diagnosing a crash.
 
 ## Telegram and media
 
@@ -39,8 +42,11 @@ for probing and normalization.
 
 Storage upload state is carried by the media row. `storage_unknown` means the
 external Telegram result is unresolved; it must be reconciled before a new
-generation is started. The existing CLI names remain available for this
-operator workflow:
+generation is started. Marking an upload unknown explicitly fails linked active
+ingests. Attaching the Telegram message completes linked storage-waiting or
+storage-failed ingests; resetting opens those storage-related failures in a new
+generation and queues a fresh upload. The existing CLI names remain available
+for this operator workflow:
 
 ```bash
 cargo run -p sooqa-server -- storage list
