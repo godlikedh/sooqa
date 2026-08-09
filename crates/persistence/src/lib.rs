@@ -6,14 +6,12 @@ mod library;
 mod publisher;
 
 pub use inbox::{
-    AssetNormalizationStart, AssetProbeStart, CreateIngestResult, InboxRepository,
-    InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart, IngestSimilarityStart,
-    SourceDownloadStart, SourceInspectionStart,
+    AssetNormalizationStart, AssetProbeStart, CreateIngestResult, ForceSaveResult, InboxRepository,
+    InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart, SourceDownloadStart,
+    SourceInspectionStart,
 };
 pub use jobs::{JobRepository, JobRepositoryError};
-pub use library::{
-    LibraryRepository, LibraryRepositoryError, StoredVideoFingerprint, VideoFingerprintCandidate,
-};
+pub use library::{LibraryRepository, LibraryRepositoryError, VideoFingerprintCandidate};
 pub use publisher::{CreatePostResult, PublisherRepository, PublisherRepositoryError};
 
 use sooqa_config::SecretString;

@@ -7,7 +7,7 @@ use sooqa_jobs::JobType;
 use sooqa_media::{
     BinaryCheck, CanonicalImageProfile, CanonicalVideoProfile, DirectHttpDownloader,
     DownloadLimits, FfmpegExecutor, FfprobeAdapter, FrameExtractor, ImageNormalizer,
-    MediaWorkspace, NormalizationPlanner, ProcessCommandRunner, SimilarityConfig, SourceDownloader,
+    MediaWorkspace, NormalizationPlanner, ProcessCommandRunner, SourceDownloader,
     SourceDownloaderRouter, diagnose_binaries,
 };
 use sooqa_persistence::Database;
@@ -15,9 +15,9 @@ use uuid::Uuid;
 
 use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
 use sooqa_worker::{
-    HandlerRegistry, Worker, check_similarity_handler, compute_fingerprint_handler,
-    download_source_handler, finalize_ingest_handler, inspect_source_handler,
-    normalize_asset_handler, probe_asset_handler, upload_storage_asset_handler,
+    HandlerRegistry, Worker, compute_fingerprint_handler, download_source_handler,
+    finalize_ingest_handler, inspect_source_handler, normalize_asset_handler, probe_asset_handler,
+    upload_storage_asset_handler,
 };
 
 #[tokio::main]
@@ -93,10 +93,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     handlers.register(JobType::ComputeFingerprint, move |job| fingerprint_handler(job));
     tracing::info!("video fingerprint handler enabled");
-    let similarity_handler =
-        check_similarity_handler(database.inbox(), database.library(), SimilarityConfig::default());
-    handlers.register(JobType::CheckSimilarity, move |job| similarity_handler(job));
-    tracing::info!("similarity candidate handler enabled");
     let finalize_handler = finalize_ingest_handler(database.inbox(), database.library());
     handlers.register(JobType::FinalizeIngest, move |job| finalize_handler(job));
     tracing::info!("ingest finalization handler enabled");

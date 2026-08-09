@@ -52,9 +52,9 @@ a later normalization slice.
 
 F2 executes the plan, parses progress, validates the output against this
 profile with ffprobe, hashes it, and hands the typed result to the durable
-`finalize_ingest` boundary. That boundary records or reuses the canonical
-library asset and its SHA-256 without holding a database transaction across
-ffmpeg or ffprobe. The composed worker also dispatches static JPEG/PNG inputs
-to the separate image normalizer and records its thumbnail asset. Audio,
-animation, and unknown inputs remain terminal `unsupported_media_kind` cases;
-they do not enter either current normalizer.
+video identity boundary. That boundary records or reuses the canonical library
+asset and its SHA-256 without holding a database transaction across ffmpeg or
+ffprobe. The composed worker dispatches static JPEG/PNG inputs to the separate
+image normalizer and records its thumbnail asset. Audio and animation inputs
+retain their downloaded source artifact and use exact SHA storage behavior;
+none of these non-video paths perform video fingerprinting.

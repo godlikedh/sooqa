@@ -2,17 +2,12 @@ use std::env;
 
 use serde_json::json;
 use sooqa_inbox::{
-    IngestFinalization, IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection,
-    SourceMediaKind, SubmittedVia,
+    IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection, SourceMediaKind,
+    SubmittedVia,
 };
-use sooqa_jobs::{JobStatus, JobType, NewJob};
-use sooqa_library::{
-    MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
-};
-use sooqa_persistence::{
-    Database, InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart,
-    SourceInspectionStart,
-};
+use sooqa_jobs::{JobStatus, JobType};
+use sooqa_library::VideoIdentityOutcome;
+use sooqa_persistence::{Database, InboxRepositoryError, SourceInspectionStart};
 use uuid::Uuid;
 
 async fn database() -> Database {
@@ -181,187 +176,58 @@ async fn source_inspection_completion_commits_job_success_with_transition() {
         .unwrap();
 }
 
-fn video_ingest(sha256: Vec<u8>, source: &str) -> MediaIngest {
-    MediaIngest {
-        media: NewMedia {
-            kind: MediaKind::Video,
-            title: Some("ordering test".to_owned()),
-            description: None,
-            notes: None,
-        },
-        metadata: MediaMetadata {
-            kind: MediaKind::Video,
-            mime_type: Some("video/mp4".to_owned()),
-            container: Some("mp4".to_owned()),
-            video_codec: Some("h264".to_owned()),
-            audio_codec: Some("aac".to_owned()),
-            width: Some(1),
-            height: Some(1),
-            duration_ms: Some(1),
-            bit_rate: Some(1),
-            file_size_bytes: Some(1),
-            sha256: Some(sha256),
-            local_work_path: Some("/tmp/sooqa-ordering-test.mp4".to_owned()),
-        },
-        source: MediaSourceInput {
-            ingest_id: None,
-            kind: SourceKind::DirectUrl,
-            original_url: Some(source.to_owned()),
-            normalized_url: Some(source.to_owned()),
-            platform: None,
-            platform_content_id: None,
-            author_name: None,
-            title: None,
-            description: None,
-            published_at: None,
-            metadata: json!({}),
-        },
-        tags: Vec::new(),
-    }
-}
-
-async fn prepare_video_ingest(database: &Database, suffix: &str) -> (Uuid, Uuid) {
-    let source = format!("https://example.test/video-{suffix}");
-    let media = database
-        .library()
-        .resolve_media(video_ingest(vec![suffix.as_bytes()[0]; 32], &source))
-        .await
-        .unwrap();
-    let request = database
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn duplicate_pending_force_save_is_durable_and_idempotent() {
+    let database = database().await;
+    let ingest = database
         .inbox()
         .create_ingest(
-            IngestSubmission::try_new(IngestSubmissionInput::new(&source, SubmittedVia::Api))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    sqlx::query(
-        "UPDATE ingests SET media_id = $2, state = 'storing', input_json = $3, completed_at = NULL, error_code = NULL, error_message = NULL WHERE id = $1",
-    )
-    .bind(request.ingest.id)
-    .bind(media.media.id)
-    .bind(json!({ "normalization": { "media_kind": "video" } }))
-    .execute(database.pool())
-    .await
-    .unwrap();
-    (media.media.id, request.ingest.id)
-}
-
-async fn advance_video_to_similarity(database: &Database, media_id: Uuid, ingest_id: Uuid) {
-    database
-        .jobs()
-        .enqueue(
-            NewJob::finalize_ingest(ingest_id).dedupe_key(format!("test:{ingest_id}:finalize")),
-        )
-        .await
-        .unwrap();
-    let finalization_job = database
-        .jobs()
-        .claim_next(
-            "ordering-finalizer",
-            std::time::Duration::from_secs(30),
-            &[JobType::FinalizeIngest],
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let finalization_attempt = finalization_job.lease().unwrap();
-    assert!(matches!(
-        database.inbox().begin_ingest_finalization(ingest_id, &finalization_attempt).await.unwrap(),
-        IngestFinalizationStart::Ready(_)
-    ));
-    let finalized = database
-        .inbox()
-        .complete_ingest_finalization(
-            ingest_id,
-            &finalization_attempt,
-            IngestFinalization { media_id },
-        )
-        .await
-        .unwrap();
-    assert_eq!(finalized.status, IngestStatus::Fingerprinting);
-    database.jobs().complete_lease(&finalization_attempt).await.unwrap();
-
-    let fingerprint_job = database
-        .jobs()
-        .claim_next(
-            "ordering-fingerprinter",
-            std::time::Duration::from_secs(30),
-            &[JobType::ComputeFingerprint],
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let fingerprint_attempt = fingerprint_job.lease().unwrap();
-    assert!(matches!(
-        database
-            .inbox()
-            .begin_ingest_fingerprinting(ingest_id, &fingerprint_attempt)
-            .await
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/duplicate-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
             .unwrap(),
-        IngestFingerprintStart::Ready(_)
-    ));
-    let fingerprinted = database
-        .inbox()
-        .complete_ingest_fingerprint(
-            ingest_id,
-            &fingerprint_attempt,
-            Some(json!({ "algorithm": "test" })),
         )
         .await
         .unwrap();
-    assert_eq!(fingerprinted.status, IngestStatus::SimilarityCheck);
-    database.jobs().complete_lease(&fingerprint_attempt).await.unwrap();
-}
-
-async fn complete_similarity(database: &Database, ingest_id: Uuid) {
-    let similarity_job = database
-        .jobs()
-        .claim_next(
-            "ordering-similarity",
-            std::time::Duration::from_secs(30),
-            &[JobType::CheckSimilarity],
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let similarity_attempt = similarity_job.lease().unwrap();
-    assert!(matches!(
-        database.inbox().begin_ingest_similarity(ingest_id, &similarity_attempt).await.unwrap(),
-        sooqa_persistence::IngestSimilarityStart::Ready(_)
-    ));
-    let completed =
-        database.inbox().complete_ingest_similarity(ingest_id, &similarity_attempt).await.unwrap();
-    assert_eq!(completed.status, IngestStatus::Storing);
-    database.jobs().complete_lease(&similarity_attempt).await.unwrap();
-}
-
-async fn storage_job_count(database: &Database, media_id: Uuid) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' = $1",
-    )
-    .bind(media_id.to_string())
-    .fetch_one(database.pool())
-    .await
-    .unwrap()
-}
-
-async fn cleanup_video_ingest(database: &Database, media_id: Uuid, ingest_id: Uuid) {
     sqlx::query(
-        "DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1 OR payload->>'media_id' = $2",
+        "UPDATE ingests SET state = 'duplicate_pending', duplicate_evidence = $2 WHERE id = $1",
     )
-    .bind(ingest_id.to_string())
-    .bind(media_id.to_string())
+    .bind(ingest.ingest.id)
+    .bind(json!({"algorithm_version": "video_sequence_v1", "matches": []}))
     .execute(database.pool())
     .await
     .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest_id)
+
+    let resumed = database.inbox().force_save(ingest.ingest.id).await.unwrap();
+    assert!(resumed.resumed);
+    assert_eq!(resumed.ingest.status, IngestStatus::Normalizing);
+    assert!(resumed.ingest.force_save);
+    assert!(resumed.ingest.duplicate_evidence.is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'normalize_asset' AND payload->>'ingest_id' = $1",
+        )
+        .bind(ingest.ingest.id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        1
+    );
+
+    let replay = database.inbox().force_save(ingest.ingest.id).await.unwrap();
+    assert!(!replay.resumed);
+    assert_eq!(replay.ingest.id, resumed.ingest.id);
+    assert_eq!(replay.ingest.status, IngestStatus::Normalizing);
+
+    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
+        .bind(ingest.ingest.id.to_string())
         .execute(database.pool())
         .await
         .unwrap();
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(media_id)
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(ingest.ingest.id)
         .execute(database.pool())
         .await
         .unwrap();
@@ -369,64 +235,83 @@ async fn cleanup_video_ingest(database: &Database, media_id: Uuid, ingest_id: Uu
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
-async fn video_storage_waits_for_similarity_and_reconciles_success_or_failure() {
+async fn video_identity_completion_persists_duplicate_pending_and_fences_job() {
     let database = database().await;
-    let (success_media, success_ingest) = prepare_video_ingest(&database, "success").await;
-    let (failure_media, failure_ingest) = prepare_video_ingest(&database, "failure").await;
-    advance_video_to_similarity(&database, success_media, success_ingest).await;
-    advance_video_to_similarity(&database, failure_media, failure_ingest).await;
-
-    assert_eq!(storage_job_count(&database, success_media).await, 0);
-    assert_eq!(storage_job_count(&database, failure_media).await, 0);
-    assert_eq!(database.inbox().complete_storage_for_media(success_media).await.unwrap(), 0);
+    let ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/pending-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ingests SET state = 'fingerprinting' WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
+        .bind(ingest.ingest.id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let job = database
+        .jobs()
+        .enqueue(
+            sooqa_jobs::NewJob::compute_fingerprint(ingest.ingest.id)
+                .with_priority(i32::MAX)
+                .dedupe_key(format!("test:fingerprint:{}", ingest.ingest.id)),
+        )
+        .await
+        .unwrap();
+    let claimed = database
+        .jobs()
+        .claim_next(
+            "duplicate-pending-worker",
+            std::time::Duration::from_secs(30),
+            &[JobType::ComputeFingerprint],
+        )
+        .await
+        .unwrap()
+        .expect("fingerprint job should be claimable");
+    assert_eq!(claimed.id, job.id);
+    let attempt = claimed.lease().unwrap();
+    let completed = database
+        .inbox()
+        .complete_video_identity(
+            ingest.ingest.id,
+            &attempt,
+            VideoIdentityOutcome::DuplicatePending {
+                evidence: sooqa_library::VideoDuplicateEvidence {
+                    algorithm_version: "video_sequence_v1".to_owned(),
+                    matches: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.status, IngestStatus::DuplicatePending);
+    assert!(completed.duplicate_evidence.is_some());
     assert_eq!(
-        database
-            .inbox()
-            .fail_storage_for_media(
-                failure_media,
-                IngestStatus::FailedRetryable,
-                "storage_upload",
-                "must wait for similarity",
-            )
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(claimed.id)
+            .fetch_one(database.pool())
             .await
             .unwrap(),
-        0
+        JobStatus::Succeeded.as_str()
     );
 
-    complete_similarity(&database, success_ingest).await;
-    assert_eq!(storage_job_count(&database, success_media).await, 1);
-    sqlx::query(
-        "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = -100123, telegram_storage_message_id = 9001, telegram_file_id = 'success-file', stored_at = now() WHERE id = $1",
-    )
-    .bind(success_media)
-    .execute(database.pool())
-    .await
-    .unwrap();
-    assert_eq!(database.inbox().complete_storage_for_media(success_media).await.unwrap(), 1);
-    assert_eq!(
-        database.inbox().find(success_ingest).await.unwrap().unwrap().status,
-        IngestStatus::Completed
-    );
-
-    complete_similarity(&database, failure_ingest).await;
-    assert_eq!(storage_job_count(&database, failure_media).await, 1);
-    assert_eq!(
-        database
-            .inbox()
-            .fail_storage_for_media(
-                failure_media,
-                IngestStatus::FailedTerminal,
-                "storage_upload",
-                "storage failed after similarity",
-            )
-            .await
-            .unwrap(),
-        1
-    );
-    let failed = database.inbox().find(failure_ingest).await.unwrap().unwrap();
-    assert_eq!(failed.status, IngestStatus::FailedTerminal);
-    assert_eq!(failed.error_code.as_deref(), Some("storage_upload"));
-
-    cleanup_video_ingest(&database, success_media, success_ingest).await;
-    cleanup_video_ingest(&database, failure_media, failure_ingest).await;
+    sqlx::query("DELETE FROM queue.jobs WHERE id = $1")
+        .bind(claimed.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
 }

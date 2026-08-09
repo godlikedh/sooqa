@@ -193,6 +193,15 @@ pub fn select_video_sequence_timestamps(duration_ms: u64) -> Vec<u64> {
     timestamps
 }
 
+pub fn video_sequence_interval_ms(duration_ms: u64) -> Option<u32> {
+    if duration_ms == 0 {
+        return None;
+    }
+    let interval_ms = VIDEO_SEQUENCE_BASE_INTERVAL_MS
+        .max(duration_ms.div_ceil(VIDEO_SEQUENCE_MAX_SAMPLES as u64));
+    u32::try_from(interval_ms).ok()
+}
+
 pub fn derive_search_tokens(fingerprint: &VideoSequenceFingerprint) -> Vec<i64> {
     let mut anchors = fingerprint
         .samples

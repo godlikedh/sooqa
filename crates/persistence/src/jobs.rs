@@ -352,7 +352,6 @@ async fn reconcile_exhausted_job(
             | JobType::ProbeAsset
             | JobType::NormalizeAsset
             | JobType::ComputeFingerprint
-            | JobType::CheckSimilarity
             | JobType::FinalizeIngest
     ) {
         if let Some(ingest_id) = ingest_id {

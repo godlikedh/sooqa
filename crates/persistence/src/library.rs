@@ -4,18 +4,26 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use sooqa_jobs::NewJob;
 use sooqa_library::{
-    Media, MediaCursor, MediaDetails, MediaIngest, MediaKind, MediaMetadata, MediaPage,
-    MediaSearchQuery, MediaSource, MediaSourceInput, MediaStatus, MediaStorageState, MediaSummary,
-    MediaUpdate, NewTag, SourceKind, StorageReceipt, StorageUploadAttachment, StorageUploadInfo,
+    MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, Media, MediaCursor,
+    MediaDetails, MediaIngest, MediaKind, MediaMetadata, MediaPage, MediaSearchQuery, MediaSource,
+    MediaSourceInput, MediaStatus, MediaStorageState, MediaSummary, MediaUpdate, NewTag,
+    SourceKind, StorageReceipt, StorageUploadAttachment, StorageUploadInfo,
     StorageUploadReservation, StorageUploadReservationRequest, StorageUploadStore, Tag,
+    VideoDuplicateClassification, VideoDuplicateEvidence, VideoDuplicateMatch,
+    VideoIdentityOutcome,
 };
-use sooqa_media::VideoSequenceFingerprint;
+use sooqa_media::{
+    SequenceAlignmentConfig, SequenceClassification, VideoSequenceFingerprint,
+    align_video_sequences,
+};
 use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-pub use sooqa_library::{StoredVideoFingerprint, VideoFingerprintCandidate};
+pub use sooqa_library::VideoFingerprintCandidate;
+
+const VIDEO_IDENTITY_ADVISORY_LOCK: i64 = 0x736f_6f71_615f_6964;
 
 #[derive(Clone)]
 pub struct LibraryRepository {
@@ -28,7 +36,6 @@ struct MediaRow {
     kind: String,
     storage_state: String,
     canonical_sha256: Option<Vec<u8>>,
-    fingerprint_data: Option<Vec<u8>>,
     title: Option<String>,
     description: Option<String>,
     tags: Vec<String>,
@@ -305,6 +312,205 @@ impl LibraryRepository {
         Ok(MediaResolutionResult { media, source, media_created })
     }
 
+    pub async fn resolve_video_identity(
+        &self,
+        ingest: MediaIngest,
+        fingerprint: &VideoSequenceFingerprint,
+        config: SequenceAlignmentConfig,
+        force_save: bool,
+    ) -> Result<VideoIdentityOutcome, LibraryRepositoryError> {
+        validate_media_ingest(&ingest)?;
+        if ingest.metadata.kind != MediaKind::Video {
+            return Err(LibraryRepositoryError::InvalidVideoIdentityKind);
+        }
+        config
+            .validate()
+            .map_err(|error| LibraryRepositoryError::InvalidAlignment(error.to_string()))?;
+        let sha256 =
+            ingest.metadata.sha256.as_deref().ok_or(LibraryRepositoryError::MissingSha256)?;
+        let fingerprint_data = fingerprint
+            .encode()
+            .map_err(|error| LibraryRepositoryError::InvalidFingerprint(error.to_string()))?;
+        let search_tokens = fingerprint.search_tokens();
+        let source_value = source_to_value(&ingest.source);
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(VIDEO_IDENTITY_ADVISORY_LOCK)
+            .execute(&mut *transaction)
+            .await?;
+
+        if let Some(row) = sqlx::query_as::<_, MediaRow>(
+            "SELECT * FROM media WHERE canonical_sha256 = $1 FOR UPDATE",
+        )
+        .bind(sha256)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            let merged_tags = merge_tags(&row.tags, &ingest.tags);
+            sqlx::query(
+                "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = COALESCE(description, $4), source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1",
+            )
+            .bind(row.id)
+            .bind(merged_tags)
+            .bind(&ingest.media.title)
+            .bind(&ingest.media.description)
+            .bind(ingest.source.normalized_url.clone().or(ingest.source.original_url.clone()))
+            .bind(merge_missing_source_metadata(&row.source_metadata, &source_value))
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(VideoIdentityOutcome::ExactDuplicate { media_id: row.id });
+        }
+
+        if !force_save {
+            let candidates = fetch_video_fingerprint_candidates(
+                &mut transaction,
+                fingerprint.version.as_str(),
+                &search_tokens,
+            )
+            .await?;
+            let mut matches = candidates
+                .into_iter()
+                .filter_map(|candidate| {
+                    let stored = VideoSequenceFingerprint::decode(&candidate.fingerprint_data)
+                        .map_err(|error| {
+                            LibraryRepositoryError::InvalidFingerprint(format!(
+                                "media {} has an invalid stored fingerprint: {error}",
+                                candidate.media_id
+                            ))
+                        });
+                    let stored = match stored {
+                        Ok(stored) => stored,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    let alignment =
+                        align_video_sequences(fingerprint, &stored, config).map_err(|error| {
+                            LibraryRepositoryError::InvalidAlignment(error.to_string())
+                        });
+                    match alignment {
+                        Ok(alignment) => duplicate_match(&candidate, alignment).map(Ok),
+                        Err(error) => Some(Err(error)),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            matches.sort_by(|left, right| {
+                classification_rank(right.classification)
+                    .cmp(&classification_rank(left.classification))
+                    .then_with(|| right.score_bps.cmp(&left.score_bps))
+                    .then_with(|| right.shared_token_count.cmp(&left.shared_token_count))
+                    .then_with(|| left.media_id.cmp(&right.media_id))
+            });
+            if matches
+                .iter()
+                .any(|item| item.classification == VideoDuplicateClassification::StrongDuplicate)
+            {
+                matches.truncate(MAX_VIDEO_DUPLICATE_MATCHES);
+                let evidence = VideoDuplicateEvidence {
+                    algorithm_version: fingerprint.version.as_str().to_owned(),
+                    matches,
+                };
+                let encoded = serde_json::to_vec(&evidence)?;
+                if encoded.len() > MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES {
+                    return Err(LibraryRepositoryError::DuplicateEvidenceTooLarge {
+                        max: MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES,
+                    });
+                }
+                transaction.commit().await?;
+                return Ok(VideoIdentityOutcome::DuplicatePending { evidence });
+            }
+        }
+
+        let id = Uuid::now_v7();
+        let inserted = sqlx::query_as::<_, MediaRow>(
+            r#"INSERT INTO media (
+                id, kind, storage_state, canonical_sha256, fingerprint_version,
+                fingerprint_data, fingerprint_search_tokens, title, description,
+                tags, source_url, source_metadata, mime_type, container,
+                video_codec, audio_codec, width, height, duration_ms, bit_rate,
+                file_size_bytes, local_work_path
+            ) VALUES ($1, 'video', 'pending_storage', $2, $3, $4, $5, $6, $7,
+                      $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                      $19, $20)
+            ON CONFLICT (canonical_sha256) DO NOTHING
+            RETURNING *"#,
+        )
+        .bind(id)
+        .bind(sha256)
+        .bind(fingerprint.version.as_str())
+        .bind(&fingerprint_data)
+        .bind(&search_tokens)
+        .bind(&ingest.media.title)
+        .bind(&ingest.media.description)
+        .bind(&ingest.tags)
+        .bind(ingest.source.normalized_url.clone().or(ingest.source.original_url.clone()))
+        .bind(&source_value)
+        .bind(&ingest.metadata.mime_type)
+        .bind(&ingest.metadata.container)
+        .bind(&ingest.metadata.video_codec)
+        .bind(&ingest.metadata.audio_codec)
+        .bind(ingest.metadata.width)
+        .bind(ingest.metadata.height)
+        .bind(to_i64(ingest.metadata.duration_ms, "duration_ms")?)
+        .bind(to_i64(ingest.metadata.bit_rate, "bit_rate")?)
+        .bind(to_i64(ingest.metadata.file_size_bytes, "file_size_bytes")?)
+        .bind(&ingest.metadata.local_work_path)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(row) = inserted {
+            let media_id = row.id;
+            transaction.commit().await?;
+            return Ok(VideoIdentityOutcome::NewMedia { media_id });
+        }
+
+        let media_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM media WHERE canonical_sha256 = $1 FOR UPDATE",
+        )
+        .bind(sha256)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(VideoIdentityOutcome::ExactDuplicate { media_id })
+    }
+
+    /// Resolve an already-known canonical byte identity before any video
+    /// fingerprint extraction. The final video identity transaction still
+    /// rechecks this value under its advisory lock because a concurrent ingest
+    /// may insert the exact bytes after this preflight returns `None`.
+    pub async fn resolve_exact_sha(
+        &self,
+        ingest: &MediaIngest,
+    ) -> Result<Option<Uuid>, LibraryRepositoryError> {
+        validate_media_ingest(ingest)?;
+        let sha256 =
+            ingest.metadata.sha256.as_deref().ok_or(LibraryRepositoryError::MissingSha256)?;
+        let source_value = source_to_value(&ingest.source);
+        let mut transaction = self.pool.begin().await?;
+        let Some(row) = sqlx::query_as::<_, MediaRow>(
+            "SELECT * FROM media WHERE canonical_sha256 = $1 FOR UPDATE",
+        )
+        .bind(sha256)
+        .fetch_optional(&mut *transaction)
+        .await?
+        else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        let merged_tags = merge_tags(&row.tags, &ingest.tags);
+        sqlx::query(
+            "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = COALESCE(description, $4), source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1",
+        )
+        .bind(row.id)
+        .bind(merged_tags)
+        .bind(&ingest.media.title)
+        .bind(&ingest.media.description)
+        .bind(ingest.source.normalized_url.clone().or(ingest.source.original_url.clone()))
+        .bind(merge_missing_source_metadata(&row.source_metadata, &source_value))
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(Some(row.id))
+    }
+
     pub async fn record_media_metadata(
         &self,
         id: Uuid,
@@ -338,26 +544,6 @@ impl LibraryRepository {
         row.into_media()
     }
 
-    pub async fn record_fingerprint(
-        &self,
-        media_id: Uuid,
-        algorithm_version: &str,
-        fingerprint: &Value,
-    ) -> Result<(), LibraryRepositoryError> {
-        let updated = sqlx::query(
-            "UPDATE media SET fingerprint_version = $2, fingerprint_data = $3, fingerprint_search_tokens = NULL, updated_at = now() WHERE id = $1",
-        )
-        .bind(media_id)
-        .bind(algorithm_version)
-        .bind(serde_json::to_vec(fingerprint)?)
-        .execute(&self.pool)
-        .await?;
-        if updated.rows_affected() != 1 {
-            return Err(LibraryRepositoryError::ResourceMissing(media_id));
-        }
-        Ok(())
-    }
-
     pub async fn record_video_sequence_fingerprint(
         &self,
         media_id: Uuid,
@@ -380,35 +566,6 @@ impl LibraryRepository {
             return Err(LibraryRepositoryError::ResourceMissing(media_id));
         }
         Ok(())
-    }
-
-    pub async fn list_stored_video_fingerprints(
-        &self,
-        exclude_media_id: Uuid,
-        algorithm_version: &str,
-    ) -> Result<Vec<StoredVideoFingerprint>, LibraryRepositoryError> {
-        let rows = sqlx::query_as::<_, MediaRow>(
-            "SELECT * FROM media WHERE id <> $1 AND kind = 'video' AND fingerprint_data IS NOT NULL AND fingerprint_version = $2 ORDER BY id",
-        )
-        .bind(exclude_media_id)
-        .bind(algorithm_version)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| {
-                let bytes = row
-                    .fingerprint_data
-                    .as_deref()
-                    .ok_or(LibraryRepositoryError::Invariant("media fingerprint is missing"))?;
-                Ok(StoredVideoFingerprint {
-                    media_id: row.id,
-                    width: row.width,
-                    height: row.height,
-                    audio_codec: row.audio_codec,
-                    fingerprint: serde_json::from_slice(bytes)?,
-                })
-            })
-            .collect()
     }
 
     pub async fn list_video_fingerprint_candidates(
@@ -598,6 +755,111 @@ impl LibraryRepository {
             source_url: row.source_url,
             source_metadata: source.map(|source| source.metadata),
         })
+    }
+}
+
+async fn fetch_video_fingerprint_candidates(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    fingerprint_version: &str,
+    search_tokens: &[i64],
+) -> Result<Vec<VideoFingerprintCandidateRow>, sqlx::Error> {
+    if search_tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, VideoFingerprintCandidateRow>(
+        r#"
+        WITH candidates AS (
+            SELECT
+                m.id AS media_id,
+                m.width,
+                m.height,
+                m.audio_codec,
+                m.fingerprint_version,
+                m.fingerprint_data,
+                m.fingerprint_search_tokens AS search_tokens,
+                cardinality(ARRAY(
+                    SELECT DISTINCT candidate_token
+                    FROM unnest(m.fingerprint_search_tokens) AS candidate_token
+                    WHERE candidate_token = ANY($2::bigint[])
+                ))::bigint AS shared_token_count,
+                cardinality(ARRAY(
+                    SELECT DISTINCT candidate_token
+                    FROM unnest(m.fingerprint_search_tokens) AS candidate_token
+                ))::bigint AS candidate_token_count,
+                cardinality(ARRAY(
+                    SELECT DISTINCT query_token
+                    FROM unnest($2::bigint[]) AS query_token
+                ))::bigint AS query_token_count
+            FROM media AS m
+            WHERE m.kind = 'video'
+              AND m.fingerprint_version = $1
+              AND m.fingerprint_data IS NOT NULL
+              AND m.fingerprint_search_tokens IS NOT NULL
+              AND m.storage_state IN ('pending_storage', 'ready')
+              AND m.fingerprint_search_tokens && $2::bigint[]
+        )
+        SELECT
+            media_id,
+            width,
+            height,
+            audio_codec,
+            fingerprint_version,
+            fingerprint_data,
+            search_tokens,
+            shared_token_count,
+            (
+                shared_token_count * 10000
+                / NULLIF(LEAST(candidate_token_count, query_token_count), 0)
+            )::bigint AS overlap_bps
+        FROM candidates
+        WHERE shared_token_count >= 8
+          AND shared_token_count * 10 >= LEAST(candidate_token_count, query_token_count)
+        ORDER BY shared_token_count DESC, overlap_bps DESC, media_id
+        LIMIT 20
+        "#,
+    )
+    .bind(fingerprint_version)
+    .bind(search_tokens)
+    .fetch_all(&mut **transaction)
+    .await
+}
+
+fn duplicate_match(
+    candidate: &VideoFingerprintCandidateRow,
+    alignment: sooqa_media::SequenceAlignment,
+) -> Option<VideoDuplicateMatch> {
+    let classification = match alignment.classification {
+        SequenceClassification::StrongDuplicate => VideoDuplicateClassification::StrongDuplicate,
+        SequenceClassification::PartialMatch => VideoDuplicateClassification::PartialMatch,
+        SequenceClassification::NotDuplicate => return None,
+    };
+    let evidence = alignment.evidence;
+    Some(VideoDuplicateMatch {
+        media_id: candidate.media_id,
+        fingerprint_version: candidate.fingerprint_version.clone(),
+        classification,
+        aligned_offset_ms: evidence.aligned_offset_ms,
+        informative_matched_samples: evidence.informative_matched_samples,
+        incoming_coverage_bps: evidence.incoming_coverage_bps,
+        candidate_coverage_bps: evidence.candidate_coverage_bps,
+        median_distance_bps: evidence.median_distance_bps,
+        high_percentile_distance_bps: evidence.high_percentile_distance_bps,
+        longest_temporally_consistent_run: evidence.longest_temporally_consistent_run,
+        unmatched_incoming_prefix: evidence.unmatched_incoming_prefix,
+        unmatched_incoming_suffix: evidence.unmatched_incoming_suffix,
+        unmatched_candidate_prefix: evidence.unmatched_candidate_prefix,
+        unmatched_candidate_suffix: evidence.unmatched_candidate_suffix,
+        gap_count: evidence.gap_count,
+        score_bps: evidence.score_bps,
+        shared_token_count: candidate.shared_token_count,
+        token_overlap_bps: candidate.overlap_bps,
+    })
+}
+
+fn classification_rank(classification: VideoDuplicateClassification) -> u8 {
+    match classification {
+        VideoDuplicateClassification::StrongDuplicate => 2,
+        VideoDuplicateClassification::PartialMatch => 1,
     }
 }
 
@@ -1039,6 +1301,12 @@ pub enum LibraryRepositoryError {
     Serialization(#[from] serde_json::Error),
     #[error("invalid video fingerprint: {0}")]
     InvalidFingerprint(String),
+    #[error("video identity requires a video media kind")]
+    InvalidVideoIdentityKind,
+    #[error("invalid video identity alignment: {0}")]
+    InvalidAlignment(String),
+    #[error("duplicate evidence exceeds the {max}-byte limit")]
+    DuplicateEvidenceTooLarge { max: usize },
     #[error("media {0} was not found")]
     ResourceMissing(Uuid),
     #[error("media update must change at least one field")]

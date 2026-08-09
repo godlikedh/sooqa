@@ -28,6 +28,8 @@ erDiagram
         text input_key UK
         text state
         jsonb input_json
+        boolean force_save
+        jsonb duplicate_evidence
         uuid media_id FK
     }
     MEDIA {
@@ -95,26 +97,38 @@ sequenceDiagram
     Queue-->>Worker: running row + lease token
     Worker->>Media: inspect/download/probe/normalize
     Worker->>Ingests: fenced state transition + next job
-    Worker->>Media: exact SHA check / store normalized metadata
-    Media-->>Worker: one media id
-    Worker->>Ingests: finalization records media id
-    Worker->>Ingests: video fingerprint + similarity check
-    Ingests->>Queue: enqueue upload_storage_asset
+    alt video
+        Worker->>Media: extract video_sequence_v1 outside transaction
+        Worker->>Media: advisory-locked SHA/shortlist/alignment decision
+        alt exact or new identity
+            Media-->>Worker: existing or new media id
+        else strong perceptual match
+            Worker->>Ingests: duplicate_pending + bounded evidence
+        end
+    else image, animation, or audio
+        Worker->>Media: exact SHA resolution only
+        Media-->>Worker: existing or new media id
+    end
+    Ingests->>Queue: enqueue upload only for a new reservation
     Worker->>Media: upload only after media processing
     Media-->>Worker: ready, failed, or storage_unknown
     Worker->>Ingests: consume storage outcome by media_id
 ```
 
-The current worker keeps the existing direct-media stages while the persistence
-reset lands: source inspection, download, probe, normalization, finalization,
-and video fingerprinting are separate typed jobs. Each stage updates `ingests`
-and enqueues its successor in a short transaction. For video, storage is not
-enqueued until fingerprinting and similarity checking have completed; this
-makes media-processing order explicit rather than racing storage against it.
-Network and subprocess work never runs while that transaction is open. Stage
-metadata is bounded JSON input metadata; it is decoded into typed Rust structs
-at the handler boundary. Storage completion/failure is applied by `media_id`,
-and attach/reset/mark-unknown reconcile the linked ingest rows.
+The worker keeps source inspection, download, probe, normalization,
+fingerprinting, and exact finalization as separate typed jobs. Each stage
+updates `ingests` and enqueues its successor in a short transaction. Video
+identity finalization takes one transaction-scoped advisory lock, rechecks the
+canonical SHA, asks PostgreSQL for at most twenty plausible fingerprint
+candidates, and runs bounded Rust alignment before inserting media. The lock
+does not cover download, ffmpeg, filesystem, HTTP, or Telegram work. Images,
+animations, and audio skip the video path and use exact SHA resolution. No
+storage job is enqueued for `duplicate_pending`; force-save sets the durable
+override before resuming normalization/fingerprinting. Network and subprocess
+work never runs while an identity transaction is open. Stage metadata is
+bounded JSON input metadata; it is decoded into typed Rust structs at the
+handler boundary. Storage completion/failure is applied by `media_id`, and
+attach/reset/mark-unknown reconcile the linked ingest rows.
 
 Each successful ingest stage commits its ingest transition, successor enqueue,
 and current queue-job success atomically. Final-attempt recovery therefore
@@ -139,11 +153,13 @@ state machine on the same row: `pending_storage`, `ready`,
 ambiguous results. Exact-SHA deduplication preserves the first source identity
 and only fills missing non-identity metadata from later observations.
 
-The issue #44 foundation stores `video_sequence_v1` as bounded binary
+The issue #44 implementation stores `video_sequence_v1` as bounded binary
 `fingerprint_data` plus a partial-GIN-searchable token array. PostgreSQL only
 shortlists compatible `pending_storage` and `ready` video rows; bounded Rust
-alignment remains responsible for the final visual evidence. The current
-worker switch and pre-storage identity transaction are the dependent #44 slice.
+alignment produces at most three scalar evidence matches, capped at 16 KiB.
+Exact duplicates reuse the existing media row, strong perceptual matches stop
+at durable `duplicate_pending`, and no-match videos insert one
+`pending_storage` reservation before upload.
 
 ## Publisher
 

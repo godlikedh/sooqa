@@ -148,7 +148,7 @@ pub enum IngestStatus {
     ExactDedupCheck,
     Normalizing,
     Fingerprinting,
-    SimilarityCheck,
+    DuplicatePending,
     Storing,
     Completed,
     FailedRetryable,
@@ -166,7 +166,7 @@ impl IngestStatus {
             Self::ExactDedupCheck => "exact_dedup_check",
             Self::Normalizing => "normalizing",
             Self::Fingerprinting => "fingerprinting",
-            Self::SimilarityCheck => "similarity_check",
+            Self::DuplicatePending => "duplicate_pending",
             Self::Storing => "storing",
             Self::Completed => "completed",
             Self::FailedRetryable => "failed_retryable",
@@ -207,13 +207,12 @@ impl IngestStatus {
                 | (Self::Normalizing, Self::Fingerprinting)
                 | (Self::Normalizing, Self::Storing)
                 | (Self::Fingerprinting, Self::Storing)
-                | (Self::Fingerprinting, Self::SimilarityCheck)
+                | (Self::Fingerprinting, Self::DuplicatePending)
                 | (Self::Fingerprinting, Self::Completed)
-                | (Self::SimilarityCheck, Self::Storing)
-                | (Self::SimilarityCheck, Self::Completed)
+                | (Self::DuplicatePending, Self::Fingerprinting)
+                | (Self::DuplicatePending, Self::Normalizing)
                 | (Self::FailedRetryable, Self::Storing)
                 | (Self::FailedRetryable, Self::Fingerprinting)
-                | (Self::FailedRetryable, Self::SimilarityCheck)
                 | (Self::Storing, Self::Fingerprinting)
                 | (Self::Storing, Self::Completed)
         )
@@ -232,7 +231,7 @@ impl TryFrom<&str> for IngestStatus {
             "exact_dedup_check" => Ok(Self::ExactDedupCheck),
             "normalizing" => Ok(Self::Normalizing),
             "fingerprinting" => Ok(Self::Fingerprinting),
-            "similarity_check" => Ok(Self::SimilarityCheck),
+            "duplicate_pending" => Ok(Self::DuplicatePending),
             "storing" => Ok(Self::Storing),
             "completed" => Ok(Self::Completed),
             "failed_retryable" => Ok(Self::FailedRetryable),
@@ -385,6 +384,8 @@ pub struct Ingest {
     pub supplied_tags: Vec<String>,
     pub idempotency_key: Option<String>,
     pub media_id: Option<Uuid>,
+    pub force_save: bool,
+    pub duplicate_evidence: Option<Value>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub created_at: time::OffsetDateTime,
@@ -409,6 +410,8 @@ impl Ingest {
             supplied_tags: submission.supplied_tags.clone(),
             idempotency_key: submission.idempotency_key.clone(),
             media_id: None,
+            force_save: false,
+            duplicate_evidence: None,
             error_code: None,
             error_message: None,
             created_at: now,
@@ -628,7 +631,6 @@ mod tests {
             IngestStatus::ExactDedupCheck,
             IngestStatus::Normalizing,
             IngestStatus::Fingerprinting,
-            IngestStatus::SimilarityCheck,
             IngestStatus::Storing,
             IngestStatus::Completed,
         ] {

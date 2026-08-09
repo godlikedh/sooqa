@@ -2,9 +2,7 @@
 
 ## Status
 
-Proposed as the first slice of issue #44. The media and shortlist primitives
-land here; the ingest identity gate and force-save workflow land in the
-dependent slice before issue #44 closes.
+Accepted and shipped as issue #44's video identity gate.
 
 ## Context
 
@@ -21,8 +19,8 @@ The algorithm identifier is `video_sequence_v1`. The normalized, canonical
 video is the input. Orientation is therefore already resolved by canonical
 normalization; each decoded frame is resized exactly to 32x32 with the
 project's Triangle filter before feature extraction. Aspect ratio remains
-metadata used by the later identity decision and is not silently baked into a
-second frame transform.
+available as media metadata but is not a hard candidate filter or silently
+baked into a second frame transform.
 
 ### Sampling
 
@@ -124,16 +122,26 @@ median and high-percentile distance, longest consistent run, unmatched
 prefix/suffix counts, gap count, and score. A contained short clip therefore
 cannot qualify as a full duplicate merely because its local frames align.
 
-### Deferred identity boundary
+### Identity transaction and force-save
 
-The dependent issue #44 slice will acquire one transaction-scoped advisory lock
-for video identity finalization, recheck canonical SHA, run the shortlist and
-bounded alignment, then insert one `pending_storage` reservation or persist
-`duplicate_pending` evidence before commit. The lock will not cover download,
-ffmpeg, filesystem, HTTP, or Telegram work. Exact SHA uniqueness remains the
-final byte-identity barrier. That slice will add the durable authorized
-`force_save` transition from `duplicate_pending`; force-save will skip only the
-perceptual decision and will still perform exact SHA checking.
+Video fingerprint extraction and all ffmpeg/file work happen before the
+identity transaction. The repository acquires one transaction-scoped advisory
+lock for video identity finalization, rechecks canonical SHA, runs the bounded
+shortlist/alignment decision, and then either reuses the existing media row,
+persists bounded `duplicate_pending` evidence, or inserts one
+`pending_storage` reservation with the fingerprint blob and tokens. The lock
+does not cover download, ffmpeg, filesystem, HTTP, or Telegram work. A single
+stable lock key is intentional: equivalent re-encodes with different SHAs
+must observe the first in-progress reservation before either can enqueue a
+storage upload. The canonical SHA unique constraint remains the final byte-
+identity barrier.
+
+The authorized `POST /api/v1/ingests/{id}/force-save` route is idempotent. It
+is accepted only from `duplicate_pending`, persists `force_save = true`, and
+restarts normalization so a missing normalized artifact can be rebuilt from
+the durable source workspace/input. The resumed identity transaction still
+checks exact SHA but skips only the perceptual decision. Repeated or concurrent
+force-save calls share one force-save normalization/fingerprint job chain.
 
 ## Test fixtures and current results
 
@@ -142,9 +150,11 @@ expansion, stable features, codec golden bytes, malformed/oversized blobs,
 sorted/deduplicated tokens, a one-second blank prefix, a contained clip, and
 low-information footage. PostgreSQL tests cover version/state/token bounds,
 pending and ready candidates, unknown-state exclusion, stable shortlist
-ordering, and the 20-row contract. The required codec re-encode, real blank
-prefix/trimmed-prefix media fixtures, identity transaction, force-save, and
-Telegram-call race tests are owned by the dependent workflow slice.
+ordering, the 20-row contract, exact reuse, strong duplicate-pending, force-
+save bypass, and concurrent equivalent-video reservation. Worker and API tests
+cover the active pre-storage path and durable force-save response. Real media
+calibration fixtures and Telegram-call tests remain operational follow-ups;
+the repository decision is tested before external storage I/O.
 
 ## Consequences
 
@@ -154,6 +164,7 @@ retains control of the final visual decision. Algorithm changes that alter
 sampling, feature meaning, token packing, alignment, or thresholds require a
 new fingerprint version instead of reinterpretation of stored v1 bytes.
 
-The current worker still consumes the legacy seven-frame path until the
-dependent workflow slice switches it to this representation; this PR does not
-pretend that the end-to-end duplicate gate is already active.
+The active worker consumes this representation before storage. Images,
+animations, and audio deliberately skip sequence extraction and use exact SHA
+identity only. Telegram duplicate-card presentation is outside this backend
+ADR.

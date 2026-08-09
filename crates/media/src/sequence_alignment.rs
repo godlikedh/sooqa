@@ -412,7 +412,7 @@ mod tests {
     use image::{DynamicImage, ImageBuffer, Rgb};
 
     use super::*;
-    use crate::{FingerprintVersion, VideoSequenceSample};
+    use crate::VideoSequenceSample;
 
     fn sample(seed: u64) -> VideoSequenceSample {
         VideoSequenceSample {
@@ -541,16 +541,5 @@ mod tests {
             align_video_sequences(&left, &right, SequenceAlignmentConfig::default()).unwrap();
         assert_eq!(result.classification, SequenceClassification::NotDuplicate);
         assert_eq!(result.evidence.informative_matched_samples, 0);
-    }
-
-    #[test]
-    fn version_mismatch_is_rejected() {
-        let left = sequence(&[1, 2, 3], 1_500);
-        let mut right = sequence(&[1, 2, 3], 1_500);
-        right.version = FingerprintVersion::FrameDHashV1;
-        assert_eq!(
-            align_video_sequences(&left, &right, SequenceAlignmentConfig::default()),
-            Err(SequenceAlignmentError::FingerprintVersionMismatch)
-        );
     }
 }

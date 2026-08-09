@@ -14,7 +14,8 @@ The repository currently provides:
     - PostgreSQL-backed `ingests`, one-row `media`, `channels`, `posts`, and
       durable `queue.jobs` with leases and stale-lease recovery;
 - direct HTTP and yt-dlp media adapters, ffprobe inspection, ffmpeg
-  normalization, image normalization, hashing, and optional similarity checks;
+  normalization, image normalization, exact hashing, and the bounded
+  pre-storage video identity gate;
     - a Telegram long-polling adapter for admin URL/media submission and a
       media-row storage state machine;
 - an explicit storage-intent reconciliation CLI for ambiguous Telegram
@@ -23,16 +24,18 @@ The repository currently provides:
 
 The composed worker registers `inspect_source` with the SSRF-hardened direct
 HTTP adapter, `download_source` into the shared media workspace, `probe_asset`,
-`normalize_asset`, `compute_fingerprint`, `check_similarity`, and, when configured,
-`upload_storage_asset`.
+`normalize_asset`, `compute_fingerprint`, `finalize_ingest`, and, when
+configured, `upload_storage_asset`.
 The yt-dlp adapter remains available behind the media boundary but is not yet
 enabled in the production worker because its subprocess egress needs an
-equivalent SSRF boundary. Normalization records a canonical video or static
-image artifact (plus an image thumbnail) and queues `finalize_ingest`;
-finalization creates or reuses one `media` row, stores video fingerprints on
-that row, and logs perceptual similarity findings without creating a duplicate
-aggregate. Storage upload and publication remain separate durable stages;
-Telegram publication itself is not enabled yet.
+equivalent SSRF boundary. Video normalization records a canonical artifact and
+queues sequence fingerprinting; the worker then performs exact-SHA reuse or
+the bounded `video_sequence_v1` identity decision before creating a
+`pending_storage` media row. Strong perceptual matches become durable
+`duplicate_pending` ingests and can be overridden through the authorized
+force-save route. Images, animations, and audio use exact SHA only. Storage
+upload and publication remain separate durable stages; Telegram publication
+itself is not enabled yet.
 
 Active documentation is the authority for current behavior:
 

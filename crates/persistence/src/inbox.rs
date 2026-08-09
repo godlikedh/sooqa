@@ -1,9 +1,12 @@
-use serde_json::{Value, json};
+use serde_json::json;
 use sooqa_inbox::{
     AssetNormalization, Ingest, IngestFinalization, IngestKind, IngestStateError, IngestStatus,
     IngestSubmission, SourceDownload, SourceInspection, SourceMediaKind, SubmittedVia,
 };
 use sooqa_jobs::{JobAttempt, NewJob};
+use sooqa_library::{
+    MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, VideoIdentityOutcome,
+};
 use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -262,8 +265,15 @@ impl InboxRepository {
             .execute(&mut *transaction)
             .await?;
 
-        if !matches!(media_kind, Some(SourceMediaKind::Video | SourceMediaKind::Image))
-            || unsupported_image_format
+        if !matches!(
+            media_kind,
+            Some(
+                SourceMediaKind::Video
+                    | SourceMediaKind::Image
+                    | SourceMediaKind::Animation
+                    | SourceMediaKind::Audio
+            )
+        ) || unsupported_image_format
         {
             request.transition_to(IngestStatus::FailedTerminal)?;
             request.error_code = Some(match media_kind {
@@ -299,7 +309,7 @@ impl InboxRepository {
         request.completed_at = None;
         request.updated_at = OffsetDateTime::now_utc();
         update_ingest_state(&mut transaction, &request).await?;
-        insert_normalize_job(&mut transaction, &request).await?;
+        insert_normalize_job(&mut transaction, &request, false).await?;
         succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
@@ -312,7 +322,8 @@ impl InboxRepository {
     ) -> Result<AssetNormalizationStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
-        let start = if request.original_input.get("normalization").is_some()
+        let start = if (request.original_input.get("normalization").is_some()
+            && !request.force_save)
             || !lock_current_job_attempt(&mut transaction, attempt).await?
         {
             AssetNormalizationStart::AlreadyAdvanced(request)
@@ -347,7 +358,7 @@ impl InboxRepository {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
         if request.status != IngestStatus::Normalizing
-            || request.original_input.get("normalization").is_some()
+            || (request.original_input.get("normalization").is_some() && !request.force_save)
             || !lock_current_job_attempt(&mut transaction, attempt).await?
         {
             transaction.commit().await?;
@@ -369,13 +380,22 @@ impl InboxRepository {
             .execute(&mut *transaction)
             .await?;
 
-        request.transition_to(IngestStatus::Storing)?;
+        let is_video = normalized_media_kind(&request) == Some(SourceMediaKind::Video);
+        request.transition_to(if is_video {
+            IngestStatus::Fingerprinting
+        } else {
+            IngestStatus::Storing
+        })?;
         request.error_code = None;
         request.error_message = None;
         request.completed_at = None;
         request.updated_at = OffsetDateTime::now_utc();
         update_ingest_state(&mut transaction, &request).await?;
-        insert_finalize_job(&mut transaction, &request).await?;
+        if is_video {
+            insert_fingerprint_job(&mut transaction, &request, request.force_save).await?;
+        } else {
+            insert_finalize_job(&mut transaction, &request).await?;
+        }
         succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
@@ -447,6 +467,10 @@ impl InboxRepository {
             return Ok(request);
         }
 
+        if normalized_media_kind(&request) == Some(SourceMediaKind::Video) {
+            return Err(InboxRepositoryError::VideoFinalizationNotAllowed);
+        }
+
         let media_id = finalization.media_id;
         request.media_id = Some(media_id);
         let finalization =
@@ -469,14 +493,7 @@ impl InboxRepository {
         .bind(request.updated_at)
         .execute(&mut *transaction)
         .await?;
-        if normalized_media_kind(&request) == Some(SourceMediaKind::Video) {
-            request.transition_to(IngestStatus::Fingerprinting)?;
-            request.completed_at = None;
-            update_ingest_state(&mut transaction, &request).await?;
-            insert_fingerprint_job(&mut transaction, &request).await?;
-        } else {
-            advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
-        }
+        advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
         succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
@@ -489,9 +506,7 @@ impl InboxRepository {
     ) -> Result<IngestFingerprintStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
-        let start = if request.original_input.get("fingerprint").is_some()
-            || !lock_current_job_attempt(&mut transaction, attempt).await?
-        {
+        let start = if !lock_current_job_attempt(&mut transaction, attempt).await? {
             IngestFingerprintStart::AlreadyAdvanced(request)
         } else {
             match request.status {
@@ -512,98 +527,81 @@ impl InboxRepository {
         Ok(start)
     }
 
-    pub async fn complete_ingest_fingerprint(
+    pub async fn complete_video_identity(
         &self,
         id: Uuid,
         attempt: &JobAttempt,
-        fingerprint: Option<Value>,
+        outcome: VideoIdentityOutcome,
     ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
         if request.status != IngestStatus::Fingerprinting
-            || request.original_input.get("fingerprint").is_some()
             || !lock_current_job_attempt(&mut transaction, attempt).await?
         {
             transaction.commit().await?;
             return Ok(request);
         }
 
-        let should_check_similarity = fingerprint.is_some();
-        if let Some(fingerprint) = fingerprint {
-            if let Some(object) = request.original_input.as_object_mut() {
-                object.insert("fingerprint".to_owned(), fingerprint);
-            } else {
-                request.original_input = json!({
-                    "source": request.original_input,
-                    "fingerprint": fingerprint,
-                });
-            }
-        }
-        if should_check_similarity {
-            request.transition_to(IngestStatus::SimilarityCheck)?;
-            request.error_code = None;
-            request.error_message = None;
-            request.completed_at = None;
-            request.updated_at = OffsetDateTime::now_utc();
-            update_ingest_state(&mut transaction, &request).await?;
-            insert_similarity_job(&mut transaction, &request).await?;
-        } else {
-            let media_id =
-                request.media_id.ok_or(InboxRepositoryError::MissingMediaId(request.id))?;
-            advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
-        }
-        succeed_current_job_attempt(&mut transaction, attempt).await?;
-        transaction.commit().await?;
-        Ok(request)
-    }
-
-    pub async fn begin_ingest_similarity(
-        &self,
-        id: Uuid,
-        attempt: &JobAttempt,
-    ) -> Result<IngestSimilarityStart, InboxRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let mut request = load_request(&mut transaction, id).await?;
-        let start = if !lock_current_job_attempt(&mut transaction, attempt).await? {
-            IngestSimilarityStart::AlreadyAdvanced(request)
-        } else {
-            match request.status {
-                IngestStatus::SimilarityCheck => IngestSimilarityStart::Ready(request),
-                IngestStatus::FailedRetryable => {
-                    request.transition_to(IngestStatus::SimilarityCheck)?;
-                    request.error_code = None;
-                    request.error_message = None;
-                    request.completed_at = None;
-                    request.updated_at = OffsetDateTime::now_utc();
-                    update_ingest_state(&mut transaction, &request).await?;
-                    IngestSimilarityStart::Ready(request)
+        match outcome {
+            VideoIdentityOutcome::DuplicatePending { evidence } => {
+                if evidence.matches.len() > MAX_VIDEO_DUPLICATE_MATCHES {
+                    return Err(InboxRepositoryError::DuplicateEvidenceTooManyMatches {
+                        max: MAX_VIDEO_DUPLICATE_MATCHES,
+                    });
                 }
-                _ => IngestSimilarityStart::AlreadyAdvanced(request),
+                let evidence = serde_json::to_value(evidence)?;
+                let encoded = serde_json::to_vec(&evidence)?;
+                if encoded.len() > MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES {
+                    return Err(InboxRepositoryError::DuplicateEvidenceTooLarge {
+                        max: MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES,
+                    });
+                }
+                request.transition_to(IngestStatus::DuplicatePending)?;
+                request.media_id = None;
+                request.duplicate_evidence = Some(evidence);
+                request.error_code = None;
+                request.error_message = None;
+                request.completed_at = None;
             }
-        };
-        transaction.commit().await?;
-        Ok(start)
-    }
-
-    pub async fn complete_ingest_similarity(
-        &self,
-        id: Uuid,
-        attempt: &JobAttempt,
-    ) -> Result<Ingest, InboxRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let mut request = load_request(&mut transaction, id).await?;
-        if request.status != IngestStatus::SimilarityCheck
-            || !lock_current_job_attempt(&mut transaction, attempt).await?
-        {
-            transaction.commit().await?;
-            return Ok(request);
+            VideoIdentityOutcome::ExactDuplicate { media_id }
+            | VideoIdentityOutcome::NewMedia { media_id } => {
+                request.duplicate_evidence = None;
+                advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
+            }
         }
-
-        let media_id = request.media_id.ok_or(InboxRepositoryError::MissingMediaId(request.id))?;
-        advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
+        request.updated_at = OffsetDateTime::now_utc();
+        update_ingest_state(&mut transaction, &request).await?;
         succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
+    }
+
+    pub async fn force_save(&self, id: Uuid) -> Result<ForceSaveResult, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+        let mut resumed = false;
+        match request.status {
+            IngestStatus::DuplicatePending => {
+                request.force_save = true;
+                request.duplicate_evidence = None;
+                request.transition_to(IngestStatus::Normalizing)?;
+                request.error_code = None;
+                request.error_message = None;
+                request.completed_at = None;
+                request.updated_at = OffsetDateTime::now_utc();
+                update_ingest_state(&mut transaction, &request).await?;
+                insert_normalize_job(&mut transaction, &request, true).await?;
+                resumed = true;
+            }
+            IngestStatus::Normalizing
+            | IngestStatus::Fingerprinting
+            | IngestStatus::Storing
+            | IngestStatus::Completed
+                if request.force_save => {}
+            _ => return Err(InboxRepositoryError::ForceSaveNotAllowed(request.status)),
+        }
+        transaction.commit().await?;
+        Ok(ForceSaveResult { ingest: request, resumed })
     }
 
     pub async fn complete_storage_for_media(
@@ -645,28 +643,6 @@ impl InboxRepository {
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected())
-    }
-
-    pub async fn fail_ingest_similarity(
-        &self,
-        id: Uuid,
-        attempt: &JobAttempt,
-        status: IngestStatus,
-        error_code: &str,
-        error_message: &str,
-    ) -> Result<Ingest, InboxRepositoryError> {
-        self.fail_ingest_step(
-            id,
-            status,
-            error_code,
-            error_message,
-            IngestFailureGuard {
-                ignore_completed_download: false,
-                attempt: Some(attempt),
-                expected_status: Some(IngestStatus::SimilarityCheck),
-            },
-        )
-        .await
     }
 
     pub async fn fail_ingest_fingerprint(
@@ -946,9 +922,9 @@ pub enum IngestFingerprintStart {
 }
 
 #[derive(Debug, Clone)]
-pub enum IngestSimilarityStart {
-    Ready(Ingest),
-    AlreadyAdvanced(Ingest),
+pub struct ForceSaveResult {
+    pub ingest: Ingest,
+    pub resumed: bool,
 }
 
 struct IngestFailureGuard<'a> {
@@ -973,10 +949,12 @@ async fn update_ingest_state(
         SET state = $2,
             input_json = $3,
             media_id = $4,
-            error_code = $5,
-            error_message = $6,
-            updated_at = $7,
-            completed_at = $8
+            force_save = $5,
+            duplicate_evidence = $6,
+            error_code = $7,
+            error_message = $8,
+            updated_at = $9,
+            completed_at = $10
         WHERE id = $1
         "#,
     )
@@ -984,6 +962,8 @@ async fn update_ingest_state(
     .bind(request.status.as_str())
     .bind(&request.original_input)
     .bind(request.media_id)
+    .bind(request.force_save)
+    .bind(&request.duplicate_evidence)
     .bind(&request.error_code)
     .bind(&request.error_message)
     .bind(request.updated_at)
@@ -1104,11 +1084,16 @@ async fn insert_storage_job(
 async fn insert_normalize_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request: &Ingest,
+    force_save: bool,
 ) -> Result<(), sqlx::Error> {
     insert_job(
         transaction,
         NewJob::normalize_asset(request.id),
-        format!("ingest:{}:normalize_asset:v1", request.id),
+        format!(
+            "ingest:{}:normalize_asset:v1:{}",
+            request.id,
+            if force_save { "force_save" } else { "initial" }
+        ),
     )
     .await
 }
@@ -1128,23 +1113,16 @@ async fn insert_finalize_job(
 async fn insert_fingerprint_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request: &Ingest,
+    force_save: bool,
 ) -> Result<(), sqlx::Error> {
     insert_job(
         transaction,
         NewJob::compute_fingerprint(request.id),
-        format!("ingest:{}:compute_fingerprint:v1", request.id),
-    )
-    .await
-}
-
-async fn insert_similarity_job(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    request: &Ingest,
-) -> Result<(), sqlx::Error> {
-    insert_job(
-        transaction,
-        NewJob::check_similarity(request.id),
-        format!("ingest:{}:check_similarity:v1", request.id),
+        format!(
+            "ingest:{}:compute_fingerprint:v2:{}",
+            request.id,
+            if force_save { "force_save" } else { "initial" }
+        ),
     )
     .await
 }
@@ -1317,7 +1295,8 @@ async fn load_request(
         r#"
         SELECT id, input_kind, state, submitted_via, input_json, source_url, page_url,
                page_title, supplied_caption, supplied_tags, input_key, media_id,
-               error_code, error_message, created_at, updated_at, completed_at
+               force_save, duplicate_evidence, error_code, error_message,
+               created_at, updated_at, completed_at
         FROM ingests
         WHERE id = $1
         FOR UPDATE
@@ -1402,6 +1381,8 @@ struct IngestRow {
     supplied_tags: Vec<String>,
     input_key: String,
     media_id: Option<Uuid>,
+    force_save: bool,
+    duplicate_evidence: Option<serde_json::Value>,
     error_code: Option<String>,
     error_message: Option<String>,
     created_at: OffsetDateTime,
@@ -1428,6 +1409,8 @@ impl IngestRow {
             supplied_tags: self.supplied_tags,
             idempotency_key: Some(self.input_key),
             media_id: self.media_id,
+            force_save: self.force_save,
+            duplicate_evidence: self.duplicate_evidence,
             error_code: self.error_code,
             error_message: self.error_message,
             created_at: self.created_at,
@@ -1463,10 +1446,20 @@ pub enum InboxRepositoryError {
     UnknownSubmittedVia(String),
     #[error("invalid ingest failure status: {0:?}")]
     InvalidFailureStatus(IngestStatus),
+    #[error("force-save is not allowed while ingest is in {0:?}")]
+    ForceSaveNotAllowed(IngestStatus),
+    #[error("video ingests must complete the identity gate before storage finalization")]
+    VideoFinalizationNotAllowed,
+    #[error("duplicate evidence exceeds the {max}-byte limit")]
+    DuplicateEvidenceTooLarge { max: usize },
+    #[error("duplicate evidence contains more than {max} matches")]
+    DuplicateEvidenceTooManyMatches { max: usize },
     #[error("invalid ingest state transition: {0}")]
     InvalidStateTransition(#[from] IngestStateError),
     #[error("job lease was lost before ingest completion could be committed")]
     JobLeaseLost,
     #[error("database operation failed: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("serialization operation failed: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
