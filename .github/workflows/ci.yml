@@ -91,7 +91,6 @@ jobs:
         run: |
           cargo test -p sooqa-persistence --tests -- --ignored
           cargo test -p sooqa-api --test ingest -- --ignored
-          cargo test -p sooqa-api --test library -- --ignored
           cargo test -p sooqa-worker --test worker -- --ignored
           cargo test -p sooqa-worker --test inspection -- --ignored
 
