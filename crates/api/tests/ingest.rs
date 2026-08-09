@@ -25,7 +25,7 @@ async fn app() -> (Database, axum::Router) {
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn api_authenticates_with_the_single_configured_bearer_secret() {
-    let (_database, app) = app().await;
+    let (database, app) = app().await;
     let response = app
         .clone()
         .oneshot(
@@ -53,6 +53,22 @@ async fn api_authenticates_with_the_single_configured_bearer_secret() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let ingest_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM ingests WHERE input_key = $1")
+        .bind("api-test-key")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
+        .bind(ingest_id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(ingest_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
