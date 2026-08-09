@@ -1,2592 +1,38 @@
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use sooqa_jobs::NewJob;
 use sooqa_library::{
-    AssetRole, ContentItem, ContentItemUpdate, DuplicateCandidate, DuplicateCandidateAction,
-    DuplicateCandidateEvent, DuplicateCandidateStatus, ExactDuplicateRequest,
-    ExactDuplicateResolution, LibraryCursor, LibraryItemDetail, LibraryItemSummary,
-    LibrarySearchPage, LibrarySearchQuery, MediaAsset, MediaKind, NewContentItem,
-    NewDuplicateCandidate, NewMediaAsset, NewSourceRecord, NewSourceRecordDraft, NewStorageObject,
-    NewTag, SourceRecord, StorageObject, StorageUploadAttachment, StorageUploadIntent,
+    Media, MediaCursor, MediaDetails, MediaIngest, MediaKind, MediaMetadata, MediaPage,
+    MediaSearchQuery, MediaSource, MediaSourceInput, MediaStatus, MediaStorageState, MediaSummary,
+    MediaUpdate, NewTag, SourceKind, StorageReceipt, StorageUploadAttachment, StorageUploadInfo,
     StorageUploadReservation, StorageUploadReservationRequest, StorageUploadStore, Tag,
 };
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+pub use sooqa_library::StoredVideoFingerprint;
 
 #[derive(Clone)]
 pub struct LibraryRepository {
     pool: PgPool,
 }
 
-#[derive(Debug, Clone)]
-pub struct StoredVideoFingerprint {
-    pub content_item_id: Uuid,
-    pub width: Option<i32>,
-    pub height: Option<i32>,
-    pub audio_codec: Option<String>,
-    pub fingerprint: Value,
-}
-
-impl LibraryRepository {
-    pub(crate) fn new(pool: PgPool) -> Self {
-        Self { pool }
-    }
-
-    pub async fn list_stored_video_fingerprints(
-        &self,
-        exclude_content_item_id: Uuid,
-        algorithm_version: &str,
-    ) -> Result<Vec<StoredVideoFingerprint>, LibraryRepositoryError> {
-        let rows = sqlx::query_as::<_, StoredVideoFingerprintRow>(
-            r#"
-            SELECT DISTINCT ON (ci.id)
-                ci.id AS content_item_id,
-                ma.width,
-                ma.height,
-                ma.audio_codec,
-                ir.original_input->'fingerprint' AS fingerprint
-            FROM content_items ci
-            JOIN media_assets ma
-              ON ma.id = ci.canonical_asset_id
-             AND ma.role = 'canonical'
-             AND ma.media_kind = 'video'
-            JOIN source_records sr ON sr.content_item_id = ci.id
-            JOIN ingest_requests ir ON ir.id = sr.ingest_request_id
-            WHERE ci.kind = 'video'
-              AND ci.id <> $1
-              AND ir.status = 'completed'
-              AND ir.original_input->'fingerprint'->>'version' = $2
-            ORDER BY ci.id, ir.updated_at DESC, sr.retrieved_at DESC
-            "#,
-        )
-        .bind(exclude_content_item_id)
-        .bind(algorithm_version)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(StoredVideoFingerprintRow::into_stored).collect())
-    }
-
-    pub async fn list_storage_upload_intents(
-        &self,
-    ) -> Result<Vec<StorageUploadIntent>, LibraryRepositoryError> {
-        let rows = sqlx::query_as::<_, StorageUploadIntentListingRow>(
-            r#"
-            SELECT id, idempotency_key, response_body, resource_id, created_at,
-                   storage_asset_id, storage_job_id, storage_generation,
-                   storage_provider, storage_chat_id, reservation_expires_at
-            FROM idempotency_records
-            WHERE scope = $1
-            ORDER BY created_at ASC, id ASC
-            "#,
-        )
-        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(StorageUploadIntentListingRow::into_intent).collect()
-    }
-
-    pub async fn mark_storage_upload_intent_unknown(
-        &self,
-        intent_id: Uuid,
-        force: bool,
-    ) -> Result<(), LibraryRepositoryError> {
-        let updated = sqlx::query(
-            r#"
-            UPDATE idempotency_records
-            SET response_body = '{"state":"unknown"}'::jsonb,
-                reservation_owner = NULL,
-                reservation_expires_at = NULL
-            WHERE id = $1
-              AND scope = $2
-              AND resource_id IS NULL
-              AND (
-                  response_body->>'state' = 'unknown'
-                  OR (
-                      response_body->>'state' = 'pending'
-                      AND ($3 OR reservation_expires_at IS NULL OR reservation_expires_at <= now())
-                  )
-              )
-            "#,
-        )
-        .bind(intent_id)
-        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
-        .bind(force)
-        .execute(&self.pool)
-        .await?;
-        if updated.rows_affected() != 1 {
-            return Err(LibraryRepositoryError::StorageUploadIntentMissing(intent_id));
-        }
-        Ok(())
-    }
-
-    pub async fn reset_storage_upload_intent(
-        &self,
-        intent_id: Uuid,
-    ) -> Result<(), LibraryRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let intent = sqlx::query_as::<_, StorageUploadRecoveryRow>(
-            r#"
-            SELECT storage_asset_id, storage_job_id, storage_generation,
-                   storage_provider, response_body, reservation_expires_at
-            FROM idempotency_records
-            WHERE id = $1 AND scope = $2 AND resource_id IS NULL
-            FOR UPDATE
-            "#,
-        )
-        .bind(intent_id)
-        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(LibraryRepositoryError::StorageUploadIntentMissing(intent_id))?;
-
-        let state = intent.state();
-        let expired = intent
-            .reservation_expires_at
-            .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc());
-        if state != Some("unknown") && !(state == Some("pending") && expired) {
-            return Err(LibraryRepositoryError::StorageUploadIntentActive(intent_id));
-        }
-
-        let asset_id = intent
-            .storage_asset_id
-            .ok_or(LibraryRepositoryError::StorageUploadAssetMissing(intent_id))?;
-        if intent.storage_provider.is_none() {
-            return Err(LibraryRepositoryError::StorageUploadProviderMissing(intent_id));
-        }
-        let generation = intent
-            .storage_generation
-            .checked_add(1)
-            .ok_or(LibraryRepositoryError::StorageUploadGenerationOverflow(intent_id))?;
-
-        if let Some(job_id) = intent.storage_job_id {
-            let job = sqlx::query_as::<_, RecoveryJobRow>(
-                "SELECT status, lease_expires_at FROM jobs WHERE id = $1 FOR UPDATE",
-            )
-            .bind(job_id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(LibraryRepositoryError::StorageUploadJobMissing(job_id))?;
-            if job.status == "running"
-                && job
-                    .lease_expires_at
-                    .is_some_and(|expires_at| expires_at > OffsetDateTime::now_utc())
-            {
-                return Err(LibraryRepositoryError::StorageUploadJobActive(job_id));
-            }
-            if matches!(job.status.as_str(), "queued" | "retry_wait" | "running") {
-                sqlx::query(
-                    r#"
-                    UPDATE jobs
-                    SET status = 'cancelled', lease_owner = NULL,
-                        lease_expires_at = NULL, last_heartbeat_at = NULL,
-                        completed_at = now(), updated_at = now(),
-                        last_error_class = 'storage_intent_reset',
-                        last_error_message = 'superseded by storage intent reset'
-                    WHERE id = $1
-                    "#,
-                )
-                .bind(job_id)
-                .execute(&mut *transaction)
-                .await?;
-                sqlx::query(
-                    r#"
-                    UPDATE job_attempts
-                    SET status = 'cancelled', finished_at = now(),
-                        error_class = 'storage_intent_reset',
-                        error_message = 'superseded by storage intent reset'
-                    WHERE job_id = $1 AND status = 'running'
-                    "#,
-                )
-                .bind(job_id)
-                .execute(&mut *transaction)
-                .await?;
-            }
-        }
-
-        let idempotency_key = storage_upload_job_key(asset_id, generation);
-        let new_job = NewJob::upload_storage_asset_generation(asset_id, generation)
-            .idempotency_key(idempotency_key.clone());
-        let new_job_id: Uuid = sqlx::query_scalar(
-            r#"
-            INSERT INTO jobs (job_type, payload_json, idempotency_key)
-            VALUES ($1, $2, $3)
-            RETURNING id
-            "#,
-        )
-        .bind(new_job.job_type().as_str())
-        .bind(new_job.payload_json())
-        .bind(new_job.idempotency_key_value())
-        .fetch_one(&mut *transaction)
-        .await?;
-
-        let updated = sqlx::query(
-            r#"
-            UPDATE idempotency_records
-            SET idempotency_key = $2,
-                storage_job_id = $3,
-                storage_generation = $4,
-                response_status = NULL,
-                response_body = '{"state":"queued"}'::jsonb,
-                resource_id = NULL,
-                reservation_owner = NULL,
-                reservation_expires_at = NULL
-            WHERE id = $1 AND scope = $5 AND resource_id IS NULL
-            "#,
-        )
-        .bind(intent_id)
-        .bind(&idempotency_key)
-        .bind(new_job_id)
-        .bind(generation)
-        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
-        .execute(&mut *transaction)
-        .await?;
-        if updated.rows_affected() != 1 {
-            return Err(LibraryRepositoryError::StorageUploadIntentMissing(intent_id));
-        }
-        transaction.commit().await?;
-        Ok(())
-    }
-
-    pub async fn attach_storage_upload(
-        &self,
-        intent_id: Uuid,
-        attachment: StorageUploadAttachment,
-    ) -> Result<StorageObject, LibraryRepositoryError> {
-        let attachment = validate_storage_upload_attachment(attachment)?;
-        let mut transaction = self.pool.begin().await?;
-        let intent = sqlx::query_as::<_, StorageUploadAttachmentRow>(
-            r#"
-            SELECT storage_asset_id, storage_provider, storage_chat_id,
-                   request_hash, response_body
-            FROM idempotency_records
-            WHERE id = $1 AND scope = $2 AND resource_id IS NULL
-            FOR UPDATE
-            "#,
-        )
-        .bind(intent_id)
-        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(LibraryRepositoryError::StorageUploadIntentMissing(intent_id))?;
-        if intent.state() != Some("unknown") {
-            return Err(LibraryRepositoryError::StorageUploadIntentNotUnknown(intent_id));
-        }
-        let asset_id = intent
-            .storage_asset_id
-            .ok_or(LibraryRepositoryError::StorageUploadAssetMissing(intent_id))?;
-        let provider = intent
-            .storage_provider
-            .clone()
-            .ok_or(LibraryRepositoryError::StorageUploadProviderMissing(intent_id))?;
-        if intent.storage_chat_id != Some(attachment.storage_chat_id) {
-            return Err(LibraryRepositoryError::StorageUploadChatMismatch { intent_id });
-        }
-        let (canonical_asset_id, media_kind, role, sha256): (
-            Uuid,
-            String,
-            String,
-            Option<Vec<u8>>,
-        ) = sqlx::query_as(
-            "SELECT id, media_kind, role, sha256 FROM media_assets WHERE id = $1 FOR UPDATE",
-        )
-        .bind(asset_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(LibraryRepositoryError::ResourceMissing(asset_id))?;
-        if role != AssetRole::Canonical.as_str() {
-            return Err(LibraryRepositoryError::StorageUploadAssetNotCanonical(asset_id));
-        }
-        if sha256.as_deref() != Some(intent.request_hash.as_slice()) {
-            return Err(LibraryRepositoryError::StorageUploadAssetHashMismatch(asset_id));
-        }
-        let media_kind = MediaKind::try_from(media_kind.as_str())
-            .map_err(LibraryRepositoryError::UnknownMediaKind)?;
-        let object = NewStorageObject {
-            asset_id: canonical_asset_id,
-            provider,
-            storage_chat_id: attachment.storage_chat_id,
-            storage_message_id: attachment.storage_message_id,
-            telegram_file_id: attachment.telegram_file_id,
-            telegram_file_unique_id: attachment.telegram_file_unique_id,
-            media_kind,
-        };
-        let storage_object = insert_storage_object(&mut transaction, &object).await?;
-        let updated = sqlx::query(
-            r#"
-            UPDATE idempotency_records
-            SET resource_id = $2,
-                response_status = $3,
-                response_body = $4,
-                reservation_owner = NULL,
-                reservation_expires_at = NULL
-            WHERE id = $1
-              AND scope = $5
-              AND resource_id IS NULL
-              AND response_body->>'state' = 'unknown'
-            "#,
-        )
-        .bind(intent_id)
-        .bind(storage_object.id)
-        .bind(STORAGE_UPLOAD_COMPLETED_STATUS)
-        .bind(json!({ "id": storage_object.id, "status": storage_object.status.as_str() }))
-        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
-        .execute(&mut *transaction)
-        .await?;
-        if updated.rows_affected() != 1 {
-            return Err(LibraryRepositoryError::StorageUploadIntentMissing(intent_id));
-        }
-        let updated_asset =
-            sqlx::query("UPDATE media_assets SET storage_state = 'uploaded' WHERE id = $1")
-                .bind(canonical_asset_id)
-                .execute(&mut *transaction)
-                .await?;
-        if updated_asset.rows_affected() != 1 {
-            return Err(LibraryRepositoryError::ResourceMissing(canonical_asset_id));
-        }
-        transaction.commit().await?;
-        Ok(storage_object)
-    }
-
-    pub async fn upsert_duplicate_candidate(
-        &self,
-        candidate: NewDuplicateCandidate,
-    ) -> Result<DuplicateCandidate, LibraryRepositoryError> {
-        let candidate = NewDuplicateCandidate::try_new(
-            candidate.left_content_item_id,
-            candidate.right_content_item_id,
-            candidate.algorithm_version,
-            candidate.score_basis_points,
-            candidate.evidence_json,
-        )?;
-        let row = sqlx::query_as::<_, DuplicateCandidateRow>(
-            r#"
-            INSERT INTO duplicate_candidates (
-                left_content_item_id, right_content_item_id, algorithm_version,
-                score_basis_points, evidence_json
-            )
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (left_content_item_id, right_content_item_id, algorithm_version)
-            DO UPDATE SET
-                score_basis_points = EXCLUDED.score_basis_points,
-                evidence_json = EXCLUDED.evidence_json,
-                updated_at = now()
-            RETURNING
-                id, left_content_item_id, right_content_item_id, algorithm_version,
-                score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
-            "#,
-        )
-        .bind(candidate.left_content_item_id)
-        .bind(candidate.right_content_item_id)
-        .bind(&candidate.algorithm_version)
-        .bind(i16::try_from(candidate.score_basis_points).map_err(|_| {
-            LibraryRepositoryError::Invariant("duplicate candidate score did not fit smallint")
-        })?)
-        .bind(candidate.evidence_json)
-        .fetch_one(&self.pool)
-        .await?;
-        row.into_duplicate_candidate()
-    }
-
-    pub async fn find_duplicate_candidate(
-        &self,
-        left_content_item_id: Uuid,
-        right_content_item_id: Uuid,
-        algorithm_version: &str,
-    ) -> Result<Option<DuplicateCandidate>, LibraryRepositoryError> {
-        let candidate = NewDuplicateCandidate::try_new(
-            left_content_item_id,
-            right_content_item_id,
-            algorithm_version,
-            0,
-            Value::Null,
-        )?;
-        let row = sqlx::query_as::<_, DuplicateCandidateRow>(
-            r#"
-            SELECT
-                id, left_content_item_id, right_content_item_id, algorithm_version,
-                score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
-            FROM duplicate_candidates
-            WHERE left_content_item_id = $1
-              AND right_content_item_id = $2
-              AND algorithm_version = $3
-            "#,
-        )
-        .bind(candidate.left_content_item_id)
-        .bind(candidate.right_content_item_id)
-        .bind(candidate.algorithm_version)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(DuplicateCandidateRow::into_duplicate_candidate).transpose()
-    }
-
-    pub async fn find_duplicate_candidate_by_id(
-        &self,
-        candidate_id: Uuid,
-    ) -> Result<Option<DuplicateCandidate>, LibraryRepositoryError> {
-        let row = sqlx::query_as::<_, DuplicateCandidateRow>(
-            r#"
-            SELECT
-                id, left_content_item_id, right_content_item_id, algorithm_version,
-                score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
-            FROM duplicate_candidates
-            WHERE id = $1
-            "#,
-        )
-        .bind(candidate_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(DuplicateCandidateRow::into_duplicate_candidate).transpose()
-    }
-
-    pub async fn list_duplicate_candidates(
-        &self,
-        status: Option<DuplicateCandidateStatus>,
-        limit: u32,
-    ) -> Result<Vec<DuplicateCandidate>, LibraryRepositoryError> {
-        if !(1..=100).contains(&limit) {
-            return Err(LibraryRepositoryError::InvalidLimit { value: limit });
-        }
-        let rows = if let Some(status) = status {
-            sqlx::query_as::<_, DuplicateCandidateRow>(
-                r#"
-                SELECT
-                    id, left_content_item_id, right_content_item_id, algorithm_version,
-                    score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
-                FROM duplicate_candidates
-                WHERE status = $1
-                ORDER BY score_basis_points DESC, updated_at DESC, id
-                LIMIT $2
-                "#,
-            )
-            .bind(status.as_str())
-            .bind(i64::from(limit))
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as::<_, DuplicateCandidateRow>(
-                r#"
-                SELECT
-                    id, left_content_item_id, right_content_item_id, algorithm_version,
-                    score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
-                FROM duplicate_candidates
-                ORDER BY score_basis_points DESC, updated_at DESC, id
-                LIMIT $1
-                "#,
-            )
-            .bind(i64::from(limit))
-            .fetch_all(&self.pool)
-            .await?
-        };
-        rows.into_iter().map(DuplicateCandidateRow::into_duplicate_candidate).collect()
-    }
-
-    pub async fn decide_duplicate_candidate(
-        &self,
-        candidate_id: Uuid,
-        action: DuplicateCandidateAction,
-        actor_device_token_id: Uuid,
-        idempotency_key: &str,
-    ) -> Result<DuplicateCandidate, LibraryRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let current = sqlx::query_as::<_, DuplicateCandidateRow>(
-            r#"
-            SELECT
-                id, left_content_item_id, right_content_item_id, algorithm_version,
-                score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
-            FROM duplicate_candidates
-            WHERE id = $1
-            FOR UPDATE
-            "#,
-        )
-        .bind(candidate_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(LibraryRepositoryError::DuplicateCandidateMissing(candidate_id))?;
-        let current_status = DuplicateCandidateStatus::try_from(current.status.as_str())
-            .map_err(|_| LibraryRepositoryError::Invariant("unknown duplicate candidate status"))?;
-        if let Some(existing_action) = sqlx::query_scalar::<_, String>(
-            r#"
-            SELECT action
-            FROM duplicate_candidate_events
-            WHERE candidate_id = $1
-              AND actor_device_token_id = $2
-              AND idempotency_key = $3
-            "#,
-        )
-        .bind(candidate_id)
-        .bind(actor_device_token_id)
-        .bind(idempotency_key)
-        .fetch_optional(&mut *transaction)
-        .await?
-        {
-            if existing_action == action.as_str() {
-                transaction.commit().await?;
-                return current.into_duplicate_candidate();
-            }
-            return Err(LibraryRepositoryError::DuplicateCandidateIdempotencyConflict(
-                candidate_id,
-            ));
-        }
-        if current_status != DuplicateCandidateStatus::Pending {
-            return Err(LibraryRepositoryError::InvalidCandidateState {
-                id: candidate_id,
-                status: current_status,
-            });
-        }
-        let updated = sqlx::query_as::<_, DuplicateCandidateRow>(
-            r#"
-            UPDATE duplicate_candidates
-            SET status = $2, resolved_at = now(), updated_at = now()
-            WHERE id = $1
-            RETURNING
-                id, left_content_item_id, right_content_item_id, algorithm_version,
-                score_basis_points, evidence_json, status, created_at, updated_at, resolved_at
-            "#,
-        )
-        .bind(candidate_id)
-        .bind(action.resulting_status().as_str())
-        .fetch_one(&mut *transaction)
-        .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO duplicate_candidate_events
-                (candidate_id, action, actor_device_token_id, idempotency_key)
-            VALUES ($1, $2, $3, $4)
-            "#,
-        )
-        .bind(candidate_id)
-        .bind(action.as_str())
-        .bind(actor_device_token_id)
-        .bind(idempotency_key)
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-        updated.into_duplicate_candidate()
-    }
-
-    pub async fn list_duplicate_candidate_events(
-        &self,
-        candidate_id: Uuid,
-    ) -> Result<Vec<DuplicateCandidateEvent>, LibraryRepositoryError> {
-        let rows = sqlx::query_as::<_, DuplicateCandidateEventRow>(
-            r#"
-            SELECT id, candidate_id, action, actor_device_token_id, created_at
-            FROM duplicate_candidate_events
-            WHERE candidate_id = $1
-            ORDER BY created_at ASC, id ASC
-            "#,
-        )
-        .bind(candidate_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(DuplicateCandidateEventRow::into_duplicate_candidate_event).collect()
-    }
-
-    pub async fn resolve_exact_duplicate(
-        &self,
-        request: ExactDuplicateRequest,
-    ) -> Result<ExactDuplicateResolution, LibraryRepositoryError> {
-        validate_exact_duplicate_request(&request)?;
-        let mut transaction = self.pool.begin().await?;
-
-        if let Some(source_record) =
-            find_source_by_identity(&mut transaction, &request.source).await?
-        {
-            let (content_item, canonical_asset) =
-                load_resolution_for_content(&mut transaction, source_record.content_item_id, None)
-                    .await?;
-            transaction.commit().await?;
-            return Ok(ExactDuplicateResolution {
-                content_item,
-                canonical_asset,
-                source_record,
-                content_created: false,
-                source_created: false,
-            });
-        }
-
-        if let Some(asset) = find_canonical_asset_by_sha256(
-            &mut transaction,
-            request.asset.sha256.as_deref().expect("validated SHA-256 must exist"),
-        )
-        .await?
-        {
-            let (content_item, canonical_asset) =
-                load_resolution_for_content(&mut transaction, asset.content_item_id, Some(asset))
-                    .await?;
-            let (source_record, source_created) =
-                insert_source_or_find_existing(&mut transaction, content_item.id, &request.source)
-                    .await?;
-
-            if source_record.content_item_id == content_item.id {
-                transaction.commit().await?;
-                return Ok(ExactDuplicateResolution {
-                    content_item,
-                    canonical_asset,
-                    source_record,
-                    content_created: false,
-                    source_created,
-                });
-            }
-
-            let (content_item, canonical_asset) =
-                load_resolution_for_content(&mut transaction, source_record.content_item_id, None)
-                    .await?;
-            transaction.commit().await?;
-            return Ok(ExactDuplicateResolution {
-                content_item,
-                canonical_asset,
-                source_record,
-                content_created: false,
-                source_created: false,
-            });
-        }
-
-        let content_row =
-            insert_content_item_in_transaction(&mut transaction, &request.content_item).await?;
-        let content_item = content_row.into_content_item()?;
-        let asset_row = insert_canonical_asset_in_transaction(
-            &mut transaction,
-            content_item.id,
-            &request.asset,
-        )
-        .await?;
-
-        let Some(asset_row) = asset_row else {
-            let asset = find_canonical_asset_by_sha256(
-                &mut transaction,
-                request.asset.sha256.as_deref().expect("validated SHA-256 must exist"),
-            )
-            .await?
-            .ok_or(LibraryRepositoryError::Invariant(
-                "canonical asset conflict had no matching asset",
-            ))?;
-            let (existing_content, canonical_asset) =
-                load_resolution_for_content(&mut transaction, asset.content_item_id, Some(asset))
-                    .await?;
-            let (source_record, source_created) = insert_source_or_find_existing(
-                &mut transaction,
-                existing_content.id,
-                &request.source,
-            )
-            .await?;
-            delete_uncommitted_content(&mut transaction, content_item.id).await?;
-
-            if source_record.content_item_id == existing_content.id {
-                transaction.commit().await?;
-                return Ok(ExactDuplicateResolution {
-                    content_item: existing_content,
-                    canonical_asset,
-                    source_record,
-                    content_created: false,
-                    source_created,
-                });
-            }
-
-            let (content_item, canonical_asset) =
-                load_resolution_for_content(&mut transaction, source_record.content_item_id, None)
-                    .await?;
-            transaction.commit().await?;
-            return Ok(ExactDuplicateResolution {
-                content_item,
-                canonical_asset,
-                source_record,
-                content_created: false,
-                source_created: false,
-            });
-        };
-
-        let asset = asset_row.into_media_asset()?;
-        let content_item =
-            set_canonical_asset_in_transaction(&mut transaction, content_item.id, asset.id)
-                .await?
-                .into_content_item()?;
-        let Some(source_record) =
-            insert_source_in_transaction(&mut transaction, content_item.id, &request.source)
-                .await?
-        else {
-            let source_record = find_source_by_identity(&mut transaction, &request.source)
-                .await?
-                .ok_or(LibraryRepositoryError::Invariant(
-                "source conflict had no matching source record",
-            ))?;
-            let (existing_content, canonical_asset) =
-                load_resolution_for_content(&mut transaction, source_record.content_item_id, None)
-                    .await?;
-            delete_uncommitted_content(&mut transaction, content_item.id).await?;
-            transaction.commit().await?;
-            return Ok(ExactDuplicateResolution {
-                content_item: existing_content,
-                canonical_asset,
-                source_record,
-                content_created: false,
-                source_created: false,
-            });
-        };
-
-        transaction.commit().await?;
-        Ok(ExactDuplicateResolution {
-            content_item,
-            canonical_asset: asset,
-            source_record,
-            content_created: true,
-            source_created: true,
-        })
-    }
-
-    pub async fn find_library_item(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<LibraryItemDetail>, LibraryRepositoryError> {
-        let Some(content_item) = self.find_content_item(id).await? else {
-            return Ok(None);
-        };
-        let canonical_asset = self.load_canonical_asset(&content_item).await?;
-        let tags = self.list_tags(id).await?;
-        let sources = self.list_source_records(id).await?;
-        Ok(Some(LibraryItemDetail { content_item, canonical_asset, tags, sources }))
-    }
-
-    pub async fn search_library(
-        &self,
-        query: LibrarySearchQuery,
-    ) -> Result<LibrarySearchPage, LibraryRepositoryError> {
-        if !(1..=100).contains(&query.limit) {
-            return Err(LibraryRepositoryError::InvalidLimit { value: query.limit });
-        }
-
-        let tags = (!query.tags.is_empty()).then_some(query.tags);
-        let rows = sqlx::query_as::<_, ContentItemRow>(
-            r#"
-            SELECT
-                ci.id, ci.kind, ci.status, ci.canonical_asset_id, ci.preferred_title,
-                ci.editorial_description, ci.notes, ci.created_at, ci.updated_at,
-                ci.archived_at
-            FROM content_items ci
-            WHERE ($1::text IS NULL OR (
-                    ci.preferred_title ILIKE '%' || $1 || '%'
-                    OR ci.editorial_description ILIKE '%' || $1 || '%'
-                    OR ci.notes ILIKE '%' || $1 || '%'
-                    OR EXISTS (
-                        SELECT 1
-                        FROM source_records sr
-                        WHERE sr.content_item_id = ci.id
-                          AND (sr.source_title ILIKE '%' || $1 || '%'
-                               OR sr.source_description ILIKE '%' || $1 || '%')
-                    )
-                    OR EXISTS (
-                        SELECT 1
-                        FROM content_item_tags cit_search
-                        INNER JOIN tags t_search ON t_search.id = cit_search.tag_id
-                        WHERE cit_search.content_item_id = ci.id
-                          AND t_search.normalized_name ILIKE '%' || $1 || '%'
-                    )
-                ))
-              AND ($2::text IS NULL OR ci.kind = $2)
-              AND ($3::text IS NULL OR ci.status = $3)
-              AND (
-                    $4::text[] IS NULL
-                    OR ci.id IN (
-                        SELECT cit_filter.content_item_id
-                        FROM content_item_tags cit_filter
-                        INNER JOIN tags t_filter ON t_filter.id = cit_filter.tag_id
-                        WHERE t_filter.normalized_name = ANY($4)
-                        GROUP BY cit_filter.content_item_id
-                        HAVING count(DISTINCT t_filter.normalized_name) = cardinality($4)
-                    )
-                )
-              AND ($5::timestamptz IS NULL OR ci.updated_at < $5
-                   OR (ci.updated_at = $5 AND ci.id < $6))
-            ORDER BY ci.updated_at DESC, ci.id DESC
-            LIMIT $7
-            "#,
-        )
-        .bind(query.text.as_deref())
-        .bind(query.kind.map(|kind| kind.as_str()))
-        .bind(query.status.map(|status| status.as_str()))
-        .bind(tags)
-        .bind(query.cursor.as_ref().map(|cursor| cursor.updated_at))
-        .bind(query.cursor.as_ref().map(|cursor| cursor.id))
-        .bind(i64::from(query.limit) + 1)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let has_more = rows.len() > query.limit as usize;
-        let rows = rows.into_iter().take(query.limit as usize).collect::<Vec<_>>();
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows {
-            let content_item = row.into_content_item()?;
-            let canonical_asset = self.load_canonical_asset(&content_item).await?;
-            let tags = self.list_tags(content_item.id).await?;
-            let source_count = sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM source_records WHERE content_item_id = $1",
-            )
-            .bind(content_item.id)
-            .fetch_one(&self.pool)
-            .await?;
-            let source_count = u64::try_from(source_count)
-                .map_err(|_| LibraryRepositoryError::InvalidNumber { field: "source_count" })?;
-            items.push(LibraryItemSummary { content_item, canonical_asset, tags, source_count });
-        }
-
-        let next_cursor = has_more
-            .then(|| {
-                items.last().map(|item| LibraryCursor {
-                    updated_at: item.content_item.updated_at,
-                    id: item.content_item.id,
-                })
-            })
-            .flatten();
-        Ok(LibrarySearchPage { items, next_cursor })
-    }
-
-    pub async fn update_content_item(
-        &self,
-        id: Uuid,
-        update: ContentItemUpdate,
-    ) -> Result<ContentItem, LibraryRepositoryError> {
-        if update.preferred_title.is_none()
-            && update.editorial_description.is_none()
-            && update.notes.is_none()
-        {
-            return Err(LibraryRepositoryError::EmptyUpdate);
-        }
-
-        let row = sqlx::query_as::<_, ContentItemRow>(
-            r#"
-            UPDATE content_items
-            SET preferred_title = CASE WHEN $2 THEN $3 ELSE preferred_title END,
-                editorial_description = CASE WHEN $4 THEN $5 ELSE editorial_description END,
-                notes = CASE WHEN $6 THEN $7 ELSE notes END,
-                updated_at = now()
-            WHERE id = $1
-              AND ($8::timestamptz IS NULL OR updated_at = $8)
-            RETURNING
-                id, kind, status, canonical_asset_id, preferred_title,
-                editorial_description, notes, created_at, updated_at, archived_at
-            "#,
-        )
-        .bind(id)
-        .bind(update.preferred_title.is_some())
-        .bind(update.preferred_title.as_ref().and_then(|value| value.as_deref()))
-        .bind(update.editorial_description.is_some())
-        .bind(update.editorial_description.as_ref().and_then(|value| value.as_deref()))
-        .bind(update.notes.is_some())
-        .bind(update.notes.as_ref().and_then(|value| value.as_deref()))
-        .bind(update.expected_updated_at)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(row) = row {
-            return row.into_content_item();
-        }
-        if self.find_content_item(id).await?.is_none() {
-            return Err(LibraryRepositoryError::ResourceMissing(id));
-        }
-        Err(LibraryRepositoryError::OptimisticConflict(id))
-    }
-
-    pub async fn archive_content_item(
-        &self,
-        id: Uuid,
-    ) -> Result<ContentItem, LibraryRepositoryError> {
-        let row = sqlx::query_as::<_, ContentItemRow>(
-            r#"
-            UPDATE content_items
-            SET status = 'archived', archived_at = COALESCE(archived_at, now()), updated_at = now()
-            WHERE id = $1 AND status <> 'deleted'
-            RETURNING
-                id, kind, status, canonical_asset_id, preferred_title,
-                editorial_description, notes, created_at, updated_at, archived_at
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(row) = row {
-            return row.into_content_item();
-        }
-        if self.find_content_item(id).await?.is_none() {
-            return Err(LibraryRepositoryError::ResourceMissing(id));
-        }
-        Err(LibraryRepositoryError::InvalidState { id, operation: "archive" })
-    }
-
-    pub async fn add_tag(
-        &self,
-        content_item_id: Uuid,
-        tag: NewTag,
-    ) -> Result<Tag, LibraryRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let content_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_items WHERE id = $1)")
-                .bind(content_item_id)
-                .fetch_one(&mut *transaction)
-                .await?;
-        if !content_exists {
-            return Err(LibraryRepositoryError::ResourceMissing(content_item_id));
-        }
-
-        let tag_row = upsert_tag_in_transaction(&mut transaction, tag).await?;
-        sqlx::query(
-            r#"
-            INSERT INTO content_item_tags (content_item_id, tag_id)
-            VALUES ($1, $2)
-            ON CONFLICT (content_item_id, tag_id) DO NOTHING
-            "#,
-        )
-        .bind(content_item_id)
-        .bind(tag_row.id)
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-        Ok(tag_row.into_tag())
-    }
-
-    pub async fn remove_tag(
-        &self,
-        content_item_id: Uuid,
-        normalized_name: &str,
-    ) -> Result<(), LibraryRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let content_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_items WHERE id = $1)")
-                .bind(content_item_id)
-                .fetch_one(&mut *transaction)
-                .await?;
-        if !content_exists {
-            return Err(LibraryRepositoryError::ResourceMissing(content_item_id));
-        }
-
-        let result = sqlx::query(
-            r#"
-            DELETE FROM content_item_tags
-            WHERE content_item_id = $1
-              AND tag_id = (SELECT id FROM tags WHERE normalized_name = $2)
-            "#,
-        )
-        .bind(content_item_id)
-        .bind(normalized_name)
-        .execute(&mut *transaction)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(LibraryRepositoryError::TagNotAttached);
-        }
-        transaction.commit().await?;
-        Ok(())
-    }
-
-    async fn load_canonical_asset(
-        &self,
-        content_item: &ContentItem,
-    ) -> Result<Option<MediaAsset>, LibraryRepositoryError> {
-        match content_item.canonical_asset_id {
-            Some(id) => self.find_media_asset(id).await,
-            None => Ok(None),
-        }
-    }
-
-    pub async fn create_content_item(
-        &self,
-        new_item: NewContentItem,
-    ) -> Result<ContentItem, LibraryRepositoryError> {
-        let row = sqlx::query_as::<_, ContentItemRow>(
-            r#"
-            INSERT INTO content_items (
-                kind, preferred_title, editorial_description, notes
-            )
-            VALUES ($1, $2, $3, $4)
-            RETURNING
-                id, kind, status, canonical_asset_id, preferred_title,
-                editorial_description, notes, created_at, updated_at, archived_at
-            "#,
-        )
-        .bind(new_item.kind.as_str())
-        .bind(new_item.preferred_title)
-        .bind(new_item.editorial_description)
-        .bind(new_item.notes)
-        .fetch_one(&self.pool)
-        .await?;
-
-        row.into_content_item()
-    }
-
-    pub async fn find_content_item(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<ContentItem>, LibraryRepositoryError> {
-        let row = sqlx::query_as::<_, ContentItemRow>(
-            r#"
-            SELECT
-                id, kind, status, canonical_asset_id, preferred_title,
-                editorial_description, notes, created_at, updated_at, archived_at
-            FROM content_items
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(ContentItemRow::into_content_item).transpose()
-    }
-
-    pub async fn create_media_asset(
-        &self,
-        new_asset: NewMediaAsset,
-    ) -> Result<MediaAsset, LibraryRepositoryError> {
-        let duration_ms = to_database_u64(new_asset.duration_ms, "duration_ms")?;
-        let bit_rate = to_database_u64(new_asset.bit_rate, "bit_rate")?;
-        let file_size_bytes = to_database_u64(new_asset.file_size_bytes, "file_size_bytes")?;
-        let row = sqlx::query_as::<_, MediaAssetRow>(
-            r#"
-            INSERT INTO media_assets (
-                content_item_id, role, media_kind, mime_type, container,
-                video_codec, audio_codec, width, height, duration_ms, bit_rate,
-                file_size_bytes, sha256, local_work_path, storage_state
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            RETURNING
-                id, content_item_id, role, media_kind, mime_type, container,
-                video_codec, audio_codec, width, height, duration_ms, bit_rate,
-                file_size_bytes, sha256, local_work_path, storage_state, created_at
-            "#,
-        )
-        .bind(new_asset.content_item_id)
-        .bind(new_asset.role.as_str())
-        .bind(new_asset.media_kind.as_str())
-        .bind(new_asset.mime_type)
-        .bind(new_asset.container)
-        .bind(new_asset.video_codec)
-        .bind(new_asset.audio_codec)
-        .bind(new_asset.width)
-        .bind(new_asset.height)
-        .bind(duration_ms)
-        .bind(bit_rate)
-        .bind(file_size_bytes)
-        .bind(new_asset.sha256)
-        .bind(new_asset.local_work_path)
-        .bind(new_asset.storage_state.as_str())
-        .fetch_one(&self.pool)
-        .await?;
-
-        row.into_media_asset()
-    }
-
-    /// Records the result of normalization after all external work has finished.
-    ///
-    /// The transaction only protects the content item and its canonical pointer. It
-    /// is intentionally separate from ffmpeg, ffprobe, and hashing calls so a slow
-    /// subprocess cannot hold a database transaction open.
-    pub async fn record_canonical_asset(
-        &self,
-        content_item_id: Uuid,
-        new_asset: NewMediaAsset,
-    ) -> Result<MediaAsset, LibraryRepositoryError> {
-        validate_canonical_asset(content_item_id, &new_asset)?;
-        let sha256 = new_asset.sha256.as_deref().ok_or(LibraryRepositoryError::MissingSha256)?;
-        let mut transaction = self.pool.begin().await?;
-        let content = sqlx::query_as::<_, ContentItemRow>(
-            r#"
-            SELECT
-                id, kind, status, canonical_asset_id, preferred_title,
-                editorial_description, notes, created_at, updated_at, archived_at
-            FROM content_items
-            WHERE id = $1
-            FOR UPDATE
-            "#,
-        )
-        .bind(content_item_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(LibraryRepositoryError::ResourceMissing(content_item_id))?;
-
-        let existing = if let Some(asset_id) = content.canonical_asset_id {
-            Some(find_media_asset_in_transaction(&mut transaction, asset_id).await?.ok_or(
-                LibraryRepositoryError::Invariant(
-                    "content item referred to a missing canonical asset",
-                ),
-            )?)
-        } else {
-            find_canonical_asset_for_content(&mut transaction, content_item_id).await?
-        };
-
-        let asset_row = if let Some(existing) = existing {
-            if existing.sha256.as_deref() != Some(sha256) {
-                return Err(LibraryRepositoryError::CanonicalAssetConflict {
-                    asset_id: existing.id,
-                    content_item_id: existing.content_item_id,
-                });
-            }
-            existing
-        } else if let Some(inserted) =
-            insert_canonical_media_asset_in_transaction(&mut transaction, &new_asset).await?
-        {
-            inserted
-        } else {
-            let existing = find_canonical_asset_for_content(&mut transaction, content_item_id)
-                .await?
-                .or(find_canonical_asset_by_sha256(&mut transaction, sha256).await?);
-            existing.ok_or(LibraryRepositoryError::Invariant(
-                "canonical asset conflict had no matching asset",
-            ))?
-        };
-
-        if asset_row.content_item_id != content_item_id {
-            return Err(LibraryRepositoryError::CanonicalAssetConflict {
-                asset_id: asset_row.id,
-                content_item_id: asset_row.content_item_id,
-            });
-        }
-
-        let asset = asset_row.into_media_asset()?;
-        if content.canonical_asset_id != Some(asset.id) {
-            set_canonical_asset_in_transaction(&mut transaction, content_item_id, asset.id).await?;
-        }
-        enqueue_storage_upload_in_transaction(&mut transaction, asset.id).await?;
-        transaction.commit().await?;
-        Ok(asset)
-    }
-
-    /// Records an idempotent derived asset such as an image thumbnail. The
-    /// thumbnail is deliberately separate from the canonical pointer and does
-    /// not create a storage-upload intent.
-    pub async fn record_thumbnail_asset(
-        &self,
-        content_item_id: Uuid,
-        new_asset: NewMediaAsset,
-    ) -> Result<MediaAsset, LibraryRepositoryError> {
-        validate_thumbnail_asset(content_item_id, &new_asset)?;
-        let sha256 = new_asset.sha256.as_deref().ok_or(LibraryRepositoryError::MissingSha256)?;
-        let mut transaction = self.pool.begin().await?;
-        let content_exists =
-            sqlx::query_scalar::<_, Uuid>("SELECT id FROM content_items WHERE id = $1 FOR UPDATE")
-                .bind(content_item_id)
-                .fetch_optional(&mut *transaction)
-                .await?
-                .is_some();
-        if !content_exists {
-            return Err(LibraryRepositoryError::ResourceMissing(content_item_id));
-        }
-
-        let existing = sqlx::query_as::<_, MediaAssetRow>(
-            r#"
-            SELECT
-                id, content_item_id, role, media_kind, mime_type, container,
-                video_codec, audio_codec, width, height, duration_ms, bit_rate,
-                file_size_bytes, sha256, local_work_path, storage_state, created_at
-            FROM media_assets
-            WHERE content_item_id = $1 AND role = 'thumbnail'
-            ORDER BY created_at ASC, id ASC
-            LIMIT 1
-            FOR UPDATE
-            "#,
-        )
-        .bind(content_item_id)
-        .fetch_optional(&mut *transaction)
-        .await?;
-
-        let asset = if let Some(existing) = existing {
-            if existing.sha256.as_deref() != Some(sha256) {
-                return Err(LibraryRepositoryError::ThumbnailAssetConflict {
-                    asset_id: existing.id,
-                    content_item_id,
-                });
-            }
-            existing.into_media_asset()?
-        } else {
-            insert_media_asset_in_transaction(&mut transaction, &new_asset)
-                .await?
-                .into_media_asset()?
-        };
-        transaction.commit().await?;
-        Ok(asset)
-    }
-
-    pub async fn find_media_asset(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<MediaAsset>, LibraryRepositoryError> {
-        let row = sqlx::query_as::<_, MediaAssetRow>(
-            r#"
-            SELECT
-                id, content_item_id, role, media_kind, mime_type, container,
-                video_codec, audio_codec, width, height, duration_ms, bit_rate,
-                file_size_bytes, sha256, local_work_path, storage_state, created_at
-            FROM media_assets
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(MediaAssetRow::into_media_asset).transpose()
-    }
-
-    pub async fn create_source_record(
-        &self,
-        new_source: NewSourceRecord,
-    ) -> Result<SourceRecord, LibraryRepositoryError> {
-        let row = sqlx::query_as::<_, SourceRecordRow>(
-            r#"
-            INSERT INTO source_records (
-                content_item_id, ingest_request_id, source_type, original_url,
-                normalized_url, platform, platform_content_id, author_name,
-                source_title, source_description, source_published_at, metadata_json
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            RETURNING
-                id, content_item_id, ingest_request_id, source_type, original_url,
-                normalized_url, platform, platform_content_id, author_name,
-                source_title, source_description, source_published_at,
-                retrieved_at, metadata_json
-            "#,
-        )
-        .bind(new_source.content_item_id)
-        .bind(new_source.ingest_request_id)
-        .bind(new_source.source_type.as_str())
-        .bind(new_source.original_url)
-        .bind(new_source.normalized_url)
-        .bind(new_source.platform)
-        .bind(new_source.platform_content_id)
-        .bind(new_source.author_name)
-        .bind(new_source.source_title)
-        .bind(new_source.source_description)
-        .bind(new_source.source_published_at)
-        .bind(new_source.metadata_json)
-        .fetch_one(&self.pool)
-        .await?;
-
-        row.into_source_record()
-    }
-
-    pub async fn list_source_records(
-        &self,
-        content_item_id: Uuid,
-    ) -> Result<Vec<SourceRecord>, LibraryRepositoryError> {
-        let rows = sqlx::query_as::<_, SourceRecordRow>(
-            r#"
-            SELECT
-                id, content_item_id, ingest_request_id, source_type, original_url,
-                normalized_url, platform, platform_content_id, author_name,
-                source_title, source_description, source_published_at,
-                retrieved_at, metadata_json
-            FROM source_records
-            WHERE content_item_id = $1
-            ORDER BY retrieved_at ASC, id ASC
-            "#,
-        )
-        .bind(content_item_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(SourceRecordRow::into_source_record).collect()
-    }
-
-    pub async fn upsert_tag(&self, new_tag: NewTag) -> Result<Tag, LibraryRepositoryError> {
-        let row = sqlx::query_as::<_, TagRow>(
-            r#"
-            INSERT INTO tags (normalized_name, display_name)
-            VALUES ($1, $2)
-            ON CONFLICT (normalized_name) DO UPDATE
-            SET display_name = EXCLUDED.display_name
-            RETURNING id, normalized_name, display_name, created_at
-            "#,
-        )
-        .bind(new_tag.normalized_name)
-        .bind(new_tag.display_name)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(row.into_tag())
-    }
-
-    pub async fn attach_tag(
-        &self,
-        content_item_id: Uuid,
-        tag_id: Uuid,
-    ) -> Result<(), LibraryRepositoryError> {
-        sqlx::query(
-            r#"
-            INSERT INTO content_item_tags (content_item_id, tag_id)
-            VALUES ($1, $2)
-            ON CONFLICT (content_item_id, tag_id) DO NOTHING
-            "#,
-        )
-        .bind(content_item_id)
-        .bind(tag_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn list_tags(
-        &self,
-        content_item_id: Uuid,
-    ) -> Result<Vec<Tag>, LibraryRepositoryError> {
-        let rows = sqlx::query_as::<_, TagRow>(
-            r#"
-            SELECT t.id, t.normalized_name, t.display_name, t.created_at
-            FROM tags t
-            INNER JOIN content_item_tags cit ON cit.tag_id = t.id
-            WHERE cit.content_item_id = $1
-            ORDER BY t.normalized_name ASC
-            "#,
-        )
-        .bind(content_item_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows.into_iter().map(TagRow::into_tag).collect())
-    }
-
-    pub async fn create_storage_object(
-        &self,
-        new_object: NewStorageObject,
-    ) -> Result<StorageObject, LibraryRepositoryError> {
-        let row = sqlx::query_as::<_, StorageObjectRow>(
-            r#"
-            INSERT INTO storage_objects (
-                asset_id, provider, storage_chat_id, storage_message_id,
-                telegram_file_id, telegram_file_unique_id, media_kind
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING
-                id, asset_id, provider, storage_chat_id, storage_message_id,
-                telegram_file_id, telegram_file_unique_id, media_kind,
-                stored_at, verified_at, status
-            "#,
-        )
-        .bind(new_object.asset_id)
-        .bind(new_object.provider)
-        .bind(new_object.storage_chat_id)
-        .bind(new_object.storage_message_id)
-        .bind(new_object.telegram_file_id)
-        .bind(new_object.telegram_file_unique_id)
-        .bind(new_object.media_kind.as_str())
-        .fetch_one(&self.pool)
-        .await?;
-
-        row.into_storage_object()
-    }
-}
-
-const STORAGE_UPLOAD_IDEMPOTENCY_SCOPE: &str = "storage:upload";
-const STORAGE_UPLOAD_COMPLETED_STATUS: i32 = 201;
-
-fn storage_upload_job_key(asset_id: Uuid, generation: i32) -> String {
-    format!("asset:{asset_id}:upload_storage:v1:{generation}")
-}
-
-async fn insert_storage_object(
-    transaction: &mut Transaction<'_, Postgres>,
-    object: &NewStorageObject,
-) -> Result<StorageObject, LibraryRepositoryError> {
-    let row = sqlx::query_as::<_, StorageObjectRow>(
-        r#"
-        INSERT INTO storage_objects (
-            asset_id, provider, storage_chat_id, storage_message_id,
-            telegram_file_id, telegram_file_unique_id, media_kind
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING
-            id, asset_id, provider, storage_chat_id, storage_message_id,
-            telegram_file_id, telegram_file_unique_id, media_kind,
-            stored_at, verified_at, status
-        "#,
-    )
-    .bind(object.asset_id)
-    .bind(&object.provider)
-    .bind(object.storage_chat_id)
-    .bind(object.storage_message_id)
-    .bind(&object.telegram_file_id)
-    .bind(&object.telegram_file_unique_id)
-    .bind(object.media_kind.as_str())
-    .fetch_one(&mut **transaction)
-    .await?;
-    row.into_storage_object()
-}
-
-#[async_trait::async_trait]
-impl StorageUploadStore for LibraryRepository {
-    type Error = LibraryRepositoryError;
-
-    async fn find_canonical_asset(
-        &self,
-        asset_id: Uuid,
-    ) -> Result<Option<MediaAsset>, Self::Error> {
-        Ok(self
-            .find_media_asset(asset_id)
-            .await?
-            .filter(|asset| asset.role == AssetRole::Canonical))
-    }
-
-    async fn find_active_storage_object(
-        &self,
-        asset_id: Uuid,
-        provider: &str,
-    ) -> Result<Option<StorageObject>, Self::Error> {
-        let row = sqlx::query_as::<_, StorageObjectRow>(
-            r#"
-            SELECT
-                id, asset_id, provider, storage_chat_id, storage_message_id,
-                telegram_file_id, telegram_file_unique_id, media_kind,
-                stored_at, verified_at, status
-            FROM storage_objects
-            WHERE asset_id = $1 AND provider = $2 AND status = 'active'
-            ORDER BY stored_at DESC, id DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(asset_id)
-        .bind(provider)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(StorageObjectRow::into_storage_object).transpose()
-    }
-
-    async fn reserve_storage_upload(
-        &self,
-        request: StorageUploadReservationRequest,
-    ) -> Result<StorageUploadReservation, Self::Error> {
-        let StorageUploadReservationRequest {
-            asset_id,
-            provider,
-            idempotency_key,
-            request_hash,
-            job_id,
-            generation,
-            storage_chat_id,
-        } = request;
-        let mut transaction = self.pool.begin().await?;
-
-        let inserted = sqlx::query_as::<_, (Uuid, Uuid)>(
-            r#"
-            INSERT INTO idempotency_records (
-                scope, idempotency_key, request_hash, resource_type,
-                response_body, reservation_owner, reservation_expires_at,
-                storage_asset_id, storage_job_id, storage_generation,
-                storage_provider, storage_chat_id
-            )
-            VALUES (
-                $1, $2, $3, 'storage_object',
-                '{"state":"pending"}'::jsonb, gen_random_uuid(),
-                now() + interval '10 minutes', $4, $5, $6, $7, $8
-            )
-            ON CONFLICT (scope, idempotency_key) DO NOTHING
-            RETURNING id, reservation_owner
-            "#,
-        )
-        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
-        .bind(&idempotency_key)
-        .bind(&request_hash)
-        .bind(asset_id)
-        .bind(job_id)
-        .bind(generation)
-        .bind(&provider)
-        .bind(storage_chat_id)
-        .fetch_optional(&mut *transaction)
-        .await?;
-
-        if let Some((intent_id, owner_token)) = inserted {
-            transaction.commit().await?;
-            return Ok(StorageUploadReservation::Reserved { intent_id, owner_token });
-        }
-
-        let existing = sqlx::query_as::<_, StorageUploadIntentRow>(
-            r#"
-            SELECT id, request_hash, resource_id, response_body,
-                   reservation_owner, reservation_expires_at,
-                   storage_asset_id, storage_job_id, storage_generation,
-                   storage_provider, storage_chat_id
-            FROM idempotency_records
-            WHERE scope = $1 AND idempotency_key = $2
-            FOR UPDATE
-            "#,
-        )
-        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
-        .bind(&idempotency_key)
-        .fetch_one(&mut *transaction)
-        .await?;
-
-        if existing.request_hash.as_slice() != request_hash.as_slice() {
-            return Err(LibraryRepositoryError::StorageUploadIdempotencyConflict {
-                key: idempotency_key.to_owned(),
-            });
-        }
-        if existing.storage_asset_id != Some(asset_id)
-            || existing.storage_job_id != Some(job_id)
-            || existing.storage_generation != generation
-            || existing.storage_provider.as_deref() != Some(provider.as_str())
-            || existing.storage_chat_id != Some(storage_chat_id)
-        {
-            return Err(LibraryRepositoryError::StorageUploadIntentBindingConflict {
-                key: idempotency_key.to_owned(),
-            });
-        }
-
-        let existing_state = existing
-            .response_body
-            .as_ref()
-            .and_then(|body| body.get("state"))
-            .and_then(Value::as_str);
-        let reservation = match existing.resource_id {
-            Some(storage_object_id) => {
-                let object = sqlx::query_as::<_, StorageObjectRow>(
-                    r#"
-                    SELECT
-                        id, asset_id, provider, storage_chat_id, storage_message_id,
-                        telegram_file_id, telegram_file_unique_id, media_kind,
-                        stored_at, verified_at, status
-                    FROM storage_objects
-                    WHERE id = $1 AND asset_id = $2 AND provider = $3 AND status = 'active'
-                    "#,
-                )
-                .bind(storage_object_id)
-                .bind(asset_id)
-                .bind(&provider)
-                .fetch_optional(&mut *transaction)
-                .await?
-                .ok_or(LibraryRepositoryError::StorageUploadObjectMissing(storage_object_id))?;
-                StorageUploadReservation::Reused(object.into_storage_object()?)
-            }
-            None if existing_state == Some("queued") && existing.reservation_owner.is_none() => {
-                let owner_token = Uuid::new_v4();
-                sqlx::query(
-                    r#"
-                    UPDATE idempotency_records
-                    SET response_body = '{"state":"pending"}'::jsonb,
-                        reservation_owner = $2,
-                        reservation_expires_at = now() + interval '10 minutes'
-                    WHERE id = $1
-                    "#,
-                )
-                .bind(existing.id)
-                .bind(owner_token)
-                .execute(&mut *transaction)
-                .await?;
-                StorageUploadReservation::Reserved { intent_id: existing.id, owner_token }
-            }
-            None if existing_state == Some("pending") => {
-                if existing
-                    .reservation_expires_at
-                    .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
-                {
-                    sqlx::query(
-                        r#"
-                        UPDATE idempotency_records
-                        SET response_body = '{"state":"unknown"}'::jsonb,
-                            reservation_owner = NULL,
-                            reservation_expires_at = NULL
-                        WHERE id = $1
-                        "#,
-                    )
-                    .bind(existing.id)
-                    .execute(&mut *transaction)
-                    .await?;
-                    StorageUploadReservation::InProgress { retry_at: None }
-                } else {
-                    StorageUploadReservation::InProgress {
-                        retry_at: existing.reservation_expires_at,
-                    }
-                }
-            }
-            None => StorageUploadReservation::InProgress { retry_at: None },
-        };
-        transaction.commit().await?;
-        Ok(reservation)
-    }
-
-    async fn renew_storage_upload(
-        &self,
-        intent_id: Uuid,
-        owner_token: Uuid,
-        lease_duration: Duration,
-    ) -> Result<OffsetDateTime, Self::Error> {
-        let seconds = lease_duration.as_secs_f64();
-        if !seconds.is_finite() || seconds <= 0.0 {
-            return Err(LibraryRepositoryError::InvalidStorageLeaseDuration);
-        }
-        let expires_at = sqlx::query_scalar::<_, OffsetDateTime>(
-            r#"
-            UPDATE idempotency_records
-            SET reservation_expires_at = now() + ($3::double precision * interval '1 second')
-            WHERE id = $1
-              AND reservation_owner = $2
-              AND resource_id IS NULL
-              AND response_body->>'state' = 'pending'
-            RETURNING reservation_expires_at
-            "#,
-        )
-        .bind(intent_id)
-        .bind(owner_token)
-        .bind(seconds)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(LibraryRepositoryError::StorageUploadIntentMissing(intent_id))?;
-        Ok(expires_at)
-    }
-
-    async fn complete_storage_upload(
-        &self,
-        intent_id: Uuid,
-        owner_token: Uuid,
-        object: NewStorageObject,
-    ) -> Result<StorageObject, Self::Error> {
-        let mut transaction = self.pool.begin().await?;
-        let intent = sqlx::query_as::<_, StorageUploadAttachmentRow>(
-            r#"
-            SELECT storage_asset_id, storage_provider, storage_chat_id,
-                   request_hash, response_body
-            FROM idempotency_records
-            WHERE id = $1 AND scope = $2
-            FOR UPDATE
-            "#,
-        )
-        .bind(intent_id)
-        .bind(STORAGE_UPLOAD_IDEMPOTENCY_SCOPE)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(LibraryRepositoryError::StorageUploadIntentMissing(intent_id))?;
-        if intent.state() != Some("pending")
-            || intent.storage_asset_id != Some(object.asset_id)
-            || intent.storage_provider.as_deref() != Some(object.provider.as_str())
-            || intent.storage_chat_id != Some(object.storage_chat_id)
-        {
-            return Err(LibraryRepositoryError::StorageUploadCompletionBindingConflict {
-                intent_id,
-            });
-        }
-        let row = sqlx::query_as::<_, StorageObjectRow>(
-            r#"
-            INSERT INTO storage_objects (
-                asset_id, provider, storage_chat_id, storage_message_id,
-                telegram_file_id, telegram_file_unique_id, media_kind
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING
-                id, asset_id, provider, storage_chat_id, storage_message_id,
-                telegram_file_id, telegram_file_unique_id, media_kind,
-                stored_at, verified_at, status
-            "#,
-        )
-        .bind(object.asset_id)
-        .bind(&object.provider)
-        .bind(object.storage_chat_id)
-        .bind(object.storage_message_id)
-        .bind(&object.telegram_file_id)
-        .bind(&object.telegram_file_unique_id)
-        .bind(object.media_kind.as_str())
-        .fetch_one(&mut *transaction)
-        .await?;
-        let storage_object = row.into_storage_object()?;
-
-        let updated_intent = sqlx::query(
-            r#"
-            UPDATE idempotency_records
-            SET resource_id = $2,
-                response_status = $4,
-                response_body = $3
-            WHERE id = $1
-              AND reservation_owner = $5
-              AND resource_id IS NULL
-              AND response_status IS NULL
-              AND response_body->>'state' = 'pending'
-              AND reservation_expires_at > now()
-            "#,
-        )
-        .bind(intent_id)
-        .bind(storage_object.id)
-        .bind(json!({ "id": storage_object.id, "status": storage_object.status.as_str() }))
-        .bind(STORAGE_UPLOAD_COMPLETED_STATUS)
-        .bind(owner_token)
-        .execute(&mut *transaction)
-        .await?;
-        if updated_intent.rows_affected() != 1 {
-            return Err(LibraryRepositoryError::StorageUploadIntentMissing(intent_id));
-        }
-
-        let updated_asset =
-            sqlx::query("UPDATE media_assets SET storage_state = 'uploaded' WHERE id = $1")
-                .bind(object.asset_id)
-                .execute(&mut *transaction)
-                .await?;
-        if updated_asset.rows_affected() != 1 {
-            return Err(LibraryRepositoryError::ResourceMissing(object.asset_id));
-        }
-
-        transaction.commit().await?;
-        Ok(storage_object)
-    }
-
-    async fn release_storage_upload(
-        &self,
-        intent_id: Uuid,
-        owner_token: Uuid,
-    ) -> Result<(), Self::Error> {
-        sqlx::query(
-            "DELETE FROM idempotency_records WHERE id = $1 AND reservation_owner = $2 AND resource_id IS NULL AND response_status IS NULL AND response_body->>'state' = 'pending'",
-        )
-            .bind(intent_id)
-            .bind(owner_token)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn mark_storage_upload_unknown(
-        &self,
-        intent_id: Uuid,
-        owner_token: Uuid,
-    ) -> Result<(), Self::Error> {
-        sqlx::query(
-            r#"
-            UPDATE idempotency_records
-            SET response_body = '{"state":"unknown"}'::jsonb,
-                reservation_owner = NULL,
-                reservation_expires_at = NULL
-            WHERE id = $1 AND reservation_owner = $2 AND resource_id IS NULL
-            "#,
-        )
-        .bind(intent_id)
-        .bind(owner_token)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-}
-
-const SHA256_LENGTH: usize = 32;
-
-fn validate_canonical_asset(
-    content_item_id: Uuid,
-    asset: &NewMediaAsset,
-) -> Result<(), LibraryRepositoryError> {
-    if asset.content_item_id != content_item_id {
-        return Err(LibraryRepositoryError::ContentItemMismatch {
-            expected: content_item_id,
-            actual: asset.content_item_id,
-        });
-    }
-    if asset.role != AssetRole::Canonical {
-        return Err(LibraryRepositoryError::InvalidCanonicalAssetRole);
-    }
-    let sha256 = asset.sha256.as_ref().ok_or(LibraryRepositoryError::MissingSha256)?;
-    if sha256.len() != SHA256_LENGTH {
-        return Err(LibraryRepositoryError::InvalidSha256Length { actual: sha256.len() });
-    }
-    to_database_u64(asset.duration_ms, "duration_ms")?;
-    to_database_u64(asset.bit_rate, "bit_rate")?;
-    to_database_u64(asset.file_size_bytes, "file_size_bytes")?;
-    Ok(())
-}
-
-fn validate_thumbnail_asset(
-    content_item_id: Uuid,
-    asset: &NewMediaAsset,
-) -> Result<(), LibraryRepositoryError> {
-    if asset.content_item_id != content_item_id {
-        return Err(LibraryRepositoryError::ContentItemMismatch {
-            expected: content_item_id,
-            actual: asset.content_item_id,
-        });
-    }
-    if asset.role != AssetRole::Thumbnail {
-        return Err(LibraryRepositoryError::InvalidThumbnailAssetRole);
-    }
-    let sha256 = asset.sha256.as_ref().ok_or(LibraryRepositoryError::MissingSha256)?;
-    if sha256.len() != SHA256_LENGTH {
-        return Err(LibraryRepositoryError::InvalidSha256Length { actual: sha256.len() });
-    }
-    to_database_u64(asset.duration_ms, "duration_ms")?;
-    to_database_u64(asset.bit_rate, "bit_rate")?;
-    to_database_u64(asset.file_size_bytes, "file_size_bytes")?;
-    Ok(())
-}
-
-fn validate_exact_duplicate_request(
-    request: &ExactDuplicateRequest,
-) -> Result<(), LibraryRepositoryError> {
-    if request.asset.role != AssetRole::Canonical {
-        return Err(LibraryRepositoryError::InvalidCanonicalAssetRole);
-    }
-    let sha256 = request.asset.sha256.as_ref().ok_or(LibraryRepositoryError::MissingSha256)?;
-    if sha256.len() != SHA256_LENGTH {
-        return Err(LibraryRepositoryError::InvalidSha256Length { actual: sha256.len() });
-    }
-    if request.source.platform.is_some() != request.source.platform_content_id.is_some() {
-        return Err(LibraryRepositoryError::InvalidSourceIdentity);
-    }
-    Ok(())
-}
-
-async fn insert_content_item_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    new_item: &NewContentItem,
-) -> Result<ContentItemRow, LibraryRepositoryError> {
-    Ok(sqlx::query_as::<_, ContentItemRow>(
-        r#"
-        INSERT INTO content_items (kind, preferred_title, editorial_description, notes)
-        VALUES ($1, $2, $3, $4)
-        RETURNING
-            id, kind, status, canonical_asset_id, preferred_title,
-            editorial_description, notes, created_at, updated_at, archived_at
-        "#,
-    )
-    .bind(new_item.kind.as_str())
-    .bind(new_item.preferred_title.as_deref())
-    .bind(new_item.editorial_description.as_deref())
-    .bind(new_item.notes.as_deref())
-    .fetch_one(&mut **transaction)
-    .await?)
-}
-
-async fn insert_canonical_asset_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    content_item_id: Uuid,
-    asset: &sooqa_library::NewMediaAssetDraft,
-) -> Result<Option<MediaAssetRow>, LibraryRepositoryError> {
-    let duration_ms = to_database_u64(asset.duration_ms, "duration_ms")?;
-    let bit_rate = to_database_u64(asset.bit_rate, "bit_rate")?;
-    let file_size_bytes = to_database_u64(asset.file_size_bytes, "file_size_bytes")?;
-
-    Ok(sqlx::query_as::<_, MediaAssetRow>(
-        r#"
-        INSERT INTO media_assets (
-            content_item_id, role, media_kind, mime_type, container,
-            video_codec, audio_codec, width, height, duration_ms, bit_rate,
-            file_size_bytes, sha256, local_work_path, storage_state
-        )
-        VALUES ($1, 'canonical', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-        ON CONFLICT DO NOTHING
-        RETURNING
-            id, content_item_id, role, media_kind, mime_type, container,
-            video_codec, audio_codec, width, height, duration_ms, bit_rate,
-            file_size_bytes, sha256, local_work_path, storage_state, created_at
-        "#,
-    )
-    .bind(content_item_id)
-    .bind(asset.media_kind.as_str())
-    .bind(asset.mime_type.as_deref())
-    .bind(asset.container.as_deref())
-    .bind(asset.video_codec.as_deref())
-    .bind(asset.audio_codec.as_deref())
-    .bind(asset.width)
-    .bind(asset.height)
-    .bind(duration_ms)
-    .bind(bit_rate)
-    .bind(file_size_bytes)
-    .bind(asset.sha256.clone())
-    .bind(asset.local_work_path.as_deref())
-    .bind(asset.storage_state.as_str())
-    .fetch_optional(&mut **transaction)
-    .await?)
-}
-
-async fn insert_canonical_media_asset_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    asset: &NewMediaAsset,
-) -> Result<Option<MediaAssetRow>, LibraryRepositoryError> {
-    let duration_ms = to_database_u64(asset.duration_ms, "duration_ms")?;
-    let bit_rate = to_database_u64(asset.bit_rate, "bit_rate")?;
-    let file_size_bytes = to_database_u64(asset.file_size_bytes, "file_size_bytes")?;
-
-    Ok(sqlx::query_as::<_, MediaAssetRow>(
-        r#"
-        INSERT INTO media_assets (
-            content_item_id, role, media_kind, mime_type, container,
-            video_codec, audio_codec, width, height, duration_ms, bit_rate,
-            file_size_bytes, sha256, local_work_path, storage_state
-        )
-        VALUES ($1, 'canonical', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-        ON CONFLICT DO NOTHING
-        RETURNING
-            id, content_item_id, role, media_kind, mime_type, container,
-            video_codec, audio_codec, width, height, duration_ms, bit_rate,
-            file_size_bytes, sha256, local_work_path, storage_state, created_at
-        "#,
-    )
-    .bind(asset.content_item_id)
-    .bind(asset.media_kind.as_str())
-    .bind(asset.mime_type.as_deref())
-    .bind(asset.container.as_deref())
-    .bind(asset.video_codec.as_deref())
-    .bind(asset.audio_codec.as_deref())
-    .bind(asset.width)
-    .bind(asset.height)
-    .bind(duration_ms)
-    .bind(bit_rate)
-    .bind(file_size_bytes)
-    .bind(asset.sha256.clone())
-    .bind(asset.local_work_path.as_deref())
-    .bind(asset.storage_state.as_str())
-    .fetch_optional(&mut **transaction)
-    .await?)
-}
-
-async fn insert_media_asset_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    asset: &NewMediaAsset,
-) -> Result<MediaAssetRow, LibraryRepositoryError> {
-    let duration_ms = to_database_u64(asset.duration_ms, "duration_ms")?;
-    let bit_rate = to_database_u64(asset.bit_rate, "bit_rate")?;
-    let file_size_bytes = to_database_u64(asset.file_size_bytes, "file_size_bytes")?;
-
-    Ok(sqlx::query_as::<_, MediaAssetRow>(
-        r#"
-        INSERT INTO media_assets (
-            content_item_id, role, media_kind, mime_type, container,
-            video_codec, audio_codec, width, height, duration_ms, bit_rate,
-            file_size_bytes, sha256, local_work_path, storage_state
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-        RETURNING
-            id, content_item_id, role, media_kind, mime_type, container,
-            video_codec, audio_codec, width, height, duration_ms, bit_rate,
-            file_size_bytes, sha256, local_work_path, storage_state, created_at
-        "#,
-    )
-    .bind(asset.content_item_id)
-    .bind(asset.role.as_str())
-    .bind(asset.media_kind.as_str())
-    .bind(asset.mime_type.as_deref())
-    .bind(asset.container.as_deref())
-    .bind(asset.video_codec.as_deref())
-    .bind(asset.audio_codec.as_deref())
-    .bind(asset.width)
-    .bind(asset.height)
-    .bind(duration_ms)
-    .bind(bit_rate)
-    .bind(file_size_bytes)
-    .bind(asset.sha256.clone())
-    .bind(asset.local_work_path.as_deref())
-    .bind(asset.storage_state.as_str())
-    .fetch_one(&mut **transaction)
-    .await?)
-}
-
-async fn enqueue_storage_upload_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    asset_id: Uuid,
-) -> Result<(), sqlx::Error> {
-    let job =
-        NewJob::upload_storage_asset(asset_id).idempotency_key(storage_upload_job_key(asset_id, 0));
-    sqlx::query(
-        r#"
-        INSERT INTO jobs (job_type, payload_json, idempotency_key)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-        "#,
-    )
-    .bind(job.job_type().as_str())
-    .bind(job.payload_json())
-    .bind(job.idempotency_key_value())
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
-}
-
-async fn set_canonical_asset_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    content_item_id: Uuid,
-    asset_id: Uuid,
-) -> Result<ContentItemRow, LibraryRepositoryError> {
-    Ok(sqlx::query_as::<_, ContentItemRow>(
-        r#"
-        UPDATE content_items
-        SET canonical_asset_id = $2, updated_at = now()
-        WHERE id = $1
-        RETURNING
-            id, kind, status, canonical_asset_id, preferred_title,
-            editorial_description, notes, created_at, updated_at, archived_at
-        "#,
-    )
-    .bind(content_item_id)
-    .bind(asset_id)
-    .fetch_one(&mut **transaction)
-    .await?)
-}
-
-async fn find_source_by_identity(
-    transaction: &mut Transaction<'_, Postgres>,
-    source: &NewSourceRecordDraft,
-) -> Result<Option<SourceRecord>, LibraryRepositoryError> {
-    let row = sqlx::query_as::<_, SourceRecordRow>(
-        r#"
-        SELECT
-            id, content_item_id, ingest_request_id, source_type, original_url,
-            normalized_url, platform, platform_content_id, author_name,
-            source_title, source_description, source_published_at,
-            retrieved_at, metadata_json
-        FROM source_records
-        WHERE ($1::text IS NOT NULL AND normalized_url = $1)
-           OR ($2::text IS NOT NULL AND platform = $2 AND platform_content_id = $3)
-        ORDER BY retrieved_at ASC, id ASC
-        LIMIT 1
-        "#,
-    )
-    .bind(source.normalized_url.as_deref())
-    .bind(source.platform.as_deref())
-    .bind(source.platform_content_id.as_deref())
-    .fetch_optional(&mut **transaction)
-    .await?;
-
-    row.map(SourceRecordRow::into_source_record).transpose()
-}
-
-async fn upsert_tag_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    new_tag: NewTag,
-) -> Result<TagRow, LibraryRepositoryError> {
-    Ok(sqlx::query_as::<_, TagRow>(
-        r#"
-        INSERT INTO tags (normalized_name, display_name)
-        VALUES ($1, $2)
-        ON CONFLICT (normalized_name) DO UPDATE
-        SET display_name = EXCLUDED.display_name
-        RETURNING id, normalized_name, display_name, created_at
-        "#,
-    )
-    .bind(new_tag.normalized_name)
-    .bind(new_tag.display_name)
-    .fetch_one(&mut **transaction)
-    .await?)
-}
-
-async fn find_canonical_asset_by_sha256(
-    transaction: &mut Transaction<'_, Postgres>,
-    sha256: &[u8],
-) -> Result<Option<MediaAssetRow>, LibraryRepositoryError> {
-    Ok(sqlx::query_as::<_, MediaAssetRow>(
-        r#"
-        SELECT
-            id, content_item_id, role, media_kind, mime_type, container,
-            video_codec, audio_codec, width, height, duration_ms, bit_rate,
-            file_size_bytes, sha256, local_work_path, storage_state, created_at
-        FROM media_assets
-        WHERE role = 'canonical' AND sha256 = $1
-        "#,
-    )
-    .bind(sha256)
-    .fetch_optional(&mut **transaction)
-    .await?)
-}
-
-async fn find_media_asset_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    asset_id: Uuid,
-) -> Result<Option<MediaAssetRow>, LibraryRepositoryError> {
-    Ok(sqlx::query_as::<_, MediaAssetRow>(
-        r#"
-        SELECT
-            id, content_item_id, role, media_kind, mime_type, container,
-            video_codec, audio_codec, width, height, duration_ms, bit_rate,
-            file_size_bytes, sha256, local_work_path, storage_state, created_at
-        FROM media_assets
-        WHERE id = $1
-        "#,
-    )
-    .bind(asset_id)
-    .fetch_optional(&mut **transaction)
-    .await?)
-}
-
-async fn find_canonical_asset_for_content(
-    transaction: &mut Transaction<'_, Postgres>,
-    content_item_id: Uuid,
-) -> Result<Option<MediaAssetRow>, LibraryRepositoryError> {
-    Ok(sqlx::query_as::<_, MediaAssetRow>(
-        r#"
-        SELECT
-            id, content_item_id, role, media_kind, mime_type, container,
-            video_codec, audio_codec, width, height, duration_ms, bit_rate,
-            file_size_bytes, sha256, local_work_path, storage_state, created_at
-        FROM media_assets
-        WHERE content_item_id = $1 AND role = 'canonical'
-        ORDER BY created_at ASC, id ASC
-        LIMIT 1
-        "#,
-    )
-    .bind(content_item_id)
-    .fetch_optional(&mut **transaction)
-    .await?)
-}
-
-async fn find_any_asset_for_content(
-    transaction: &mut Transaction<'_, Postgres>,
-    content_item_id: Uuid,
-) -> Result<Option<MediaAssetRow>, LibraryRepositoryError> {
-    Ok(sqlx::query_as::<_, MediaAssetRow>(
-        r#"
-        SELECT
-            id, content_item_id, role, media_kind, mime_type, container,
-            video_codec, audio_codec, width, height, duration_ms, bit_rate,
-            file_size_bytes, sha256, local_work_path, storage_state, created_at
-        FROM media_assets
-        WHERE content_item_id = $1
-        ORDER BY created_at ASC, id ASC
-        LIMIT 1
-        "#,
-    )
-    .bind(content_item_id)
-    .fetch_optional(&mut **transaction)
-    .await?)
-}
-
-async fn insert_source_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    content_item_id: Uuid,
-    source: &NewSourceRecordDraft,
-) -> Result<Option<SourceRecord>, LibraryRepositoryError> {
-    let source = source.clone().for_content_item(content_item_id);
-    let row = sqlx::query_as::<_, SourceRecordRow>(
-        r#"
-        INSERT INTO source_records (
-            content_item_id, ingest_request_id, source_type, original_url,
-            normalized_url, platform, platform_content_id, author_name,
-            source_title, source_description, source_published_at, metadata_json
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        ON CONFLICT DO NOTHING
-        RETURNING
-            id, content_item_id, ingest_request_id, source_type, original_url,
-            normalized_url, platform, platform_content_id, author_name,
-            source_title, source_description, source_published_at,
-            retrieved_at, metadata_json
-        "#,
-    )
-    .bind(source.content_item_id)
-    .bind(source.ingest_request_id)
-    .bind(source.source_type.as_str())
-    .bind(source.original_url)
-    .bind(source.normalized_url)
-    .bind(source.platform)
-    .bind(source.platform_content_id)
-    .bind(source.author_name)
-    .bind(source.source_title)
-    .bind(source.source_description)
-    .bind(source.source_published_at)
-    .bind(source.metadata_json)
-    .fetch_optional(&mut **transaction)
-    .await?;
-
-    row.map(SourceRecordRow::into_source_record).transpose()
-}
-
-async fn insert_source_or_find_existing(
-    transaction: &mut Transaction<'_, Postgres>,
-    content_item_id: Uuid,
-    source: &NewSourceRecordDraft,
-) -> Result<(SourceRecord, bool), LibraryRepositoryError> {
-    if let Some(source_record) =
-        insert_source_in_transaction(transaction, content_item_id, source).await?
-    {
-        return Ok((source_record, true));
-    }
-
-    let source_record = find_source_by_identity(transaction, source).await?.ok_or(
-        LibraryRepositoryError::Invariant("source conflict had no matching source record"),
-    )?;
-    Ok((source_record, false))
-}
-
-async fn load_resolution_for_content(
-    transaction: &mut Transaction<'_, Postgres>,
-    content_item_id: Uuid,
-    fallback_asset: Option<MediaAssetRow>,
-) -> Result<(ContentItem, MediaAsset), LibraryRepositoryError> {
-    let content_row = sqlx::query_as::<_, ContentItemRow>(
-        r#"
-        SELECT
-            id, kind, status, canonical_asset_id, preferred_title,
-            editorial_description, notes, created_at, updated_at, archived_at
-        FROM content_items
-        WHERE id = $1
-        "#,
-    )
-    .bind(content_item_id)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(LibraryRepositoryError::Invariant(
-        "source or asset referred to a missing content item",
-    ))?;
-    let content_item = content_row.into_content_item()?;
-
-    let asset_row = if let Some(canonical_asset_id) = content_item.canonical_asset_id {
-        find_media_asset_in_transaction(transaction, canonical_asset_id).await?.ok_or(
-            LibraryRepositoryError::Invariant("content item referred to a missing canonical asset"),
-        )?
-    } else if let Some(asset_row) =
-        find_canonical_asset_for_content(transaction, content_item.id).await?
-    {
-        asset_row
-    } else if let Some(asset_row) = fallback_asset {
-        asset_row
-    } else {
-        find_any_asset_for_content(transaction, content_item.id)
-            .await?
-            .ok_or(LibraryRepositoryError::Invariant("duplicate content item had no asset"))?
-    };
-
-    Ok((content_item, asset_row.into_media_asset()?))
-}
-
-async fn delete_uncommitted_content(
-    transaction: &mut Transaction<'_, Postgres>,
-    content_item_id: Uuid,
-) -> Result<(), LibraryRepositoryError> {
-    sqlx::query("UPDATE content_items SET canonical_asset_id = NULL WHERE id = $1")
-        .bind(content_item_id)
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query("DELETE FROM media_assets WHERE content_item_id = $1")
-        .bind(content_item_id)
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query("DELETE FROM content_items WHERE id = $1")
-        .bind(content_item_id)
-        .execute(&mut **transaction)
-        .await?;
-    Ok(())
-}
-
-#[derive(Debug, Error)]
-pub enum LibraryRepositoryError {
-    #[error("database operation failed: {0}")]
-    Database(#[from] sqlx::Error),
-    #[error("database returned invalid {field} value {value:?}")]
-    InvalidEnum { field: &'static str, value: String },
-    #[error("database returned an invalid non-negative {field} value")]
-    InvalidNumber { field: &'static str },
-    #[error("exact duplicate resolution requires a canonical asset")]
-    InvalidCanonicalAssetRole,
-    #[error("thumbnail asset recording requires a thumbnail asset")]
-    InvalidThumbnailAssetRole,
-    #[error("canonical asset belongs to content item {actual}, expected {expected}")]
-    ContentItemMismatch { expected: Uuid, actual: Uuid },
-    #[error("exact duplicate resolution requires a SHA-256 digest")]
-    MissingSha256,
-    #[error("SHA-256 digest must contain exactly 32 bytes, got {actual}")]
-    InvalidSha256Length { actual: usize },
-    #[error("platform and platform content ID must be supplied together")]
-    InvalidSourceIdentity,
-    #[error("database invariant violated: {0}")]
-    Invariant(&'static str),
-    #[error("canonical asset {asset_id} already belongs to content item {content_item_id}")]
-    CanonicalAssetConflict { asset_id: Uuid, content_item_id: Uuid },
-    #[error("thumbnail asset {asset_id} already belongs to content item {content_item_id}")]
-    ThumbnailAssetConflict { asset_id: Uuid, content_item_id: Uuid },
-    #[error("library item {0} was not found")]
-    ResourceMissing(Uuid),
-    #[error("library item {0} was changed by another request")]
-    OptimisticConflict(Uuid),
-    #[error("library update contains no editable fields")]
-    EmptyUpdate,
-    #[error("library item {id} cannot be {operation} in its current state")]
-    InvalidState { id: Uuid, operation: &'static str },
-    #[error("tag is not attached to the library item")]
-    TagNotAttached,
-    #[error("library search limit must be between 1 and 100, got {value}")]
-    InvalidLimit { value: u32 },
-    #[error("duplicate candidate validation failed: {0}")]
-    InvalidDuplicateCandidate(#[from] sooqa_library::DuplicateCandidateValidationError),
-    #[error("duplicate candidate {0} was not found")]
-    DuplicateCandidateMissing(Uuid),
-    #[error("duplicate candidate {id} is already in status {status:?}")]
-    InvalidCandidateState { id: Uuid, status: DuplicateCandidateStatus },
-    #[error("idempotency key conflicts with an earlier decision for duplicate candidate {0}")]
-    DuplicateCandidateIdempotencyConflict(Uuid),
-    #[error("storage upload idempotency key conflicts with an earlier upload: {key}")]
-    StorageUploadIdempotencyConflict { key: String },
-    #[error("storage upload object {0} was not found after a completed intent")]
-    StorageUploadObjectMissing(Uuid),
-    #[error("storage upload intent {0} was not found or already completed")]
-    StorageUploadIntentMissing(Uuid),
-    #[error("storage upload intent {0} is still active")]
-    StorageUploadIntentActive(Uuid),
-    #[error("storage upload intent {0} has no bound asset")]
-    StorageUploadAssetMissing(Uuid),
-    #[error("storage upload intent {0} has no bound provider")]
-    StorageUploadProviderMissing(Uuid),
-    #[error("storage upload intent {0} has an active job")]
-    StorageUploadJobActive(Uuid),
-    #[error("storage upload job {0} was not found")]
-    StorageUploadJobMissing(Uuid),
-    #[error("storage upload intent {0} generation overflowed")]
-    StorageUploadGenerationOverflow(Uuid),
-    #[error("storage upload intent binding conflicts with the requested job: {key}")]
-    StorageUploadIntentBindingConflict { key: String },
-    #[error("storage upload intent {0} is not unknown")]
-    StorageUploadIntentNotUnknown(Uuid),
-    #[error("storage upload intent {intent_id} is bound to a different Telegram chat")]
-    StorageUploadChatMismatch { intent_id: Uuid },
-    #[error("storage upload completion does not match intent {intent_id}")]
-    StorageUploadCompletionBindingConflict { intent_id: Uuid },
-    #[error("storage upload asset {0} is not canonical")]
-    StorageUploadAssetNotCanonical(Uuid),
-    #[error("storage upload asset {0} does not match the intent digest")]
-    StorageUploadAssetHashMismatch(Uuid),
-    #[error("storage upload attachment message ID must be positive, got {value}")]
-    StorageUploadMessageIdInvalid { value: i64 },
-    #[error("storage upload attachment {field} must not be empty")]
-    StorageUploadAttachmentFieldEmpty { field: &'static str },
-    #[error("database returned unknown media kind: {0}")]
-    UnknownMediaKind(String),
-    #[error("storage upload lease duration must be greater than zero")]
-    InvalidStorageLeaseDuration,
-}
-
-fn validate_storage_upload_attachment(
-    mut attachment: StorageUploadAttachment,
-) -> Result<StorageUploadAttachment, LibraryRepositoryError> {
-    if attachment.storage_message_id <= 0 {
-        return Err(LibraryRepositoryError::StorageUploadMessageIdInvalid {
-            value: attachment.storage_message_id,
-        });
-    }
-    attachment.telegram_file_id =
-        Some(trim_storage_attachment_field(attachment.telegram_file_id, "telegram_file_id")?);
-    attachment.telegram_file_unique_id = Some(trim_storage_attachment_field(
-        attachment.telegram_file_unique_id,
-        "telegram_file_unique_id",
-    )?);
-    Ok(attachment)
-}
-
-fn trim_storage_attachment_field(
-    value: Option<String>,
-    field: &'static str,
-) -> Result<String, LibraryRepositoryError> {
-    let value = value
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .ok_or(LibraryRepositoryError::StorageUploadAttachmentFieldEmpty { field })?;
-    Ok(value)
-}
-
-#[derive(Debug, FromRow)]
-struct StorageUploadIntentRow {
-    id: Uuid,
-    request_hash: Vec<u8>,
-    resource_id: Option<Uuid>,
-    response_body: Option<Value>,
-    reservation_owner: Option<Uuid>,
-    reservation_expires_at: Option<OffsetDateTime>,
-    storage_asset_id: Option<Uuid>,
-    storage_job_id: Option<Uuid>,
-    storage_generation: i32,
-    storage_provider: Option<String>,
-    storage_chat_id: Option<i64>,
-}
-
-#[derive(Debug, FromRow)]
-struct StorageUploadIntentListingRow {
-    id: Uuid,
-    idempotency_key: String,
-    response_body: Option<Value>,
-    resource_id: Option<Uuid>,
-    created_at: OffsetDateTime,
-    storage_asset_id: Option<Uuid>,
-    storage_job_id: Option<Uuid>,
-    storage_generation: i32,
-    storage_provider: Option<String>,
-    storage_chat_id: Option<i64>,
-    reservation_expires_at: Option<OffsetDateTime>,
-}
-
-impl StorageUploadIntentListingRow {
-    fn into_intent(self) -> Result<StorageUploadIntent, LibraryRepositoryError> {
-        let state = self
-            .response_body
-            .as_ref()
-            .and_then(|body| body.get("state"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned();
-        Ok(StorageUploadIntent {
-            id: self.id,
-            asset_id: self.storage_asset_id,
-            job_id: self.storage_job_id,
-            generation: self.storage_generation,
-            provider: self.storage_provider,
-            storage_chat_id: self.storage_chat_id,
-            idempotency_key: self.idempotency_key,
-            state,
-            resource_id: self.resource_id,
-            created_at: self.created_at,
-            reservation_expires_at: self.reservation_expires_at,
-        })
-    }
-}
-
-#[derive(Debug, FromRow)]
-struct StorageUploadRecoveryRow {
-    storage_asset_id: Option<Uuid>,
-    storage_job_id: Option<Uuid>,
-    storage_generation: i32,
-    storage_provider: Option<String>,
-    response_body: Option<Value>,
-    reservation_expires_at: Option<OffsetDateTime>,
-}
-
-impl StorageUploadRecoveryRow {
-    fn state(&self) -> Option<&str> {
-        self.response_body.as_ref().and_then(|body| body.get("state")).and_then(Value::as_str)
-    }
-}
-
-#[derive(Debug, FromRow)]
-struct RecoveryJobRow {
-    status: String,
-    lease_expires_at: Option<OffsetDateTime>,
-}
-
-#[derive(Debug, FromRow)]
-struct StorageUploadAttachmentRow {
-    storage_asset_id: Option<Uuid>,
-    storage_provider: Option<String>,
-    storage_chat_id: Option<i64>,
-    request_hash: Vec<u8>,
-    response_body: Option<Value>,
-}
-
-impl StorageUploadAttachmentRow {
-    fn state(&self) -> Option<&str> {
-        self.response_body.as_ref().and_then(|body| body.get("state")).and_then(Value::as_str)
-    }
-}
-
-#[derive(Debug, FromRow)]
-struct StoredVideoFingerprintRow {
-    content_item_id: Uuid,
-    width: Option<i32>,
-    height: Option<i32>,
-    audio_codec: Option<String>,
-    fingerprint: Value,
-}
-
-impl StoredVideoFingerprintRow {
-    fn into_stored(self) -> StoredVideoFingerprint {
-        StoredVideoFingerprint {
-            content_item_id: self.content_item_id,
-            width: self.width,
-            height: self.height,
-            audio_codec: self.audio_codec,
-            fingerprint: self.fingerprint,
-        }
-    }
-}
-
-#[derive(Debug, FromRow)]
-struct DuplicateCandidateRow {
-    id: Uuid,
-    left_content_item_id: Uuid,
-    right_content_item_id: Uuid,
-    algorithm_version: String,
-    score_basis_points: i16,
-    evidence_json: Value,
-    status: String,
-    created_at: OffsetDateTime,
-    updated_at: OffsetDateTime,
-    resolved_at: Option<OffsetDateTime>,
-}
-
-impl DuplicateCandidateRow {
-    fn into_duplicate_candidate(self) -> Result<DuplicateCandidate, LibraryRepositoryError> {
-        Ok(DuplicateCandidate {
-            id: self.id,
-            left_content_item_id: self.left_content_item_id,
-            right_content_item_id: self.right_content_item_id,
-            algorithm_version: self.algorithm_version,
-            score_basis_points: u16::try_from(self.score_basis_points).map_err(|_| {
-                LibraryRepositoryError::Invariant("duplicate candidate score was negative")
-            })?,
-            evidence_json: self.evidence_json,
-            status: parse_enum("duplicate_candidates.status", &self.status)?,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            resolved_at: self.resolved_at,
-        })
-    }
-}
-
-#[derive(Debug, FromRow)]
-struct DuplicateCandidateEventRow {
-    id: Uuid,
-    candidate_id: Uuid,
-    action: String,
-    actor_device_token_id: Option<Uuid>,
-    created_at: OffsetDateTime,
-}
-
-impl DuplicateCandidateEventRow {
-    fn into_duplicate_candidate_event(
-        self,
-    ) -> Result<DuplicateCandidateEvent, LibraryRepositoryError> {
-        let action = match self.action.as_str() {
-            "confirm_variant" => DuplicateCandidateAction::ConfirmVariant,
-            "keep_separate" => DuplicateCandidateAction::KeepSeparate,
-            "dismiss" => DuplicateCandidateAction::Dismiss,
-            _ => {
-                return Err(LibraryRepositoryError::Invariant(
-                    "unknown duplicate candidate action",
-                ));
-            }
-        };
-        Ok(DuplicateCandidateEvent {
-            id: self.id,
-            candidate_id: self.candidate_id,
-            action,
-            actor_device_token_id: self.actor_device_token_id,
-            created_at: self.created_at,
-        })
-    }
-}
-
-#[derive(Debug, FromRow)]
-struct ContentItemRow {
+#[derive(Debug, Clone, FromRow)]
+struct MediaRow {
     id: Uuid,
     kind: String,
-    status: String,
-    canonical_asset_id: Option<Uuid>,
-    preferred_title: Option<String>,
-    editorial_description: Option<String>,
-    notes: Option<String>,
-    created_at: OffsetDateTime,
-    updated_at: OffsetDateTime,
-    archived_at: Option<OffsetDateTime>,
-}
-
-impl ContentItemRow {
-    fn into_content_item(self) -> Result<ContentItem, LibraryRepositoryError> {
-        Ok(ContentItem {
-            id: self.id,
-            kind: parse_enum("content_items.kind", &self.kind)?,
-            status: parse_enum("content_items.status", &self.status)?,
-            canonical_asset_id: self.canonical_asset_id,
-            preferred_title: self.preferred_title,
-            editorial_description: self.editorial_description,
-            notes: self.notes,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-            archived_at: self.archived_at,
-        })
-    }
-}
-
-#[derive(Debug, FromRow)]
-struct MediaAssetRow {
-    id: Uuid,
-    content_item_id: Uuid,
-    role: String,
-    media_kind: String,
+    storage_state: String,
+    canonical_sha256: Option<Vec<u8>>,
+    fingerprint: Option<Vec<u8>>,
+    title: Option<String>,
+    description: Option<String>,
+    tags: Vec<String>,
+    source_url: Option<String>,
+    source_metadata: Value,
     mime_type: Option<String>,
     container: Option<String>,
     video_codec: Option<String>,
@@ -2596,138 +42,856 @@ struct MediaAssetRow {
     duration_ms: Option<i64>,
     bit_rate: Option<i64>,
     file_size_bytes: Option<i64>,
-    sha256: Option<Vec<u8>>,
     local_work_path: Option<String>,
-    storage_state: String,
+    telegram_storage_chat_id: Option<i64>,
+    telegram_storage_message_id: Option<i64>,
+    telegram_file_id: Option<String>,
+    telegram_file_unique_id: Option<String>,
+    storage_generation: i32,
+    storage_token: Option<Uuid>,
+    storage_started_at: Option<OffsetDateTime>,
     created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+    stored_at: Option<OffsetDateTime>,
 }
 
-impl MediaAssetRow {
-    fn into_media_asset(self) -> Result<MediaAsset, LibraryRepositoryError> {
-        Ok(MediaAsset {
+impl LibraryRepository {
+    pub(crate) fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn find_media(&self, id: Uuid) -> Result<Option<Media>, LibraryRepositoryError> {
+        self.load(id).await?.map(MediaRow::into_media).transpose()
+    }
+
+    pub async fn find_media_details(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<MediaDetails>, LibraryRepositoryError> {
+        let Some(row) = self.load(id).await? else { return Ok(None) };
+        let media = row.clone().into_media()?;
+        let tags = row.tags.iter().map(|tag| tag_from_name(tag, row.updated_at)).collect();
+        let source = source_from_row(&row)?;
+        Ok(Some(MediaDetails { media, tags, source }))
+    }
+
+    pub async fn search_media(
+        &self,
+        query: MediaSearchQuery,
+    ) -> Result<MediaPage, LibraryRepositoryError> {
+        if !(1..=100).contains(&query.limit) {
+            return Err(LibraryRepositoryError::InvalidLimit { value: query.limit });
+        }
+        let text = query.text.filter(|value| !value.trim().is_empty());
+        let kind = query.kind.map(|value| value.as_str().to_owned());
+        let status = query.status.map(|value| value.as_str().to_owned());
+        let tags = (!query.tags.is_empty()).then_some(query.tags);
+        let rows = sqlx::query_as::<_, MediaRow>(
+            r#"
+            SELECT * FROM media
+            WHERE ($1::text IS NULL OR kind = $1)
+              AND ($2::text IS NULL OR title ILIKE '%' || $2 || '%' OR description ILIKE '%' || $2 || '%')
+              AND ($3::text[] IS NULL OR tags @> $3)
+              AND ($4::timestamptz IS NULL OR (updated_at, id) < ($4, $5))
+              AND ($6::text IS NULL OR ($6 = 'active' AND source_metadata->>'archived' IS DISTINCT FROM 'true') OR ($6 = 'archived' AND source_metadata->>'archived' = 'true'))
+            ORDER BY updated_at DESC, id DESC
+            LIMIT $7
+            "#,
+        )
+        .bind(kind)
+        .bind(text)
+        .bind(tags)
+        .bind(query.cursor.as_ref().map(|cursor| cursor.updated_at))
+        .bind(query.cursor.as_ref().map(|cursor| cursor.id))
+        .bind(status)
+        .bind(i64::from(query.limit) + 1)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let has_more = rows.len() > query.limit as usize;
+        let rows = rows.into_iter().take(query.limit as usize).collect::<Vec<_>>();
+        let next_cursor = has_more
+            .then(|| rows.last())
+            .flatten()
+            .map(|row| MediaCursor { updated_at: row.updated_at, id: row.id });
+        let items = rows
+            .into_iter()
+            .map(|row| self.summary_from_row(row))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(MediaPage { items, next_cursor })
+    }
+
+    pub async fn update_media(
+        &self,
+        id: Uuid,
+        update: MediaUpdate,
+    ) -> Result<Media, LibraryRepositoryError> {
+        if update.title.is_none() && update.description.is_none() && update.notes.is_none() {
+            return Err(LibraryRepositoryError::EmptyUpdate);
+        }
+        let current = self.load(id).await?.ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        if update.expected_updated_at.is_some_and(|expected| expected != current.updated_at) {
+            return Err(LibraryRepositoryError::OptimisticConflict(id));
+        }
+        let title = update.title.unwrap_or(current.title.clone());
+        let description = update.description.unwrap_or(current.description.clone());
+        let notes = update.notes.unwrap_or_else(|| {
+            current.source_metadata.get("notes").and_then(Value::as_str).map(str::to_owned)
+        });
+        let metadata = with_notes(current.source_metadata, notes);
+        let row = sqlx::query_as::<_, MediaRow>(
+            "UPDATE media SET title = $2, description = $3, source_metadata = $4, updated_at = now() WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(title)
+        .bind(description)
+        .bind(metadata)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        row.into_media()
+    }
+
+    pub async fn archive_media(&self, id: Uuid) -> Result<Media, LibraryRepositoryError> {
+        let row = sqlx::query_as::<_, MediaRow>(
+            "UPDATE media SET source_metadata = source_metadata || jsonb_build_object('archived', true), updated_at = now() WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        row.into_media()
+    }
+
+    pub async fn add_tag(&self, id: Uuid, tag: NewTag) -> Result<Tag, LibraryRepositoryError> {
+        let row = sqlx::query_as::<_, MediaRow>(
+            "UPDATE media SET tags = array_append(array_remove(tags, $2), $2), updated_at = now() WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(&tag.normalized_name)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        Ok(tag_from_name(&tag.normalized_name, row.updated_at))
+    }
+
+    pub async fn remove_tag(&self, id: Uuid, tag: &str) -> Result<(), LibraryRepositoryError> {
+        let updated = sqlx::query(
+            "UPDATE media SET tags = array_remove(tags, $2), updated_at = now() WHERE id = $1 AND $2 = ANY(tags)",
+        )
+        .bind(id)
+        .bind(tag)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() != 0 {
+            return Ok(());
+        }
+        let exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM media WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
+        if !exists {
+            return Err(LibraryRepositoryError::ResourceMissing(id));
+        }
+        Err(LibraryRepositoryError::TagNotAttached)
+    }
+
+    pub async fn list_tags(&self, id: Uuid) -> Result<Vec<Tag>, LibraryRepositoryError> {
+        let row = self.load(id).await?.ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        Ok(row.tags.iter().map(|tag| tag_from_name(tag, row.updated_at)).collect())
+    }
+
+    pub async fn resolve_media(
+        &self,
+        ingest: MediaIngest,
+    ) -> Result<MediaResolutionResult, LibraryRepositoryError> {
+        validate_media_ingest(&ingest)?;
+        let sha256 =
+            ingest.metadata.sha256.as_deref().ok_or(LibraryRepositoryError::MissingSha256)?;
+        let mut transaction = self.pool.begin().await?;
+        let id = Uuid::now_v7();
+        let source_value = source_to_value(&ingest.source);
+        let inserted = sqlx::query_as::<_, MediaRow>(
+            r#"INSERT INTO media (
+                id, kind, storage_state, canonical_sha256, title, description,
+                tags, source_url, source_metadata, mime_type, container,
+                video_codec, audio_codec, width, height, duration_ms, bit_rate,
+                file_size_bytes, local_work_path
+            ) VALUES ($1, $2, 'pending_storage', $3, $4, $5, $6, $7, $8, $9,
+                      $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            ON CONFLICT (canonical_sha256) DO NOTHING
+            RETURNING *"#,
+        )
+        .bind(id)
+        .bind(ingest.metadata.kind.as_str())
+        .bind(sha256)
+        .bind(&ingest.media.title)
+        .bind(&ingest.media.description)
+        .bind(&ingest.tags)
+        .bind(ingest.source.normalized_url.clone().or(ingest.source.original_url.clone()))
+        .bind(&source_value)
+        .bind(&ingest.metadata.mime_type)
+        .bind(&ingest.metadata.container)
+        .bind(&ingest.metadata.video_codec)
+        .bind(&ingest.metadata.audio_codec)
+        .bind(ingest.metadata.width)
+        .bind(ingest.metadata.height)
+        .bind(to_i64(ingest.metadata.duration_ms, "duration_ms")?)
+        .bind(to_i64(ingest.metadata.bit_rate, "bit_rate")?)
+        .bind(to_i64(ingest.metadata.file_size_bytes, "file_size_bytes")?)
+        .bind(&ingest.metadata.local_work_path)
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        let (row, media_created) = match inserted {
+            Some(row) => (row, true),
+            None => {
+                let row = sqlx::query_as::<_, MediaRow>(
+                    "SELECT * FROM media WHERE canonical_sha256 = $1 FOR UPDATE",
+                )
+                .bind(sha256)
+                .fetch_one(&mut *transaction)
+                .await?;
+                let merged_tags = merge_tags(&row.tags, &ingest.tags);
+                let row = sqlx::query_as::<_, MediaRow>(
+                    "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = COALESCE(description, $4), source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1 RETURNING *",
+                )
+                .bind(row.id)
+                .bind(merged_tags)
+                .bind(&ingest.media.title)
+                .bind(&ingest.media.description)
+                .bind(ingest.source.normalized_url.clone().or(ingest.source.original_url.clone()))
+                .bind(merge_missing_source_metadata(&row.source_metadata, &source_value))
+                .fetch_one(&mut *transaction)
+                .await?;
+                (row, false)
+            }
+        };
+        transaction.commit().await?;
+        let media = row.clone().into_media()?;
+        let source = source_from_row(&row)?
+            .ok_or(LibraryRepositoryError::Invariant("resolved media source is missing"))?;
+        Ok(MediaResolutionResult { media, source, media_created })
+    }
+
+    pub async fn record_media_metadata(
+        &self,
+        id: Uuid,
+        metadata: MediaMetadata,
+    ) -> Result<Media, LibraryRepositoryError> {
+        let row = sqlx::query_as::<_, MediaRow>(
+            r#"UPDATE media SET kind = $2, canonical_sha256 = $3,
+                mime_type = $4, container = $5, video_codec = $6, audio_codec = $7,
+                width = $8, height = $9, duration_ms = $10, bit_rate = $11,
+                file_size_bytes = $12, local_work_path = $13,
+                storage_state = CASE WHEN storage_state IN ('ready', 'storage_unknown')
+                    THEN storage_state ELSE 'pending_storage' END,
+                updated_at = now() WHERE id = $1 RETURNING *"#,
+        )
+        .bind(id)
+        .bind(metadata.kind.as_str())
+        .bind(metadata.sha256)
+        .bind(metadata.mime_type)
+        .bind(metadata.container)
+        .bind(metadata.video_codec)
+        .bind(metadata.audio_codec)
+        .bind(metadata.width)
+        .bind(metadata.height)
+        .bind(to_i64(metadata.duration_ms, "duration_ms")?)
+        .bind(to_i64(metadata.bit_rate, "bit_rate")?)
+        .bind(to_i64(metadata.file_size_bytes, "file_size_bytes")?)
+        .bind(metadata.local_work_path)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        row.into_media()
+    }
+
+    pub async fn record_fingerprint(
+        &self,
+        media_id: Uuid,
+        algorithm_version: &str,
+        fingerprint: &Value,
+    ) -> Result<(), LibraryRepositoryError> {
+        let updated = sqlx::query(
+            "UPDATE media SET fingerprint_version = $2, fingerprint = $3, updated_at = now() WHERE id = $1",
+        )
+        .bind(media_id)
+        .bind(algorithm_version)
+        .bind(serde_json::to_vec(fingerprint)?)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(LibraryRepositoryError::ResourceMissing(media_id));
+        }
+        Ok(())
+    }
+
+    pub async fn list_stored_video_fingerprints(
+        &self,
+        exclude_media_id: Uuid,
+        algorithm_version: &str,
+    ) -> Result<Vec<StoredVideoFingerprint>, LibraryRepositoryError> {
+        let rows = sqlx::query_as::<_, MediaRow>(
+            "SELECT * FROM media WHERE id <> $1 AND kind = 'video' AND fingerprint IS NOT NULL AND fingerprint_version = $2 ORDER BY id",
+        )
+        .bind(exclude_media_id)
+        .bind(algorithm_version)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let bytes = row
+                    .fingerprint
+                    .as_deref()
+                    .ok_or(LibraryRepositoryError::Invariant("media fingerprint is missing"))?;
+                Ok(StoredVideoFingerprint {
+                    media_id: row.id,
+                    width: row.width,
+                    height: row.height,
+                    audio_codec: row.audio_codec,
+                    fingerprint: serde_json::from_slice(bytes)?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_storage_uploads(
+        &self,
+    ) -> Result<Vec<StorageUploadInfo>, LibraryRepositoryError> {
+        let rows = sqlx::query_as::<_, MediaRow>(
+            "SELECT * FROM media WHERE storage_state IN ('pending_storage', 'storage_unknown') ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(MediaRow::into_storage_info).collect()
+    }
+
+    pub async fn mark_storage_upload_unknown(
+        &self,
+        id: Uuid,
+        force: bool,
+    ) -> Result<(), LibraryRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        if row.storage_token.is_some() && !force {
+            return Err(LibraryRepositoryError::StorageUploadActive(id));
+        }
+        sqlx::query(
+            "UPDATE media SET storage_state = 'storage_unknown', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        mark_linked_ingests_storage_unknown(&mut transaction, id).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn reset_storage_upload(&self, id: Uuid) -> Result<(), LibraryRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        if row.storage_token.is_some() {
+            return Err(LibraryRepositoryError::StorageUploadActive(id));
+        }
+        let generation = row
+            .storage_generation
+            .checked_add(1)
+            .ok_or(LibraryRepositoryError::StorageGenerationOverflow(id))?;
+        sqlx::query(
+            "UPDATE media SET storage_state = 'pending_storage', storage_generation = $2, telegram_storage_chat_id = NULL, telegram_storage_message_id = NULL, telegram_file_id = NULL, telegram_file_unique_id = NULL, storage_token = NULL, storage_started_at = NULL, stored_at = NULL, updated_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(generation)
+        .execute(&mut *transaction)
+        .await?;
+        reopen_linked_ingests_for_storage(&mut transaction, id).await?;
+        let job = NewJob::upload_storage_asset_generation(id, generation)
+            .dedupe_key(format!("media:{id}:upload_storage:v1:{generation}"));
+        sqlx::query(
+            "INSERT INTO queue.jobs (kind, payload, state, run_at, max_attempts, dedupe_key) VALUES ($1, $2, 'queued', COALESCE($3, now()), $4, $5) ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING",
+        )
+        .bind(job.job_type().as_str())
+        .bind(job.payload_json())
+        .bind(job.run_at_value())
+        .bind(job.max_attempts_value())
+        .bind(job.dedupe_key_value())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn attach_storage_upload(
+        &self,
+        id: Uuid,
+        generation: i32,
+        attachment: StorageUploadAttachment,
+    ) -> Result<StorageReceipt, LibraryRepositoryError> {
+        validate_attachment(&attachment)?;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, MediaRow>(
+            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $3, telegram_storage_message_id = $4, telegram_file_id = $5, telegram_file_unique_id = $6, storage_token = NULL, storage_started_at = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_generation = $2 AND storage_state = 'storage_unknown' RETURNING *",
+        )
+        .bind(id)
+        .bind(generation)
+        .bind(attachment.storage_chat_id)
+        .bind(attachment.storage_message_id)
+        .bind(attachment.telegram_file_id)
+        .bind(attachment.telegram_file_unique_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(LibraryRepositoryError::StorageUploadNotUnknown(id))?;
+        complete_linked_ingests_for_storage(&mut transaction, id).await?;
+        transaction.commit().await?;
+        row.into_storage_receipt()
+    }
+
+    async fn load(&self, id: Uuid) -> Result<Option<MediaRow>, LibraryRepositoryError> {
+        Ok(sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    fn summary_from_row(&self, row: MediaRow) -> Result<MediaSummary, LibraryRepositoryError> {
+        let media = row.clone().into_media()?;
+        let tags = row.tags.iter().map(|tag| tag_from_name(tag, row.updated_at)).collect();
+        let source = source_from_row(&row)?;
+        Ok(MediaSummary {
+            media,
+            tags,
+            source_count: u64::from(source.is_some()),
+            source_url: row.source_url,
+            source_metadata: source.map(|source| source.metadata),
+        })
+    }
+}
+
+pub type MediaResolutionResult = sooqa_library::MediaResolution;
+
+#[async_trait]
+impl StorageUploadStore for LibraryRepository {
+    type Error = LibraryRepositoryError;
+
+    async fn find_media(&self, media_id: Uuid) -> Result<Option<Media>, Self::Error> {
+        LibraryRepository::find_media(self, media_id).await
+    }
+
+    async fn find_storage_receipt(
+        &self,
+        media_id: Uuid,
+    ) -> Result<Option<StorageReceipt>, Self::Error> {
+        let row = self.load(media_id).await?;
+        row.map(|row| {
+            if row.storage_state == "ready" {
+                row.into_storage_receipt().map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .transpose()
+        .map(|value| value.flatten())
+    }
+
+    async fn reserve_storage_upload(
+        &self,
+        request: StorageUploadReservationRequest,
+    ) -> Result<StorageUploadReservation, Self::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
+            .bind(request.media_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(LibraryRepositoryError::ResourceMissing(request.media_id))?;
+        if row.storage_state == "ready" {
+            let receipt = row.into_storage_receipt()?;
+            transaction.commit().await?;
+            return Ok(StorageUploadReservation::Reused(receipt));
+        }
+        if row.storage_generation != request.generation {
+            transaction.commit().await?;
+            return Ok(StorageUploadReservation::StaleGeneration {
+                current_generation: row.storage_generation,
+            });
+        }
+        if matches!(row.storage_state.as_str(), "storage_unknown" | "missing") {
+            transaction.commit().await?;
+            return Ok(StorageUploadReservation::ReconciliationRequired);
+        }
+        if row.storage_token.is_some() {
+            let retry_at =
+                row.storage_started_at.map(|started| started + time::Duration::seconds(600));
+            transaction.commit().await?;
+            return Ok(StorageUploadReservation::InProgress { retry_at });
+        }
+        let owner_token = Uuid::now_v7();
+        let updated = sqlx::query(
+            "UPDATE media SET storage_token = $2, storage_started_at = now(), updated_at = now() WHERE id = $1 AND storage_state = 'pending_storage' AND storage_generation = $3 AND storage_token IS NULL",
+        )
+        .bind(request.media_id)
+        .bind(owner_token)
+        .bind(request.generation)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        if updated.rows_affected() != 1 {
+            return Ok(StorageUploadReservation::InProgress { retry_at: None });
+        }
+        Ok(StorageUploadReservation::Reserved { media_id: request.media_id, owner_token })
+    }
+
+    async fn renew_storage_upload(
+        &self,
+        media_id: Uuid,
+        owner_token: Uuid,
+        lease_duration: Duration,
+    ) -> Result<OffsetDateTime, Self::Error> {
+        let seconds = i64::try_from(lease_duration.as_secs())
+            .map_err(|_| LibraryRepositoryError::InvalidLeaseDuration)?;
+        let updated = sqlx::query_scalar::<_, OffsetDateTime>(
+            "UPDATE media SET storage_started_at = now(), updated_at = now() WHERE id = $1 AND storage_token = $2 RETURNING storage_started_at + ($3 * interval '1 second')",
+        )
+        .bind(media_id)
+        .bind(owner_token)
+        .bind(seconds)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(LibraryRepositoryError::StorageUploadLeaseLost(media_id))?;
+        Ok(updated)
+    }
+
+    async fn complete_storage_upload(
+        &self,
+        media_id: Uuid,
+        owner_token: Uuid,
+        attachment: StorageUploadAttachment,
+    ) -> Result<StorageReceipt, Self::Error> {
+        validate_attachment(&attachment)?;
+        let row = sqlx::query_as::<_, MediaRow>(
+            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $2, telegram_storage_message_id = $3, telegram_file_id = $4, telegram_file_unique_id = $5, storage_token = NULL, storage_started_at = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_token = $6 AND storage_state = 'pending_storage' RETURNING *",
+        )
+        .bind(media_id)
+        .bind(attachment.storage_chat_id)
+        .bind(attachment.storage_message_id)
+        .bind(attachment.telegram_file_id)
+        .bind(attachment.telegram_file_unique_id)
+        .bind(owner_token)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(LibraryRepositoryError::StorageUploadLeaseLost(media_id))?;
+        row.into_storage_receipt()
+    }
+
+    async fn release_storage_upload(
+        &self,
+        media_id: Uuid,
+        owner_token: Uuid,
+    ) -> Result<(), Self::Error> {
+        sqlx::query(
+            "UPDATE media SET storage_state = 'pending_storage', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1 AND storage_token = $2",
+        )
+        .bind(media_id)
+        .bind(owner_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_storage_upload_unknown(
+        &self,
+        media_id: Uuid,
+        owner_token: Uuid,
+    ) -> Result<(), Self::Error> {
+        let mut transaction = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE media SET storage_state = 'storage_unknown', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1 AND storage_token = $2 AND storage_state = 'pending_storage'",
+        )
+        .bind(media_id)
+        .bind(owner_token)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(LibraryRepositoryError::StorageUploadLeaseLost(media_id));
+        }
+        mark_linked_ingests_storage_unknown(&mut transaction, media_id).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+}
+
+async fn mark_linked_ingests_storage_unknown(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    media_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE ingests SET state = 'failed_terminal', error_code = 'storage_unknown', error_message = 'media storage requires explicit reconciliation', completed_at = now(), updated_at = now() WHERE media_id = $1 AND (state NOT IN ('cancelled', 'failed_terminal') OR error_code IN ('storage_upload', 'storage_unknown'))",
+    )
+    .bind(media_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn reopen_linked_ingests_for_storage(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    media_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE ingests SET state = 'storing', error_code = NULL, error_message = NULL, completed_at = NULL, updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state IN ('completed', 'storing') OR error_code IN ('storage_upload', 'storage_unknown'))",
+    )
+    .bind(media_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn complete_linked_ingests_for_storage(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    media_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE ingests SET state = 'completed', error_code = NULL, error_message = NULL, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
+    )
+    .bind(media_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+impl MediaRow {
+    fn into_media(self) -> Result<Media, LibraryRepositoryError> {
+        Ok(Media {
             id: self.id,
-            content_item_id: self.content_item_id,
-            role: parse_enum("media_assets.role", &self.role)?,
-            media_kind: parse_enum("media_assets.media_kind", &self.media_kind)?,
+            kind: MediaKind::try_from(self.kind.as_str())
+                .map_err(LibraryRepositoryError::UnknownMediaKind)?,
+            status: if self.source_metadata.get("archived").and_then(Value::as_bool) == Some(true) {
+                MediaStatus::Archived
+            } else {
+                MediaStatus::Active
+            },
+            title: self.title,
+            description: self.description,
+            notes: self.source_metadata.get("notes").and_then(Value::as_str).map(str::to_owned),
             mime_type: self.mime_type,
             container: self.container,
             video_codec: self.video_codec,
             audio_codec: self.audio_codec,
             width: self.width,
             height: self.height,
-            duration_ms: from_database_i64(self.duration_ms, "duration_ms")?,
-            bit_rate: from_database_i64(self.bit_rate, "bit_rate")?,
-            file_size_bytes: from_database_i64(self.file_size_bytes, "file_size_bytes")?,
-            sha256: self.sha256,
+            duration_ms: to_u64(self.duration_ms, "duration_ms")?,
+            bit_rate: to_u64(self.bit_rate, "bit_rate")?,
+            file_size_bytes: to_u64(self.file_size_bytes, "file_size_bytes")?,
+            sha256: self.canonical_sha256,
             local_work_path: self.local_work_path,
-            storage_state: parse_enum("media_assets.storage_state", &self.storage_state)?,
+            storage_state: MediaStorageState::try_from(self.storage_state.as_str())
+                .map_err(LibraryRepositoryError::UnknownStorageState)?,
             created_at: self.created_at,
+            updated_at: self.updated_at,
+            archived_at: (self.source_metadata.get("archived").and_then(Value::as_bool)
+                == Some(true))
+            .then_some(self.updated_at),
         })
     }
-}
 
-#[derive(Debug, FromRow)]
-struct SourceRecordRow {
-    id: Uuid,
-    content_item_id: Uuid,
-    ingest_request_id: Option<Uuid>,
-    source_type: String,
-    original_url: Option<String>,
-    normalized_url: Option<String>,
-    platform: Option<String>,
-    platform_content_id: Option<String>,
-    author_name: Option<String>,
-    source_title: Option<String>,
-    source_description: Option<String>,
-    source_published_at: Option<OffsetDateTime>,
-    retrieved_at: OffsetDateTime,
-    metadata_json: Value,
-}
-
-impl SourceRecordRow {
-    fn into_source_record(self) -> Result<SourceRecord, LibraryRepositoryError> {
-        Ok(SourceRecord {
-            id: self.id,
-            content_item_id: self.content_item_id,
-            ingest_request_id: self.ingest_request_id,
-            source_type: parse_enum("source_records.source_type", &self.source_type)?,
-            original_url: self.original_url,
-            normalized_url: self.normalized_url,
-            platform: self.platform,
-            platform_content_id: self.platform_content_id,
-            author_name: self.author_name,
-            source_title: self.source_title,
-            source_description: self.source_description,
-            source_published_at: self.source_published_at,
-            retrieved_at: self.retrieved_at,
-            metadata_json: self.metadata_json,
+    fn into_storage_info(self) -> Result<StorageUploadInfo, LibraryRepositoryError> {
+        Ok(StorageUploadInfo {
+            media_id: self.id,
+            state: self.storage_state,
+            generation: self.storage_generation,
+            storage_chat_id: self.telegram_storage_chat_id,
+            storage_message_id: self.telegram_storage_message_id,
+            file_id: self.telegram_file_id,
+            file_unique_id: self.telegram_file_unique_id,
+            updated_at: self.updated_at,
         })
     }
-}
 
-#[derive(Debug, FromRow)]
-struct TagRow {
-    id: Uuid,
-    normalized_name: String,
-    display_name: String,
-    created_at: OffsetDateTime,
-}
-
-impl TagRow {
-    fn into_tag(self) -> Tag {
-        Tag {
-            id: self.id,
-            normalized_name: self.normalized_name,
-            display_name: self.display_name,
-            created_at: self.created_at,
-        }
-    }
-}
-
-#[derive(Debug, FromRow)]
-struct StorageObjectRow {
-    id: Uuid,
-    asset_id: Uuid,
-    provider: String,
-    storage_chat_id: i64,
-    storage_message_id: i64,
-    telegram_file_id: Option<String>,
-    telegram_file_unique_id: Option<String>,
-    media_kind: String,
-    stored_at: OffsetDateTime,
-    verified_at: Option<OffsetDateTime>,
-    status: String,
-}
-
-impl StorageObjectRow {
-    fn into_storage_object(self) -> Result<StorageObject, LibraryRepositoryError> {
-        Ok(StorageObject {
-            id: self.id,
-            asset_id: self.asset_id,
-            provider: self.provider,
-            storage_chat_id: self.storage_chat_id,
-            storage_message_id: self.storage_message_id,
+    fn into_storage_receipt(self) -> Result<StorageReceipt, LibraryRepositoryError> {
+        Ok(StorageReceipt {
+            media_id: self.id,
+            storage_chat_id: self
+                .telegram_storage_chat_id
+                .ok_or(LibraryRepositoryError::StorageReceiptMissing(self.id))?,
+            storage_message_id: self
+                .telegram_storage_message_id
+                .ok_or(LibraryRepositoryError::StorageReceiptMissing(self.id))?,
             telegram_file_id: self.telegram_file_id,
             telegram_file_unique_id: self.telegram_file_unique_id,
-            media_kind: parse_enum("storage_objects.media_kind", &self.media_kind)?,
-            stored_at: self.stored_at,
-            verified_at: self.verified_at,
-            status: parse_enum("storage_objects.status", &self.status)?,
+            media_kind: MediaKind::try_from(self.kind.as_str())
+                .map_err(LibraryRepositoryError::UnknownMediaKind)?,
+            stored_at: self.stored_at.unwrap_or(self.updated_at),
         })
     }
 }
 
-fn parse_enum<T>(field: &'static str, value: &str) -> Result<T, LibraryRepositoryError>
-where
-    T: for<'value> TryFrom<&'value str, Error = String>,
-{
-    T::try_from(value).map_err(|value| LibraryRepositoryError::InvalidEnum { field, value })
+fn source_from_row(row: &MediaRow) -> Result<Option<MediaSource>, LibraryRepositoryError> {
+    if row.source_url.is_none()
+        && (row.source_metadata.is_null()
+            || row.source_metadata.as_object().is_some_and(|object| object.is_empty()))
+    {
+        return Ok(None);
+    }
+    let kind = row
+        .source_metadata
+        .get("kind")
+        .or_else(|| row.source_metadata.get("source_kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("direct_url");
+    let kind = SourceKind::try_from(kind).map_err(LibraryRepositoryError::UnknownSourceKind)?;
+    Ok(Some(MediaSource {
+        ingest_id: row
+            .source_metadata
+            .get("ingest_id")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok()),
+        kind,
+        original_url: row
+            .source_metadata
+            .get("original_url")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        normalized_url: row.source_url.clone(),
+        platform: row.source_metadata.get("platform").and_then(Value::as_str).map(str::to_owned),
+        platform_content_id: row
+            .source_metadata
+            .get("platform_content_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        author_name: row
+            .source_metadata
+            .get("author_name")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        title: row.source_metadata.get("title").and_then(Value::as_str).map(str::to_owned),
+        description: row
+            .source_metadata
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        published_at: row.source_metadata.get("published_at").and_then(Value::as_str).and_then(
+            |value| {
+                time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            },
+        ),
+        retrieved_at: row.updated_at,
+        metadata: row
+            .source_metadata
+            .get("metadata")
+            .cloned()
+            .unwrap_or_else(|| row.source_metadata.clone()),
+    }))
 }
 
-fn to_database_u64(
-    value: Option<u64>,
-    field: &'static str,
-) -> Result<Option<i64>, LibraryRepositoryError> {
+fn source_to_value(source: &MediaSourceInput) -> Value {
+    json!({
+        "ingest_id": source.ingest_id.map(|id| id.to_string()),
+        "kind": source.kind.as_str(),
+        "original_url": source.original_url,
+        "platform": source.platform,
+        "platform_content_id": source.platform_content_id,
+        "author_name": source.author_name,
+        "title": source.title,
+        "description": source.description,
+        "published_at": source.published_at.map(|value| value.to_string()),
+        "retrieved_at": OffsetDateTime::now_utc().to_string(),
+        "metadata": source.metadata,
+    })
+}
+
+fn merge_missing_source_metadata(existing: &Value, incoming: &Value) -> Value {
+    match (existing, incoming) {
+        (Value::Object(existing), Value::Object(incoming)) => {
+            let mut merged = existing.clone();
+            for (key, incoming_value) in incoming {
+                match merged.get(key) {
+                    Some(existing_value)
+                        if existing_value.is_object() && incoming_value.is_object() =>
+                    {
+                        merged.insert(
+                            key.clone(),
+                            merge_missing_source_metadata(existing_value, incoming_value),
+                        );
+                    }
+                    Some(existing_value) if !existing_value.is_null() => {}
+                    Some(_) | None if !incoming_value.is_null() => {
+                        merged.insert(key.clone(), incoming_value.clone());
+                    }
+                    _ => {}
+                }
+            }
+            Value::Object(merged)
+        }
+        (Value::Null, incoming) => incoming.clone(),
+        (existing, _) => existing.clone(),
+    }
+}
+
+fn merge_tags(existing: &[String], incoming: &[String]) -> Vec<String> {
+    let mut tags = existing.to_vec();
+    for tag in incoming {
+        if !tags.iter().any(|current| current == tag) {
+            tags.push(tag.clone());
+        }
+    }
+    tags
+}
+
+fn tag_from_name(name: &str, created_at: OffsetDateTime) -> Tag {
+    Tag { normalized_name: name.to_owned(), display_name: name.to_owned(), created_at }
+}
+
+fn with_notes(mut metadata: Value, notes: Option<String>) -> Value {
+    if !metadata.is_object() {
+        metadata = json!({ "metadata": metadata });
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        match notes {
+            Some(notes) => {
+                object.insert("notes".to_owned(), Value::String(notes));
+            }
+            None => {
+                object.remove("notes");
+            }
+        }
+    }
+    metadata
+}
+
+fn validate_media_ingest(ingest: &MediaIngest) -> Result<(), LibraryRepositoryError> {
+    let Some(sha256) = ingest.metadata.sha256.as_deref() else {
+        return Err(LibraryRepositoryError::MissingSha256);
+    };
+    if sha256.len() != 32 {
+        return Err(LibraryRepositoryError::InvalidSha256Length { actual: sha256.len() });
+    }
+    Ok(())
+}
+
+fn validate_attachment(attachment: &StorageUploadAttachment) -> Result<(), LibraryRepositoryError> {
+    if attachment.storage_message_id <= 0 {
+        return Err(LibraryRepositoryError::InvalidStorageMessageId(attachment.storage_message_id));
+    }
+    if attachment.telegram_file_id.as_deref().is_some_and(str::is_empty) {
+        return Err(LibraryRepositoryError::EmptyStorageField("telegram_file_id"));
+    }
+    if attachment.telegram_file_unique_id.as_deref().is_some_and(str::is_empty) {
+        return Err(LibraryRepositoryError::EmptyStorageField("telegram_file_unique_id"));
+    }
+    Ok(())
+}
+
+fn to_i64(value: Option<u64>, field: &'static str) -> Result<Option<i64>, LibraryRepositoryError> {
     value
         .map(|value| {
             i64::try_from(value).map_err(|_| LibraryRepositoryError::InvalidNumber { field })
@@ -2735,13 +899,58 @@ fn to_database_u64(
         .transpose()
 }
 
-fn from_database_i64(
-    value: Option<i64>,
-    field: &'static str,
-) -> Result<Option<u64>, LibraryRepositoryError> {
+fn to_u64(value: Option<i64>, field: &'static str) -> Result<Option<u64>, LibraryRepositoryError> {
     value
         .map(|value| {
             u64::try_from(value).map_err(|_| LibraryRepositoryError::InvalidNumber { field })
         })
         .transpose()
+}
+
+#[derive(Debug, Error)]
+pub enum LibraryRepositoryError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("media {0} was not found")]
+    ResourceMissing(Uuid),
+    #[error("media update must change at least one field")]
+    EmptyUpdate,
+    #[error("media {0} was modified by another request")]
+    OptimisticConflict(Uuid),
+    #[error("tag is not attached")]
+    TagNotAttached,
+    #[error("media search limit must be between 1 and 100, got {value}")]
+    InvalidLimit { value: u32 },
+    #[error("media SHA-256 is required")]
+    MissingSha256,
+    #[error("media SHA-256 must contain 32 bytes, got {actual}")]
+    InvalidSha256Length { actual: usize },
+    #[error("media {0} has an invalid kind")]
+    UnknownMediaKind(String),
+    #[error("media has an invalid storage state: {0}")]
+    UnknownStorageState(String),
+    #[error("media source has an invalid kind: {0}")]
+    UnknownSourceKind(String),
+    #[error("media violates a repository invariant: {0}")]
+    Invariant(&'static str),
+    #[error("invalid numeric value for {field}")]
+    InvalidNumber { field: &'static str },
+    #[error("storage upload for media {0} is active")]
+    StorageUploadActive(Uuid),
+    #[error("storage generation for media {0} overflowed")]
+    StorageGenerationOverflow(Uuid),
+    #[error("storage upload for media {0} is not unknown")]
+    StorageUploadNotUnknown(Uuid),
+    #[error("storage upload lease for media {0} was lost")]
+    StorageUploadLeaseLost(Uuid),
+    #[error("storage receipt for media {0} is incomplete")]
+    StorageReceiptMissing(Uuid),
+    #[error("Telegram storage message ID must be positive, got {0}")]
+    InvalidStorageMessageId(i64),
+    #[error("storage attachment field {0} must not be empty")]
+    EmptyStorageField(&'static str),
+    #[error("storage lease duration is invalid")]
+    InvalidLeaseDuration,
 }

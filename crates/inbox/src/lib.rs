@@ -73,8 +73,7 @@ pub struct AssetThumbnailNormalization {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IngestFinalization {
-    pub content_item_id: Uuid,
-    pub canonical_asset_id: Uuid,
+    pub media_id: Uuid,
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize)]
@@ -207,6 +206,7 @@ impl IngestStatus {
                 | (Self::ExactDedupCheck, Self::Normalizing)
                 | (Self::Normalizing, Self::Fingerprinting)
                 | (Self::Normalizing, Self::Storing)
+                | (Self::Fingerprinting, Self::Storing)
                 | (Self::Fingerprinting, Self::SimilarityCheck)
                 | (Self::Fingerprinting, Self::Completed)
                 | (Self::SimilarityCheck, Self::Storing)
@@ -371,7 +371,7 @@ impl IngestSubmission {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct IngestRequest {
+pub struct Ingest {
     pub id: Uuid,
     pub kind: IngestKind,
     pub status: IngestStatus,
@@ -384,6 +384,7 @@ pub struct IngestRequest {
     pub supplied_caption: Option<String>,
     pub supplied_tags: Vec<String>,
     pub idempotency_key: Option<String>,
+    pub media_id: Option<Uuid>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub created_at: time::OffsetDateTime,
@@ -391,7 +392,7 @@ pub struct IngestRequest {
     pub completed_at: Option<time::OffsetDateTime>,
 }
 
-impl IngestRequest {
+impl Ingest {
     pub fn from_submission(id: Uuid, submission: &IngestSubmission) -> Self {
         let now = time::OffsetDateTime::now_utc();
         Self {
@@ -407,6 +408,7 @@ impl IngestRequest {
             supplied_caption: submission.supplied_caption.clone(),
             supplied_tags: submission.supplied_tags.clone(),
             idempotency_key: submission.idempotency_key.clone(),
+            media_id: None,
             error_code: None,
             error_message: None,
             created_at: now,
@@ -617,7 +619,7 @@ mod tests {
     #[test]
     fn state_machine_allows_pipeline_and_retry_transitions() {
         let mut request =
-            IngestRequest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
+            Ingest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
 
         for status in [
             IngestStatus::Queued,
@@ -634,7 +636,7 @@ mod tests {
         }
 
         let mut storing =
-            IngestRequest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
+            Ingest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
         for status in [
             IngestStatus::Queued,
             IngestStatus::Downloading,
@@ -648,13 +650,14 @@ mod tests {
             .transition_to(IngestStatus::Fingerprinting)
             .expect("stored content should enter fingerprinting");
         storing
-            .transition_to(IngestStatus::Completed)
-            .expect("fingerprinted content should complete");
+            .transition_to(IngestStatus::Storing)
+            .expect("fingerprinted content should wait for storage");
+        storing.transition_to(IngestStatus::Completed).expect("stored content should complete");
 
         assert!(request.transition_to(IngestStatus::Queued).is_err());
 
         let mut direct_normalizing =
-            IngestRequest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
+            Ingest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
         for status in [
             IngestStatus::Queued,
             IngestStatus::Downloading,
@@ -667,7 +670,7 @@ mod tests {
         }
 
         let mut retrying =
-            IngestRequest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
+            Ingest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
         retrying.transition_to(IngestStatus::Queued).expect("request should queue");
         retrying
             .transition_to(IngestStatus::FailedRetryable)
@@ -680,7 +683,7 @@ mod tests {
     #[test]
     fn terminal_states_cannot_transition() {
         let mut request =
-            IngestRequest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
+            Ingest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
         request.transition_to(IngestStatus::Cancelled).expect("request should be cancellable");
 
         assert!(request.transition_to(IngestStatus::Queued).is_err());

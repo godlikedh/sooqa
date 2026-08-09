@@ -35,21 +35,22 @@ pub enum AppRole {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CliCommand {
     Migrate,
-    StorageIntents(StorageIntentCommand),
+    Storage(StorageCommand),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum StorageIntentCommand {
+pub enum StorageCommand {
     List,
     MarkUnknown {
-        intent_id: String,
+        media_id: String,
         force: bool,
     },
     Reset {
-        intent_id: String,
+        media_id: String,
     },
     Attach {
-        intent_id: String,
+        media_id: String,
+        generation: String,
         storage_chat_id: String,
         storage_message_id: String,
         telegram_file_id: String,
@@ -90,10 +91,8 @@ impl CliOptions {
             match argument.as_str() {
                 "--check-config" => check_config = true,
                 "migrate" => command = Some(CliCommand::Migrate),
-                "storage-intents" => {
-                    command = Some(CliCommand::StorageIntents(parse_storage_intent_command(
-                        &mut arguments,
-                    )?));
+                "storage" => {
+                    command = Some(CliCommand::Storage(parse_storage_command(&mut arguments)?));
                 }
                 "--config" => {
                     let path = arguments.next().ok_or(ConfigError::MissingArgument("--config"))?;
@@ -108,16 +107,14 @@ impl CliOptions {
     }
 }
 
-fn parse_storage_intent_command(
+fn parse_storage_command(
     arguments: &mut impl Iterator<Item = String>,
-) -> Result<StorageIntentCommand, ConfigError> {
-    let subcommand =
-        arguments.next().ok_or(ConfigError::MissingArgument("storage-intents command"))?;
+) -> Result<StorageCommand, ConfigError> {
+    let subcommand = arguments.next().ok_or(ConfigError::MissingArgument("storage command"))?;
     match subcommand.as_str() {
-        "list" => Ok(StorageIntentCommand::List),
+        "list" => Ok(StorageCommand::List),
         "mark-unknown" => {
-            let intent_id =
-                next_storage_argument(arguments, "storage-intents mark-unknown intent-id")?;
+            let media_id = next_storage_argument(arguments, "storage mark-unknown media-id")?;
             let force = match arguments.next() {
                 None => false,
                 Some(option) if option == "--force" => {
@@ -128,27 +125,25 @@ fn parse_storage_intent_command(
                 }
                 Some(unknown) => return Err(ConfigError::UnknownArgument(unknown)),
             };
-            Ok(StorageIntentCommand::MarkUnknown { intent_id, force })
+            Ok(StorageCommand::MarkUnknown { media_id, force })
         }
         "reset" => {
-            let intent_id = next_storage_argument(arguments, "storage-intents reset intent-id")?;
+            let media_id = next_storage_argument(arguments, "storage reset media-id")?;
             match arguments.next().as_deref() {
-                Some("--confirm") => Ok(StorageIntentCommand::Reset { intent_id }),
+                Some("--confirm") => Ok(StorageCommand::Reset { media_id }),
                 Some(unknown) => Err(ConfigError::UnknownArgument(unknown.to_owned())),
                 None => Err(ConfigError::MissingArgument("--confirm")),
             }
         }
-        "attach" => Ok(StorageIntentCommand::Attach {
-            intent_id: next_storage_argument(arguments, "storage-intents attach intent-id")?,
-            storage_chat_id: next_storage_argument(arguments, "storage-intents attach chat-id")?,
-            storage_message_id: next_storage_argument(
-                arguments,
-                "storage-intents attach message-id",
-            )?,
-            telegram_file_id: next_storage_argument(arguments, "storage-intents attach file-id")?,
+        "attach" => Ok(StorageCommand::Attach {
+            media_id: next_storage_argument(arguments, "storage attach media-id")?,
+            generation: next_storage_argument(arguments, "storage attach generation")?,
+            storage_chat_id: next_storage_argument(arguments, "storage attach chat-id")?,
+            storage_message_id: next_storage_argument(arguments, "storage attach message-id")?,
+            telegram_file_id: next_storage_argument(arguments, "storage attach file-id")?,
             telegram_file_unique_id: next_storage_argument(
                 arguments,
-                "storage-intents attach file-unique-id",
+                "storage attach file-unique-id",
             )?,
         }),
         unknown => Err(ConfigError::UnknownArgument(unknown.to_owned())),
@@ -258,6 +253,7 @@ pub struct ObservabilityConfig {
 pub struct SecretConfig {
     pub database_url: Option<SecretString>,
     pub telegram_bot_token: Option<SecretString>,
+    pub api_token: Option<SecretString>,
 }
 
 impl fmt::Debug for SecretConfig {
@@ -266,6 +262,7 @@ impl fmt::Debug for SecretConfig {
             .debug_struct("SecretConfig")
             .field("database_url", &self.database_url)
             .field("telegram_bot_token", &self.telegram_bot_token)
+            .field("api_token", &self.api_token)
             .finish()
     }
 }
@@ -391,13 +388,14 @@ impl AppConfig {
             secrets: SecretConfig {
                 database_url: raw.secrets.database_url.map(SecretString::new),
                 telegram_bot_token: raw.secrets.telegram_bot_token.map(SecretString::new),
+                api_token: raw.secrets.api_token.map(SecretString::new),
             },
         })
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.max_download_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.max_download_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -422,6 +420,7 @@ impl AppConfig {
             self.observability.log_level,
             configured_state(self.secrets.database_url.as_ref()),
             configured_state(self.secrets.telegram_bot_token.as_ref()),
+            configured_state(self.secrets.api_token.as_ref()),
         )
     }
 
@@ -481,6 +480,9 @@ impl AppConfig {
         }
         if let Some(value) = optional_env_string("SOOQA_TELEGRAM_BOT_TOKEN")? {
             self.secrets.telegram_bot_token = Some(SecretString::new(value));
+        }
+        if let Some(value) = optional_env_string("SOOQA_API_TOKEN")? {
+            self.secrets.api_token = Some(SecretString::new(value));
         }
         if let Some(value) = optional_env_string("SOOQA_TELEGRAM_API_BASE_URL")? {
             self.telegram.api_base_url = value;
@@ -705,6 +707,7 @@ struct RawObservabilityConfig {
 struct RawSecretConfig {
     database_url: Option<String>,
     telegram_bot_token: Option<String>,
+    api_token: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -872,46 +875,37 @@ mod tests {
     }
 
     #[test]
-    fn storage_intent_commands_parse_with_explicit_reset_confirmation() {
+    fn storage_commands_parse_with_explicit_reset_confirmation() {
         assert_eq!(
-            CliOptions::parse(["storage-intents", "list"])
-                .expect("list command should parse")
-                .command,
-            Some(CliCommand::StorageIntents(StorageIntentCommand::List))
+            CliOptions::parse(["storage", "list"]).expect("list command should parse").command,
+            Some(CliCommand::Storage(StorageCommand::List))
         );
         assert_eq!(
-            CliOptions::parse(["storage-intents", "reset", "intent-id", "--confirm"])
+            CliOptions::parse(["storage", "reset", "media-id", "--confirm"])
                 .expect("reset command should parse")
                 .command,
-            Some(CliCommand::StorageIntents(StorageIntentCommand::Reset {
-                intent_id: "intent-id".to_owned(),
-            }))
+            Some(CliCommand::Storage(StorageCommand::Reset { media_id: "media-id".to_owned() }))
         );
-        assert!(CliOptions::parse(["storage-intents", "reset", "intent-id"]).is_err());
+        assert!(CliOptions::parse(["storage", "reset", "media-id"]).is_err());
     }
 
     #[test]
-    fn storage_intent_commands_parse_force_and_typed_attach_arguments() {
+    fn storage_commands_parse_force_and_typed_attach_arguments() {
         assert_eq!(
-            CliOptions::parse([
-                "storage-intents",
-                "mark-unknown",
-                "intent-id",
-                "--force",
-                "--confirm",
-            ])
-            .expect("forced mark-unknown should parse")
-            .command,
-            Some(CliCommand::StorageIntents(StorageIntentCommand::MarkUnknown {
-                intent_id: "intent-id".to_owned(),
+            CliOptions::parse(["storage", "mark-unknown", "media-id", "--force", "--confirm",])
+                .expect("forced mark-unknown should parse")
+                .command,
+            Some(CliCommand::Storage(StorageCommand::MarkUnknown {
+                media_id: "media-id".to_owned(),
                 force: true,
             }))
         );
         assert_eq!(
             CliOptions::parse([
-                "storage-intents",
+                "storage",
                 "attach",
-                "intent-id",
+                "media-id",
+                "3",
                 "-100123",
                 "789",
                 "file-id",
@@ -919,17 +913,16 @@ mod tests {
             ])
             .expect("typed attach should parse")
             .command,
-            Some(CliCommand::StorageIntents(StorageIntentCommand::Attach {
-                intent_id: "intent-id".to_owned(),
+            Some(CliCommand::Storage(StorageCommand::Attach {
+                media_id: "media-id".to_owned(),
+                generation: "3".to_owned(),
                 storage_chat_id: "-100123".to_owned(),
                 storage_message_id: "789".to_owned(),
                 telegram_file_id: "file-id".to_owned(),
                 telegram_file_unique_id: "unique-id".to_owned(),
             }))
         );
-        assert!(
-            CliOptions::parse(["storage-intents", "mark-unknown", "intent-id", "--force"]).is_err()
-        );
+        assert!(CliOptions::parse(["storage", "mark-unknown", "media-id", "--force"]).is_err());
     }
 
     #[test]

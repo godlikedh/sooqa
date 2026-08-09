@@ -1,4 +1,4 @@
-//! Content catalogue and duplicate-management boundaries for sooqa.
+//! Media catalogue and storage boundaries for sooqa.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -10,14 +10,14 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ContentKind {
+pub enum MediaKind {
     Video,
     Image,
     Animation,
     Audio,
 }
 
-impl ContentKind {
+impl MediaKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Video => "video",
@@ -28,7 +28,7 @@ impl ContentKind {
     }
 }
 
-impl TryFrom<&str> for ContentKind {
+impl TryFrom<&str> for MediaKind {
     type Error = String;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
@@ -44,13 +44,13 @@ impl TryFrom<&str> for ContentKind {
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ContentStatus {
+pub enum MediaStatus {
     Active,
     Archived,
     Deleted,
 }
 
-impl ContentStatus {
+impl MediaStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
@@ -60,7 +60,7 @@ impl ContentStatus {
     }
 }
 
-impl TryFrom<&str> for ContentStatus {
+impl TryFrom<&str> for MediaStatus {
     type Error = String;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
@@ -75,33 +75,33 @@ impl TryFrom<&str> for ContentStatus {
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AssetRole {
-    Original,
-    Canonical,
-    Preview,
-    Thumbnail,
+pub enum MediaStorageState {
+    Pending,
+    Ready,
+    Unknown,
+    Missing,
 }
 
-impl AssetRole {
+impl MediaStorageState {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Original => "original",
-            Self::Canonical => "canonical",
-            Self::Preview => "preview",
-            Self::Thumbnail => "thumbnail",
+            Self::Pending => "pending_storage",
+            Self::Ready => "ready",
+            Self::Unknown => "storage_unknown",
+            Self::Missing => "missing",
         }
     }
 }
 
-impl TryFrom<&str> for AssetRole {
+impl TryFrom<&str> for MediaStorageState {
     type Error = String;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
-            "original" => Ok(Self::Original),
-            "canonical" => Ok(Self::Canonical),
-            "preview" => Ok(Self::Preview),
-            "thumbnail" => Ok(Self::Thumbnail),
+            "pending_storage" => Ok(Self::Pending),
+            "ready" => Ok(Self::Ready),
+            "storage_unknown" => Ok(Self::Unknown),
+            "missing" => Ok(Self::Missing),
             unknown => Err(unknown.to_owned()),
         }
     }
@@ -109,41 +109,7 @@ impl TryFrom<&str> for AssetRole {
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MediaKind {
-    Video,
-    Image,
-    Audio,
-    Animation,
-}
-
-impl MediaKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Video => "video",
-            Self::Image => "image",
-            Self::Audio => "audio",
-            Self::Animation => "animation",
-        }
-    }
-}
-
-impl TryFrom<&str> for MediaKind {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "video" => Ok(Self::Video),
-            "image" => Ok(Self::Image),
-            "audio" => Ok(Self::Audio),
-            "animation" => Ok(Self::Animation),
-            unknown => Err(unknown.to_owned()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceType {
+pub enum SourceKind {
     Webpage,
     DirectUrl,
     Youtube,
@@ -151,7 +117,7 @@ pub enum SourceType {
     Upload,
 }
 
-impl SourceType {
+impl SourceKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Webpage => "webpage",
@@ -163,7 +129,7 @@ impl SourceType {
     }
 }
 
-impl TryFrom<&str> for SourceType {
+impl TryFrom<&str> for SourceKind {
     type Error = String;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
@@ -178,105 +144,48 @@ impl TryFrom<&str> for SourceType {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StorageState {
-    Local,
-    Uploaded,
-    Missing,
-}
-
-impl StorageState {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Uploaded => "uploaded",
-            Self::Missing => "missing",
-        }
-    }
-}
-
-impl TryFrom<&str> for StorageState {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "local" => Ok(Self::Local),
-            "uploaded" => Ok(Self::Uploaded),
-            "missing" => Ok(Self::Missing),
-            unknown => Err(unknown.to_owned()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StorageObjectStatus {
-    Active,
-    Missing,
-    Inaccessible,
-    Deleted,
-}
-
-impl StorageObjectStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Missing => "missing",
-            Self::Inaccessible => "inaccessible",
-            Self::Deleted => "deleted",
-        }
-    }
-}
-
-impl TryFrom<&str> for StorageObjectStatus {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "active" => Ok(Self::Active),
-            "missing" => Ok(Self::Missing),
-            "inaccessible" => Ok(Self::Inaccessible),
-            "deleted" => Ok(Self::Deleted),
-            unknown => Err(unknown.to_owned()),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ContentItem {
+pub struct Media {
     pub id: Uuid,
-    pub kind: ContentKind,
-    pub status: ContentStatus,
-    pub canonical_asset_id: Option<Uuid>,
-    pub preferred_title: Option<String>,
-    pub editorial_description: Option<String>,
+    pub kind: MediaKind,
+    pub status: MediaStatus,
+    pub title: Option<String>,
+    pub description: Option<String>,
     pub notes: Option<String>,
+    pub mime_type: Option<String>,
+    pub container: Option<String>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub bit_rate: Option<u64>,
+    pub file_size_bytes: Option<u64>,
+    pub sha256: Option<Vec<u8>>,
+    pub local_work_path: Option<String>,
+    pub storage_state: MediaStorageState,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub archived_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NewContentItem {
-    pub kind: ContentKind,
-    pub preferred_title: Option<String>,
-    pub editorial_description: Option<String>,
+pub struct NewMedia {
+    pub kind: MediaKind,
+    pub title: Option<String>,
+    pub description: Option<String>,
     pub notes: Option<String>,
 }
 
-impl NewContentItem {
-    pub fn new(kind: ContentKind) -> Self {
-        Self { kind, preferred_title: None, editorial_description: None, notes: None }
+impl NewMedia {
+    pub fn new(kind: MediaKind) -> Self {
+        Self { kind, title: None, description: None, notes: None }
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct MediaAsset {
-    pub id: Uuid,
-    pub content_item_id: Uuid,
-    pub role: AssetRole,
-    pub media_kind: MediaKind,
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MediaMetadata {
+    pub kind: MediaKind,
     pub mime_type: Option<String>,
     pub container: Option<String>,
     pub video_codec: Option<String>,
@@ -288,338 +197,102 @@ pub struct MediaAsset {
     pub file_size_bytes: Option<u64>,
     pub sha256: Option<Vec<u8>>,
     pub local_work_path: Option<String>,
-    pub storage_state: StorageState,
-    pub created_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NewMediaAsset {
-    pub content_item_id: Uuid,
-    pub role: AssetRole,
-    pub media_kind: MediaKind,
-    pub mime_type: Option<String>,
-    pub container: Option<String>,
-    pub video_codec: Option<String>,
-    pub audio_codec: Option<String>,
-    pub width: Option<i32>,
-    pub height: Option<i32>,
-    pub duration_ms: Option<u64>,
-    pub bit_rate: Option<u64>,
-    pub file_size_bytes: Option<u64>,
-    pub sha256: Option<Vec<u8>>,
-    pub local_work_path: Option<String>,
-    pub storage_state: StorageState,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NewMediaAssetDraft {
-    pub role: AssetRole,
-    pub media_kind: MediaKind,
-    pub mime_type: Option<String>,
-    pub container: Option<String>,
-    pub video_codec: Option<String>,
-    pub audio_codec: Option<String>,
-    pub width: Option<i32>,
-    pub height: Option<i32>,
-    pub duration_ms: Option<u64>,
-    pub bit_rate: Option<u64>,
-    pub file_size_bytes: Option<u64>,
-    pub sha256: Option<Vec<u8>>,
-    pub local_work_path: Option<String>,
-    pub storage_state: StorageState,
-}
-
-impl NewMediaAssetDraft {
-    pub fn for_content_item(self, content_item_id: Uuid) -> NewMediaAsset {
-        NewMediaAsset {
-            content_item_id,
-            role: self.role,
-            media_kind: self.media_kind,
-            mime_type: self.mime_type,
-            container: self.container,
-            video_codec: self.video_codec,
-            audio_codec: self.audio_codec,
-            width: self.width,
-            height: self.height,
-            duration_ms: self.duration_ms,
-            bit_rate: self.bit_rate,
-            file_size_bytes: self.file_size_bytes,
-            sha256: self.sha256,
-            local_work_path: self.local_work_path,
-            storage_state: self.storage_state,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SourceRecord {
-    pub id: Uuid,
-    pub content_item_id: Uuid,
-    pub ingest_request_id: Option<Uuid>,
-    pub source_type: SourceType,
+pub struct MediaSourceInput {
+    pub ingest_id: Option<Uuid>,
+    pub kind: SourceKind,
     pub original_url: Option<String>,
     pub normalized_url: Option<String>,
     pub platform: Option<String>,
     pub platform_content_id: Option<String>,
     pub author_name: Option<String>,
-    pub source_title: Option<String>,
-    pub source_description: Option<String>,
-    pub source_published_at: Option<OffsetDateTime>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub published_at: Option<OffsetDateTime>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MediaIngest {
+    pub media: NewMedia,
+    pub metadata: MediaMetadata,
+    pub source: MediaSourceInput,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MediaSource {
+    pub ingest_id: Option<Uuid>,
+    pub kind: SourceKind,
+    pub original_url: Option<String>,
+    pub normalized_url: Option<String>,
+    pub platform: Option<String>,
+    pub platform_content_id: Option<String>,
+    pub author_name: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub published_at: Option<OffsetDateTime>,
     pub retrieved_at: OffsetDateTime,
-    pub metadata_json: Value,
+    pub metadata: Value,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NewSourceRecord {
-    pub content_item_id: Uuid,
-    pub ingest_request_id: Option<Uuid>,
-    pub source_type: SourceType,
-    pub original_url: Option<String>,
-    pub normalized_url: Option<String>,
-    pub platform: Option<String>,
-    pub platform_content_id: Option<String>,
-    pub author_name: Option<String>,
-    pub source_title: Option<String>,
-    pub source_description: Option<String>,
-    pub source_published_at: Option<OffsetDateTime>,
-    pub metadata_json: Value,
+pub struct MediaResolution {
+    pub media: Media,
+    pub source: MediaSource,
+    pub media_created: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NewSourceRecordDraft {
-    pub ingest_request_id: Option<Uuid>,
-    pub source_type: SourceType,
-    pub original_url: Option<String>,
-    pub normalized_url: Option<String>,
-    pub platform: Option<String>,
-    pub platform_content_id: Option<String>,
-    pub author_name: Option<String>,
-    pub source_title: Option<String>,
-    pub source_description: Option<String>,
-    pub source_published_at: Option<OffsetDateTime>,
-    pub metadata_json: Value,
-}
-
-impl NewSourceRecordDraft {
-    pub fn for_content_item(self, content_item_id: Uuid) -> NewSourceRecord {
-        NewSourceRecord {
-            content_item_id,
-            ingest_request_id: self.ingest_request_id,
-            source_type: self.source_type,
-            original_url: self.original_url,
-            normalized_url: self.normalized_url,
-            platform: self.platform,
-            platform_content_id: self.platform_content_id,
-            author_name: self.author_name,
-            source_title: self.source_title,
-            source_description: self.source_description,
-            source_published_at: self.source_published_at,
-            metadata_json: self.metadata_json,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ExactDuplicateRequest {
-    pub content_item: NewContentItem,
-    pub asset: NewMediaAssetDraft,
-    pub source: NewSourceRecordDraft,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ExactDuplicateResolution {
-    pub content_item: ContentItem,
-    pub canonical_asset: MediaAsset,
-    pub source_record: SourceRecord,
-    pub content_created: bool,
-    pub source_created: bool,
-}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DuplicateCandidateStatus {
-    Pending,
-    ConfirmedVariant,
-    KeptSeparate,
-    Dismissed,
-}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DuplicateCandidateAction {
-    ConfirmVariant,
-    KeepSeparate,
-    Dismiss,
-}
-
-impl DuplicateCandidateAction {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ConfirmVariant => "confirm_variant",
-            Self::KeepSeparate => "keep_separate",
-            Self::Dismiss => "dismiss",
-        }
-    }
-
-    pub const fn resulting_status(self) -> DuplicateCandidateStatus {
-        match self {
-            Self::ConfirmVariant => DuplicateCandidateStatus::ConfirmedVariant,
-            Self::KeepSeparate => DuplicateCandidateStatus::KeptSeparate,
-            Self::Dismiss => DuplicateCandidateStatus::Dismissed,
-        }
-    }
-}
-
-impl DuplicateCandidateStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::ConfirmedVariant => "confirmed_variant",
-            Self::KeptSeparate => "kept_separate",
-            Self::Dismissed => "dismissed",
-        }
-    }
-}
-
-impl TryFrom<&str> for DuplicateCandidateStatus {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "confirmed_variant" => Ok(Self::ConfirmedVariant),
-            "kept_separate" => Ok(Self::KeptSeparate),
-            "dismissed" => Ok(Self::Dismissed),
-            unknown => Err(unknown.to_owned()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DuplicateCandidate {
-    pub id: Uuid,
-    pub left_content_item_id: Uuid,
-    pub right_content_item_id: Uuid,
-    pub algorithm_version: String,
-    pub score_basis_points: u16,
-    pub evidence_json: Value,
-    pub status: DuplicateCandidateStatus,
-    pub created_at: OffsetDateTime,
-    pub updated_at: OffsetDateTime,
-    pub resolved_at: Option<OffsetDateTime>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DuplicateCandidateEvent {
-    pub id: Uuid,
-    pub candidate_id: Uuid,
-    pub action: DuplicateCandidateAction,
-    pub actor_device_token_id: Option<Uuid>,
-    pub created_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NewDuplicateCandidate {
-    pub left_content_item_id: Uuid,
-    pub right_content_item_id: Uuid,
-    pub algorithm_version: String,
-    pub score_basis_points: u16,
-    pub evidence_json: Value,
-}
-
-impl NewDuplicateCandidate {
-    pub fn try_new(
-        left_content_item_id: Uuid,
-        right_content_item_id: Uuid,
-        algorithm_version: impl Into<String>,
-        score_basis_points: u16,
-        evidence_json: Value,
-    ) -> Result<Self, DuplicateCandidateValidationError> {
-        if left_content_item_id == right_content_item_id {
-            return Err(DuplicateCandidateValidationError::SameContentItem);
-        }
-        if score_basis_points > 10_000 {
-            return Err(DuplicateCandidateValidationError::InvalidScore(score_basis_points));
-        }
-        let algorithm_version = algorithm_version.into();
-        if algorithm_version.trim().is_empty() {
-            return Err(DuplicateCandidateValidationError::EmptyAlgorithmVersion);
-        }
-        let (left_content_item_id, right_content_item_id) =
-            if left_content_item_id < right_content_item_id {
-                (left_content_item_id, right_content_item_id)
-            } else {
-                (right_content_item_id, left_content_item_id)
-            };
-        Ok(Self {
-            left_content_item_id,
-            right_content_item_id,
-            algorithm_version,
-            score_basis_points,
-            evidence_json,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Error)]
-pub enum DuplicateCandidateValidationError {
-    #[error("duplicate candidate must reference two different content items")]
-    SameContentItem,
-    #[error("duplicate candidate score must be between 0 and 10000 basis points, got {0}")]
-    InvalidScore(u16),
-    #[error("duplicate candidate algorithm version must not be empty")]
-    EmptyAlgorithmVersion,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct LibraryItemDetail {
-    pub content_item: ContentItem,
-    pub canonical_asset: Option<MediaAsset>,
+pub struct MediaDetails {
+    pub media: Media,
     pub tags: Vec<Tag>,
-    pub sources: Vec<SourceRecord>,
+    pub source: Option<MediaSource>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct LibraryItemSummary {
-    pub content_item: ContentItem,
-    pub canonical_asset: Option<MediaAsset>,
+pub struct MediaSummary {
+    pub media: Media,
     pub tags: Vec<Tag>,
     pub source_count: u64,
+    pub source_url: Option<String>,
+    pub source_metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct LibraryCursor {
+pub struct MediaCursor {
     pub updated_at: OffsetDateTime,
     pub id: Uuid,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct LibrarySearchQuery {
+pub struct MediaSearchQuery {
     pub text: Option<String>,
     pub tags: Vec<String>,
-    pub kind: Option<ContentKind>,
-    pub status: Option<ContentStatus>,
+    pub kind: Option<MediaKind>,
+    pub status: Option<MediaStatus>,
     pub limit: u32,
-    pub cursor: Option<LibraryCursor>,
+    pub cursor: Option<MediaCursor>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct LibrarySearchPage {
-    pub items: Vec<LibraryItemSummary>,
-    pub next_cursor: Option<LibraryCursor>,
+pub struct MediaPage {
+    pub items: Vec<MediaSummary>,
+    pub next_cursor: Option<MediaCursor>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ContentItemUpdate {
-    pub preferred_title: Option<Option<String>>,
-    pub editorial_description: Option<Option<String>>,
+pub struct MediaUpdate {
+    pub title: Option<Option<String>>,
+    pub description: Option<Option<String>>,
     pub notes: Option<Option<String>>,
     pub expected_updated_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Tag {
-    pub id: Uuid,
     pub normalized_name: String,
     pub display_name: String,
     pub created_at: OffsetDateTime,
@@ -633,8 +306,7 @@ pub struct NewTag {
 
 impl NewTag {
     pub fn try_new(display_name: impl Into<String>) -> Result<Self, TagValidationError> {
-        let display_name = display_name.into();
-        let display_name = display_name.trim().to_owned();
+        let display_name = display_name.into().trim().to_owned();
         if display_name.is_empty() {
             return Err(TagValidationError::Empty);
         }
@@ -655,52 +327,36 @@ pub enum TagValidationError {
     TooLong { max: usize },
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredVideoFingerprint {
+    pub media_id: Uuid,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub audio_codec: Option<String>,
+    pub fingerprint: Value,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StorageObject {
-    pub id: Uuid,
-    pub asset_id: Uuid,
-    pub provider: String,
+pub struct StorageReceipt {
+    pub media_id: Uuid,
     pub storage_chat_id: i64,
     pub storage_message_id: i64,
     pub telegram_file_id: Option<String>,
     pub telegram_file_unique_id: Option<String>,
     pub media_kind: MediaKind,
     pub stored_at: OffsetDateTime,
-    pub verified_at: Option<OffsetDateTime>,
-    pub status: StorageObjectStatus,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NewStorageObject {
-    pub asset_id: Uuid,
-    pub provider: String,
-    pub storage_chat_id: i64,
-    pub storage_message_id: i64,
-    pub telegram_file_id: Option<String>,
-    pub telegram_file_unique_id: Option<String>,
-    pub media_kind: MediaKind,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum StorageUploadReservation {
-    Reserved { intent_id: Uuid, owner_token: Uuid },
-    Reused(StorageObject),
-    InProgress { retry_at: Option<OffsetDateTime> },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct StorageUploadIntent {
-    pub id: Uuid,
-    pub asset_id: Option<Uuid>,
-    pub job_id: Option<Uuid>,
-    pub generation: i32,
-    pub provider: Option<String>,
-    pub storage_chat_id: Option<i64>,
-    pub idempotency_key: String,
+pub struct StorageUploadInfo {
+    pub media_id: Uuid,
     pub state: String,
-    pub resource_id: Option<Uuid>,
-    pub created_at: OffsetDateTime,
-    pub reservation_expires_at: Option<OffsetDateTime>,
+    pub generation: i32,
+    pub storage_chat_id: Option<i64>,
+    pub storage_message_id: Option<i64>,
+    pub file_id: Option<String>,
+    pub file_unique_id: Option<String>,
+    pub updated_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -713,27 +369,29 @@ pub struct StorageUploadAttachment {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StorageUploadReservationRequest {
-    pub asset_id: Uuid,
-    pub provider: String,
-    pub idempotency_key: String,
-    pub request_hash: Vec<u8>,
-    pub job_id: Uuid,
+    pub media_id: Uuid,
     pub generation: i32,
-    pub storage_chat_id: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum StorageUploadReservation {
+    Reserved { media_id: Uuid, owner_token: Uuid },
+    Reused(StorageReceipt),
+    InProgress { retry_at: Option<OffsetDateTime> },
+    ReconciliationRequired,
+    StaleGeneration { current_generation: i32 },
 }
 
 #[async_trait]
 pub trait StorageUploadStore: Clone + Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    async fn find_canonical_asset(&self, asset_id: Uuid)
-    -> Result<Option<MediaAsset>, Self::Error>;
+    async fn find_media(&self, media_id: Uuid) -> Result<Option<Media>, Self::Error>;
 
-    async fn find_active_storage_object(
+    async fn find_storage_receipt(
         &self,
-        asset_id: Uuid,
-        provider: &str,
-    ) -> Result<Option<StorageObject>, Self::Error>;
+        media_id: Uuid,
+    ) -> Result<Option<StorageReceipt>, Self::Error>;
 
     async fn reserve_storage_upload(
         &self,
@@ -742,30 +400,27 @@ pub trait StorageUploadStore: Clone + Send + Sync + 'static {
 
     async fn renew_storage_upload(
         &self,
-        intent_id: Uuid,
+        media_id: Uuid,
         owner_token: Uuid,
         lease_duration: Duration,
     ) -> Result<OffsetDateTime, Self::Error>;
 
     async fn complete_storage_upload(
         &self,
-        intent_id: Uuid,
+        media_id: Uuid,
         owner_token: Uuid,
-        object: NewStorageObject,
-    ) -> Result<StorageObject, Self::Error>;
+        attachment: StorageUploadAttachment,
+    ) -> Result<StorageReceipt, Self::Error>;
 
     async fn release_storage_upload(
         &self,
-        intent_id: Uuid,
+        media_id: Uuid,
         owner_token: Uuid,
     ) -> Result<(), Self::Error>;
 
-    /// Preserve an intent after an external request whose outcome is unknown.
-    /// A later reconciliation can complete the same intent with the returned
-    /// Telegram message reference instead of sending another message.
     async fn mark_storage_upload_unknown(
         &self,
-        intent_id: Uuid,
+        media_id: Uuid,
         owner_token: Uuid,
     ) -> Result<(), Self::Error>;
 }
@@ -775,18 +430,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn content_kinds_round_trip_to_database_values() {
-        for kind in
-            [ContentKind::Video, ContentKind::Image, ContentKind::Animation, ContentKind::Audio]
-        {
-            assert_eq!(ContentKind::try_from(kind.as_str()), Ok(kind));
+    fn media_kinds_round_trip_to_database_values() {
+        for kind in [MediaKind::Video, MediaKind::Image, MediaKind::Animation, MediaKind::Audio] {
+            assert_eq!(MediaKind::try_from(kind.as_str()), Ok(kind));
         }
+    }
+
+    #[test]
+    fn storage_states_preserve_ambiguous_uploads() {
+        assert_eq!(MediaStorageState::try_from("storage_unknown"), Ok(MediaStorageState::Unknown));
+        assert_eq!(MediaStorageState::Unknown.as_str(), "storage_unknown");
     }
 
     #[test]
     fn tags_trim_and_normalize_without_merging_display_text() {
         let tag = NewTag::try_new("  Rust 🦀  ").expect("tag should be valid");
-
         assert_eq!(tag.display_name, "Rust 🦀");
         assert_eq!(tag.normalized_name, "rust 🦀");
     }
@@ -797,22 +455,5 @@ mod tests {
             NewTag::try_new("   ").expect_err("empty tag must fail"),
             TagValidationError::Empty
         );
-    }
-
-    #[test]
-    fn duplicate_candidate_ids_are_canonicalized_and_validated() {
-        let left = Uuid::from_u128(2);
-        let right = Uuid::from_u128(1);
-        let candidate = NewDuplicateCandidate::try_new(
-            left,
-            right,
-            "frame_dhash_v1",
-            9_000,
-            serde_json::json!({"final_score": 0.9}),
-        )
-        .expect("candidate should be valid");
-        assert_eq!(candidate.left_content_item_id, right);
-        assert_eq!(candidate.right_content_item_id, left);
-        assert_eq!(DuplicateCandidateStatus::Pending.as_str(), "pending");
     }
 }

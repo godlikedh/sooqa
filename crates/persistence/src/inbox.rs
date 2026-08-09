@@ -1,16 +1,13 @@
 use serde_json::{Value, json};
 use sooqa_inbox::{
-    AssetNormalization, IngestFinalization, IngestKind, IngestRequest, IngestStateError,
-    IngestStatus, IngestSubmission, SourceDownload, SourceInspection, SourceMediaKind,
-    SubmittedVia,
+    AssetNormalization, Ingest, IngestFinalization, IngestKind, IngestStateError, IngestStatus,
+    IngestSubmission, SourceDownload, SourceInspection, SourceMediaKind, SubmittedVia,
 };
 use sooqa_jobs::{JobAttempt, NewJob};
 use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-const IDEMPOTENCY_SCOPE: &str = "ingest:create";
 
 #[derive(Clone)]
 pub struct InboxRepository {
@@ -29,60 +26,62 @@ impl InboxRepository {
         let request_hash = submission.request_hash();
         let request_id = Uuid::now_v7();
         let mut transaction = self.pool.begin().await?;
-
-        if let Some(idempotency_key) = submission.idempotency_key.as_deref() {
-            let inserted_id = sqlx::query_scalar::<_, Uuid>(
-                r#"
-                INSERT INTO idempotency_records (
-                    scope, idempotency_key, request_hash, resource_type, resource_id,
-                    response_status, response_body
-                )
-                VALUES ($1, $2, $3, 'ingest_request', $4, 202, $5)
-                ON CONFLICT (scope, idempotency_key) DO NOTHING
-                RETURNING id
-                "#,
-            )
-            .bind(IDEMPOTENCY_SCOPE)
-            .bind(idempotency_key)
-            .bind(request_hash.as_slice())
-            .bind(request_id)
-            .bind(json!({ "id": request_id, "status": IngestStatus::Queued.as_str() }))
-            .fetch_optional(&mut *transaction)
-            .await?;
-
-            if inserted_id.is_none() {
-                let existing = sqlx::query_as::<_, IdempotencyRow>(
-                    r#"
-                    SELECT request_hash, resource_id
-                    FROM idempotency_records
-                    WHERE scope = $1 AND idempotency_key = $2
-                    "#,
-                )
-                .bind(IDEMPOTENCY_SCOPE)
-                .bind(idempotency_key)
-                .fetch_one(&mut *transaction)
-                .await?;
-
-                if existing.request_hash.as_slice() != request_hash.as_slice() {
-                    return Err(InboxRepositoryError::IdempotencyConflict {
-                        key: idempotency_key.to_owned(),
-                    });
-                }
-
-                let existing_id = existing
-                    .resource_id
-                    .ok_or(InboxRepositoryError::IncompleteIdempotencyRecord)?;
-                let request = load_request(&mut transaction, existing_id).await?;
-                transaction.commit().await?;
-                return Ok(CreateIngestResult { request, created: false });
-            }
-        }
-
-        let mut request = IngestRequest::from_submission(request_id, &submission);
+        let mut request = Ingest::from_submission(request_id, &submission);
         request
             .transition_to(IngestStatus::Queued)
             .expect("received ingest requests must be queueable");
-        insert_request(&mut transaction, &request).await?;
+        let input_key = submission.idempotency_key.clone().unwrap_or_else(|| {
+            format!("{}:{}", submission.kind.as_str(), submission.normalized_url)
+        });
+        let inserted_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO ingests (
+                id, input_key, request_hash, input_kind, state, submitted_via,
+                input_json, source_url, page_url, page_title, supplied_caption,
+                supplied_tags, media_id, error_code, error_message, created_at,
+                updated_at, completed_at
+            )
+            VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11,
+                    $12, $13, $14, $15, $16, $17)
+            ON CONFLICT (input_key) DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(request.id)
+        .bind(&input_key)
+        .bind(request_hash.as_slice())
+        .bind(request.kind.as_str())
+        .bind(request.submitted_via.as_str())
+        .bind(&request.original_input)
+        .bind(&request.source_url)
+        .bind(&request.page_url)
+        .bind(&request.page_title)
+        .bind(&request.supplied_caption)
+        .bind(&request.supplied_tags)
+        .bind(request.media_id)
+        .bind(&request.error_code)
+        .bind(&request.error_message)
+        .bind(request.created_at)
+        .bind(request.updated_at)
+        .bind(request.completed_at)
+        .fetch_optional(&mut *transaction)
+        .await?;
+
+        if inserted_id.is_none() {
+            let existing = sqlx::query_as::<_, IngestIdentityRow>(
+                "SELECT id, request_hash FROM ingests WHERE input_key = $1 FOR UPDATE",
+            )
+            .bind(&input_key)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if existing.request_hash.as_slice() != request_hash.as_slice() {
+                return Err(InboxRepositoryError::IdempotencyConflict { key: input_key });
+            }
+            let request = load_request(&mut transaction, existing.id).await?;
+            transaction.commit().await?;
+            return Ok(CreateIngestResult { ingest: request, created: false });
+        }
+
         match request.kind {
             IngestKind::Url => insert_inspect_job(&mut transaction, &request).await?,
             IngestKind::TelegramMessage | IngestKind::Upload => {
@@ -91,10 +90,10 @@ impl InboxRepository {
         }
 
         transaction.commit().await?;
-        Ok(CreateIngestResult { request, created: true })
+        Ok(CreateIngestResult { ingest: request, created: true })
     }
 
-    pub async fn find(&self, id: Uuid) -> Result<Option<IngestRequest>, InboxRepositoryError> {
+    pub async fn find(&self, id: Uuid) -> Result<Option<Ingest>, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let request = load_request(&mut transaction, id).await;
         match request {
@@ -113,21 +112,26 @@ impl InboxRepository {
     pub async fn begin_source_inspection(
         &self,
         id: Uuid,
+        attempt: &JobAttempt,
     ) -> Result<SourceInspectionStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
-        let start = match request.status {
-            IngestStatus::Queued => SourceInspectionStart::Ready(request),
-            IngestStatus::FailedRetryable => {
-                request.transition_to(IngestStatus::Queued)?;
-                request.error_code = None;
-                request.error_message = None;
-                request.completed_at = None;
-                request.updated_at = OffsetDateTime::now_utc();
-                update_ingest_state(&mut transaction, &request).await?;
-                SourceInspectionStart::Ready(request)
+        let start = if !lock_current_job_attempt(&mut transaction, attempt).await? {
+            SourceInspectionStart::AlreadyAdvanced(request)
+        } else {
+            match request.status {
+                IngestStatus::Queued => SourceInspectionStart::Ready(request),
+                IngestStatus::FailedRetryable => {
+                    request.transition_to(IngestStatus::Queued)?;
+                    request.error_code = None;
+                    request.error_message = None;
+                    request.completed_at = None;
+                    request.updated_at = OffsetDateTime::now_utc();
+                    update_ingest_state(&mut transaction, &request).await?;
+                    SourceInspectionStart::Ready(request)
+                }
+                _ => SourceInspectionStart::AlreadyAdvanced(request),
             }
-            _ => SourceInspectionStart::AlreadyAdvanced(request),
         };
         transaction.commit().await?;
         Ok(start)
@@ -218,7 +222,7 @@ impl InboxRepository {
         id: Uuid,
         attempt: &JobAttempt,
         probe: serde_json::Value,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
         if request.status != IngestStatus::Probing {
@@ -251,14 +255,12 @@ impl InboxRepository {
             });
         }
         request.updated_at = OffsetDateTime::now_utc();
-        sqlx::query(
-            "UPDATE ingest_requests SET original_input = $2, updated_at = $3 WHERE id = $1",
-        )
-        .bind(request.id)
-        .bind(&request.original_input)
-        .bind(request.updated_at)
-        .execute(&mut *transaction)
-        .await?;
+        sqlx::query("UPDATE ingests SET input_json = $2, updated_at = $3 WHERE id = $1")
+            .bind(request.id)
+            .bind(&request.original_input)
+            .bind(request.updated_at)
+            .execute(&mut *transaction)
+            .await?;
 
         if !matches!(media_kind, Some(SourceMediaKind::Video | SourceMediaKind::Image))
             || unsupported_image_format
@@ -286,6 +288,7 @@ impl InboxRepository {
             request.completed_at = Some(OffsetDateTime::now_utc());
             request.updated_at = OffsetDateTime::now_utc();
             update_ingest_state(&mut transaction, &request).await?;
+            succeed_current_job_attempt(&mut transaction, attempt).await?;
             transaction.commit().await?;
             return Ok(request);
         }
@@ -297,6 +300,7 @@ impl InboxRepository {
         request.updated_at = OffsetDateTime::now_utc();
         update_ingest_state(&mut transaction, &request).await?;
         insert_normalize_job(&mut transaction, &request).await?;
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -339,7 +343,7 @@ impl InboxRepository {
         id: Uuid,
         attempt: &JobAttempt,
         normalization: AssetNormalization,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
         if request.status != IngestStatus::Normalizing
@@ -358,14 +362,12 @@ impl InboxRepository {
             request.original_input =
                 json!({ "source": request.original_input, "normalization": normalization });
         }
-        sqlx::query(
-            "UPDATE ingest_requests SET original_input = $2, updated_at = $3 WHERE id = $1",
-        )
-        .bind(request.id)
-        .bind(&request.original_input)
-        .bind(OffsetDateTime::now_utc())
-        .execute(&mut *transaction)
-        .await?;
+        sqlx::query("UPDATE ingests SET input_json = $2, updated_at = $3 WHERE id = $1")
+            .bind(request.id)
+            .bind(&request.original_input)
+            .bind(OffsetDateTime::now_utc())
+            .execute(&mut *transaction)
+            .await?;
 
         request.transition_to(IngestStatus::Storing)?;
         request.error_code = None;
@@ -374,6 +376,7 @@ impl InboxRepository {
         request.updated_at = OffsetDateTime::now_utc();
         update_ingest_state(&mut transaction, &request).await?;
         insert_finalize_job(&mut transaction, &request).await?;
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -385,7 +388,7 @@ impl InboxRepository {
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         self.fail_ingest_step(
             id,
             status,
@@ -433,7 +436,7 @@ impl InboxRepository {
         id: Uuid,
         attempt: &JobAttempt,
         finalization: IngestFinalization,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
         if request.status != IngestStatus::Storing
@@ -444,6 +447,8 @@ impl InboxRepository {
             return Ok(request);
         }
 
+        let media_id = finalization.media_id;
+        request.media_id = Some(media_id);
         let finalization =
             serde_json::to_value(finalization).expect("ingest finalization is serializable");
         if let Some(object) = request.original_input.as_object_mut() {
@@ -456,10 +461,11 @@ impl InboxRepository {
         request.error_message = None;
         request.updated_at = OffsetDateTime::now_utc();
         sqlx::query(
-            "UPDATE ingest_requests SET original_input = $2, updated_at = $3 WHERE id = $1",
+            "UPDATE ingests SET input_json = $2, media_id = $3, updated_at = $4 WHERE id = $1",
         )
         .bind(request.id)
         .bind(&request.original_input)
+        .bind(request.media_id)
         .bind(request.updated_at)
         .execute(&mut *transaction)
         .await?;
@@ -469,10 +475,9 @@ impl InboxRepository {
             update_ingest_state(&mut transaction, &request).await?;
             insert_fingerprint_job(&mut transaction, &request).await?;
         } else {
-            request.transition_to(IngestStatus::Completed)?;
-            request.completed_at = Some(OffsetDateTime::now_utc());
-            update_ingest_state(&mut transaction, &request).await?;
+            advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
         }
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -512,7 +517,7 @@ impl InboxRepository {
         id: Uuid,
         attempt: &JobAttempt,
         fingerprint: Option<Value>,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
         if request.status != IngestStatus::Fingerprinting
@@ -534,28 +539,20 @@ impl InboxRepository {
                 });
             }
         }
-        let next_status = if should_check_similarity {
-            IngestStatus::SimilarityCheck
-        } else {
-            IngestStatus::Completed
-        };
-        request.transition_to(next_status)?;
-        request.error_code = None;
-        request.error_message = None;
-        request.completed_at = (!should_check_similarity).then(OffsetDateTime::now_utc);
-        request.updated_at = OffsetDateTime::now_utc();
-        sqlx::query(
-            "UPDATE ingest_requests SET original_input = $2, updated_at = $3 WHERE id = $1",
-        )
-        .bind(request.id)
-        .bind(&request.original_input)
-        .bind(request.updated_at)
-        .execute(&mut *transaction)
-        .await?;
-        update_ingest_state(&mut transaction, &request).await?;
         if should_check_similarity {
+            request.transition_to(IngestStatus::SimilarityCheck)?;
+            request.error_code = None;
+            request.error_message = None;
+            request.completed_at = None;
+            request.updated_at = OffsetDateTime::now_utc();
+            update_ingest_state(&mut transaction, &request).await?;
             insert_similarity_job(&mut transaction, &request).await?;
+        } else {
+            let media_id =
+                request.media_id.ok_or(InboxRepositoryError::MissingMediaId(request.id))?;
+            advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
         }
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -592,7 +589,7 @@ impl InboxRepository {
         &self,
         id: Uuid,
         attempt: &JobAttempt,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
         if request.status != IngestStatus::SimilarityCheck
@@ -602,15 +599,52 @@ impl InboxRepository {
             return Ok(request);
         }
 
-        request.transition_to(IngestStatus::Storing)?;
-        request.transition_to(IngestStatus::Completed)?;
-        request.error_code = None;
-        request.error_message = None;
-        request.completed_at = Some(OffsetDateTime::now_utc());
-        request.updated_at = OffsetDateTime::now_utc();
-        update_ingest_state(&mut transaction, &request).await?;
+        let media_id = request.media_id.ok_or(InboxRepositoryError::MissingMediaId(request.id))?;
+        advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
+    }
+
+    pub async fn complete_storage_for_media(
+        &self,
+        media_id: Uuid,
+    ) -> Result<u64, InboxRepositoryError> {
+        let now = OffsetDateTime::now_utc();
+        let updated = sqlx::query(
+            "UPDATE ingests SET state = 'completed', completed_at = $2, error_code = NULL, error_message = NULL, updated_at = $2 WHERE media_id = $1 AND EXISTS (SELECT 1 FROM media WHERE id = $1 AND storage_state = 'ready') AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
+        )
+        .bind(media_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected())
+    }
+
+    pub async fn fail_storage_for_media(
+        &self,
+        media_id: Uuid,
+        status: IngestStatus,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<u64, InboxRepositoryError> {
+        if !matches!(status, IngestStatus::FailedRetryable | IngestStatus::FailedTerminal) {
+            return Err(InboxRepositoryError::InvalidFailureStatus(status));
+        }
+        let now = OffsetDateTime::now_utc();
+        let completed_at = (status == IngestStatus::FailedTerminal).then_some(now);
+        let updated = sqlx::query(
+            "UPDATE ingests SET state = $2, error_code = $3, error_message = $4, completed_at = $5, updated_at = $6 WHERE media_id = $1 AND (state = 'storing' OR (state = 'failed_retryable' AND error_code = 'storage_upload'))",
+        )
+        .bind(media_id)
+        .bind(status.as_str())
+        .bind(error_code)
+        .bind(error_message)
+        .bind(completed_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected())
     }
 
     pub async fn fail_ingest_similarity(
@@ -620,7 +654,7 @@ impl InboxRepository {
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         self.fail_ingest_step(
             id,
             status,
@@ -642,7 +676,7 @@ impl InboxRepository {
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         self.fail_ingest_step(
             id,
             status,
@@ -664,7 +698,7 @@ impl InboxRepository {
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         self.fail_ingest_step(
             id,
             status,
@@ -682,11 +716,14 @@ impl InboxRepository {
     pub async fn complete_source_inspection(
         &self,
         id: Uuid,
+        attempt: &JobAttempt,
         inspection: SourceInspection,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
-        if request.status != IngestStatus::Queued {
+        if request.status != IngestStatus::Queued
+            || !lock_current_job_attempt(&mut transaction, attempt).await?
+        {
             transaction.commit().await?;
             return Ok(request);
         }
@@ -701,9 +738,9 @@ impl InboxRepository {
         let job = NewJob::download_source(id, inspection);
         sqlx::query(
             r#"
-            INSERT INTO jobs (job_type, payload_json, idempotency_key)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+            INSERT INTO queue.jobs (kind, payload, state, dedupe_key)
+            VALUES ($1, $2, 'queued', $3)
+            ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
             "#,
         )
         .bind(job.job_type().as_str())
@@ -712,6 +749,7 @@ impl InboxRepository {
         .execute(&mut *transaction)
         .await?;
 
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -721,7 +759,7 @@ impl InboxRepository {
         id: Uuid,
         attempt: &JobAttempt,
         download: SourceDownload,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
         if request.status != IngestStatus::Downloading
@@ -743,7 +781,7 @@ impl InboxRepository {
         request.error_message = None;
         request.updated_at = OffsetDateTime::now_utc();
         sqlx::query(
-            "UPDATE ingest_requests SET original_input = $2, error_code = $3, error_message = $4, updated_at = $5 WHERE id = $1",
+            "UPDATE ingests SET input_json = $2, error_code = $3, error_message = $4, updated_at = $5 WHERE id = $1",
         )
         .bind(request.id)
         .bind(&request.original_input)
@@ -755,6 +793,7 @@ impl InboxRepository {
 
         insert_probe_job(&mut transaction, &request).await?;
 
+        succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
         Ok(request)
     }
@@ -766,7 +805,7 @@ impl InboxRepository {
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         self.fail_ingest_step(
             id,
             status,
@@ -784,10 +823,11 @@ impl InboxRepository {
     pub async fn fail_source_inspection(
         &self,
         id: Uuid,
+        attempt: &JobAttempt,
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         self.fail_ingest_step(
             id,
             status,
@@ -795,7 +835,7 @@ impl InboxRepository {
             error_message,
             IngestFailureGuard {
                 ignore_completed_download: false,
-                attempt: None,
+                attempt: Some(attempt),
                 expected_status: Some(IngestStatus::Queued),
             },
         )
@@ -809,7 +849,7 @@ impl InboxRepository {
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         self.fail_ingest_step(
             id,
             status,
@@ -831,7 +871,7 @@ impl InboxRepository {
         error_code: &str,
         error_message: &str,
         guard: IngestFailureGuard<'_>,
-    ) -> Result<IngestRequest, InboxRepositoryError> {
+    ) -> Result<Ingest, InboxRepositoryError> {
         if !matches!(status, IngestStatus::FailedRetryable | IngestStatus::FailedTerminal) {
             return Err(InboxRepositoryError::InvalidFailureStatus(status));
         }
@@ -871,44 +911,44 @@ impl InboxRepository {
 
 #[derive(Debug, Clone)]
 pub enum SourceInspectionStart {
-    Ready(IngestRequest),
-    AlreadyAdvanced(IngestRequest),
+    Ready(Ingest),
+    AlreadyAdvanced(Ingest),
 }
 
 #[derive(Debug, Clone)]
 pub enum SourceDownloadStart {
-    Ready(IngestRequest),
-    AlreadyAdvanced(IngestRequest),
+    Ready(Ingest),
+    AlreadyAdvanced(Ingest),
 }
 
 #[derive(Debug, Clone)]
 pub enum AssetProbeStart {
-    Ready(IngestRequest),
-    AlreadyAdvanced(IngestRequest),
+    Ready(Ingest),
+    AlreadyAdvanced(Ingest),
 }
 
 #[derive(Debug, Clone)]
 pub enum AssetNormalizationStart {
-    Ready(IngestRequest),
-    AlreadyAdvanced(IngestRequest),
+    Ready(Ingest),
+    AlreadyAdvanced(Ingest),
 }
 
 #[derive(Debug, Clone)]
 pub enum IngestFinalizationStart {
-    Ready(IngestRequest),
-    AlreadyAdvanced(IngestRequest),
+    Ready(Ingest),
+    AlreadyAdvanced(Ingest),
 }
 
 #[derive(Debug, Clone)]
 pub enum IngestFingerprintStart {
-    Ready(IngestRequest),
-    AlreadyAdvanced(IngestRequest),
+    Ready(Ingest),
+    AlreadyAdvanced(Ingest),
 }
 
 #[derive(Debug, Clone)]
 pub enum IngestSimilarityStart {
-    Ready(IngestRequest),
-    AlreadyAdvanced(IngestRequest),
+    Ready(Ingest),
+    AlreadyAdvanced(Ingest),
 }
 
 struct IngestFailureGuard<'a> {
@@ -919,39 +959,33 @@ struct IngestFailureGuard<'a> {
 
 #[derive(Debug, Clone)]
 pub struct CreateIngestResult {
-    pub request: IngestRequest,
+    pub ingest: Ingest,
     pub created: bool,
 }
 
-async fn insert_request(
+async fn update_ingest_state(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    request: &IngestRequest,
+    request: &Ingest,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO ingest_requests (
-            id, kind, status, submitted_via, submitted_by_admin_id, original_input,
-            source_url, page_url, page_title, supplied_caption, supplied_tags,
-            idempotency_key, error_code, error_message, created_at, updated_at, completed_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        UPDATE ingests
+        SET state = $2,
+            input_json = $3,
+            media_id = $4,
+            error_code = $5,
+            error_message = $6,
+            updated_at = $7,
+            completed_at = $8
+        WHERE id = $1
         "#,
     )
     .bind(request.id)
-    .bind(request.kind.as_str())
     .bind(request.status.as_str())
-    .bind(request.submitted_via.as_str())
-    .bind(request.submitted_by_admin_id)
     .bind(&request.original_input)
-    .bind(&request.source_url)
-    .bind(&request.page_url)
-    .bind(&request.page_title)
-    .bind(&request.supplied_caption)
-    .bind(&request.supplied_tags)
-    .bind(&request.idempotency_key)
+    .bind(request.media_id)
     .bind(&request.error_code)
     .bind(&request.error_message)
-    .bind(request.created_at)
     .bind(request.updated_at)
     .bind(request.completed_at)
     .execute(&mut **transaction)
@@ -959,27 +993,64 @@ async fn insert_request(
     Ok(())
 }
 
-async fn update_ingest_state(
+async fn advance_after_media_processing(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    request: &IngestRequest,
+    request: &mut Ingest,
+    media_id: Uuid,
+) -> Result<(), InboxRepositoryError> {
+    let storage_state =
+        sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1")
+            .bind(media_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or(InboxRepositoryError::MissingMediaId(request.id))?;
+
+    request.media_id = Some(media_id);
+    request.error_code = None;
+    request.error_message = None;
+    request.completed_at = None;
+    match storage_state.as_str() {
+        "ready" => {
+            request.transition_to(IngestStatus::Completed)?;
+            request.completed_at = Some(OffsetDateTime::now_utc());
+        }
+        "pending_storage" => {
+            request.transition_to(IngestStatus::Storing)?;
+            insert_storage_job(transaction, media_id).await?;
+        }
+        "storage_unknown" | "missing" => {
+            request.transition_to(IngestStatus::FailedTerminal)?;
+            request.error_code = Some("storage_unknown".to_owned());
+            request.error_message = Some(
+                "media storage requires explicit reconciliation before ingest can complete"
+                    .to_owned(),
+            );
+            request.completed_at = Some(OffsetDateTime::now_utc());
+        }
+        state => return Err(InboxRepositoryError::UnknownStorageState(state.to_owned())),
+    }
+    request.updated_at = OffsetDateTime::now_utc();
+    update_ingest_state(transaction, request).await?;
+    Ok(())
+}
+
+async fn insert_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: NewJob,
+    dedupe_key: String,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        UPDATE ingest_requests
-        SET status = $2,
-            error_code = $3,
-            error_message = $4,
-            updated_at = $5,
-            completed_at = $6
-        WHERE id = $1
+        INSERT INTO queue.jobs (kind, payload, state, run_at, max_attempts, dedupe_key)
+        VALUES ($1, $2, 'queued', COALESCE($3, now()), $4, $5)
+        ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
         "#,
     )
-    .bind(request.id)
-    .bind(request.status.as_str())
-    .bind(&request.error_code)
-    .bind(&request.error_message)
-    .bind(request.updated_at)
-    .bind(request.completed_at)
+    .bind(job.job_type().as_str())
+    .bind(job.payload_json())
+    .bind(job.run_at_value())
+    .bind(job.max_attempts_value())
+    .bind(dedupe_key)
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -987,124 +1058,98 @@ async fn update_ingest_state(
 
 async fn insert_inspect_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    request: &IngestRequest,
+    request: &Ingest,
 ) -> Result<(), sqlx::Error> {
-    let job = NewJob::inspect_source(request.id);
-    sqlx::query(
-        r#"
-        INSERT INTO jobs (job_type, payload_json, idempotency_key)
-        VALUES ($1, $2, $3)
-        "#,
+    insert_job(
+        transaction,
+        NewJob::inspect_source(request.id),
+        format!("ingest:{}:inspect_source:v1", request.id),
     )
-    .bind(job.job_type().as_str())
-    .bind(job.payload_json())
-    .bind(format!("ingest:{}:inspect_source:v1", request.id))
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    .await
 }
 
 async fn insert_probe_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    request: &IngestRequest,
+    request: &Ingest,
 ) -> Result<(), sqlx::Error> {
-    let job = NewJob::probe_asset(request.id);
-    sqlx::query(
-        r#"
-        INSERT INTO jobs (job_type, payload_json, idempotency_key)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-        "#,
+    insert_job(
+        transaction,
+        NewJob::probe_asset(request.id),
+        format!("ingest:{}:probe_asset:v1", request.id),
     )
-    .bind(job.job_type().as_str())
-    .bind(job.payload_json())
-    .bind(format!("ingest:{}:probe_asset:v1", request.id))
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    .await
+}
+
+async fn insert_storage_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    media_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let Some(generation) = sqlx::query_scalar::<_, i32>(
+        "SELECT storage_generation FROM media WHERE id = $1 AND storage_state = 'pending_storage'",
+    )
+    .bind(media_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    else {
+        return Ok(());
+    };
+    insert_job(
+        transaction,
+        NewJob::upload_storage_asset_generation(media_id, generation),
+        format!("media:{media_id}:upload_storage:v1:{generation}"),
+    )
+    .await
 }
 
 async fn insert_normalize_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    request: &IngestRequest,
+    request: &Ingest,
 ) -> Result<(), sqlx::Error> {
-    let job = NewJob::normalize_asset(request.id);
-    sqlx::query(
-        r#"
-        INSERT INTO jobs (job_type, payload_json, idempotency_key)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-        "#,
+    insert_job(
+        transaction,
+        NewJob::normalize_asset(request.id),
+        format!("ingest:{}:normalize_asset:v1", request.id),
     )
-    .bind(job.job_type().as_str())
-    .bind(job.payload_json())
-    .bind(format!("ingest:{}:normalize_asset:v1", request.id))
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    .await
 }
 
 async fn insert_finalize_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    request: &IngestRequest,
+    request: &Ingest,
 ) -> Result<(), sqlx::Error> {
-    let job = NewJob::finalize_ingest(request.id);
-    sqlx::query(
-        r#"
-        INSERT INTO jobs (job_type, payload_json, idempotency_key)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-        "#,
+    insert_job(
+        transaction,
+        NewJob::finalize_ingest(request.id),
+        format!("ingest:{}:finalize_ingest:v1", request.id),
     )
-    .bind(job.job_type().as_str())
-    .bind(job.payload_json())
-    .bind(format!("ingest:{}:finalize_ingest:v1", request.id))
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    .await
 }
 
 async fn insert_fingerprint_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    request: &IngestRequest,
+    request: &Ingest,
 ) -> Result<(), sqlx::Error> {
-    let job = NewJob::compute_fingerprint(request.id);
-    sqlx::query(
-        r#"
-        INSERT INTO jobs (job_type, payload_json, idempotency_key)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-        "#,
+    insert_job(
+        transaction,
+        NewJob::compute_fingerprint(request.id),
+        format!("ingest:{}:compute_fingerprint:v1", request.id),
     )
-    .bind(job.job_type().as_str())
-    .bind(job.payload_json())
-    .bind(format!("ingest:{}:compute_fingerprint:v1", request.id))
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    .await
 }
 
 async fn insert_similarity_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    request: &IngestRequest,
+    request: &Ingest,
 ) -> Result<(), sqlx::Error> {
-    let job = NewJob::check_similarity(request.id);
-    sqlx::query(
-        r#"
-        INSERT INTO jobs (job_type, payload_json, idempotency_key)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-        "#,
+    insert_job(
+        transaction,
+        NewJob::check_similarity(request.id),
+        format!("ingest:{}:check_similarity:v1", request.id),
     )
-    .bind(job.job_type().as_str())
-    .bind(job.payload_json())
-    .bind(format!("ingest:{}:check_similarity:v1", request.id))
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    .await
 }
 
-fn request_media_kind(request: &IngestRequest) -> Option<SourceMediaKind> {
+fn request_media_kind(request: &Ingest) -> Option<SourceMediaKind> {
     if let Some(value) = request.original_input.get("probed_media_kind")
         && let Ok(media_kind) = serde_json::from_value(value.clone())
     {
@@ -1118,7 +1163,7 @@ fn request_media_kind(request: &IngestRequest) -> Option<SourceMediaKind> {
     serde_json::from_value(value.clone()).ok()
 }
 
-fn normalized_media_kind(request: &IngestRequest) -> Option<SourceMediaKind> {
+fn normalized_media_kind(request: &Ingest) -> Option<SourceMediaKind> {
     request
         .original_input
         .get("normalization")
@@ -1126,7 +1171,7 @@ fn normalized_media_kind(request: &IngestRequest) -> Option<SourceMediaKind> {
         .and_then(|value| serde_json::from_value(value.clone()).ok())
 }
 
-fn request_mime_type(request: &IngestRequest) -> Option<&str> {
+fn request_mime_type(request: &Ingest) -> Option<&str> {
     let value = if request.kind == IngestKind::Url {
         request.original_input.get("download")?.get("mime_type")?
     } else {
@@ -1143,7 +1188,7 @@ enum ImageFormatKind {
     Unknown,
 }
 
-fn request_file_name(request: &IngestRequest) -> Option<&str> {
+fn request_file_name(request: &Ingest) -> Option<&str> {
     if request.kind == IngestKind::Url {
         None
     } else {
@@ -1151,7 +1196,7 @@ fn request_file_name(request: &IngestRequest) -> Option<&str> {
     }
 }
 
-fn request_image_format_is_supported(request: &IngestRequest, probe: &serde_json::Value) -> bool {
+fn request_image_format_is_supported(request: &Ingest, probe: &serde_json::Value) -> bool {
     let declared = request_mime_type(request)
         .map(image_format_from_mime)
         .filter(|format| *format != ImageFormatKind::Unknown)
@@ -1267,13 +1312,13 @@ fn probed_media_kind(probe: &serde_json::Value) -> Option<SourceMediaKind> {
 async fn load_request(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: Uuid,
-) -> Result<IngestRequest, InboxRepositoryError> {
-    let row = sqlx::query_as::<_, IngestRequestRow>(
+) -> Result<Ingest, InboxRepositoryError> {
+    let row = sqlx::query_as::<_, IngestRow>(
         r#"
-        SELECT id, kind, status, submitted_via, submitted_by_admin_id, original_input,
-               source_url, page_url, page_title, supplied_caption, supplied_tags,
-               idempotency_key, error_code, error_message, created_at, updated_at, completed_at
-        FROM ingest_requests
+        SELECT id, input_kind, state, submitted_via, input_json, source_url, page_url,
+               page_title, supplied_caption, supplied_tags, input_key, media_id,
+               error_code, error_message, created_at, updated_at, completed_at
+        FROM ingests
         WHERE id = $1
         FOR UPDATE
         "#,
@@ -1283,7 +1328,7 @@ async fn load_request(
     .await?
     .ok_or(InboxRepositoryError::ResourceMissing(id))?;
 
-    row.into_request()
+    row.into_ingest()
 }
 
 async fn lock_current_job_attempt(
@@ -1293,11 +1338,12 @@ async fn lock_current_job_attempt(
     let current_job = sqlx::query_scalar::<_, Uuid>(
         r#"
         SELECT id
-        FROM jobs
+        FROM queue.jobs
         WHERE id = $1
-          AND status = 'running'
+          AND state = 'running'
           AND attempt_count = $2
           AND lease_owner = $3
+          AND lease_token = $4
           AND lease_expires_at > now()
         FOR UPDATE
         "#,
@@ -1305,25 +1351,57 @@ async fn lock_current_job_attempt(
     .bind(attempt.job_id)
     .bind(attempt.attempt_number)
     .bind(&attempt.lease_owner)
+    .bind(attempt.lease_token)
     .fetch_optional(&mut **transaction)
     .await?;
     Ok(current_job.is_some())
 }
 
+async fn succeed_current_job_attempt(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    attempt: &JobAttempt,
+) -> Result<(), InboxRepositoryError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE queue.jobs
+        SET state = 'succeeded', lease_token = NULL, lease_owner = NULL,
+            lease_expires_at = NULL, last_heartbeat_at = NULL,
+            completed_at = now(), updated_at = now()
+        WHERE id = $1
+          AND state = 'running'
+          AND attempt_count = $2
+          AND lease_owner = $3
+          AND lease_token = $4
+          AND lease_expires_at > now()
+        "#,
+    )
+    .bind(attempt.job_id)
+    .bind(attempt.attempt_number)
+    .bind(&attempt.lease_owner)
+    .bind(attempt.lease_token)
+    .execute(&mut **transaction)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(InboxRepositoryError::JobLeaseLost);
+    }
+    Ok(())
+}
+
 #[derive(Debug, FromRow)]
-struct IngestRequestRow {
+struct IngestRow {
     id: Uuid,
-    kind: String,
-    status: String,
+    input_kind: String,
+    state: String,
     submitted_via: String,
-    submitted_by_admin_id: Option<Uuid>,
-    original_input: serde_json::Value,
+    input_json: serde_json::Value,
     source_url: Option<String>,
     page_url: Option<String>,
     page_title: Option<String>,
     supplied_caption: Option<String>,
     supplied_tags: Vec<String>,
-    idempotency_key: Option<String>,
+    input_key: String,
+    media_id: Option<Uuid>,
     error_code: Option<String>,
     error_message: Option<String>,
     created_at: OffsetDateTime,
@@ -1331,24 +1409,25 @@ struct IngestRequestRow {
     completed_at: Option<OffsetDateTime>,
 }
 
-impl IngestRequestRow {
-    fn into_request(self) -> Result<IngestRequest, InboxRepositoryError> {
-        Ok(IngestRequest {
+impl IngestRow {
+    fn into_ingest(self) -> Result<Ingest, InboxRepositoryError> {
+        Ok(Ingest {
             id: self.id,
-            kind: IngestKind::try_from(self.kind.as_str())
+            kind: IngestKind::try_from(self.input_kind.as_str())
                 .map_err(InboxRepositoryError::UnknownIngestKind)?,
-            status: IngestStatus::try_from(self.status.as_str())
+            status: IngestStatus::try_from(self.state.as_str())
                 .map_err(InboxRepositoryError::UnknownIngestStatus)?,
             submitted_via: SubmittedVia::try_from(self.submitted_via.as_str())
                 .map_err(InboxRepositoryError::UnknownSubmittedVia)?,
-            submitted_by_admin_id: self.submitted_by_admin_id,
-            original_input: self.original_input,
+            submitted_by_admin_id: None,
+            original_input: self.input_json,
             source_url: self.source_url.ok_or(InboxRepositoryError::MissingSourceUrl(self.id))?,
             page_url: self.page_url,
             page_title: self.page_title,
             supplied_caption: self.supplied_caption,
             supplied_tags: self.supplied_tags,
-            idempotency_key: self.idempotency_key,
+            idempotency_key: Some(self.input_key),
+            media_id: self.media_id,
             error_code: self.error_code,
             error_message: self.error_message,
             created_at: self.created_at,
@@ -1359,21 +1438,23 @@ impl IngestRequestRow {
 }
 
 #[derive(Debug, FromRow)]
-struct IdempotencyRow {
+struct IngestIdentityRow {
+    id: Uuid,
     request_hash: Vec<u8>,
-    resource_id: Option<Uuid>,
 }
 
 #[derive(Debug, Error)]
 pub enum InboxRepositoryError {
     #[error("idempotency key already belongs to a different request: {key}")]
     IdempotencyConflict { key: String },
-    #[error("idempotency record does not reference an ingest request")]
-    IncompleteIdempotencyRecord,
-    #[error("idempotency record references missing ingest request {0}")]
+    #[error("ingest {0} was not found")]
     ResourceMissing(Uuid),
     #[error("ingest request {0} has no source URL")]
     MissingSourceUrl(Uuid),
+    #[error("ingest {0} has no media ID")]
+    MissingMediaId(Uuid),
+    #[error("media has an invalid storage state: {0}")]
+    UnknownStorageState(String),
     #[error("unknown ingest kind in database: {0}")]
     UnknownIngestKind(String),
     #[error("unknown ingest status in database: {0}")]
@@ -1384,6 +1465,8 @@ pub enum InboxRepositoryError {
     InvalidFailureStatus(IngestStatus),
     #[error("invalid ingest state transition: {0}")]
     InvalidStateTransition(#[from] IngestStateError),
+    #[error("job lease was lost before ingest completion could be committed")]
+    JobLeaseLost,
     #[error("database operation failed: {0}")]
     Database(#[from] sqlx::Error),
 }

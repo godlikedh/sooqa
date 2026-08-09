@@ -1,644 +1,432 @@
-use std::{env, sync::OnceLock, time::Duration};
+use std::env;
 
+use serde_json::json;
 use sooqa_inbox::{
-    AssetNormalization, IngestStatus, IngestSubmission, IngestSubmissionInput, SourceMediaKind,
-    SubmittedVia, TelegramSubmissionInput,
+    IngestFinalization, IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection,
+    SourceMediaKind, SubmittedVia,
 };
-use sooqa_jobs::JobType;
-use sooqa_persistence::{Database, InboxRepositoryError};
-use tokio::sync::Mutex;
+use sooqa_jobs::{JobStatus, JobType, NewJob};
+use sooqa_library::{
+    MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
+};
+use sooqa_persistence::{
+    Database, InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart,
+    SourceInspectionStart,
+};
 use uuid::Uuid;
 
-static INTEGRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-async fn integration_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    INTEGRATION_LOCK.get_or_init(|| Mutex::new(())).lock().await
-}
-
-fn submission(url: &str, key: &str) -> IngestSubmission {
-    let mut input = IngestSubmissionInput::new(url, SubmittedVia::Api);
-    input.idempotency_key = Some(key.to_owned());
-    IngestSubmission::try_new(input).expect("submission should be valid")
-}
-
-fn telegram_submission(key: &str) -> IngestSubmission {
-    telegram_submission_with_kind(key, "video")
-}
-
-fn telegram_submission_with_kind(key: &str, media_kind: &str) -> IngestSubmission {
-    telegram_submission_with_kind_and_mime(key, media_kind, None)
-}
-
-fn telegram_submission_with_kind_and_mime(
-    key: &str,
-    media_kind: &str,
-    mime_type: Option<&str>,
-) -> IngestSubmission {
-    telegram_submission_with_kind_and_metadata(key, media_kind, mime_type, None)
-}
-
-fn telegram_submission_with_kind_and_metadata(
-    key: &str,
-    media_kind: &str,
-    mime_type: Option<&str>,
-    file_name: Option<&str>,
-) -> IngestSubmission {
-    IngestSubmission::try_new_telegram(TelegramSubmissionInput {
-        source_reference: "telegram://42/99".to_owned(),
-        submitted_via: SubmittedVia::TelegramBot,
-        submitted_by_admin_id: None,
-        original_input: serde_json::json!({
-            "telegram_chat_id": 42,
-            "telegram_message_id": 99,
-            "telegram_file_unique_id": "unique-file",
-            "media_kind": media_kind,
-            "mime_type": mime_type,
-            "file_name": file_name,
-            "local_work_path": "/tmp/sooqa-telegram-11.bin",
-        }),
-        supplied_caption: Some("caption".to_owned()),
-        idempotency_key: Some(key.to_owned()),
-    })
-    .expect("Telegram submission should be valid")
-}
-
-async fn clean_up(database: &Database, key_prefix: &str) {
-    sqlx::query(
-        r#"
-        DELETE FROM jobs
-        WHERE payload_json->>'ingest_request_id' IN (
-            SELECT id::text
-            FROM ingest_requests
-            WHERE idempotency_key LIKE $1
-        )
-        "#,
-    )
-    .bind(format!("{key_prefix}%"))
-    .execute(database.pool())
-    .await
-    .expect("test jobs should clean up");
-    sqlx::query(
-        "DELETE FROM idempotency_records WHERE scope = 'ingest:create' AND idempotency_key LIKE $1",
-    )
-    .bind(format!("{key_prefix}%"))
-    .execute(database.pool())
-    .await
-    .expect("test idempotency records should clean up");
-    sqlx::query("DELETE FROM ingest_requests WHERE idempotency_key LIKE $1")
-        .bind(format!("{key_prefix}%"))
-        .execute(database.pool())
-        .await
-        .expect("test ingest requests should clean up");
+async fn database() -> Database {
+    let url = env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL");
+    let database = Database::connect(&url, 10).await.expect("database should connect");
+    database.migrate().await.expect("migration should apply");
+    database
 }
 
 #[tokio::test]
-#[ignore = "requires a running PostgreSQL instance"]
-async fn creates_ingest_and_inspect_job_atomically_with_idempotency() {
-    let _test_guard = integration_test_lock().await;
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
-    let database =
-        Database::connect(&database_url, 10).await.expect("database should be reachable");
-    database.migrate().await.expect("migrations should succeed");
-
-    let key_prefix = format!("c1-{}-", Uuid::new_v4());
-    clean_up(&database, &key_prefix).await;
-    let key = format!("{key_prefix}request");
-    let inbox = database.inbox();
-
-    let first = inbox
-        .create_ingest(submission(
-            "HTTPS://Example.COM:443/video?id=123&utm_source=test#fragment",
-            &key,
-        ))
-        .await
-        .expect("ingest should be created");
-    assert!(first.created);
-    assert_eq!(first.request.status, IngestStatus::Queued);
-    assert_eq!(first.request.source_url, "https://example.com/video?id=123");
-
-    let (job_type, payload, job_key): (String, serde_json::Value, String) = sqlx::query_as(
-        "SELECT job_type, payload_json, idempotency_key FROM jobs WHERE payload_json->>'ingest_request_id' = $1",
-    )
-    .bind(first.request.id.to_string())
-    .fetch_one(database.pool())
-    .await
-    .expect("inspect job should exist");
-    assert_eq!(job_type, "inspect_source");
-    assert_eq!(payload["ingest_request_id"], first.request.id.to_string());
-    assert_eq!(job_key, format!("ingest:{}:inspect_source:v1", first.request.id));
-
-    let repeated = inbox
-        .create_ingest(submission(
-            "HTTPS://Example.COM:443/video?id=123&utm_source=test#fragment",
-            &key,
-        ))
-        .await
-        .expect("repeated idempotent request should succeed");
-    assert!(!repeated.created);
-    assert_eq!(repeated.request.id, first.request.id);
-
-    let request_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM ingest_requests WHERE idempotency_key = $1")
-            .bind(&key)
-            .fetch_one(database.pool())
-            .await
-            .expect("request count should load");
-    assert_eq!(request_count, 1);
-
-    let job_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM jobs WHERE payload_json->>'ingest_request_id' = $1",
-    )
-    .bind(first.request.id.to_string())
-    .fetch_one(database.pool())
-    .await
-    .expect("job count should load");
-    assert_eq!(job_count, 1);
-
-    let conflict =
-        inbox.create_ingest(submission("https://example.com/a-different-video", &key)).await;
-    assert!(matches!(
-        conflict,
-        Err(InboxRepositoryError::IdempotencyConflict { key: conflict_key })
-            if conflict_key == key
-    ));
-
-    clean_up(&database, &key_prefix).await;
-}
-
-#[tokio::test]
-#[ignore = "requires a running PostgreSQL instance"]
-async fn unsupported_image_format_does_not_enqueue_static_normalization() {
-    let _test_guard = integration_test_lock().await;
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
-    let database =
-        Database::connect(&database_url, 10).await.expect("database should be reachable");
-    database.migrate().await.expect("migrations should succeed");
-
-    let key_prefix = format!("h6-image-format-{}-", Uuid::new_v4());
-    clean_up(&database, &key_prefix).await;
-    for (case, mime_type, file_name, probed_format, supported) in [
-        ("declared-webp", Some("image/webp"), None, "webp", false),
-        ("filename-webp", None, Some("photo.webp"), "webp", false),
-        ("mismatched-mime", Some("image/png"), None, "webp", false),
-        ("supported-mismatch", Some("image/jpeg"), Some("photo.jpg"), "png", true),
-        ("declared-image-probed-video", Some("image/png"), Some("photo.png"), "webm", true),
-    ] {
-        let created = database
-            .inbox()
-            .create_ingest(telegram_submission_with_kind_and_metadata(
-                &format!("{key_prefix}{case}"),
-                "image",
-                mime_type,
-                file_name,
-            ))
-            .await
-            .expect("unsupported image ingest should be created");
-        sqlx::query("UPDATE jobs SET priority = 200000 WHERE idempotency_key = $1")
-            .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
-            .execute(database.pool())
-            .await
-            .expect("image probe job should be prioritized");
-        let job = database
-            .jobs()
-            .claim_next("worker-h6-image-format", Duration::from_secs(30), &[JobType::ProbeAsset])
-            .await
-            .expect("image probe job should be claimable")
-            .expect("image probe job should exist");
-        let attempt = job.attempt().expect("claimed job should have an attempt");
-        database
-            .inbox()
-            .begin_asset_probe(created.request.id, &attempt)
-            .await
-            .expect("probe should begin");
-        database
-            .inbox()
-            .complete_asset_probe(
-                created.request.id,
-                &attempt,
-                serde_json::json!({
-                    "container_format": probed_format,
-                    "size_bytes": 10,
-                    "streams": [{"kind": "video", "codec": probed_format}]
-                }),
-            )
-            .await
-            .expect("unsupported image probe should be recorded");
-
-        let (status, error_code): (String, Option<String>) =
-            sqlx::query_as("SELECT status, error_code FROM ingest_requests WHERE id = $1")
-                .bind(created.request.id)
-                .fetch_one(database.pool())
-                .await
-                .expect("unsupported image state should be queryable");
-        if supported {
-            assert_eq!(status, "normalizing");
-            assert!(error_code.is_none());
-        } else {
-            assert_eq!(status, "failed_terminal");
-            assert_eq!(error_code.as_deref(), Some("unsupported_image_format"));
-        }
-        let normalize_job_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
-                .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
-                .fetch_one(database.pool())
-                .await
-                .expect("normalize job count should be queryable");
-        assert_eq!(normalize_job_count, i64::from(supported));
-    }
-
-    clean_up(&database, &key_prefix).await;
-}
-
-#[tokio::test]
-#[ignore = "requires a running PostgreSQL instance"]
-async fn probe_kind_routes_to_the_composed_normalizer_or_terminal_failure() {
-    let _test_guard = integration_test_lock().await;
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
-    let database =
-        Database::connect(&database_url, 10).await.expect("database should be reachable");
-    database.migrate().await.expect("migrations should succeed");
-
-    let key_prefix = format!("h5-kind-{}-", Uuid::new_v4());
-    clean_up(&database, &key_prefix).await;
-    for (index, media_kind) in ["image", "audio", "animation"].into_iter().enumerate() {
-        let submission = if media_kind == "image" {
-            telegram_submission_with_kind_and_metadata(
-                &format!("{key_prefix}{media_kind}"),
-                media_kind,
-                Some("application/octet-stream"),
-                Some("photo.png"),
-            )
-        } else {
-            telegram_submission_with_kind(&format!("{key_prefix}{media_kind}"), media_kind)
-        };
-        let created = database
-            .inbox()
-            .create_ingest(submission)
-            .await
-            .expect("unsupported ingest should be created");
-        sqlx::query("UPDATE jobs SET priority = $2 WHERE idempotency_key = $1")
-            .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
-            .bind(200000 + index as i32)
-            .execute(database.pool())
-            .await
-            .expect("probe job should be prioritized");
-        let job = database
-            .jobs()
-            .claim_next("worker-h5-kind", Duration::from_secs(30), &[JobType::ProbeAsset])
-            .await
-            .expect("probe job should be claimable")
-            .expect("probe job should exist");
-        let attempt = job.attempt().expect("claimed job should have an attempt");
-        database
-            .inbox()
-            .begin_asset_probe(created.request.id, &attempt)
-            .await
-            .expect("probe should begin");
-        let probe = if media_kind == "image" {
-            serde_json::json!({
-                "container_format": "png",
-                "size_bytes": 10,
-                "streams": [{"kind": "video", "codec": "png"}]
-            })
-        } else {
-            serde_json::json!({"container_format": "unsupported", "size_bytes": 10})
-        };
-        database
-            .inbox()
-            .complete_asset_probe(created.request.id, &attempt, probe)
-            .await
-            .expect("unsupported probe should be recorded");
-        database
-            .jobs()
-            .complete(job.id, "worker-h5-kind")
-            .await
-            .expect("unsupported probe job should complete");
-
-        let (status, error_code): (String, Option<String>) =
-            sqlx::query_as("SELECT status, error_code FROM ingest_requests WHERE id = $1")
-                .bind(created.request.id)
-                .fetch_one(database.pool())
-                .await
-                .expect("unsupported ingest state should be queryable");
-        if media_kind == "image" {
-            assert_eq!(status, "normalizing");
-            assert!(error_code.is_none(), "image normalization should not have an error");
-        } else {
-            assert_eq!(status, "failed_terminal");
-            assert_eq!(error_code.as_deref(), Some("unsupported_media_kind"));
-        }
-        let normalize_job_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
-                .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
-                .fetch_one(database.pool())
-                .await
-                .expect("normalize job count should be queryable");
-        assert_eq!(normalize_job_count, i64::from(media_kind == "image"));
-    }
-
-    clean_up(&database, &key_prefix).await;
-}
-
-#[tokio::test]
-#[ignore = "requires a running PostgreSQL instance"]
-async fn creates_telegram_ingest_and_probe_job_atomically() {
-    let _test_guard = integration_test_lock().await;
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
-    let database =
-        Database::connect(&database_url, 10).await.expect("database should be reachable");
-    database.migrate().await.expect("migrations should succeed");
-
-    let key_prefix = format!("h4-{}-", Uuid::new_v4());
-    clean_up(&database, &key_prefix).await;
-    let key = format!("{}telegram", key_prefix);
+#[ignore = "requires PostgreSQL"]
+async fn input_key_replays_identical_ingests_and_rejects_conflicts() {
+    let database = database().await;
+    let key = format!("test-ingest-{}", Uuid::new_v4());
+    let mut input = IngestSubmissionInput::new("https://example.test/video", SubmittedVia::Api);
+    input.idempotency_key = Some(key.clone());
     let first = database
         .inbox()
-        .create_ingest(telegram_submission(&key))
+        .create_ingest(IngestSubmission::try_new(input.clone()).unwrap())
         .await
-        .expect("Telegram ingest should be created");
+        .unwrap();
+    let replay =
+        database.inbox().create_ingest(IngestSubmission::try_new(input).unwrap()).await.unwrap();
+    assert_eq!(first.ingest.id, replay.ingest.id);
+    assert!(!replay.created);
 
-    assert!(first.created);
-    assert_eq!(first.request.kind.as_str(), "telegram_message");
-    assert_eq!(first.request.status, IngestStatus::Queued);
-    assert_eq!(first.request.source_url, "telegram://42/99");
-    assert_eq!(first.request.supplied_caption.as_deref(), Some("caption"));
-    assert_eq!(first.request.original_input["telegram_file_unique_id"], "unique-file");
+    let mut conflicting =
+        IngestSubmissionInput::new("https://example.test/other", SubmittedVia::Api);
+    conflicting.idempotency_key = Some(key);
+    let error = database
+        .inbox()
+        .create_ingest(IngestSubmission::try_new(conflicting).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, InboxRepositoryError::IdempotencyConflict { .. }));
+    let claimed = database
+        .jobs()
+        .claim_next(
+            "stale-inspection-worker",
+            std::time::Duration::from_secs(30),
+            &[JobType::InspectSource],
+        )
+        .await
+        .unwrap()
+        .expect("inspect job should be claimable");
+    let stale_attempt = claimed.lease().expect("claimed job should have a lease");
+    database
+        .jobs()
+        .retry_lease(
+            &stale_attempt,
+            time::OffsetDateTime::now_utc(),
+            "test_retry",
+            "simulated retry",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        database.inbox().begin_source_inspection(first.ingest.id, &stale_attempt).await.unwrap(),
+        SourceInspectionStart::AlreadyAdvanced(_)
+    ));
+    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
+        .bind(first.ingest.id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(first.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+}
 
-    let (job_type, payload, job_key): (String, serde_json::Value, String) = sqlx::query_as(
-        "SELECT job_type, payload_json, idempotency_key FROM jobs WHERE payload_json->>'ingest_request_id' = $1",
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn source_inspection_completion_commits_job_success_with_transition() {
+    let database = database().await;
+    let ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/inspect-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET max_attempts = 1, priority = 2147483647 WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",
     )
-    .bind(first.request.id.to_string())
-    .fetch_one(database.pool())
+    .bind(ingest.ingest.id.to_string())
+    .execute(database.pool())
     .await
-    .expect("probe job should exist");
-    assert_eq!(job_type, "probe_asset");
-    assert_eq!(payload["ingest_request_id"], first.request.id.to_string());
-    assert_eq!(job_key, format!("ingest:{}:probe_asset:v1", first.request.id));
+    .unwrap();
 
-    let repeated = database
-        .inbox()
-        .create_ingest(telegram_submission(&key))
-        .await
-        .expect("repeated Telegram ingest should be idempotent");
-    assert!(!repeated.created);
-    assert_eq!(repeated.request.id, first.request.id);
-
-    clean_up(&database, &key_prefix).await;
-}
-
-#[tokio::test]
-#[ignore = "requires a running PostgreSQL instance"]
-async fn stale_probe_failure_cannot_poison_a_newer_normalize_handoff() {
-    let _test_guard = integration_test_lock().await;
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
-    let database =
-        Database::connect(&database_url, 10).await.expect("database should be reachable");
-    database.migrate().await.expect("migrations should succeed");
-
-    let key_prefix = format!("h5-probe-fence-{}-", Uuid::new_v4());
-    clean_up(&database, "h5-probe-fence-").await;
-    clean_up(&database, &key_prefix).await;
-    let key = format!("{key_prefix}telegram");
-    let created = database
-        .inbox()
-        .create_ingest(telegram_submission(&key))
-        .await
-        .expect("Telegram ingest should be created");
-    sqlx::query("UPDATE jobs SET priority = 300000 WHERE idempotency_key = $1")
-        .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
-        .execute(database.pool())
-        .await
-        .expect("probe job should be prioritized");
-
-    let first_job = database
-        .jobs()
-        .claim_next("worker-h5-stale-probe", Duration::from_secs(1), &[JobType::ProbeAsset])
-        .await
-        .expect("first probe attempt should be claimable")
-        .expect("first probe attempt should exist");
-    assert_eq!(first_job.attempt_count, 1);
-    let first_attempt = first_job.attempt().expect("claimed job should have an attempt");
-    assert!(matches!(
-        database
-            .inbox()
-            .begin_asset_probe(created.request.id, &first_attempt)
-            .await
-            .expect("first probe should begin"),
-        sooqa_persistence::AssetProbeStart::Ready(_)
-    ));
-
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    database.jobs().recover_stale_leases().await.expect("stale probe attempt should be recovered");
-    let second_job = database
-        .jobs()
-        .claim_next("worker-h5-fresh-probe", Duration::from_secs(30), &[JobType::ProbeAsset])
-        .await
-        .expect("second probe attempt should be claimable")
-        .expect("second probe attempt should exist");
-    assert_eq!(second_job.id, first_job.id);
-    assert_eq!(second_job.attempt_count, 2);
-    let second_attempt = second_job.attempt().expect("reclaimed job should have an attempt");
-    assert!(matches!(
-        database
-            .inbox()
-            .begin_asset_probe(created.request.id, &second_attempt)
-            .await
-            .expect("second probe should begin"),
-        sooqa_persistence::AssetProbeStart::Ready(_)
-    ));
-    database
-        .inbox()
-        .complete_asset_probe(
-            created.request.id,
-            &second_attempt,
-            serde_json::json!({"container_format": "webm", "size_bytes": 10}),
-        )
-        .await
-        .expect("second probe should enqueue normalization");
-    database
-        .inbox()
-        .fail_asset_probe(
-            created.request.id,
-            &first_attempt,
-            IngestStatus::FailedTerminal,
-            "stale_probe",
-            "stale attempt must not change the request",
-        )
-        .await
-        .expect("stale failure should be ignored");
-
-    let status: String = sqlx::query_scalar("SELECT status FROM ingest_requests WHERE id = $1")
-        .bind(created.request.id)
-        .fetch_one(database.pool())
-        .await
-        .expect("ingest status should be queryable");
-    assert_eq!(status, "normalizing");
-    let normalize_job_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
-            .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
-            .fetch_one(database.pool())
-            .await
-            .expect("normalize job count should be queryable");
-    assert_eq!(normalize_job_count, 1);
-
-    clean_up(&database, &key_prefix).await;
-}
-
-#[tokio::test]
-#[ignore = "requires a running PostgreSQL instance"]
-async fn stale_normalization_failure_cannot_poison_a_newer_finalize_handoff() {
-    let _test_guard = integration_test_lock().await;
-    let database_url =
-        env::var("DATABASE_URL").expect("DATABASE_URL must point to the integration database");
-    let database =
-        Database::connect(&database_url, 10).await.expect("database should be reachable");
-    database.migrate().await.expect("migrations should succeed");
-
-    let key_prefix = format!("h5-normalize-fence-{}-", Uuid::new_v4());
-    clean_up(&database, "h5-normalize-fence-").await;
-    clean_up(&database, &key_prefix).await;
-    let created = database
-        .inbox()
-        .create_ingest(telegram_submission(&format!("{key_prefix}telegram")))
-        .await
-        .expect("Telegram ingest should be created");
-    sqlx::query("UPDATE jobs SET priority = 500000 WHERE idempotency_key = $1")
-        .bind(format!("ingest:{}:probe_asset:v1", created.request.id))
-        .execute(database.pool())
-        .await
-        .expect("probe job should be prioritized");
-    let probe_job = database
+    let claimed = database
         .jobs()
         .claim_next(
-            "worker-h5-normalize-fence-probe",
-            Duration::from_secs(30),
-            &[JobType::ProbeAsset],
+            "inspect-success-worker",
+            std::time::Duration::from_secs(30),
+            &[JobType::InspectSource],
         )
         .await
-        .expect("probe job should be claimable")
-        .expect("probe job should exist");
-    let probe_attempt = probe_job.attempt().expect("probe job should have an attempt");
-    database
+        .unwrap()
+        .expect("inspect job should be claimable");
+    let lease = claimed.lease().expect("claimed job should have a lease");
+    let completed = database
         .inbox()
-        .begin_asset_probe(created.request.id, &probe_attempt)
-        .await
-        .expect("probe should begin");
-    database
-        .inbox()
-        .complete_asset_probe(
-            created.request.id,
-            &probe_attempt,
-            serde_json::json!({"container_format": "webm", "size_bytes": 10}),
-        )
-        .await
-        .expect("probe should enqueue normalization");
-    database
-        .jobs()
-        .complete(probe_job.id, "worker-h5-normalize-fence-probe")
-        .await
-        .expect("probe job should complete");
-
-    sqlx::query("UPDATE jobs SET priority = 500000 WHERE idempotency_key = $1")
-        .bind(format!("ingest:{}:normalize_asset:v1", created.request.id))
-        .execute(database.pool())
-        .await
-        .expect("normalize job should be prioritized");
-    let first_job = database
-        .jobs()
-        .claim_next(
-            "worker-h5-normalize-fence-first",
-            Duration::from_secs(1),
-            &[JobType::NormalizeAsset],
-        )
-        .await
-        .expect("first normalize attempt should be claimable")
-        .expect("first normalize attempt should exist");
-    let first_attempt = first_job.attempt().expect("first normalize job should have an attempt");
-    assert!(matches!(
-        database
-            .inbox()
-            .begin_asset_normalization(created.request.id, &first_attempt)
-            .await
-            .expect("first normalization should begin"),
-        sooqa_persistence::AssetNormalizationStart::Ready(_)
-    ));
-
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    database.jobs().recover_stale_leases().await.expect("stale normalize attempt should recover");
-    let second_job = database
-        .jobs()
-        .claim_next(
-            "worker-h5-normalize-fence-second",
-            Duration::from_secs(30),
-            &[JobType::NormalizeAsset],
-        )
-        .await
-        .expect("second normalize attempt should be claimable")
-        .expect("second normalize attempt should exist");
-    assert_eq!(second_job.id, first_job.id);
-    let second_attempt = second_job.attempt().expect("second normalize job should have an attempt");
-    assert!(matches!(
-        database
-            .inbox()
-            .begin_asset_normalization(created.request.id, &second_attempt)
-            .await
-            .expect("second normalization should begin"),
-        sooqa_persistence::AssetNormalizationStart::Ready(_)
-    ));
-    database
-        .inbox()
-        .complete_asset_normalization(
-            created.request.id,
-            &second_attempt,
-            AssetNormalization {
-                local_work_path: "/var/lib/sooqa/work/jobs/test/normalized/canonical.mp4"
-                    .to_owned(),
-                file_size_bytes: 10,
-                sha256: "a".repeat(64),
+        .complete_source_inspection(
+            ingest.ingest.id,
+            &lease,
+            SourceInspection {
+                adapter: "test".to_owned(),
+                source_url: "https://example.test/inspected.webm".to_owned(),
+                resolved_url: None,
                 media_kind: SourceMediaKind::Video,
-                mime_type: Some("video/mp4".to_owned()),
-                container: Some("mp4".to_owned()),
-                video_codec: Some("h264".to_owned()),
-                audio_codec: Some("aac".to_owned()),
-                width: Some(16),
-                height: Some(16),
-                duration_ms: Some(1_000),
-                bit_rate: Some(1_000),
-                thumbnail: None,
+                mime_type: Some("video/webm".to_owned()),
+                content_length_bytes: Some(1),
+                title: None,
+                metadata: json!({}),
             },
         )
         .await
-        .expect("second normalization should enqueue finalization");
-    database
-        .inbox()
-        .fail_asset_normalization(
-            created.request.id,
-            &first_attempt,
-            IngestStatus::FailedTerminal,
-            "stale_normalize",
-            "stale attempt must not change the finalize handoff",
-        )
-        .await
-        .expect("stale normalization failure should be ignored");
+        .unwrap();
+    assert_eq!(completed.status, IngestStatus::Downloading);
 
-    let status: String = sqlx::query_scalar("SELECT status FROM ingest_requests WHERE id = $1")
-        .bind(created.request.id)
+    let job_state = sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+        .bind(claimed.id)
         .fetch_one(database.pool())
         .await
-        .expect("ingest status should be queryable");
-    assert_eq!(status, "storing");
-    let finalize_job_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE idempotency_key = $1")
-            .bind(format!("ingest:{}:finalize_ingest:v1", created.request.id))
-            .fetch_one(database.pool())
-            .await
-            .expect("finalize job count should be queryable");
-    assert_eq!(finalize_job_count, 1);
+        .unwrap();
+    assert_eq!(job_state, JobStatus::Succeeded.as_str());
+    let successor_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM queue.jobs WHERE kind = 'download_source' AND state = 'queued' AND payload->>'ingest_id' = $1",
+    )
+    .bind(ingest.ingest.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(successor_count, 1);
 
-    clean_up(&database, &key_prefix).await;
+    let acknowledged = database.jobs().complete_lease(&lease).await.unwrap();
+    assert_eq!(acknowledged.status, JobStatus::Succeeded);
+
+    database.jobs().recover_stale_leases().await.unwrap();
+    let request = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
+    assert_eq!(request.status, IngestStatus::Downloading);
+    let successor_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM queue.jobs WHERE kind = 'download_source' AND state = 'queued' AND payload->>'ingest_id' = $1",
+    )
+    .bind(ingest.ingest.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(successor_count, 1);
+
+    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
+        .bind(ingest.ingest.id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+}
+
+fn video_ingest(sha256: Vec<u8>, source: &str) -> MediaIngest {
+    MediaIngest {
+        media: NewMedia {
+            kind: MediaKind::Video,
+            title: Some("ordering test".to_owned()),
+            description: None,
+            notes: None,
+        },
+        metadata: MediaMetadata {
+            kind: MediaKind::Video,
+            mime_type: Some("video/mp4".to_owned()),
+            container: Some("mp4".to_owned()),
+            video_codec: Some("h264".to_owned()),
+            audio_codec: Some("aac".to_owned()),
+            width: Some(1),
+            height: Some(1),
+            duration_ms: Some(1),
+            bit_rate: Some(1),
+            file_size_bytes: Some(1),
+            sha256: Some(sha256),
+            local_work_path: Some("/tmp/sooqa-ordering-test.mp4".to_owned()),
+        },
+        source: MediaSourceInput {
+            ingest_id: None,
+            kind: SourceKind::DirectUrl,
+            original_url: Some(source.to_owned()),
+            normalized_url: Some(source.to_owned()),
+            platform: None,
+            platform_content_id: None,
+            author_name: None,
+            title: None,
+            description: None,
+            published_at: None,
+            metadata: json!({}),
+        },
+        tags: Vec::new(),
+    }
+}
+
+async fn prepare_video_ingest(database: &Database, suffix: &str) -> (Uuid, Uuid) {
+    let source = format!("https://example.test/video-{suffix}");
+    let media = database
+        .library()
+        .resolve_media(video_ingest(vec![suffix.as_bytes()[0]; 32], &source))
+        .await
+        .unwrap();
+    let request = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(&source, SubmittedVia::Api))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ingests SET media_id = $2, state = 'storing', input_json = $3, completed_at = NULL, error_code = NULL, error_message = NULL WHERE id = $1",
+    )
+    .bind(request.ingest.id)
+    .bind(media.media.id)
+    .bind(json!({ "normalization": { "media_kind": "video" } }))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    (media.media.id, request.ingest.id)
+}
+
+async fn advance_video_to_similarity(database: &Database, media_id: Uuid, ingest_id: Uuid) {
+    database
+        .jobs()
+        .enqueue(
+            NewJob::finalize_ingest(ingest_id).dedupe_key(format!("test:{ingest_id}:finalize")),
+        )
+        .await
+        .unwrap();
+    let finalization_job = database
+        .jobs()
+        .claim_next(
+            "ordering-finalizer",
+            std::time::Duration::from_secs(30),
+            &[JobType::FinalizeIngest],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let finalization_attempt = finalization_job.lease().unwrap();
+    assert!(matches!(
+        database.inbox().begin_ingest_finalization(ingest_id, &finalization_attempt).await.unwrap(),
+        IngestFinalizationStart::Ready(_)
+    ));
+    let finalized = database
+        .inbox()
+        .complete_ingest_finalization(
+            ingest_id,
+            &finalization_attempt,
+            IngestFinalization { media_id },
+        )
+        .await
+        .unwrap();
+    assert_eq!(finalized.status, IngestStatus::Fingerprinting);
+    database.jobs().complete_lease(&finalization_attempt).await.unwrap();
+
+    let fingerprint_job = database
+        .jobs()
+        .claim_next(
+            "ordering-fingerprinter",
+            std::time::Duration::from_secs(30),
+            &[JobType::ComputeFingerprint],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let fingerprint_attempt = fingerprint_job.lease().unwrap();
+    assert!(matches!(
+        database
+            .inbox()
+            .begin_ingest_fingerprinting(ingest_id, &fingerprint_attempt)
+            .await
+            .unwrap(),
+        IngestFingerprintStart::Ready(_)
+    ));
+    let fingerprinted = database
+        .inbox()
+        .complete_ingest_fingerprint(
+            ingest_id,
+            &fingerprint_attempt,
+            Some(json!({ "algorithm": "test" })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fingerprinted.status, IngestStatus::SimilarityCheck);
+    database.jobs().complete_lease(&fingerprint_attempt).await.unwrap();
+}
+
+async fn complete_similarity(database: &Database, ingest_id: Uuid) {
+    let similarity_job = database
+        .jobs()
+        .claim_next(
+            "ordering-similarity",
+            std::time::Duration::from_secs(30),
+            &[JobType::CheckSimilarity],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let similarity_attempt = similarity_job.lease().unwrap();
+    assert!(matches!(
+        database.inbox().begin_ingest_similarity(ingest_id, &similarity_attempt).await.unwrap(),
+        sooqa_persistence::IngestSimilarityStart::Ready(_)
+    ));
+    let completed =
+        database.inbox().complete_ingest_similarity(ingest_id, &similarity_attempt).await.unwrap();
+    assert_eq!(completed.status, IngestStatus::Storing);
+    database.jobs().complete_lease(&similarity_attempt).await.unwrap();
+}
+
+async fn storage_job_count(database: &Database, media_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' = $1",
+    )
+    .bind(media_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .unwrap()
+}
+
+async fn cleanup_video_ingest(database: &Database, media_id: Uuid, ingest_id: Uuid) {
+    sqlx::query(
+        "DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1 OR payload->>'media_id' = $2",
+    )
+    .bind(ingest_id.to_string())
+    .bind(media_id.to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(ingest_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM media WHERE id = $1")
+        .bind(media_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn video_storage_waits_for_similarity_and_reconciles_success_or_failure() {
+    let database = database().await;
+    let (success_media, success_ingest) = prepare_video_ingest(&database, "success").await;
+    let (failure_media, failure_ingest) = prepare_video_ingest(&database, "failure").await;
+    advance_video_to_similarity(&database, success_media, success_ingest).await;
+    advance_video_to_similarity(&database, failure_media, failure_ingest).await;
+
+    assert_eq!(storage_job_count(&database, success_media).await, 0);
+    assert_eq!(storage_job_count(&database, failure_media).await, 0);
+    assert_eq!(database.inbox().complete_storage_for_media(success_media).await.unwrap(), 0);
+    assert_eq!(
+        database
+            .inbox()
+            .fail_storage_for_media(
+                failure_media,
+                IngestStatus::FailedRetryable,
+                "storage_upload",
+                "must wait for similarity",
+            )
+            .await
+            .unwrap(),
+        0
+    );
+
+    complete_similarity(&database, success_ingest).await;
+    assert_eq!(storage_job_count(&database, success_media).await, 1);
+    sqlx::query(
+        "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = -100123, telegram_storage_message_id = 9001, telegram_file_id = 'success-file', stored_at = now() WHERE id = $1",
+    )
+    .bind(success_media)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(database.inbox().complete_storage_for_media(success_media).await.unwrap(), 1);
+    assert_eq!(
+        database.inbox().find(success_ingest).await.unwrap().unwrap().status,
+        IngestStatus::Completed
+    );
+
+    complete_similarity(&database, failure_ingest).await;
+    assert_eq!(storage_job_count(&database, failure_media).await, 1);
+    assert_eq!(
+        database
+            .inbox()
+            .fail_storage_for_media(
+                failure_media,
+                IngestStatus::FailedTerminal,
+                "storage_upload",
+                "storage failed after similarity",
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let failed = database.inbox().find(failure_ingest).await.unwrap().unwrap();
+    assert_eq!(failed.status, IngestStatus::FailedTerminal);
+    assert_eq!(failed.error_code.as_deref(), Some("storage_upload"));
+
+    cleanup_video_ingest(&database, success_media, success_ingest).await;
+    cleanup_video_ingest(&database, failure_media, failure_ingest).await;
 }

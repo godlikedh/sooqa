@@ -56,10 +56,16 @@ run the documented destructive reset explicitly.
 - `queue.jobs` is the technical queue. It owns typed job payloads, `run_at`,
   bounded retries, leases, fencing tokens, dedupe keys, and current errors.
 
-The ingest workflow should normally advance through one durable
-`process_ingest` job. Independently scheduled work, especially
-`publish_post`, may remain separate when its job identity represents a real
-durable unit of work.
+The ingest workflow advances through durable, stage-specific jobs that
+reference the ingest row and are fenced by their queue lease. Each stage
+transition enqueues the next stage idempotently. Independently scheduled work,
+especially `publish_post`, may remain separate when its job identity
+represents a real durable unit of work.
+
+For every successful ingest stage, the ingest transition, successor enqueue,
+and success of the current queue job are one database transaction. Final-attempt
+lease recovery may mark the owning ingest failed only when that transaction did
+not commit; it must not overwrite a committed transition with a successor.
 
 ### Idempotency and external effects
 
@@ -71,7 +77,13 @@ or fencing tokens on Telegram storage/send state.
 Database transactions remain short and never span Telegram, HTTP, ffmpeg,
 ffprobe, or another subprocess. A stale worker must not commit with an old
 lease token. An uncertain external result becomes an explicit durable unknown
-state and is reconciled intentionally rather than blindly retried.
+state and is reconciled intentionally rather than blindly retried. Ingest
+storage is ordered after media finalization and video fingerprint/similarity
+checking. Storage outcomes are consumed by the media identity and reconcile
+linked ingests; `attach` completes storage-related waiting/failure states,
+`reset` reopens them in a new generation, and `mark-unknown` makes linked
+active ingests fail explicitly. Recovery of an expired final job likewise
+records an explicit failure on its owning ingest.
 
 ### Configuration and authentication
 

@@ -3,17 +3,16 @@
 use std::error::Error;
 
 use axum::Router;
-use sooqa_config::{AppConfig, AppRole, CliCommand, CliOptions, ConfigError, StorageIntentCommand};
+use sooqa_config::{AppConfig, AppRole, CliCommand, CliOptions, ConfigError, StorageCommand};
 use sooqa_inbox::{
     IngestSubmission, IngestSubmissionInput, IngestValidationError, SubmittedVia,
     TelegramSubmissionInput,
 };
 use sooqa_library::StorageUploadAttachment;
 use sooqa_persistence::InboxRepository;
-use sooqa_persistence::{TelegramRepository, TelegramRepositoryError};
 use sooqa_telegram::{
-    IngestAccepted, IngestService, MediaIngestCommand, TelegramRuntime, UpdateClaim,
-    UpdateClaimResult, UpdateStore, UrlIngestCommand,
+    IngestAccepted, IngestService, MediaIngestCommand, MemoryUpdateStore, TelegramRuntime,
+    UrlIngestCommand,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -51,8 +50,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 database.migrate().await?;
                 println!("sooqa-server: database migrations applied");
             }
-            CliCommand::StorageIntents(command) => {
-                run_storage_intent_command(&database, command).await?;
+            CliCommand::Storage(command) => {
+                run_storage_command(&database, command).await?;
             }
         }
         return Ok(());
@@ -64,6 +63,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let database =
         sooqa_persistence::Database::connect_secret(database_url, config.database.max_connections)
             .await?;
+    let api_token = config
+        .secrets
+        .api_token
+        .as_ref()
+        .filter(|token| token.is_configured())
+        .ok_or(ConfigError::MissingSecret("API token"))?;
     let listener = TcpListener::bind(&config.server.listen_address).await?;
     let api_settings = sooqa_api::ApiSettings {
         request_body_limit_bytes: config.server.request_body_limit_bytes,
@@ -73,7 +78,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         api_settings,
         sooqa_api::ApiState::new(
             database.inbox(),
-            database.device_tokens(),
+            api_token.expose_secret(),
             database.library(),
             database.publisher(),
         ),
@@ -88,7 +93,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             token.expose_secret(),
             &config.telegram.api_base_url,
             std::time::Duration::from_secs(config.telegram.poll_timeout_seconds),
-            DatabaseUpdateStore { repository: database.telegram() },
+            MemoryUpdateStore::default(),
             config.telegram.admin_user_ids.clone(),
             config.telegram.storage_chat_id,
             DatabaseIngestService { repository: database.inbox() },
@@ -108,58 +113,56 @@ async fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn run_storage_intent_command(
+async fn run_storage_command(
     database: &sooqa_persistence::Database,
-    command: StorageIntentCommand,
+    command: StorageCommand,
 ) -> Result<(), Box<dyn Error>> {
     match command {
-        StorageIntentCommand::List => {
+        StorageCommand::List => {
             println!(
-                "id\tstate\tasset_id\tjob_id\tgeneration\tprovider\tstorage_chat_id\tidempotency_key\tresource_id\tcreated_at\treservation_expires_at"
+                "media_id\tstate\tgeneration\tstorage_chat_id\tstorage_message_id\tfile_id\tfile_unique_id\tupdated_at"
             );
-            for intent in database.library().list_storage_upload_intents().await? {
+            for upload in database.library().list_storage_uploads().await? {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    intent.id,
-                    intent.state,
-                    intent.asset_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
-                    intent.job_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
-                    intent.generation,
-                    intent.provider.as_deref().unwrap_or("-"),
-                    intent.storage_chat_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
-                    intent.idempotency_key,
-                    intent.resource_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
-                    intent.created_at,
-                    intent
-                        .reservation_expires_at
-                        .map_or_else(|| "-".to_owned(), |expires_at| expires_at.to_string()),
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    upload.media_id,
+                    upload.state,
+                    upload.generation,
+                    upload.storage_chat_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
+                    upload.storage_message_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
+                    upload.file_id.as_deref().unwrap_or("-"),
+                    upload.file_unique_id.as_deref().unwrap_or("-"),
+                    upload.updated_at,
                 );
             }
         }
-        StorageIntentCommand::MarkUnknown { intent_id, force } => {
-            let intent_id = parse_uuid("intent-id", &intent_id)?;
-            database.library().mark_storage_upload_intent_unknown(intent_id, force).await?;
-            println!("sooqa-server: storage upload intent {intent_id} marked unknown");
+        StorageCommand::MarkUnknown { media_id, force } => {
+            let media_id = parse_uuid("media-id", &media_id)?;
+            database.library().mark_storage_upload_unknown(media_id, force).await?;
+            println!("sooqa-server: storage upload for media {media_id} marked unknown");
         }
-        StorageIntentCommand::Reset { intent_id } => {
-            let intent_id = parse_uuid("intent-id", &intent_id)?;
-            database.library().reset_storage_upload_intent(intent_id).await?;
-            println!("sooqa-server: storage upload intent {intent_id} reset");
+        StorageCommand::Reset { media_id } => {
+            let media_id = parse_uuid("media-id", &media_id)?;
+            database.library().reset_storage_upload(media_id).await?;
+            println!("sooqa-server: storage upload for media {media_id} reset");
         }
-        StorageIntentCommand::Attach {
-            intent_id,
+        StorageCommand::Attach {
+            media_id,
+            generation,
             storage_chat_id,
             storage_message_id,
             telegram_file_id,
             telegram_file_unique_id,
         } => {
-            let intent_id = parse_uuid("intent-id", &intent_id)?;
+            let media_id = parse_uuid("media-id", &media_id)?;
+            let generation = parse_i32("generation", &generation)?;
             let storage_chat_id = parse_i64("storage-chat-id", &storage_chat_id)?;
             let storage_message_id = parse_i64("storage-message-id", &storage_message_id)?;
             let object = database
                 .library()
                 .attach_storage_upload(
-                    intent_id,
+                    media_id,
+                    generation,
                     StorageUploadAttachment {
                         storage_chat_id,
                         storage_message_id,
@@ -168,7 +171,10 @@ async fn run_storage_intent_command(
                     },
                 )
                 .await?;
-            println!("sooqa-server: storage upload intent {intent_id} attached as {}", object.id);
+            println!(
+                "sooqa-server: storage upload for media {media_id} attached at message {}",
+                object.storage_message_id
+            );
         }
     }
     Ok(())
@@ -182,9 +188,8 @@ fn parse_i64(name: &str, value: &str) -> Result<i64, Box<dyn Error>> {
     value.parse().map_err(|error| format!("{name} is not an integer: {error}").into())
 }
 
-#[derive(Clone)]
-struct DatabaseUpdateStore {
-    repository: TelegramRepository,
+fn parse_i32(name: &str, value: &str) -> Result<i32, Box<dyn Error>> {
+    value.parse().map_err(|error| format!("{name} is not an integer: {error}").into())
 }
 
 #[derive(Clone)]
@@ -210,8 +215,8 @@ impl IngestService for DatabaseIngestService {
         let submission = IngestSubmission::try_new(input)?;
         let result = self.repository.create_ingest(submission).await?;
         Ok(IngestAccepted {
-            request_id: result.request.id,
-            status: result.request.status.as_str().to_owned(),
+            request_id: result.ingest.id,
+            status: result.ingest.status.as_str().to_owned(),
         })
     }
 
@@ -245,46 +250,8 @@ impl IngestService for DatabaseIngestService {
         })?;
         let result = self.repository.create_ingest(submission).await?;
         Ok(IngestAccepted {
-            request_id: result.request.id,
-            status: result.request.status.as_str().to_owned(),
+            request_id: result.ingest.id,
+            status: result.ingest.status.as_str().to_owned(),
         })
-    }
-}
-
-#[async_trait::async_trait]
-impl UpdateStore for DatabaseUpdateStore {
-    type Error = TelegramRepositoryError;
-
-    async fn claim_update(&self, update_id: i64) -> Result<UpdateClaimResult, Self::Error> {
-        self.repository.claim_update(update_id).await.map(|claim| match claim {
-            sooqa_persistence::TelegramUpdateClaimResult::Claimed(claim) => {
-                UpdateClaimResult::Claimed(UpdateClaim {
-                    update_id: claim.update_id,
-                    claim_token: claim.claim_token,
-                })
-            }
-            sooqa_persistence::TelegramUpdateClaimResult::Completed => UpdateClaimResult::Completed,
-            sooqa_persistence::TelegramUpdateClaimResult::InProgress => {
-                UpdateClaimResult::InProgress
-            }
-        })
-    }
-
-    async fn complete_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
-        self.repository
-            .complete_update(sooqa_persistence::TelegramUpdateClaim {
-                update_id: claim.update_id,
-                claim_token: claim.claim_token,
-            })
-            .await
-    }
-
-    async fn release_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
-        self.repository
-            .release_update(sooqa_persistence::TelegramUpdateClaim {
-                update_id: claim.update_id,
-                claim_token: claim.claim_token,
-            })
-            .await
     }
 }

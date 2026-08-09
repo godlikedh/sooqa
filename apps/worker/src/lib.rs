@@ -17,10 +17,9 @@ use sooqa_inbox::{
     AssetNormalization, AssetThumbnailNormalization, IngestFinalization, IngestKind, IngestStatus,
     SourceDownload, SourceMediaKind,
 };
-use sooqa_jobs::{Job, JobCommand, JobStatus, JobType};
+use sooqa_jobs::{Job, JobCommand, JobLease, JobStatus, JobType};
 use sooqa_library::{
-    AssetRole, ContentKind, ExactDuplicateRequest, MediaKind, NewContentItem,
-    NewDuplicateCandidate, NewMediaAssetDraft, NewSourceRecordDraft, SourceType, StorageState,
+    MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
     StorageUploadStore,
 };
 use sooqa_media::{
@@ -163,14 +162,18 @@ pub fn download_source_handler(
     })
 }
 
-pub fn upload_storage_asset_handler<A, S>(provider: StorageUploadProvider<A, S>) -> HandlerFn
+pub fn upload_storage_asset_handler<A, S>(
+    inbox: InboxRepository,
+    provider: StorageUploadProvider<A, S>,
+) -> HandlerFn
 where
     A: TelegramStorageApi,
     S: StorageUploadStore,
 {
     Arc::new(move |job| {
+        let inbox = inbox.clone();
         let provider = provider.clone();
-        Box::pin(async move { upload_storage_asset(&provider, job).await })
+        Box::pin(async move { upload_storage_asset(&inbox, &provider, job).await })
     })
 }
 
@@ -217,15 +220,19 @@ pub fn finalize_ingest_handler(inbox: InboxRepository, library: LibraryRepositor
 
 pub fn compute_fingerprint_handler(
     inbox: InboxRepository,
+    library: LibraryRepository,
     work_root: impl Into<PathBuf>,
     extractor: FrameExtractor,
 ) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
+        let library = library.clone();
         let work_root = work_root.clone();
         let extractor = extractor.clone();
-        Box::pin(async move { compute_fingerprint(&inbox, &work_root, &extractor, job).await })
+        Box::pin(
+            async move { compute_fingerprint(&inbox, &library, &work_root, &extractor, job).await },
+        )
     })
 }
 
@@ -248,7 +255,7 @@ async fn probe_asset(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::ProbeAsset(payload) => payload.ingest_request_id,
+        JobCommand::ProbeAsset(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -380,7 +387,7 @@ async fn normalize_asset(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::NormalizeAsset(payload) => payload.ingest_request_id,
+        JobCommand::NormalizeAsset(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -554,7 +561,7 @@ async fn normalize_image_asset(
     inbox: &InboxRepository,
     work_root: &std::path::Path,
     image_normalizer: ImageNormalizer,
-    request: &sooqa_inbox::IngestRequest,
+    request: &sooqa_inbox::Ingest,
     ingest_request_id: Uuid,
     job_attempt: &sooqa_jobs::JobAttempt,
 ) -> Result<(), HandlerFailure> {
@@ -628,7 +635,7 @@ fn normalization_error_is_retryable(error: &NormalizationExecutionError) -> bool
     }
 }
 
-fn request_media_kind(request: &sooqa_inbox::IngestRequest) -> Option<SourceMediaKind> {
+fn request_media_kind(request: &sooqa_inbox::Ingest) -> Option<SourceMediaKind> {
     if let Some(value) = request.original_input.get("probed_media_kind")
         && let Ok(media_kind) = serde_json::from_value(value.clone())
     {
@@ -678,9 +685,7 @@ fn probe_media_kind(probe: &MediaProbe) -> Option<SourceMediaKind> {
     None
 }
 
-fn workspace_input(
-    request: &sooqa_inbox::IngestRequest,
-) -> Result<(Uuid, &'static str), HandlerFailure> {
+fn workspace_input(request: &sooqa_inbox::Ingest) -> Result<(Uuid, &'static str), HandlerFailure> {
     if request.kind == IngestKind::Url {
         return Ok((request.id, "source.bin"));
     }
@@ -775,7 +780,7 @@ async fn finalize_ingest(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::FinalizeIngest(payload) => payload.ingest_request_id,
+        JobCommand::FinalizeIngest(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -823,32 +828,24 @@ async fn finalize_ingest(
             .await;
         }
     };
-    let asset_draft = match normalization_to_library_asset(&normalization) {
-        Ok(asset) => asset,
+    let metadata = match normalization_to_media_metadata(&normalization) {
+        Ok(metadata) => metadata,
         Err(failure) => {
             return fail_finalization(inbox, ingest_request_id, &job_attempt, failure).await;
         }
     };
     let source = source_record_for_request(&request);
-    let content_kind = match content_kind_for_normalization(&normalization) {
-        Ok(content_kind) => content_kind,
-        Err(failure) => {
-            return fail_finalization(inbox, ingest_request_id, &job_attempt, failure).await;
-        }
-    };
     let resolution = match library
-        .resolve_exact_duplicate(ExactDuplicateRequest {
-            content_item: NewContentItem {
-                kind: content_kind,
-                preferred_title: request
-                    .page_title
-                    .clone()
-                    .or_else(|| request.supplied_caption.clone()),
-                editorial_description: None,
+        .resolve_media(MediaIngest {
+            media: NewMedia {
+                kind: metadata.kind,
+                title: request.page_title.clone().or_else(|| request.supplied_caption.clone()),
+                description: None,
                 notes: None,
             },
-            asset: asset_draft.clone(),
+            metadata,
             source,
+            tags: request.supplied_tags.clone(),
         })
         .await
     {
@@ -863,54 +860,11 @@ async fn finalize_ingest(
             .await;
         }
     };
-    let canonical_asset = match library
-        .record_canonical_asset(
-            resolution.content_item.id,
-            asset_draft.for_content_item(resolution.content_item.id),
-        )
-        .await
-    {
-        Ok(asset) => asset,
-        Err(error) => {
-            return fail_finalization(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                map_library_error(error),
-            )
-            .await;
-        }
-    };
-    if let Some(thumbnail) = normalization.thumbnail.as_ref() {
-        let thumbnail_asset =
-            match thumbnail_to_library_asset(&normalization, thumbnail, resolution.content_item.id)
-            {
-                Ok(asset) => asset,
-                Err(failure) => {
-                    return fail_finalization(inbox, ingest_request_id, &job_attempt, failure)
-                        .await;
-                }
-            };
-        if let Err(error) =
-            library.record_thumbnail_asset(resolution.content_item.id, thumbnail_asset).await
-        {
-            return fail_finalization(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                map_library_error(error),
-            )
-            .await;
-        }
-    }
     inbox
         .complete_ingest_finalization(
             ingest_request_id,
             &job_attempt,
-            IngestFinalization {
-                content_item_id: resolution.content_item.id,
-                canonical_asset_id: canonical_asset.id,
-            },
+            IngestFinalization { media_id: resolution.media.id },
         )
         .await
         .map_err(map_inbox_error)?;
@@ -919,12 +873,13 @@ async fn finalize_ingest(
 
 async fn compute_fingerprint(
     inbox: &InboxRepository,
+    library: &LibraryRepository,
     work_root: &Path,
     extractor: &FrameExtractor,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::ComputeFingerprint(payload) => payload.ingest_request_id,
+        JobCommand::ComputeFingerprint(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -1046,6 +1001,19 @@ async fn compute_fingerprint(
     };
     let fingerprint =
         serde_json::to_value(result.fingerprint).expect("video fingerprints are serializable");
+    let media_id = request.media_id.ok_or_else(|| {
+        HandlerFailure::permanent(
+            "invalid_ingest_state",
+            "completed ingest has no media ID for fingerprint persistence",
+        )
+    })?;
+    if let Err(error) = library
+        .record_fingerprint(media_id, FingerprintVersion::FrameDHashV1.as_str(), &fingerprint)
+        .await
+    {
+        return fail_fingerprint(inbox, ingest_request_id, &job_attempt, map_library_error(error))
+            .await;
+    }
     inbox
         .complete_ingest_fingerprint(ingest_request_id, &job_attempt, Some(fingerprint))
         .await
@@ -1060,7 +1028,7 @@ async fn check_similarity(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::CheckSimilarity(payload) => payload.ingest_request_id,
+        JobCommand::CheckSimilarity(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -1086,10 +1054,7 @@ async fn check_similarity(
         }
     };
     let stored = match library
-        .list_stored_video_fingerprints(
-            input.content_item_id,
-            FingerprintVersion::FrameDHashV1.as_str(),
-        )
+        .list_stored_video_fingerprints(input.media_id, FingerprintVersion::FrameDHashV1.as_str())
         .await
     {
         Ok(stored) => stored,
@@ -1116,7 +1081,7 @@ async fn check_similarity(
                         "invalid_similarity_state",
                         format!(
                             "stored fingerprint for content item {} could not be decoded: {error}",
-                            candidate.content_item_id
+                            candidate.media_id
                         ),
                     ),
                 )
@@ -1153,26 +1118,13 @@ async fn check_similarity(
         ) {
             continue;
         }
-        let evidence_json = serde_json::to_value(&result.evidence)
-            .expect("similarity evidence should be serializable");
-        if let Err(error) = library
-            .upsert_duplicate_candidate(NewDuplicateCandidate {
-                left_content_item_id: input.content_item_id,
-                right_content_item_id: candidate.content_item_id,
-                algorithm_version: result.evidence.algorithm_version.as_str().to_owned(),
-                score_basis_points: result.score_basis_points(),
-                evidence_json,
-            })
-            .await
-        {
-            return fail_similarity(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                map_library_error(error),
-            )
-            .await;
-        }
+        tracing::info!(
+            ingest_id = %ingest_request_id,
+            existing_media_id = %candidate.media_id,
+            classification = ?result.classification,
+            score_basis_points = result.score_basis_points(),
+            "similar media detected; no duplicate aggregate is persisted in the MVP"
+        );
     }
     inbox
         .complete_ingest_similarity(ingest_request_id, &job_attempt)
@@ -1182,15 +1134,13 @@ async fn check_similarity(
 }
 
 struct SimilarityInput {
-    content_item_id: uuid::Uuid,
+    media_id: uuid::Uuid,
     fingerprint: VideoFingerprint,
     aspect_ratio: Option<f64>,
     has_audio: Option<bool>,
 }
 
-fn similarity_input(
-    request: &sooqa_inbox::IngestRequest,
-) -> Result<SimilarityInput, HandlerFailure> {
+fn similarity_input(request: &sooqa_inbox::Ingest) -> Result<SimilarityInput, HandlerFailure> {
     let normalization = request
         .original_input
         .get("normalization")
@@ -1252,7 +1202,7 @@ fn similarity_input(
             })
         })?;
     Ok(SimilarityInput {
-        content_item_id: finalization.content_item_id,
+        media_id: finalization.media_id,
         fingerprint,
         aspect_ratio: normalization_aspect_ratio(&normalization)?,
         has_audio: Some(normalization.audio_codec.is_some()),
@@ -1346,12 +1296,11 @@ async fn fail_fingerprint(
     Err(failure)
 }
 
-fn normalization_to_library_asset(
+fn normalization_to_media_metadata(
     normalization: &AssetNormalization,
-) -> Result<NewMediaAssetDraft, HandlerFailure> {
-    Ok(NewMediaAssetDraft {
-        role: AssetRole::Canonical,
-        media_kind: media_kind_for_normalization(normalization.media_kind)?,
+) -> Result<MediaMetadata, HandlerFailure> {
+    Ok(MediaMetadata {
+        kind: media_kind_for_normalization(normalization.media_kind)?,
         mime_type: normalization.mime_type.clone(),
         container: normalization.container.clone(),
         video_codec: normalization.video_codec.clone(),
@@ -1363,23 +1312,7 @@ fn normalization_to_library_asset(
         file_size_bytes: Some(normalization.file_size_bytes),
         sha256: Some(decode_sha256(&normalization.sha256)?),
         local_work_path: Some(normalization.local_work_path.clone()),
-        storage_state: StorageState::Local,
     })
-}
-
-fn content_kind_for_normalization(
-    normalization: &AssetNormalization,
-) -> Result<ContentKind, HandlerFailure> {
-    match normalization.media_kind {
-        SourceMediaKind::Video => Ok(ContentKind::Video),
-        SourceMediaKind::Image => Ok(ContentKind::Image),
-        SourceMediaKind::Audio => Ok(ContentKind::Audio),
-        SourceMediaKind::Animation => Ok(ContentKind::Animation),
-        SourceMediaKind::Unknown => Err(HandlerFailure::permanent(
-            "invalid_normalization",
-            "normalized media kind is unknown",
-        )),
-    }
 }
 
 fn media_kind_for_normalization(media_kind: SourceMediaKind) -> Result<MediaKind, HandlerFailure> {
@@ -1393,36 +1326,6 @@ fn media_kind_for_normalization(media_kind: SourceMediaKind) -> Result<MediaKind
             "normalized media kind is unknown",
         )),
     }
-}
-
-fn thumbnail_to_library_asset(
-    normalization: &AssetNormalization,
-    thumbnail: &AssetThumbnailNormalization,
-    content_item_id: Uuid,
-) -> Result<sooqa_library::NewMediaAsset, HandlerFailure> {
-    if normalization.media_kind != SourceMediaKind::Image {
-        return Err(HandlerFailure::permanent(
-            "invalid_normalization",
-            "only image normalization may contain a thumbnail",
-        ));
-    }
-    Ok(sooqa_library::NewMediaAsset {
-        content_item_id,
-        role: AssetRole::Thumbnail,
-        media_kind: MediaKind::Image,
-        mime_type: thumbnail.mime_type.clone(),
-        container: None,
-        video_codec: None,
-        audio_codec: None,
-        width: to_database_dimension(thumbnail.width, "thumbnail width")?,
-        height: to_database_dimension(thumbnail.height, "thumbnail height")?,
-        duration_ms: None,
-        bit_rate: None,
-        file_size_bytes: Some(thumbnail.file_size_bytes),
-        sha256: Some(decode_sha256(&thumbnail.sha256)?),
-        local_work_path: Some(thumbnail.local_work_path.clone()),
-        storage_state: StorageState::Local,
-    })
 }
 
 fn to_database_dimension(
@@ -1477,34 +1380,34 @@ fn decode_hex_digit(value: u8) -> Option<u8> {
     }
 }
 
-fn source_record_for_request(request: &sooqa_inbox::IngestRequest) -> NewSourceRecordDraft {
-    let (source_type, normalized_url, platform, platform_content_id) = match request.kind {
-        IngestKind::Url => (SourceType::DirectUrl, Some(request.source_url.clone()), None, None),
+fn source_record_for_request(request: &sooqa_inbox::Ingest) -> MediaSourceInput {
+    let (kind, normalized_url, platform, platform_content_id) = match request.kind {
+        IngestKind::Url => (SourceKind::DirectUrl, Some(request.source_url.clone()), None, None),
         IngestKind::TelegramMessage => (
-            SourceType::Telegram,
+            SourceKind::Telegram,
             None,
             Some("telegram".to_owned()),
             Some(request.source_url.clone()),
         ),
         IngestKind::Upload => (
-            SourceType::Upload,
+            SourceKind::Upload,
             None,
             Some("sooqa_ingest".to_owned()),
             Some(request.id.to_string()),
         ),
     };
-    NewSourceRecordDraft {
-        ingest_request_id: Some(request.id),
-        source_type,
+    MediaSourceInput {
+        ingest_id: Some(request.id),
+        kind,
         original_url: Some(request.source_url.clone()),
         normalized_url,
         platform,
         platform_content_id,
         author_name: None,
-        source_title: request.page_title.clone(),
-        source_description: request.supplied_caption.clone(),
-        source_published_at: None,
-        metadata_json: source_provenance_for_request(request),
+        title: request.page_title.clone(),
+        description: request.supplied_caption.clone(),
+        published_at: None,
+        metadata: source_provenance_for_request(request),
     }
 }
 
@@ -1526,7 +1429,7 @@ struct SourceProvenance {
     telegram_file_unique_id: Option<String>,
 }
 
-fn source_provenance_for_request(request: &sooqa_inbox::IngestRequest) -> serde_json::Value {
+fn source_provenance_for_request(request: &sooqa_inbox::Ingest) -> serde_json::Value {
     let input = &request.original_input;
     let download = input.get("download");
     let media_kind = request_media_kind(request);
@@ -1591,6 +1494,7 @@ async fn fail_finalization(
 }
 
 async fn upload_storage_asset<A, S>(
+    inbox: &InboxRepository,
     provider: &StorageUploadProvider<A, S>,
     job: Job,
 ) -> Result<(), HandlerFailure>
@@ -1598,8 +1502,8 @@ where
     A: TelegramStorageApi,
     S: StorageUploadStore,
 {
-    let (asset_id, generation) = match &job.command {
-        JobCommand::UploadStorageAsset(payload) => (payload.asset_id, payload.generation),
+    let (media_id, generation) = match &job.command {
+        JobCommand::UploadStorageAsset(payload) => (payload.media_id, payload.generation),
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -1608,24 +1512,39 @@ where
         }
     };
 
-    provider
-        .upload(StorageUploadInput { asset_id, job_id: job.id, generation })
-        .await
-        .map(|_| ())
-        .map_err(|error| {
+    match provider.upload(StorageUploadInput { media_id, generation }).await {
+        Ok(_) => {
+            inbox.complete_storage_for_media(media_id).await.map_err(map_inbox_error)?;
+            Ok(())
+        }
+        Err(error) => {
             let message = error.to_string();
-            if let StorageUploadError::InProgress { retry_at: Some(retry_at) } = &error {
-                return HandlerFailure::defer("storage_upload_in_progress", message, *retry_at);
+            if matches!(&error, StorageUploadError::StaleGeneration { .. }) {
+                return Ok(());
             }
-            if matches!(error, StorageUploadError::InProgress { retry_at: None }) {
-                return HandlerFailure::permanent("storage_upload_unknown", message);
+            if let StorageUploadError::InProgress { retry_at: Some(retry_at) } = &error
+                && job.attempt_count < job.max_attempts
+            {
+                return Err(HandlerFailure::defer(
+                    "storage_upload_in_progress",
+                    message,
+                    *retry_at,
+                ));
             }
-            if error.is_retryable() && job.attempt_count < job.max_attempts {
-                HandlerFailure::retryable("storage_upload", message)
+            let terminal = !error.is_retryable() || job.attempt_count >= job.max_attempts;
+            let status =
+                if terminal { IngestStatus::FailedTerminal } else { IngestStatus::FailedRetryable };
+            inbox
+                .fail_storage_for_media(media_id, status, "storage_upload", &message)
+                .await
+                .map_err(map_inbox_error)?;
+            if terminal {
+                Err(HandlerFailure::permanent("storage_upload", message))
             } else {
-                HandlerFailure::permanent("storage_upload", message)
+                Err(HandlerFailure::retryable("storage_upload", message))
             }
-        })
+        }
+    }
 }
 
 async fn inspect_source(
@@ -1634,7 +1553,7 @@ async fn inspect_source(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
-        JobCommand::InspectSource(payload) => payload.ingest_request_id,
+        JobCommand::InspectSource(payload) => payload.ingest_id,
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -1643,7 +1562,13 @@ async fn inspect_source(
         }
     };
 
-    let request = match inbox.begin_source_inspection(ingest_request_id).await {
+    let job_attempt = job.attempt().ok_or_else(|| {
+        HandlerFailure::permanent(
+            "invalid_job_state",
+            "inspect_source handler requires a running job lease",
+        )
+    })?;
+    let request = match inbox.begin_source_inspection(ingest_request_id, &job_attempt).await {
         Ok(SourceInspectionStart::Ready(request)) => request,
         Ok(SourceInspectionStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
@@ -1663,7 +1588,7 @@ async fn inspect_source(
             let class = error.class().to_owned();
             let message = error.to_string();
             inbox
-                .fail_source_inspection(ingest_request_id, status, &class, &message)
+                .fail_source_inspection(ingest_request_id, &job_attempt, status, &class, &message)
                 .await
                 .map_err(map_inbox_error)?;
             return Err(if terminal {
@@ -1675,7 +1600,7 @@ async fn inspect_source(
     };
 
     inbox
-        .complete_source_inspection(ingest_request_id, inspection)
+        .complete_source_inspection(ingest_request_id, &job_attempt, inspection)
         .await
         .map_err(map_inbox_error)?;
     Ok(())
@@ -1689,9 +1614,7 @@ async fn download_source(
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let (ingest_request_id, inspection) = match &job.command {
-        JobCommand::DownloadSource(payload) => {
-            (payload.ingest_request_id, payload.inspection.clone())
-        }
+        JobCommand::DownloadSource(payload) => (payload.ingest_id, payload.inspection.clone()),
         _ => {
             return Err(HandlerFailure::permanent(
                 "invalid_payload",
@@ -2050,12 +1973,12 @@ impl Worker {
 
             self.metrics.claimed.fetch_add(1, Ordering::Relaxed);
             info!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type(), "job claimed");
+            let lease = job.lease().ok_or(JobRepositoryError::LeaseLost)?;
 
             let Some(handler) = self.registry.handler(job.job_type()) else {
                 self.repository
-                    .fail(
-                        job.id,
-                        &self.worker_id,
+                    .fail_lease(
+                        &lease,
                         "handler_not_registered",
                         "no handler is registered for this job type",
                     )
@@ -2065,17 +1988,16 @@ impl Worker {
                 continue;
             };
 
-            let outcome = self.execute_handler(&job, handler, &mut shutdown).await?;
+            let outcome = self.execute_handler(&job, &lease, handler, &mut shutdown).await?;
             let stop_after_shutdown = match outcome {
                 HandlerRunOutcome::Completed(result) => {
-                    self.finish_job(&job, result).await?;
+                    self.finish_job(&job, &lease, result).await?;
                     false
                 }
                 HandlerRunOutcome::Shutdown => {
                     self.repository
-                        .retry(
-                            job.id,
-                            &self.worker_id,
+                        .retry_lease(
+                            &lease,
                             OffsetDateTime::now_utc(),
                             "worker_shutdown",
                             "worker stopped while the job was active",
@@ -2098,6 +2020,7 @@ impl Worker {
     async fn execute_handler<F>(
         &self,
         job: &Job,
+        lease: &JobLease,
         handler: HandlerFn,
         shutdown: &mut std::pin::Pin<&mut F>,
     ) -> Result<HandlerRunOutcome, WorkerError>
@@ -2106,14 +2029,12 @@ impl Worker {
     {
         let (stop_heartbeat, heartbeat_signal) = oneshot::channel();
         let heartbeat_repository = self.repository.clone();
-        let heartbeat_worker_id = self.worker_id.clone();
-        let heartbeat_job_id = job.id;
+        let heartbeat_lease = lease.clone();
         let heartbeat_lease_duration = self.lease_duration;
         let mut heartbeat_task = tokio::spawn(async move {
             heartbeat_loop(
                 heartbeat_repository,
-                heartbeat_job_id,
-                heartbeat_worker_id,
+                heartbeat_lease,
                 heartbeat_lease_duration,
                 heartbeat_signal,
             )
@@ -2148,19 +2069,19 @@ impl Worker {
     async fn finish_job(
         &self,
         job: &Job,
+        lease: &JobLease,
         result: Result<(), HandlerFailure>,
     ) -> Result<(), WorkerError> {
         match result {
             Ok(()) => {
-                self.repository.complete(job.id, &self.worker_id).await?;
+                self.repository.complete_lease(lease).await?;
                 self.metrics.succeeded.fetch_add(1, Ordering::Relaxed);
                 info!(worker_id = %self.worker_id, job_id = %job.id, "job completed");
             }
             Err(failure) if failure.defer_until.is_some() => {
                 self.repository
-                    .defer(
-                        job.id,
-                        &self.worker_id,
+                    .defer_lease(
+                        lease,
                         failure.defer_until.expect("defer timestamp was checked"),
                         &failure.class,
                         &failure.message,
@@ -2171,15 +2092,14 @@ impl Worker {
             Err(failure) if failure.retryable => {
                 let updated = self
                     .repository
-                    .retry(
-                        job.id,
-                        &self.worker_id,
+                    .retry_lease(
+                        lease,
                         OffsetDateTime::now_utc() + TimeDuration::seconds(1),
                         &failure.class,
                         &failure.message,
                     )
                     .await?;
-                if updated.status == JobStatus::RetryWait {
+                if updated.status == JobStatus::Queued {
                     self.metrics.retried.fetch_add(1, Ordering::Relaxed);
                     info!(worker_id = %self.worker_id, job_id = %job.id, "job scheduled for retry");
                 } else {
@@ -2188,9 +2108,7 @@ impl Worker {
                 }
             }
             Err(failure) => {
-                self.repository
-                    .fail(job.id, &self.worker_id, &failure.class, &failure.message)
-                    .await?;
+                self.repository.fail_lease(lease, &failure.class, &failure.message).await?;
                 self.metrics.failed.fetch_add(1, Ordering::Relaxed);
                 warn!(worker_id = %self.worker_id, job_id = %job.id, error_class = %failure.class, "job failed");
             }
@@ -2218,8 +2136,7 @@ enum HandlerRunOutcome {
 
 async fn heartbeat_loop(
     repository: JobRepository,
-    job_id: uuid::Uuid,
-    worker_id: String,
+    lease: JobLease,
     lease_duration: Duration,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<(), JobRepositoryError> {
@@ -2228,7 +2145,7 @@ async fn heartbeat_loop(
         tokio::select! {
             _ = &mut stop => return Ok(()),
             _ = sleep(interval) => {
-                repository.heartbeat(job_id, &worker_id, lease_duration).await?;
+                repository.heartbeat_lease(&lease, lease_duration).await?;
             }
         }
     }
@@ -2305,19 +2222,20 @@ mod tests {
         Job {
             id: Uuid::new_v4(),
             command: JobCommand::ComputeFingerprint(sooqa_jobs::IngestJobPayload {
-                ingest_request_id: Uuid::new_v4(),
+                ingest_id: Uuid::new_v4(),
             }),
             status: JobStatus::Running,
             priority: 0,
-            available_at: now,
+            run_at: now,
             attempt_count,
             max_attempts,
+            lease_token: Some(Uuid::new_v4()),
             lease_owner: Some("test-worker".to_owned()),
             lease_expires_at: None,
             last_heartbeat_at: None,
             last_error_class: None,
             last_error_message: None,
-            idempotency_key: None,
+            dedupe_key: None,
             created_at: now,
             updated_at: now,
             completed_at: None,

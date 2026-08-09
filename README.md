@@ -10,18 +10,16 @@ transactions.
 The repository currently provides:
 
 - an OpenAPI-described HTTP Inbox API for creating and reading ingest requests;
-- scoped bearer-token authentication with SHA-256 token hashes;
-- PostgreSQL-backed idempotency, ingest state, job attempts, leases, and
-  stale-lease recovery;
+    - one configured bearer secret for the single-admin API;
+    - PostgreSQL-backed `ingests`, one-row `media`, `channels`, `posts`, and
+      durable `queue.jobs` with leases and stale-lease recovery;
 - direct HTTP and yt-dlp media adapters, ffprobe inspection, ffmpeg
-  normalization, image normalization, hashing, and duplicate primitives;
-- a Telegram long-polling adapter for admin URL/media submission and a durable
-  Telegram storage-upload intent flow;
+  normalization, image normalization, hashing, and optional similarity checks;
+    - a Telegram long-polling adapter for admin URL/media submission and a
+      media-row storage state machine;
 - an explicit storage-intent reconciliation CLI for ambiguous Telegram
-  uploads.
-- Authenticated Publisher draft and schedule API backed by target channels,
-  channel policies, post drafts, publication schedules, attempts, and
-  published-post history.
+    uploads.
+    - Publisher channel/post persistence with cadence slots and fenced sends.
 
 The composed worker registers `inspect_source` with the SSRF-hardened direct
 HTTP adapter, `download_source` into the shared media workspace, `probe_asset`,
@@ -31,11 +29,10 @@ The yt-dlp adapter remains available behind the media boundary but is not yet
 enabled in the production worker because its subprocess egress needs an
 equivalent SSRF boundary. Normalization records a canonical video or static
 image artifact (plus an image thumbnail) and queues `finalize_ingest`;
-finalization creates or reuses the canonical library rows, fingerprints videos
-using the existing ingest JSON metadata, scores them against completed videos,
-and writes duplicate candidates using the existing schema. Storage upload and
-the Publisher persistence remains a separate boundary; Telegram publication
-itself is not enabled yet.
+finalization creates or reuses one `media` row, stores video fingerprints on
+that row, and logs perceptual similarity findings without creating a duplicate
+aggregate. Storage upload and publication remain separate durable stages;
+Telegram publication itself is not enabled yet.
 
 Active documentation is the authority for current behavior:
 
