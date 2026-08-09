@@ -7,6 +7,7 @@ use sooqa_library::{
     NewMedia, NewTag, SourceKind, StorageUploadAttachment, StorageUploadReservation,
     StorageUploadReservationRequest, StorageUploadStore,
 };
+use sooqa_media::{VideoSequenceFingerprint, VideoSequenceSample};
 use sooqa_persistence::Database;
 
 async fn database() -> Database {
@@ -141,6 +142,139 @@ async fn exact_sha_dedup_preserves_primary_source_metadata() {
         .execute(database.pool())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn video_fingerprint_shortlist_uses_tokens_state_and_version_bounds() {
+    let database = database().await;
+    let repository = database.library();
+    let incoming = repository
+        .resolve_media(ingest(vec![21_u8; 32], "https://example.test/incoming"))
+        .await
+        .unwrap();
+    let pending = repository
+        .resolve_media(ingest(vec![22_u8; 32], "https://example.test/pending"))
+        .await
+        .unwrap();
+    let ready = repository
+        .resolve_media(ingest(vec![23_u8; 32], "https://example.test/ready"))
+        .await
+        .unwrap();
+    let unknown = repository
+        .resolve_media(ingest(vec![24_u8; 32], "https://example.test/unknown"))
+        .await
+        .unwrap();
+
+    let fingerprint = test_sequence(0x1234_5678_9abc_def0);
+    let tokens = fingerprint.search_tokens();
+    repository.record_video_sequence_fingerprint(incoming.media.id, &fingerprint).await.unwrap();
+    repository.record_video_sequence_fingerprint(pending.media.id, &fingerprint).await.unwrap();
+    repository.record_video_sequence_fingerprint(ready.media.id, &fingerprint).await.unwrap();
+    repository.record_video_sequence_fingerprint(unknown.media.id, &fingerprint).await.unwrap();
+    sqlx::query(
+        "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = -100123, telegram_storage_message_id = 501, telegram_file_id = 'ready-501' WHERE id = $1",
+    )
+    .bind(ready.media.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE media SET storage_state = 'storage_unknown' WHERE id = $1")
+        .bind(unknown.media.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let candidates = repository
+        .list_video_fingerprint_candidates(incoming.media.id, "video_sequence_v1", &tokens)
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].media_id, pending.media.id);
+    assert_eq!(candidates[1].media_id, ready.media.id);
+    assert!(candidates.iter().all(|candidate| {
+        candidate.shared_token_count >= 8
+            && candidate.overlap_bps >= 1_000
+            && VideoSequenceFingerprint::decode(&candidate.fingerprint_data).is_ok()
+    }));
+
+    let wrong_version = repository
+        .list_video_fingerprint_candidates(incoming.media.id, "other_v1", &tokens)
+        .await
+        .unwrap();
+    assert!(wrong_version.is_empty());
+    let unrelated = repository
+        .list_video_fingerprint_candidates(incoming.media.id, "video_sequence_v1", &[1, 2, 3])
+        .await
+        .unwrap();
+    assert!(unrelated.is_empty());
+
+    sqlx::query("DELETE FROM media WHERE id = ANY($1::uuid[])")
+        .bind(vec![incoming.media.id, pending.media.id, ready.media.id, unknown.media.id])
+        .execute(database.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn video_fingerprint_shortlist_is_capped_at_twenty() {
+    let database = database().await;
+    let repository = database.library();
+    let incoming = repository
+        .resolve_media(ingest(vec![31_u8; 32], "https://example.test/cap-incoming"))
+        .await
+        .unwrap();
+    let fingerprint = test_sequence(0xfedc_ba98_7654_3210);
+    let tokens = fingerprint.search_tokens();
+    let mut media_ids = vec![incoming.media.id];
+
+    for index in 0..21_u8 {
+        let candidate = repository
+            .resolve_media(ingest(
+                vec![100_u8 + index; 32],
+                &format!("https://example.test/cap-{index}"),
+            ))
+            .await
+            .unwrap();
+        repository
+            .record_video_sequence_fingerprint(candidate.media.id, &fingerprint)
+            .await
+            .unwrap();
+        media_ids.push(candidate.media.id);
+    }
+
+    let candidates = repository
+        .list_video_fingerprint_candidates(incoming.media.id, "video_sequence_v1", &tokens)
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 20);
+    assert!(candidates.iter().all(|candidate| candidate.shared_token_count >= 8));
+
+    sqlx::query("DELETE FROM media WHERE id = ANY($1::uuid[])")
+        .bind(media_ids)
+        .execute(database.pool())
+        .await
+        .unwrap();
+}
+
+fn test_sequence(seed: u64) -> VideoSequenceFingerprint {
+    VideoSequenceFingerprint::new(
+        5_000,
+        500,
+        (0..10)
+            .map(|index| VideoSequenceSample {
+                phash: seed.wrapping_add(index),
+                dhash: seed.rotate_left(index as u32),
+                mean_luma: 100,
+                mean_chroma_u: 3,
+                mean_chroma_v: -2,
+                information_bps: 8_000,
+                transition_bps: if index == 0 { 0 } else { 500 },
+            })
+            .collect(),
+    )
+    .unwrap()
 }
 
 #[tokio::test]

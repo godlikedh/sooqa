@@ -35,7 +35,8 @@ erDiagram
         text kind
         text storage_state
         bytea canonical_sha256 UK
-        bytea fingerprint
+        bytea fingerprint_data
+        bigint[] fingerprint_search_tokens
         text[] tags
     }
     CHANNELS {
@@ -137,6 +138,12 @@ state machine on the same row: `pending_storage`, `ready`,
 `storage_unknown`, or `missing`, with generation/token fields for retries and
 ambiguous results. Exact-SHA deduplication preserves the first source identity
 and only fills missing non-identity metadata from later observations.
+
+The issue #44 foundation stores `video_sequence_v1` as bounded binary
+`fingerprint_data` plus a partial-GIN-searchable token array. PostgreSQL only
+shortlists compatible `pending_storage` and `ready` video rows; bounded Rust
+alignment remains responsible for the final visual evidence. The current
+worker switch and pre-storage identity transaction are the dependent #44 slice.
 
 ## Publisher
 

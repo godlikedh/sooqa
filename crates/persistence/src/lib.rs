@@ -11,7 +11,9 @@ pub use inbox::{
     SourceDownloadStart, SourceInspectionStart,
 };
 pub use jobs::{JobRepository, JobRepositoryError};
-pub use library::{LibraryRepository, LibraryRepositoryError, StoredVideoFingerprint};
+pub use library::{
+    LibraryRepository, LibraryRepositoryError, StoredVideoFingerprint, VideoFingerprintCandidate,
+};
 pub use publisher::{CreatePostResult, PublisherRepository, PublisherRepositoryError};
 
 use sooqa_config::SecretString;

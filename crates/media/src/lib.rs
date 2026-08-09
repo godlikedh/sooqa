@@ -21,7 +21,9 @@ mod hashing;
 mod image_normalize;
 mod normalize;
 mod publication;
+mod sequence_alignment;
 mod similarity;
+mod video_sequence;
 mod workspace;
 mod ytdlp;
 
@@ -41,8 +43,8 @@ pub use ffprobe::{
 };
 pub use fingerprint::{
     FRAME_DHASH_V1, FingerprintVersion, FrameDecodeLimits, FrameExtractionError,
-    FrameExtractionResult, FrameExtractor, FrameFingerprint, FrameTimestamp, VideoFingerprint,
-    frame_dhash_v1, select_fingerprint_timestamps,
+    FrameExtractionResult, FrameExtractor, FrameFingerprint, FrameTimestamp, VIDEO_SEQUENCE_V1,
+    VideoFingerprint, frame_dhash_v1, select_fingerprint_timestamps,
 };
 pub use hashing::{FileDigest, HashError, sha256_file};
 pub(crate) use hashing::{sha256_bytes, sha256_file_sync};
@@ -54,12 +56,22 @@ pub use normalize::{
     AudioCodec, CanonicalContainer, CanonicalVideoProfile, NormalizationError, NormalizationMode,
     NormalizationPlan, NormalizationPlanner, PixelFormat, ProfileError, VideoCodec, VideoPreset,
 };
+pub use sequence_alignment::{
+    SequenceAlignment, SequenceAlignmentConfig, SequenceAlignmentError, SequenceClassification,
+    SequenceEvidence, align_video_sequences,
+};
 pub use similarity::{
     FrameDistance, PrefilterRejection, SimilarityClassification, SimilarityConfig, SimilarityError,
     SimilarityEvidence, SimilarityResult, SimilarityThresholds, VideoSimilarityInput,
     compare_videos,
 };
 pub use sooqa_inbox::{SourceInspection, SourceMediaKind};
+pub use video_sequence::{
+    VIDEO_SEQUENCE_BASE_INTERVAL_MS, VIDEO_SEQUENCE_CODEC_V1, VIDEO_SEQUENCE_MAGIC,
+    VIDEO_SEQUENCE_MAX_ANCHORS, VIDEO_SEQUENCE_MAX_SAMPLES, VIDEO_SEQUENCE_MAX_TOKENS,
+    VideoSequenceError, VideoSequenceFingerprint, VideoSequenceSample, derive_search_tokens,
+    select_video_sequence_timestamps,
+};
 pub use workspace::{
     ManifestEntry, MediaWorkspace, WorkspaceArea, WorkspaceError, WorkspaceManifest,
 };

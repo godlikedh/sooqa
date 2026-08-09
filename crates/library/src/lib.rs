@@ -336,6 +336,19 @@ pub struct StoredVideoFingerprint {
     pub fingerprint: Value,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct VideoFingerprintCandidate {
+    pub media_id: Uuid,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub audio_codec: Option<String>,
+    pub fingerprint_version: String,
+    pub fingerprint_data: Vec<u8>,
+    pub search_tokens: Vec<i64>,
+    pub shared_token_count: i64,
+    pub overlap_bps: i64,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StorageReceipt {
     pub media_id: Uuid,
