@@ -9,12 +9,13 @@ use sooqa_library::{
     MediaUpdate, NewTag, SourceKind, StorageReceipt, StorageUploadAttachment, StorageUploadInfo,
     StorageUploadReservation, StorageUploadReservationRequest, StorageUploadStore, Tag,
 };
+use sooqa_media::VideoSequenceFingerprint;
 use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-pub use sooqa_library::StoredVideoFingerprint;
+pub use sooqa_library::{StoredVideoFingerprint, VideoFingerprintCandidate};
 
 #[derive(Clone)]
 pub struct LibraryRepository {
@@ -27,7 +28,7 @@ struct MediaRow {
     kind: String,
     storage_state: String,
     canonical_sha256: Option<Vec<u8>>,
-    fingerprint: Option<Vec<u8>>,
+    fingerprint_data: Option<Vec<u8>>,
     title: Option<String>,
     description: Option<String>,
     tags: Vec<String>,
@@ -53,6 +54,35 @@ struct MediaRow {
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     stored_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct VideoFingerprintCandidateRow {
+    media_id: Uuid,
+    width: Option<i32>,
+    height: Option<i32>,
+    audio_codec: Option<String>,
+    fingerprint_version: String,
+    fingerprint_data: Vec<u8>,
+    search_tokens: Vec<i64>,
+    shared_token_count: i64,
+    overlap_bps: i64,
+}
+
+impl VideoFingerprintCandidateRow {
+    fn into_candidate(self) -> VideoFingerprintCandidate {
+        VideoFingerprintCandidate {
+            media_id: self.media_id,
+            width: self.width,
+            height: self.height,
+            audio_codec: self.audio_codec,
+            fingerprint_version: self.fingerprint_version,
+            fingerprint_data: self.fingerprint_data,
+            search_tokens: self.search_tokens,
+            shared_token_count: self.shared_token_count,
+            overlap_bps: self.overlap_bps,
+        }
+    }
 }
 
 impl LibraryRepository {
@@ -315,11 +345,35 @@ impl LibraryRepository {
         fingerprint: &Value,
     ) -> Result<(), LibraryRepositoryError> {
         let updated = sqlx::query(
-            "UPDATE media SET fingerprint_version = $2, fingerprint = $3, updated_at = now() WHERE id = $1",
+            "UPDATE media SET fingerprint_version = $2, fingerprint_data = $3, fingerprint_search_tokens = NULL, updated_at = now() WHERE id = $1",
         )
         .bind(media_id)
         .bind(algorithm_version)
         .bind(serde_json::to_vec(fingerprint)?)
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(LibraryRepositoryError::ResourceMissing(media_id));
+        }
+        Ok(())
+    }
+
+    pub async fn record_video_sequence_fingerprint(
+        &self,
+        media_id: Uuid,
+        fingerprint: &VideoSequenceFingerprint,
+    ) -> Result<(), LibraryRepositoryError> {
+        let encoded = fingerprint
+            .encode()
+            .map_err(|error| LibraryRepositoryError::InvalidFingerprint(error.to_string()))?;
+        let tokens = fingerprint.search_tokens();
+        let updated = sqlx::query(
+            "UPDATE media SET fingerprint_version = $2, fingerprint_data = $3, fingerprint_search_tokens = $4, updated_at = now() WHERE id = $1 AND kind = 'video'",
+        )
+        .bind(media_id)
+        .bind(fingerprint.version.as_str())
+        .bind(encoded)
+        .bind(tokens)
         .execute(&self.pool)
         .await?;
         if updated.rows_affected() != 1 {
@@ -334,7 +388,7 @@ impl LibraryRepository {
         algorithm_version: &str,
     ) -> Result<Vec<StoredVideoFingerprint>, LibraryRepositoryError> {
         let rows = sqlx::query_as::<_, MediaRow>(
-            "SELECT * FROM media WHERE id <> $1 AND kind = 'video' AND fingerprint IS NOT NULL AND fingerprint_version = $2 ORDER BY id",
+            "SELECT * FROM media WHERE id <> $1 AND kind = 'video' AND fingerprint_data IS NOT NULL AND fingerprint_version = $2 ORDER BY id",
         )
         .bind(exclude_media_id)
         .bind(algorithm_version)
@@ -343,7 +397,7 @@ impl LibraryRepository {
         rows.into_iter()
             .map(|row| {
                 let bytes = row
-                    .fingerprint
+                    .fingerprint_data
                     .as_deref()
                     .ok_or(LibraryRepositoryError::Invariant("media fingerprint is missing"))?;
                 Ok(StoredVideoFingerprint {
@@ -355,6 +409,76 @@ impl LibraryRepository {
                 })
             })
             .collect()
+    }
+
+    pub async fn list_video_fingerprint_candidates(
+        &self,
+        exclude_media_id: Uuid,
+        fingerprint_version: &str,
+        search_tokens: &[i64],
+    ) -> Result<Vec<VideoFingerprintCandidate>, LibraryRepositoryError> {
+        if search_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, VideoFingerprintCandidateRow>(
+            r#"
+            WITH candidates AS (
+                SELECT
+                    m.id AS media_id,
+                    m.width,
+                    m.height,
+                    m.audio_codec,
+                    m.fingerprint_version,
+                    m.fingerprint_data,
+                    m.fingerprint_search_tokens AS search_tokens,
+                    cardinality(ARRAY(
+                        SELECT DISTINCT candidate_token
+                        FROM unnest(m.fingerprint_search_tokens) AS candidate_token
+                        WHERE candidate_token = ANY($3::bigint[])
+                    ))::bigint AS shared_token_count,
+                    cardinality(ARRAY(
+                        SELECT DISTINCT candidate_token
+                        FROM unnest(m.fingerprint_search_tokens) AS candidate_token
+                    ))::bigint AS candidate_token_count,
+                    cardinality(ARRAY(
+                        SELECT DISTINCT query_token
+                        FROM unnest($3::bigint[]) AS query_token
+                    ))::bigint AS query_token_count
+                FROM media AS m
+                WHERE m.id <> $1
+                  AND m.kind = 'video'
+                  AND m.fingerprint_version = $2
+                  AND m.fingerprint_data IS NOT NULL
+                  AND m.fingerprint_search_tokens IS NOT NULL
+                  AND m.storage_state IN ('pending_storage', 'ready')
+                  AND m.fingerprint_search_tokens && $3::bigint[]
+            )
+            SELECT
+                media_id,
+                width,
+                height,
+                audio_codec,
+                fingerprint_version,
+                fingerprint_data,
+                search_tokens,
+                shared_token_count,
+                (
+                    shared_token_count * 10000
+                    / NULLIF(LEAST(candidate_token_count, query_token_count), 0)
+                )::bigint AS overlap_bps
+            FROM candidates
+            WHERE shared_token_count >= 8
+              AND shared_token_count * 10 >= LEAST(candidate_token_count, query_token_count)
+            ORDER BY shared_token_count DESC, overlap_bps DESC, media_id
+            LIMIT 20
+            "#,
+        )
+        .bind(exclude_media_id)
+        .bind(fingerprint_version)
+        .bind(search_tokens)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(VideoFingerprintCandidateRow::into_candidate).collect())
     }
 
     pub async fn list_storage_uploads(
@@ -913,6 +1037,8 @@ pub enum LibraryRepositoryError {
     Database(#[from] sqlx::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("invalid video fingerprint: {0}")]
+    InvalidFingerprint(String),
     #[error("media {0} was not found")]
     ResourceMissing(Uuid),
     #[error("media update must change at least one field")]

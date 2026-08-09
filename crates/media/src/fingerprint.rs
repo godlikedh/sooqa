@@ -22,6 +22,7 @@ const DEFAULT_MAX_FRAME_PIXELS: u64 = 16_000_000;
 const DEFAULT_MAX_FRAME_WORKING_BYTES: u64 = 128 * 1024 * 1024;
 
 pub const FRAME_DHASH_V1: &str = "frame_dhash_v1";
+pub const VIDEO_SEQUENCE_V1: &str = "video_sequence_v1";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FrameTimestamp {
@@ -46,12 +47,15 @@ pub fn select_fingerprint_timestamps(duration_ms: u64) -> Vec<FrameTimestamp> {
 pub enum FingerprintVersion {
     #[serde(rename = "frame_dhash_v1")]
     FrameDHashV1,
+    #[serde(rename = "video_sequence_v1")]
+    VideoSequenceV1,
 }
 
 impl FingerprintVersion {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::FrameDHashV1 => FRAME_DHASH_V1,
+            Self::VideoSequenceV1 => VIDEO_SEQUENCE_V1,
         }
     }
 }

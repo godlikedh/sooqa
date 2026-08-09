@@ -106,7 +106,8 @@ CREATE TABLE media (
         CHECK (storage_state IN ('pending_storage', 'ready', 'storage_unknown', 'missing')),
     canonical_sha256 bytea,
     fingerprint_version text,
-    fingerprint bytea,
+    fingerprint_data bytea,
+    fingerprint_search_tokens bigint[],
     title text,
     description text,
     tags text[] NOT NULL DEFAULT '{}',
@@ -145,6 +146,11 @@ CREATE TABLE media (
 CREATE UNIQUE INDEX media_canonical_sha256_idx
     ON media (canonical_sha256);
 CREATE INDEX media_tags_gin_idx ON media USING gin (tags);
+CREATE INDEX media_video_fingerprint_tokens_gin_idx
+    ON media USING gin (fingerprint_search_tokens)
+    WHERE kind = 'video'
+      AND storage_state IN ('pending_storage', 'ready')
+      AND fingerprint_search_tokens IS NOT NULL;
 CREATE INDEX media_search_idx ON media (kind, storage_state, updated_at DESC);
 
 ALTER TABLE ingests

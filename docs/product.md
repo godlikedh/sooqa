@@ -45,8 +45,9 @@ tables are:
   input data, workflow state, optional resulting/matched `media_id`, and
   current error/timestamps;
 - `media`: one normalized stored media item with canonical SHA-256, compact
-  versioned fingerprint, searchable text/tags, common media properties,
-  source metadata, Telegram storage identifiers, and storage ambiguity state;
+  versioned fingerprint data and video search tokens, searchable text/tags,
+  common media properties, source metadata, Telegram storage identifiers, and
+  storage ambiguity state;
 - `channels`: one target Telegram channel with enablement, IANA time zone,
   posting window, and cadence interval;
 - `posts`: one intended Telegram post and its eventual result, including
@@ -106,6 +107,11 @@ There is no generic idempotency table and no permanent Telegram update-receipt
 table. Repeated creates may return the existing resource; updates should be
 naturally idempotent setters where possible.
 
+Issue #44 adds the versioned `video_sequence_v1` media foundation in a stacked
+implementation. Its first slice is storage-safe fingerprint encoding, token
+shortlisting, and bounded alignment; the active worker identity gate,
+`duplicate_pending` decision, and force-save API are the dependent slice.
+
 ## Single-admin security
 
 The bot token, API secret, administrator Telegram user ID, and storage chat ID
@@ -123,8 +129,8 @@ This reset does not add:
 - data-copy SQL, compatibility views, old-name aliases, or dual writes;
 - multiple administrators, users, tenants, storage providers, albums, media
   variants, derivative assets, or a generalized content taxonomy;
-- richer duplicate-interaction UX or automatic perceptual duplicate decisions;
-- a new perceptual-dedup algorithm;
+- richer duplicate-interaction UX or a production-active perceptual duplicate
+  decision; issue #44's dependent workflow slice owns that gate;
 - Grafana/Prometheus deployment;
 - Telegram publication functionality beyond behavior already present at the
   selected implementation base.
