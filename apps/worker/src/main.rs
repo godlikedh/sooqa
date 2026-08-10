@@ -53,10 +53,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let telegram_api =
         match config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured()) {
             Some(token) => Some(
-                TeloxideApi::new(
+                TeloxideApi::new_with_upload_timeout(
                     token.expose_secret(),
                     &config.telegram.api_base_url,
                     Duration::from_secs(config.telegram.poll_timeout_seconds),
+                    Duration::from_secs(config.telegram.upload_timeout_seconds),
                 )?
                 .with_source_download_max_bytes(config.telegram.source_download_max_bytes),
             ),

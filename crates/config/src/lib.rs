@@ -21,6 +21,8 @@ const DEFAULT_YTDLP_FORMAT: &str = "bestvideo*+bestaudio/best";
 const DEFAULT_MEDIA_WORK_ROOT: &str = "/var/lib/sooqa/work";
 const DEFAULT_TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
 const DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_TELEGRAM_UPLOAD_TIMEOUT_SECONDS: u64 = 3_600;
+const MAX_TELEGRAM_UPLOAD_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_NORMALIZED_STORAGE_MAX_BYTES: u64 = 1_900_000_000;
@@ -244,6 +246,7 @@ pub struct TelegramConfig {
     pub api_base_url: String,
     pub admin_user_ids: Vec<i64>,
     pub poll_timeout_seconds: u64,
+    pub upload_timeout_seconds: u64,
     pub source_download_max_bytes: u64,
     pub storage_chat_id: Option<i64>,
 }
@@ -391,6 +394,10 @@ impl AppConfig {
                     .telegram
                     .poll_timeout_seconds
                     .unwrap_or(DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS),
+                upload_timeout_seconds: raw
+                    .telegram
+                    .upload_timeout_seconds
+                    .unwrap_or(DEFAULT_TELEGRAM_UPLOAD_TIMEOUT_SECONDS),
                 source_download_max_bytes: raw
                     .telegram
                     .source_download_max_bytes
@@ -408,7 +415,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -429,6 +436,7 @@ impl AppConfig {
             self.telegram.api_base_url,
             self.telegram.admin_user_ids.len(),
             self.telegram.poll_timeout_seconds,
+            self.telegram.upload_timeout_seconds,
             self.telegram.source_download_max_bytes,
             self.telegram.storage_chat_id,
             self.observability.log_format,
@@ -527,6 +535,13 @@ impl AppConfig {
                     reason: "expected a positive integer",
                 })?;
         }
+        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_UPLOAD_TIMEOUT_SECONDS")? {
+            self.telegram.upload_timeout_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_TELEGRAM_UPLOAD_TIMEOUT_SECONDS".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
+        }
         if let Some(value) = optional_env_string("SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES")? {
             self.telegram.source_download_max_bytes =
                 value.parse().map_err(|_| ConfigError::InvalidValue {
@@ -600,6 +615,18 @@ impl AppConfig {
             return Err(ConfigError::InvalidValue {
                 name: "telegram.poll_timeout_seconds".to_owned(),
                 reason: "must be greater than zero",
+            });
+        }
+        if self.telegram.upload_timeout_seconds == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.upload_timeout_seconds".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.telegram.upload_timeout_seconds > MAX_TELEGRAM_UPLOAD_TIMEOUT_SECONDS {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.upload_timeout_seconds".to_owned(),
+                reason: "must be at most 24 hours",
             });
         }
         if self.telegram.source_download_max_bytes == 0 {
@@ -696,6 +723,7 @@ struct RawTelegramConfig {
     api_base_url: Option<String>,
     admin_user_ids: Vec<i64>,
     poll_timeout_seconds: Option<u64>,
+    upload_timeout_seconds: Option<u64>,
     source_download_max_bytes: Option<u64>,
     storage_chat_id: Option<i64>,
 }
@@ -1025,7 +1053,7 @@ mod tests {
         let config = AppConfig::from_toml_str(
             AppRole::Server,
             None,
-            "[telegram]\napi_base_url = \"http://telegram-bot-api:8081\"\nadmin_user_ids = [123456789]\npoll_timeout_seconds = 45\nstorage_chat_id = -1001234567890\n",
+            "[telegram]\napi_base_url = \"http://telegram-bot-api:8081\"\nadmin_user_ids = [123456789]\npoll_timeout_seconds = 45\nupload_timeout_seconds = 7200\nstorage_chat_id = -1001234567890\n",
         )
         .expect("TOML should parse");
 
@@ -1033,6 +1061,7 @@ mod tests {
         assert_eq!(config.telegram.api_base_url, "http://telegram-bot-api:8081");
         assert_eq!(config.telegram.admin_user_ids, vec![123456789]);
         assert_eq!(config.telegram.poll_timeout_seconds, 45);
+        assert_eq!(config.telegram.upload_timeout_seconds, 7200);
         assert_eq!(
             config.telegram.source_download_max_bytes,
             DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES
@@ -1101,6 +1130,17 @@ mod tests {
         assert!(matches!(
             too_large.validate(),
             Err(ConfigError::InvalidValue { name, .. }) if name == "media.normalized_storage_max_bytes"
+        ));
+
+        let too_long = AppConfig::from_toml_str(
+            AppRole::Server,
+            None,
+            "[telegram]\nupload_timeout_seconds = 86401\n",
+        )
+        .expect("TOML should parse");
+        assert!(matches!(
+            too_long.validate(),
+            Err(ConfigError::InvalidValue { name, .. }) if name == "telegram.upload_timeout_seconds"
         ));
     }
 

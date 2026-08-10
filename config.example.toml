@@ -30,6 +30,8 @@ max_connections = 20
 api_base_url = "https://api.telegram.org"
 admin_user_ids = []
 poll_timeout_seconds = 30
+# Full Telegram storage upload deadline, independent from polling and download stall timeouts.
+upload_timeout_seconds = 3600
 # Telegram-source download budget; the local Bot API has no download limit.
 source_download_max_bytes = 2147483648
 # Private Telegram channel used for durable media storage.

@@ -40,10 +40,12 @@ pub const STATUS_RESPONSE: &str = "sooqa is online.";
 pub const UNAUTHORIZED_RESPONSE: &str = "This bot is restricted to its configured administrator.";
 pub const ADD_USAGE_RESPONSE: &str = "Send one http(s) URL after /add, or send a bare URL.";
 pub const DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const DEFAULT_TELEGRAM_UPLOAD_TIMEOUT_SECONDS: u64 = 3_600;
 const TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 const TELEGRAM_CLOUD_UPLOAD_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
 const TELEGRAM_MEDIA_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const TELEGRAM_MEDIA_READ_TIMEOUT: Duration = Duration::from_secs(120);
+const TELEGRAM_MAX_UPLOAD_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_MEDIA_WORK_ROOT_NAME: &str = "sooqa-telegram-work";
 const RESPONSE_RATE_LIMIT: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -191,6 +193,8 @@ pub enum TelegramError {
     InvalidApiBaseUrl(String),
     #[error("Telegram polling timeout must be greater than zero")]
     InvalidPollTimeout,
+    #[error("Telegram upload timeout must be greater than zero and at most 24 hours")]
+    InvalidUploadTimeout,
     #[error("Telegram HTTP client could not be configured: {0}")]
     HttpClient(#[source] reqwest::Error),
     #[error("Telegram Ctrl-C handler could not be initialized: {0}")]
@@ -953,6 +957,7 @@ impl CallbackData {
 pub struct TeloxideApi {
     control_bot: Bot,
     media_bot: Bot,
+    upload_bot: Bot,
     cloud_download_limit_bytes: Option<u64>,
     cloud_upload_limit_bytes: Option<u64>,
     source_download_max_bytes: u64,
@@ -964,8 +969,25 @@ impl TeloxideApi {
         api_base_url: &str,
         poll_timeout: Duration,
     ) -> Result<Self, TelegramError> {
+        Self::new_with_upload_timeout(
+            token,
+            api_base_url,
+            poll_timeout,
+            Duration::from_secs(DEFAULT_TELEGRAM_UPLOAD_TIMEOUT_SECONDS),
+        )
+    }
+
+    pub fn new_with_upload_timeout(
+        token: impl Into<String>,
+        api_base_url: &str,
+        poll_timeout: Duration,
+        upload_timeout: Duration,
+    ) -> Result<Self, TelegramError> {
         if poll_timeout.is_zero() || poll_timeout.as_secs() > u64::from(u32::MAX) {
             return Err(TelegramError::InvalidPollTimeout);
+        }
+        if upload_timeout.is_zero() || upload_timeout > TELEGRAM_MAX_UPLOAD_TIMEOUT {
+            return Err(TelegramError::InvalidUploadTimeout);
         }
         let api_base_url = Url::parse(api_base_url)
             .map_err(|error| TelegramError::InvalidApiBaseUrl(error.to_string()))?;
@@ -989,10 +1011,15 @@ impl TeloxideApi {
             .build()
             .map_err(TelegramError::HttpClient)?;
         let is_cloud = api_base_url.host_str() == Some("api.telegram.org");
+        let control_bot =
+            Bot::with_client(token.clone(), control_client).set_api_url(api_base_url.clone());
+        let media_bot =
+            Bot::with_client(token.clone(), media_client).set_api_url(api_base_url.clone());
+        let upload_bot = upload_bot_with_timeout(&control_bot, upload_timeout)?;
         Ok(Self {
-            control_bot: Bot::with_client(token.clone(), control_client)
-                .set_api_url(api_base_url.clone()),
-            media_bot: Bot::with_client(token, media_client).set_api_url(api_base_url),
+            control_bot,
+            media_bot,
+            upload_bot,
             cloud_download_limit_bytes: is_cloud.then_some(TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES),
             cloud_upload_limit_bytes: is_cloud.then_some(TELEGRAM_CLOUD_UPLOAD_LIMIT_BYTES),
             source_download_max_bytes: DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
@@ -1004,6 +1031,11 @@ impl TeloxideApi {
         self
     }
 
+    pub fn with_upload_timeout(mut self, upload_timeout: Duration) -> Result<Self, TelegramError> {
+        self.upload_bot = upload_bot_with_timeout(&self.control_bot, upload_timeout)?;
+        Ok(self)
+    }
+
     fn bot(&self) -> Bot {
         self.control_bot.clone()
     }
@@ -1012,12 +1044,43 @@ impl TeloxideApi {
         self.media_bot.clone()
     }
 
+    fn upload_bot(&self) -> Bot {
+        self.upload_bot.clone()
+    }
+
+    #[cfg(test)]
+    fn with_test_media_read_timeout(
+        mut self,
+        read_timeout: Duration,
+    ) -> Result<Self, TelegramError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(TELEGRAM_MEDIA_CONNECT_TIMEOUT)
+            .read_timeout(read_timeout)
+            .build()
+            .map_err(TelegramError::HttpClient)?;
+        self.media_bot = Bot::with_client(self.media_bot.token().to_owned(), client)
+            .set_api_url(self.media_bot.api_url());
+        Ok(self)
+    }
+
     #[cfg(test)]
     fn with_test_cloud_limits(mut self, limit: u64) -> Self {
         self.cloud_download_limit_bytes = Some(limit);
         self.cloud_upload_limit_bytes = Some(limit);
         self
     }
+}
+
+fn upload_bot_with_timeout(bot: &Bot, upload_timeout: Duration) -> Result<Bot, TelegramError> {
+    if upload_timeout.is_zero() || upload_timeout > TELEGRAM_MAX_UPLOAD_TIMEOUT {
+        return Err(TelegramError::InvalidUploadTimeout);
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(TELEGRAM_MEDIA_CONNECT_TIMEOUT)
+        .timeout(upload_timeout)
+        .build()
+        .map_err(TelegramError::HttpClient)?;
+    Ok(Bot::with_client(bot.token().to_owned(), client).set_api_url(bot.api_url()))
 }
 
 fn is_safe_api_base_url(url: &Url) -> bool {
@@ -1223,6 +1286,12 @@ where
         let service =
             TelegramService::with_ingest(api.clone(), update_store, admin_user_ids, ingest_service);
         Ok(Self { api, service, poll_timeout, storage_chat_id })
+    }
+
+    pub fn with_upload_timeout(mut self, upload_timeout: Duration) -> Result<Self, TelegramError> {
+        self.api = self.api.with_upload_timeout(upload_timeout)?;
+        self.service.api = self.api.clone();
+        Ok(self)
     }
 
     pub fn with_media_work_root(mut self, media_work_root: impl Into<PathBuf>) -> Self {
@@ -1957,10 +2026,19 @@ mod tests {
     struct HttpRequestSummary {
         target: String,
         body_bytes: u64,
+        body_contains_marker: bool,
     }
 
     async fn read_http_request(
         reader: &mut BufReader<TcpStream>,
+    ) -> std::io::Result<HttpRequestSummary> {
+        read_http_request_with_options(reader, Duration::ZERO, None).await
+    }
+
+    async fn read_http_request_with_options(
+        reader: &mut BufReader<TcpStream>,
+        body_delay: Duration,
+        marker: Option<&[u8]>,
     ) -> std::io::Result<HttpRequestSummary> {
         let mut line = Vec::new();
         reader.read_until(b'\n', &mut line).await?;
@@ -2003,32 +2081,87 @@ mod tests {
             }
         }
 
+        let mut marker_position = 0;
+        let mut body_contains_marker = marker.is_some_and(|marker| marker.is_empty());
         let body_bytes = if chunked {
-            read_chunked_body(reader).await?
+            read_chunked_body(
+                reader,
+                body_delay,
+                marker,
+                &mut marker_position,
+                &mut body_contains_marker,
+            )
+            .await?
         } else if let Some(content_length) = content_length {
-            read_exact_bytes(reader, content_length).await?
+            read_exact_bytes(
+                reader,
+                content_length,
+                body_delay,
+                marker,
+                &mut marker_position,
+                &mut body_contains_marker,
+            )
+            .await?
         } else {
             0
         };
-        Ok(HttpRequestSummary { target, body_bytes })
+        Ok(HttpRequestSummary { target, body_bytes, body_contains_marker })
     }
 
     async fn read_exact_bytes(
         reader: &mut BufReader<TcpStream>,
         mut remaining: u64,
+        body_delay: Duration,
+        marker: Option<&[u8]>,
+        marker_position: &mut usize,
+        body_contains_marker: &mut bool,
     ) -> std::io::Result<u64> {
         let mut buffer = [0_u8; 8 * 1024];
         let mut read = 0_u64;
         while remaining > 0 {
             let chunk = remaining.min(buffer.len() as u64) as usize;
             reader.read_exact(&mut buffer[..chunk]).await?;
+            observe_marker(&buffer[..chunk], marker, marker_position, body_contains_marker);
+            if !body_delay.is_zero() {
+                tokio::time::sleep(body_delay).await;
+            }
             remaining -= chunk as u64;
             read += chunk as u64;
         }
         Ok(read)
     }
 
-    async fn read_chunked_body(reader: &mut BufReader<TcpStream>) -> std::io::Result<u64> {
+    fn observe_marker(
+        bytes: &[u8],
+        marker: Option<&[u8]>,
+        marker_position: &mut usize,
+        body_contains_marker: &mut bool,
+    ) {
+        let Some(marker) = marker else { return };
+        if marker.is_empty() || *body_contains_marker {
+            *body_contains_marker = true;
+            return;
+        }
+        for byte in bytes {
+            if *byte == marker[*marker_position] {
+                *marker_position += 1;
+                if *marker_position == marker.len() {
+                    *body_contains_marker = true;
+                    return;
+                }
+            } else {
+                *marker_position = usize::from(*byte == marker[0]);
+            }
+        }
+    }
+
+    async fn read_chunked_body(
+        reader: &mut BufReader<TcpStream>,
+        body_delay: Duration,
+        marker: Option<&[u8]>,
+        marker_position: &mut usize,
+        body_contains_marker: &mut bool,
+    ) -> std::io::Result<u64> {
         let mut line = Vec::new();
         let mut read = 0_u64;
         loop {
@@ -2047,7 +2180,15 @@ mod tests {
                     }
                 }
             }
-            read += read_exact_bytes(reader, size).await?;
+            read += read_exact_bytes(
+                reader,
+                size,
+                body_delay,
+                marker,
+                marker_position,
+                body_contains_marker,
+            )
+            .await?;
             let mut line_end = [0_u8; 2];
             reader.read_exact(&mut line_end).await?;
         }
@@ -2119,10 +2260,16 @@ mod tests {
         (get_file.target, file_download.target)
     }
 
-    async fn serve_upload(listener: TcpListener) -> HttpRequestSummary {
+    async fn serve_upload(
+        listener: TcpListener,
+        body_delay: Duration,
+        marker: &'static [u8],
+    ) -> HttpRequestSummary {
         let (stream, _) = listener.accept().await.expect("fake API should accept upload");
         let mut reader = BufReader::new(stream);
-        let request = read_http_request(&mut reader).await.expect("upload should be readable");
+        let request = read_http_request_with_options(&mut reader, body_delay, Some(marker))
+            .await
+            .expect("upload should be readable");
         let mut stream = reader.into_inner();
         let response = br#"{"ok":true,"result":{"message_id":7,"date":0,"chat":{"id":-100123,"type":"channel","title":"Storage"},"video":{"file_id":"stored-file-id","file_unique_id":"stored-file-unique-id","width":1,"height":1,"duration":1,"file_size":21,"mime_type":"video/mp4"}}}"#;
         let response_value: serde_json::Value =
@@ -2272,19 +2419,28 @@ mod tests {
     async fn local_bot_api_uploads_file_through_configured_endpoint_without_buffering() {
         const PAYLOAD: &[u8] = b"large upload payload";
         const REDUCED_CLOUD_CEILING: u64 = 4;
+        const MEDIA_READ_TIMEOUT: Duration = Duration::from_millis(10);
+        const UPLOAD_BODY_DELAY: Duration = Duration::from_millis(100);
         assert!(PAYLOAD.len() as u64 > REDUCED_CLOUD_CEILING);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
         let address = listener.local_addr().expect("fake API address should be available");
-        let server = tokio::spawn(serve_upload(listener));
+        let server = tokio::spawn(serve_upload(listener, UPLOAD_BODY_DELAY, PAYLOAD));
         let directory = std::env::temp_dir().join(format!("sooqa-telegram-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&directory).await.expect("test directory should be created");
         let path = directory.join("canonical.mp4");
         tokio::fs::write(&path, PAYLOAD).await.expect("upload fixture should be written");
-        let api =
-            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
-                .expect("fake API URL should be accepted");
+        let api = TeloxideApi::new_with_upload_timeout(
+            "test-token",
+            &format!("http://{address}"),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .expect("fake API URL should be accepted")
+        .with_test_media_read_timeout(MEDIA_READ_TIMEOUT)
+        .expect("test media client should be configured");
 
+        let started = std::time::Instant::now();
         let result = api
             .upload_media(StorageUploadRequest {
                 storage_chat_id: -100123,
@@ -2294,12 +2450,14 @@ mod tests {
             })
             .await
             .expect("local Bot API upload should succeed");
+        assert!(started.elapsed() >= UPLOAD_BODY_DELAY);
         assert_eq!(result.storage_message_id, 7);
         assert_eq!(result.telegram_file_id, "stored-file-id");
         let request = server.await.expect("fake API task should finish");
         assert!(request.target.contains("/bottest-token/SendVideo"));
         assert!(request.body_bytes > REDUCED_CLOUD_CEILING);
         assert!(request.body_bytes >= PAYLOAD.len() as u64);
+        assert!(request.body_contains_marker);
         tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
     }
 
@@ -2318,6 +2476,28 @@ mod tests {
         assert_eq!(local.cloud_download_limit_bytes, None);
         assert_eq!(local.cloud_upload_limit_bytes, None);
         assert_eq!(local.source_download_max_bytes, DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES);
+    }
+
+    #[test]
+    fn upload_timeout_is_positive_and_bounded() {
+        assert!(matches!(
+            TeloxideApi::new_with_upload_timeout(
+                "test-token",
+                "http://telegram-bot-api:8081",
+                Duration::from_secs(1),
+                Duration::ZERO,
+            ),
+            Err(TelegramError::InvalidUploadTimeout)
+        ));
+        assert!(matches!(
+            TeloxideApi::new_with_upload_timeout(
+                "test-token",
+                "http://telegram-bot-api:8081",
+                Duration::from_secs(1),
+                TELEGRAM_MAX_UPLOAD_TIMEOUT + Duration::from_secs(1),
+            ),
+            Err(TelegramError::InvalidUploadTimeout)
+        ));
     }
 
     #[test]

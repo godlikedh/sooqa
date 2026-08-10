@@ -32,6 +32,9 @@ source budgets may exceed the cloud Bot API's download limit; only the
 canonical normalized object is uploaded, and its configurable ceiling remains
 below the local server's documented 2000 MB upload maximum. Original inputs
 remain transient workspace artifacts.
+Telegram storage uploads also use a separate bounded deadline suitable for
+2 GB-class transfers; it is independent from polling and download stall
+timeouts.
 
 ## Target persistence model
 

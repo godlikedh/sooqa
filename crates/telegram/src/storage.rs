@@ -405,28 +405,28 @@ impl TelegramStorageApi for TeloxideApi {
         let chat_id = ChatId(request.storage_chat_id);
         let message = match request.media_kind {
             MediaKind::Video => self
-                .media_bot()
+                .upload_bot()
                 .send_video(chat_id, InputFile::file(request.local_work_path))
                 .caption(request.caption)
                 .send()
                 .await
                 .map_err(StorageUploadApiError::Api)?,
             MediaKind::Image => self
-                .media_bot()
+                .upload_bot()
                 .send_photo(chat_id, InputFile::file(request.local_work_path))
                 .caption(request.caption)
                 .send()
                 .await
                 .map_err(StorageUploadApiError::Api)?,
             MediaKind::Audio => self
-                .media_bot()
+                .upload_bot()
                 .send_audio(chat_id, InputFile::file(request.local_work_path))
                 .caption(request.caption)
                 .send()
                 .await
                 .map_err(StorageUploadApiError::Api)?,
             MediaKind::Animation => self
-                .media_bot()
+                .upload_bot()
                 .send_animation(chat_id, InputFile::file(request.local_work_path))
                 .caption(request.caption)
                 .send()

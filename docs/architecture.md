@@ -74,6 +74,8 @@ this baseline.
 - `sooqa-media` owns direct HTTP, ffprobe, ffmpeg, image normalization,
   hashing, fingerprints, workspaces, and subprocess safety.
 - `sooqa-telegram` owns Telegram protocol mapping and storage upload effects.
+  Polling, downloads, and storage uploads use separate HTTP clients and
+  timeout policies.
 - `sooqa-persistence` owns migrations and short database transactions.
 - `sooqa-api` owns HTTP routing, one configured bearer secret, limits, and
   stable request-ID errors.

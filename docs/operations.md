@@ -39,6 +39,9 @@ are present. The three media budgets are intentionally separate:
 - `SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES` bounds URL/link source staging and
   may be larger than 2 GB because normalization can reduce the source;
 - `SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES` bounds Telegram-source staging;
+- `SOOQA_TELEGRAM_UPLOAD_TIMEOUT_SECONDS` bounds one Telegram storage upload
+  independently from polling and download timeouts. It defaults to one hour
+  and is capped at 24 hours;
 - `SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES` bounds the canonical normalized
   object uploaded to Telegram storage. It must remain below the documented
   2000 MB local Bot API upload limit.
@@ -46,6 +49,8 @@ are present. The three media budgets are intentionally separate:
 The server and worker must share `media.work_root`; ffprobe and ffmpeg are
 needed for probing and normalization. Source downloads and Telegram uploads
 are streamed or path-based; no file-sized byte buffer is used.
+Polling, downloads, and storage uploads use separate HTTP timeout policies so a
+long upload cannot inherit the long-poll or download-stall deadline.
 
 ## Home local Bot API deployment
 
