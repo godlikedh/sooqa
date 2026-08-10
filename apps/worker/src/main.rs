@@ -6,9 +6,8 @@ use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
 use sooqa_jobs::JobType;
 use sooqa_media::{
     BinaryCheck, CanonicalImageProfile, CanonicalVideoProfile, DirectHttpDownloader,
-    DownloadLimits, FfmpegExecutor, FfprobeAdapter, FrameExtractor, ImageNormalizer,
-    MediaWorkspace, NormalizationPlanner, ProcessCommandRunner, SourceDownloader,
-    SourceDownloaderRouter, diagnose_binaries,
+    DownloadLimits, FfprobeAdapter, ImageNormalizer, MediaWorkspace, NormalizationPlanner,
+    ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter, diagnose_binaries,
 };
 use sooqa_persistence::Database;
 use uuid::Uuid;
@@ -17,7 +16,7 @@ use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
 use sooqa_worker::{
     HandlerRegistry, TelegramSourceDownloader, Worker, compute_fingerprint_handler,
     download_source_handler, finalize_ingest_handler, inspect_source_handler,
-    normalize_asset_handler, probe_asset_handler_with_telegram_source,
+    media_processing_components, normalize_asset_handler, probe_asset_handler_with_telegram_source,
     upload_storage_asset_handler,
 };
 
@@ -84,14 +83,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     handlers.register(JobType::ProbeAsset, move |job| probe_handler(job));
     tracing::info!("Telegram and upload ingest probe job handler enabled");
+    let processing_timeout = Duration::from_secs(config.media.processing_timeout_seconds);
     let normalization_planner = NormalizationPlanner::new(
         config.media.ffmpeg_path.clone(),
         CanonicalVideoProfile::default(),
     )?;
-    let normalization_executor = FfmpegExecutor::new(
-        Arc::new(ProcessCommandRunner),
+    let (normalization_executor, frame_extractor) = media_processing_components(
+        config.media.ffmpeg_path.clone(),
         config.media.ffprobe_path.clone(),
-        Duration::from_secs(300),
+        processing_timeout,
     );
     let normalize_handler = normalize_asset_handler(
         database.inbox(),
@@ -107,7 +107,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         database.inbox(),
         database.library(),
         config.media.work_root.clone(),
-        FrameExtractor::new(config.media.ffmpeg_path.clone(), Duration::from_secs(300)),
+        frame_extractor,
     );
     handlers.register(JobType::ComputeFingerprint, move |job| fingerprint_handler(job));
     tracing::info!("video fingerprint handler enabled");

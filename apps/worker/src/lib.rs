@@ -50,6 +50,21 @@ use uuid::Uuid;
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFailure>> + Send + 'static>>;
 pub type HandlerFn = Arc<dyn Fn(Job) -> HandlerFuture + Send + Sync>;
 
+pub fn media_processing_components(
+    ffmpeg_executable: impl Into<PathBuf>,
+    ffprobe_executable: impl Into<PathBuf>,
+    timeout: Duration,
+) -> (FfmpegExecutor, FrameExtractor) {
+    (
+        FfmpegExecutor::new(
+            Arc::new(sooqa_media::ProcessCommandRunner),
+            ffprobe_executable,
+            timeout,
+        ),
+        FrameExtractor::new(ffmpeg_executable, timeout),
+    )
+}
+
 #[async_trait]
 pub trait TelegramSourceDownloader: Send + Sync {
     async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), HandlerFailure>;
@@ -2363,6 +2378,16 @@ mod tests {
             validate_timing(Duration::from_secs(1), Duration::ZERO),
             Err(WorkerError::InvalidLeaseDuration)
         ));
+    }
+
+    #[test]
+    fn media_processing_components_use_configured_timeout() {
+        let timeout = Duration::from_secs(301);
+        let (normalization, fingerprint) =
+            media_processing_components("ffmpeg", "ffprobe", timeout);
+
+        assert_eq!(normalization.timeout_duration(), timeout);
+        assert_eq!(fingerprint.timeout_duration(), timeout);
     }
 
     #[test]

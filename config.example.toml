@@ -13,6 +13,8 @@ ffmpeg_path = "ffmpeg"
 ffprobe_path = "ffprobe"
 ytdlp_path = "yt-dlp"
 ytdlp_format = "bestvideo*+bestaudio/best"
+# Total deadline for one ffmpeg normalization or video-frame extraction.
+processing_timeout_seconds = 3600
 # Maximum bytes staged from a URL before normalization. This may exceed 2 GB
 # because the canonical normalized output has its own lower ceiling.
 source_download_max_bytes = 8589934592

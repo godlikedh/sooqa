@@ -142,6 +142,10 @@ impl FfmpegExecutor {
         Self { runner, ffprobe, timeout, max_output_bytes }
     }
 
+    pub fn timeout_duration(&self) -> Duration {
+        self.timeout
+    }
+
     pub async fn execute<F>(
         &self,
         plan: &NormalizationPlan,

@@ -34,8 +34,12 @@ when diagnosing a crash.
 ## Telegram and media
 
 Telegram polling is enabled only when its bot token and configured admin IDs
-are present. The three media budgets are intentionally separate:
+are present. The media budgets and processing deadline are intentionally
+separate:
 
+- `SOOQA_MEDIA_PROCESSING_TIMEOUT_SECONDS` bounds one ffmpeg normalization or
+  video-frame extraction command. It defaults to one hour and is capped at 24
+  hours so large canonical media can finish without an unbounded subprocess;
 - `SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES` bounds URL/link source staging and
   may be larger than 2 GB because normalization can reduce the source;
 - `SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES` bounds Telegram-source staging;

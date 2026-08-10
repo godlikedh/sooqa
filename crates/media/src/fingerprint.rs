@@ -91,6 +91,10 @@ impl FrameExtractor {
         }
     }
 
+    pub fn timeout_duration(&self) -> Duration {
+        self.timeout
+    }
+
     pub fn with_decode_limits(mut self, decode_limits: FrameDecodeLimits) -> Self {
         self.decode_limits = decode_limits;
         self
