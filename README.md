@@ -23,6 +23,8 @@ The repository currently provides:
     - Publisher channel/post persistence with cadence slots and fenced sends.
 - a minimal loopback companion at `POST /v1/submit` and a reviewed 2ch
   Tampermonkey script for direct MP4/WebM attachments;
+    - Windows PR artifacts and version-tagged GitHub Releases provide a
+      standalone x86_64 companion executable plus SHA-256 checksum.
 
 The composed worker registers `inspect_source` with the SSRF-hardened direct
 HTTP adapter, `download_source` into the shared media workspace, `probe_asset`,
@@ -79,7 +81,10 @@ cargo run -p sooqa-companion
 The companion requires its own local token plus the backend API token. Configure
 `SOOQA_COMPANION_LOCAL_TOKEN`, `SOOQA_COMPANION_BACKEND_TOKEN`, and
 `SOOQA_COMPANION_BACKEND_URL`; it never exposes or logs the backend token. The
-userscript stores only the local token in Tampermonkey storage.
+userscript stores only the local token in Tampermonkey storage. Windows users
+can download the standalone companion executable from the GitHub Releases page;
+the setup and checksum verification steps are in
+[operations.md](docs/operations.md).
 
 `apps/` contains executable processes. `crates/` contains the modular-monolith
 boundaries: configuration/runtime, Inbox, Library, Publisher, Jobs, Media,

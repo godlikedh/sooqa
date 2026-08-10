@@ -3,7 +3,9 @@
 // @namespace    sooqa
 // @version      0.1.0
 // @description  Add one-click Save controls to direct MP4/WebM attachments.
+// @match        https://2ch.su/*
 // @match        https://2ch.org/*
+// @match        https://2ch.life/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
@@ -76,9 +78,9 @@
     return parent;
   }
 
-  function makeButton(document, label, className) {
+  function makeButton(document, label, className, type = "button") {
     const button = document.createElement("button");
-    button.type = "button";
+    button.type = type;
     button.className = className;
     button.textContent = label;
     return button;
@@ -116,7 +118,7 @@
       const actions = env.document.createElement("div");
       const cancel = makeButton(env.document, "Cancel", "sooqa-cancel");
       cancel.value = "cancel";
-      const save = makeButton(env.document, "Save", "sooqa-confirm");
+      const save = makeButton(env.document, "Save", "sooqa-confirm", "submit");
       save.value = "save";
       actions.append(cancel, save);
       form.append(tagsLabel, descriptionLabel, actions);

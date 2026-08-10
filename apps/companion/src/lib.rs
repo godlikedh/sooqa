@@ -126,11 +126,11 @@ impl<'a> CompanionService<'a> {
         if request.method() != &Method::Post || request.url() != SUBMIT_PATH {
             return respond_error(request, StatusCode(404), "not_found");
         }
-        if !self.limiter.allow() {
-            return respond_error(request, StatusCode(429), "rate_limited");
-        }
         if !authorized(self.config.local_token.expose_secret(), &request) {
             return respond_error(request, StatusCode(401), "unauthorized");
+        }
+        if !self.limiter.allow() {
+            return respond_error(request, StatusCode(429), "rate_limited");
         }
         if !is_json_request(&request) {
             return respond_error(request, StatusCode(415), "content_type_required");
@@ -351,6 +351,126 @@ fn respond_json<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sooqa_config::SecretString;
+    use std::{
+        net::{SocketAddr, TcpListener},
+        thread::{self, JoinHandle},
+    };
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CapturedBackendRequest {
+        path: String,
+        authorization: String,
+        idempotency_key: String,
+        body: String,
+    }
+
+    type BackendCapture = Arc<Mutex<Vec<CapturedBackendRequest>>>;
+    type BackendThread = JoinHandle<Result<(), String>>;
+
+    fn test_config(listen_address: SocketAddr, backend_url: String) -> CompanionConfig {
+        CompanionConfig {
+            listen_address: listen_address.to_string(),
+            backend_url,
+            local_token: SecretString::new("local-secret"),
+            backend_token: SecretString::new("backend-secret"),
+            request_body_limit_bytes: 64 * 1024,
+            request_timeout_seconds: 5,
+        }
+    }
+
+    fn free_loopback_address() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        listener.local_addr().expect("test listener should have an address")
+    }
+
+    fn start_backend(statuses: Vec<u16>) -> (String, BackendCapture, BackendThread) {
+        let server = Server::http("127.0.0.1:0").expect("fake backend should bind");
+        let address = server.server_addr().to_ip().expect("fake backend should use TCP");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_by_server = Arc::clone(&captured);
+        let server_thread = thread::spawn(move || {
+            for status in statuses {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "fake backend timed out".to_owned())?;
+                let path = request.url().to_owned();
+                let authorization = request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("Authorization"))
+                    .map(|header| header.value.to_string())
+                    .unwrap_or_default();
+                let idempotency_key = request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("Idempotency-Key"))
+                    .map(|header| header.value.to_string())
+                    .unwrap_or_default();
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).map_err(|error| error.to_string())?;
+                captured_by_server
+                    .lock()
+                    .expect("capture lock should not be poisoned")
+                    .push(CapturedBackendRequest { path, authorization, idempotency_key, body });
+                request
+                    .respond(Response::from_string("{}").with_status_code(StatusCode(status)))
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        });
+        (format!("http://{address}"), captured, server_thread)
+    }
+
+    fn start_companion(
+        config: CompanionConfig,
+    ) -> (String, Arc<AtomicBool>, JoinHandle<Result<(), CompanionError>>) {
+        let address = config.listen_address.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server_thread = thread::spawn(move || serve(&config, &stop_for_server));
+        let endpoint = format!("http://{address}");
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_millis(500)).build();
+        for _ in 0..100 {
+            match agent.get(&format!("{endpoint}/")).call() {
+                Ok(_) | Err(ureq::Error::Status(_, _)) => return (endpoint, stop, server_thread),
+                Err(ureq::Error::Transport(_)) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        panic!("companion test server did not start");
+    }
+
+    fn send_json(
+        agent: &ureq::Agent,
+        endpoint: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> (u16, String) {
+        let response = agent
+            .post(endpoint)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Content-Type", "application/json")
+            .send_json(body);
+        match response {
+            Ok(response) => (response.status(), response.into_string().unwrap_or_default()),
+            Err(ureq::Error::Status(status, response)) => {
+                (status, response.into_string().unwrap_or_default())
+            }
+            Err(error) => panic!("companion request failed: {error}"),
+        }
+    }
+
+    fn submission_value(action_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "action_id": action_id,
+            "url": "https://2ch.org/b/src/1/clip.webm",
+            "page_url": "https://2ch.org/b/res/1.html",
+            "page_title": "Thread",
+            "description": "Internal note",
+            "tags": ["cats"]
+        })
+    }
 
     fn submission() -> CompanionSubmission {
         CompanionSubmission {
@@ -410,6 +530,78 @@ mod tests {
         assert!(encoded.contains("internal note"));
         assert!(!encoded.contains("action-123"));
         assert!(!encoded.contains("local-secret"));
+    }
+
+    #[test]
+    fn unauthorized_flood_does_not_consume_authenticated_rate_limit() {
+        let (backend_url, captured, backend_thread) = start_backend(vec![202]);
+        let config = test_config(free_loopback_address(), backend_url);
+        let (companion_url, stop, companion_thread) = start_companion(config);
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(2)).build();
+        let body = submission_value("after-unauthorized-flood");
+
+        for _ in 0..(RATE_LIMIT_REQUESTS * 2) {
+            let response =
+                send_json(&agent, &format!("{companion_url}{SUBMIT_PATH}"), "wrong-secret", &body);
+            assert_eq!(response.0, 401);
+        }
+        let accepted =
+            send_json(&agent, &format!("{companion_url}{SUBMIT_PATH}"), "local-secret", &body);
+        assert_eq!(accepted.0, 202);
+
+        stop.store(true, Ordering::Release);
+        companion_thread
+            .join()
+            .expect("companion thread should join")
+            .expect("companion should stop");
+        backend_thread.join().expect("backend thread should join").expect("backend should finish");
+        assert_eq!(captured.lock().expect("capture lock should not be poisoned").len(), 1);
+    }
+
+    #[test]
+    fn http_submit_uses_fixed_route_backend_auth_idempotency_and_status_mapping() {
+        let (backend_url, captured, backend_thread) = start_backend(vec![202, 500]);
+        let config = test_config(free_loopback_address(), backend_url);
+        let (companion_url, stop, companion_thread) = start_companion(config);
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(2)).build();
+        let body = submission_value("stable-action");
+
+        let wrong_route =
+            send_json(&agent, &format!("{companion_url}/v1/other"), "local-secret", &body);
+        assert_eq!(wrong_route.0, 404);
+
+        let accepted =
+            send_json(&agent, &format!("{companion_url}{SUBMIT_PATH}"), "local-secret", &body);
+        assert_eq!(accepted.0, 202);
+        let accepted_body =
+            serde_json::from_str::<serde_json::Value>(&accepted.1).expect("accepted body is JSON");
+        assert_eq!(accepted_body["accepted"], true);
+
+        let failed =
+            send_json(&agent, &format!("{companion_url}{SUBMIT_PATH}"), "local-secret", &body);
+        assert_eq!(failed.0, 502);
+        let failed_body =
+            serde_json::from_str::<serde_json::Value>(&failed.1).expect("error body is JSON");
+        assert_eq!(failed_body["error"], "backend_request_failed");
+
+        stop.store(true, Ordering::Release);
+        companion_thread
+            .join()
+            .expect("companion thread should join")
+            .expect("companion should stop");
+        backend_thread.join().expect("backend thread should join").expect("backend should finish");
+
+        let captured = captured.lock().expect("capture lock should not be poisoned");
+        assert_eq!(captured.len(), 2);
+        for request in captured.iter() {
+            assert_eq!(request.path, BACKEND_INGEST_PATH);
+            assert_eq!(request.authorization, "Bearer backend-secret");
+            assert_eq!(request.idempotency_key, "companion:stable-action");
+            let body = serde_json::from_str::<serde_json::Value>(&request.body)
+                .expect("backend body should be JSON");
+            assert_eq!(body["url"], "https://2ch.org/b/src/1/clip.webm");
+            assert!(body.get("action_id").is_none());
+        }
     }
 
     #[test]

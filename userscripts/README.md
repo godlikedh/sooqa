@@ -1,9 +1,16 @@
 # sooqa 2ch userscript
 
-Install `sooqa-2ch-save.user.js` in Tampermonkey on the supported
-`https://2ch.org/*` pages. The script adds `Save` and `Save...` controls beside
-direct `.mp4` and `.webm` attachments, including attachments added after the
-page initially loads.
+Install `sooqa-2ch-save.user.js` in Tampermonkey on these supported HTTPS
+domains:
+
+- `https://2ch.su/*`
+- `https://2ch.org/*`
+- `https://2ch.life/*`
+
+The script adds `Save` and `Save...` controls beside direct `.mp4` and
+`.webm` attachments, including attachments added after the page initially
+loads. It intentionally does not scrape other domains or page-like media
+links.
 
 The script sends only to `http://127.0.0.1:47831/v1/submit` with the local
 companion token read from Tampermonkey storage. It contains no backend API or
