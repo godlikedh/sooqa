@@ -81,6 +81,32 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/ingests/{id}/force-save:
+    post:
+      tags: [ingest]
+      operationId: forceSaveIngest
+      summary: Override a pending perceptual duplicate
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IngestId'
+      responses:
+        '200':
+          description: The force-save request was already resumed or completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '202':
+          description: Force-save was accepted and normalization was queued again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/media:
     get:
       tags: [media]
@@ -495,7 +521,7 @@ components:
       allOf:
         - $ref: '#/components/schemas/IngestAcceptedResponse'
         - type: object
-          required: [kind, source_url, created_at, updated_at, supplied_tags]
+          required: [kind, source_url, created_at, updated_at, supplied_tags, force_save]
           properties:
             kind: { type: string, enum: [url, telegram_message, upload] }
             source_url: { type: string }
@@ -503,6 +529,13 @@ components:
             page_title: { type: string, nullable: true }
             supplied_caption: { type: string, nullable: true }
             supplied_tags: { type: array, items: { type: string } }
+            media_id: { type: string, format: uuid, nullable: true }
+            force_save: { type: boolean }
+            duplicate_evidence:
+              type: object
+              allOf:
+                - $ref: '#/components/schemas/VideoDuplicateEvidence'
+              nullable: true
             error_code: { type: string, nullable: true }
             error_message: { type: string, nullable: true }
             created_at: { type: string, format: date-time }
@@ -510,7 +543,38 @@ components:
             completed_at: { type: string, format: date-time, nullable: true }
     IngestStatus:
       type: string
-      enum: [received, queued, downloading, probing, exact_dedup_check, normalizing, fingerprinting, similarity_check, storing, completed, failed_retryable, failed_terminal, cancelled]
+      enum: [received, queued, downloading, probing, exact_dedup_check, normalizing, fingerprinting, duplicate_pending, storing, completed, failed_retryable, failed_terminal, cancelled]
+    VideoDuplicateEvidence:
+      type: object
+      required: [algorithm_version, matches]
+      properties:
+        algorithm_version: { type: string }
+        matches:
+          type: array
+          maxItems: 3
+          items: { $ref: '#/components/schemas/VideoDuplicateMatch' }
+    VideoDuplicateMatch:
+      type: object
+      required: [media_id, fingerprint_version, classification, aligned_offset_ms, informative_matched_samples, incoming_coverage_bps, candidate_coverage_bps, median_distance_bps, high_percentile_distance_bps, longest_temporally_consistent_run, unmatched_incoming_prefix, unmatched_incoming_suffix, unmatched_candidate_prefix, unmatched_candidate_suffix, gap_count, score_bps, shared_token_count, token_overlap_bps]
+      properties:
+        media_id: { type: string, format: uuid }
+        fingerprint_version: { type: string }
+        classification: { type: string, enum: [strong_duplicate, partial_match] }
+        aligned_offset_ms: { type: integer, format: int64 }
+        informative_matched_samples: { type: integer, minimum: 0, maximum: 65535 }
+        incoming_coverage_bps: { type: integer, minimum: 0, maximum: 10000 }
+        candidate_coverage_bps: { type: integer, minimum: 0, maximum: 10000 }
+        median_distance_bps: { type: integer, minimum: 0, maximum: 10000 }
+        high_percentile_distance_bps: { type: integer, minimum: 0, maximum: 10000 }
+        longest_temporally_consistent_run: { type: integer, minimum: 0, maximum: 65535 }
+        unmatched_incoming_prefix: { type: integer, minimum: 0, maximum: 65535 }
+        unmatched_incoming_suffix: { type: integer, minimum: 0, maximum: 65535 }
+        unmatched_candidate_prefix: { type: integer, minimum: 0, maximum: 65535 }
+        unmatched_candidate_suffix: { type: integer, minimum: 0, maximum: 65535 }
+        gap_count: { type: integer, minimum: 0, maximum: 65535 }
+        score_bps: { type: integer, minimum: 0, maximum: 10000 }
+        shared_token_count: { type: integer, format: int64, minimum: 0 }
+        token_overlap_bps: { type: integer, format: int64, minimum: 0, maximum: 10000 }
     MediaKind:
       type: string
       enum: [video, image, animation, audio]

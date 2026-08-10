@@ -3,9 +3,9 @@
 This document is the active product authority for the architecture reset
 recorded in [ADR 0009](adr/0009-five-table-persistence-reset.md) and GitHub
 issue #43. It supersedes the old persistence model and the historical roadmap
-when they conflict. Until the implementation stack lands, the checked-out
-code and `docs/architecture.md` describe the pre-reset baseline; they are not
-permission to preserve the discarded model during the reset.
+when they conflict. The checked-out code and `docs/architecture.md` describe
+the shipped consolidated model; this document remains the product authority
+for behavior and scope.
 
 ## Product
 
@@ -20,7 +20,7 @@ The first release is intentionally narrow:
 - one administrator and one self-hosted installation;
 - PostgreSQL as the source of truth;
 - direct HTTP media plus the already-supported Telegram ingest paths;
-- durable download, probe, normalization, fingerprint, duplicate-check, and
+- durable download, probe, normalization, fingerprint, identity-gate, and
   storage workflow;
 - searchable stored media with captions/descriptions and normalized tags;
 - immediate publication or a simple per-channel cadence queue.
@@ -63,8 +63,8 @@ publication-history, or duplicate-candidate aggregates.
 The ingest process is the product state machine. It advances through durable,
 stage-specific jobs that reference the ingest row and are fenced by their
 queue lease; each stage transition enqueues the next stage idempotently. Media
-storage is downstream of media finalization: video fingerprinting and
-similarity checking finish before the upload job is created. A storage result
+storage is downstream of media identity finalization: video fingerprinting and
+exact/sequence identity checking finish before the upload job is created. A storage result
 is consumed by `media_id`, so success and failure cannot be lost because an
 ingest has not reached `storing` yet. `storage_unknown` is an explicit
 reconciliation state: attach completes linked storage-waiting or storage-failed
@@ -107,10 +107,11 @@ There is no generic idempotency table and no permanent Telegram update-receipt
 table. Repeated creates may return the existing resource; updates should be
 naturally idempotent setters where possible.
 
-Issue #44 adds the versioned `video_sequence_v1` media foundation in a stacked
-implementation. Its first slice is storage-safe fingerprint encoding, token
-shortlisting, and bounded alignment; the active worker identity gate,
-`duplicate_pending` decision, and force-save API are the dependent slice.
+Issue #44 adds the versioned `video_sequence_v1` media foundation and its
+pre-storage identity gate. Video exact SHA reuse, bounded token shortlisting,
+aligned duplicate evidence, durable `duplicate_pending`, and the authorized
+force-save route are shipped together. Images, animations, and audio retain
+exact-SHA-only behavior.
 
 ## Single-admin security
 
@@ -129,8 +130,7 @@ This reset does not add:
 - data-copy SQL, compatibility views, old-name aliases, or dual writes;
 - multiple administrators, users, tenants, storage providers, albums, media
   variants, derivative assets, or a generalized content taxonomy;
-- richer duplicate-interaction UX or a production-active perceptual duplicate
-  decision; issue #44's dependent workflow slice owns that gate;
+- Telegram duplicate-interaction cards/buttons or status-message layout;
 - Grafana/Prometheus deployment;
 - Telegram publication functionality beyond behavior already present at the
   selected implementation base.

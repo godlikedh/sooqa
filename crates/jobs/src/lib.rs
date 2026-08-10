@@ -18,7 +18,6 @@ pub enum JobType {
     ProbeAsset,
     NormalizeAsset,
     ComputeFingerprint,
-    CheckSimilarity,
     FinalizeIngest,
     UploadStorageAsset,
     PublishPost,
@@ -34,7 +33,6 @@ impl JobType {
             Self::ProbeAsset => "probe_asset",
             Self::NormalizeAsset => "normalize_asset",
             Self::ComputeFingerprint => "compute_fingerprint",
-            Self::CheckSimilarity => "check_similarity",
             Self::FinalizeIngest => "finalize_ingest",
             Self::UploadStorageAsset => "upload_storage_asset",
             Self::PublishPost => "publish_post",
@@ -60,7 +58,6 @@ impl TryFrom<&str> for JobType {
             "probe_asset" => Ok(Self::ProbeAsset),
             "normalize_asset" => Ok(Self::NormalizeAsset),
             "compute_fingerprint" => Ok(Self::ComputeFingerprint),
-            "check_similarity" => Ok(Self::CheckSimilarity),
             "finalize_ingest" => Ok(Self::FinalizeIngest),
             "upload_storage_asset" => Ok(Self::UploadStorageAsset),
             "publish_post" => Ok(Self::PublishPost),
@@ -156,7 +153,6 @@ pub enum JobCommand {
     ProbeAsset(IngestJobPayload),
     NormalizeAsset(IngestJobPayload),
     ComputeFingerprint(IngestJobPayload),
-    CheckSimilarity(IngestJobPayload),
     FinalizeIngest(IngestJobPayload),
     UploadStorageAsset(MediaJobPayload),
     PublishPost(PublishPostPayload),
@@ -172,7 +168,6 @@ impl JobCommand {
             Self::ProbeAsset(_) => JobType::ProbeAsset,
             Self::NormalizeAsset(_) => JobType::NormalizeAsset,
             Self::ComputeFingerprint(_) => JobType::ComputeFingerprint,
-            Self::CheckSimilarity(_) => JobType::CheckSimilarity,
             Self::FinalizeIngest(_) => JobType::FinalizeIngest,
             Self::UploadStorageAsset(_) => JobType::UploadStorageAsset,
             Self::PublishPost(_) => JobType::PublishPost,
@@ -193,7 +188,6 @@ impl JobCommand {
             JobType::ProbeAsset => decode!(IngestJobPayload, ProbeAsset),
             JobType::NormalizeAsset => decode!(IngestJobPayload, NormalizeAsset),
             JobType::ComputeFingerprint => decode!(IngestJobPayload, ComputeFingerprint),
-            JobType::CheckSimilarity => decode!(IngestJobPayload, CheckSimilarity),
             JobType::FinalizeIngest => decode!(IngestJobPayload, FinalizeIngest),
             JobType::UploadStorageAsset => decode!(MediaJobPayload, UploadStorageAsset),
             JobType::PublishPost => decode!(PublishPostPayload, PublishPost),
@@ -209,7 +203,6 @@ impl JobCommand {
             Self::ProbeAsset(payload) => serde_json::to_value(payload),
             Self::NormalizeAsset(payload) => serde_json::to_value(payload),
             Self::ComputeFingerprint(payload) => serde_json::to_value(payload),
-            Self::CheckSimilarity(payload) => serde_json::to_value(payload),
             Self::FinalizeIngest(payload) => serde_json::to_value(payload),
             Self::UploadStorageAsset(payload) => serde_json::to_value(payload),
             Self::PublishPost(payload) => serde_json::to_value(payload),
@@ -284,10 +277,6 @@ impl NewJob {
 
     pub fn compute_fingerprint(ingest_id: Uuid) -> Self {
         Self::new(JobCommand::ComputeFingerprint(IngestJobPayload { ingest_id }))
-    }
-
-    pub fn check_similarity(ingest_id: Uuid) -> Self {
-        Self::new(JobCommand::CheckSimilarity(IngestJobPayload { ingest_id }))
     }
 
     pub fn finalize_ingest(ingest_id: Uuid) -> Self {

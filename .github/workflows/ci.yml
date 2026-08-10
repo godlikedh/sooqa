@@ -93,6 +93,7 @@ jobs:
           cargo test -p sooqa-api --test ingest -- --ignored
           cargo test -p sooqa-worker --test worker -- --ignored
           cargo test -p sooqa-worker --test inspection -- --ignored
+          cargo test -p sooqa-worker --test identity -- --ignored
 
   media:
     name: Media integration

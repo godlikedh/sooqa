@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use sooqa_inbox::{
     AssetNormalization, AssetThumbnailNormalization, IngestFinalization, IngestKind, IngestStatus,
     SourceDownload, SourceMediaKind,
@@ -24,20 +25,18 @@ use sooqa_library::{
 };
 use sooqa_media::{
     ArtifactPublicationError, DownloadError, DownloadLimits, DownloadedSource, FfmpegExecutor,
-    FfprobeAdapter, FingerprintVersion, FrameExtractionError, FrameExtractor, ImageNormalizer,
-    MediaProbe, MediaStreamKind, MediaWorkspace, NormalizationExecutionError, NormalizationPlanner,
-    SimilarityClassification, SimilarityConfig, SimilarityError, SourceDownloader, SourceInput,
-    VideoFingerprint, VideoSimilarityInput, WorkspaceArea, WorkspaceError, compare_videos,
-    publish_artifact,
+    FfprobeAdapter, FrameExtractionError, FrameExtractor, ImageNormalizer, MediaProbe,
+    MediaStreamKind, MediaWorkspace, NormalizationExecutionError, NormalizationPlanner,
+    SequenceAlignmentConfig, SourceDownloader, SourceInput, WorkspaceArea, WorkspaceError,
+    publish_artifact, sha256_file,
 };
 use sooqa_persistence::{
     AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
-    IngestFinalizationStart, IngestFingerprintStart, IngestSimilarityStart, JobRepository,
-    JobRepositoryError, LibraryRepository, LibraryRepositoryError, SourceDownloadStart,
-    SourceInspectionStart, StoredVideoFingerprint,
+    IngestFinalizationStart, IngestFingerprintStart, JobRepository, JobRepositoryError,
+    LibraryRepository, LibraryRepositoryError, SourceDownloadStart, SourceInspectionStart,
 };
 use sooqa_telegram::StorageUploadError;
-use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramStorageApi};
+use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramApi, TelegramStorageApi};
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::{
@@ -50,6 +49,24 @@ use uuid::Uuid;
 
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFailure>> + Send + 'static>>;
 pub type HandlerFn = Arc<dyn Fn(Job) -> HandlerFuture + Send + Sync>;
+
+#[async_trait]
+pub trait TelegramSourceDownloader: Send + Sync {
+    async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), HandlerFailure>;
+}
+
+#[async_trait]
+impl TelegramSourceDownloader for sooqa_telegram::TeloxideApi {
+    async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), HandlerFailure> {
+        TelegramApi::download_file(self, file_id, destination).await.map_err(|error| {
+            if <sooqa_telegram::TeloxideApi as TelegramApi>::is_retryable_error(&error) {
+                HandlerFailure::retryable("telegram_source_download", error.to_string())
+            } else {
+                HandlerFailure::permanent("telegram_source_download", error.to_string())
+            }
+        })
+    }
+}
 
 struct DownloadAttemptArtifact {
     path: PathBuf,
@@ -182,12 +199,24 @@ pub fn probe_asset_handler(
     work_root: impl Into<std::path::PathBuf>,
     ffprobe: FfprobeAdapter,
 ) -> HandlerFn {
+    probe_asset_handler_with_telegram_source(inbox, work_root, ffprobe, None)
+}
+
+pub fn probe_asset_handler_with_telegram_source(
+    inbox: InboxRepository,
+    work_root: impl Into<std::path::PathBuf>,
+    ffprobe: FfprobeAdapter,
+    telegram_source: Option<Arc<dyn TelegramSourceDownloader>>,
+) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
         let work_root = work_root.clone();
         let ffprobe = ffprobe.clone();
-        Box::pin(async move { probe_asset(&inbox, &work_root, &ffprobe, job).await })
+        let telegram_source = telegram_source.clone();
+        Box::pin(async move {
+            probe_asset(&inbox, &work_root, &ffprobe, telegram_source.as_deref(), job).await
+        })
     })
 }
 
@@ -236,22 +265,11 @@ pub fn compute_fingerprint_handler(
     })
 }
 
-pub fn check_similarity_handler(
-    inbox: InboxRepository,
-    library: LibraryRepository,
-    config: SimilarityConfig,
-) -> HandlerFn {
-    Arc::new(move |job| {
-        let inbox = inbox.clone();
-        let library = library.clone();
-        Box::pin(async move { check_similarity(&inbox, &library, config, job).await })
-    })
-}
-
 async fn probe_asset(
     inbox: &InboxRepository,
     work_root: &std::path::Path,
     ffprobe: &FfprobeAdapter,
+    telegram_source: Option<&dyn TelegramSourceDownloader>,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
@@ -317,6 +335,19 @@ async fn probe_asset(
         }
     };
 
+    if request.kind == IngestKind::TelegramMessage
+        && !source_artifact_exists(&input_path).await?
+        && let Err(failure) = ensure_telegram_source(&workspace, &request, telegram_source).await
+    {
+        let terminal = !failure.retryable || job.attempt_count >= job.max_attempts;
+        let failure = if terminal {
+            HandlerFailure::permanent(failure.class, failure.message)
+        } else {
+            failure
+        };
+        return fail_probe(inbox, ingest_request_id, &job_attempt, failure).await;
+    }
+
     let probe = match ffprobe.probe(&input_path).await {
         Ok(probe) => probe,
         Err(error) => {
@@ -358,6 +389,79 @@ async fn probe_asset(
 
 fn map_workspace_error(error: WorkspaceError) -> HandlerFailure {
     HandlerFailure::permanent("workspace_error", error.to_string())
+}
+
+async fn source_artifact_exists(path: &Path) -> Result<bool, HandlerFailure> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(HandlerFailure::permanent(
+                "source_reconstruction",
+                format!("could not inspect source artifact: {error}"),
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(HandlerFailure::permanent(
+            "source_reconstruction",
+            "source artifact is a symlink",
+        ));
+    }
+    Ok(metadata.is_file() && metadata.len() > 0)
+}
+
+async fn ensure_telegram_source(
+    workspace: &MediaWorkspace,
+    request: &sooqa_inbox::Ingest,
+    telegram_source: Option<&dyn TelegramSourceDownloader>,
+) -> Result<(), HandlerFailure> {
+    let file_id = request
+        .original_input
+        .get("telegram_file_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|file_id| !file_id.is_empty())
+        .ok_or_else(|| {
+            HandlerFailure::permanent(
+                "source_reconstruction",
+                "Telegram ingest has no durable file ID",
+            )
+        })?;
+    let telegram_source = telegram_source.ok_or_else(|| {
+        HandlerFailure::permanent(
+            "source_reconstruction",
+            "Telegram source reconstruction is not configured in this worker",
+        )
+    })?;
+    let source_path =
+        workspace.path(WorkspaceArea::Source, "telegram-input.bin").map_err(map_workspace_error)?;
+    let temporary_path = workspace
+        .path(WorkspaceArea::Source, &format!(".sooqa-telegram-source-{}.tmp", Uuid::new_v4()))
+        .map_err(map_workspace_error)?;
+    let temporary = DownloadAttemptArtifact::new(temporary_path);
+    telegram_source.download_file(file_id, temporary.path()).await?;
+    let downloaded = read_source_artifact(workspace, temporary.path(), None).await?;
+    if downloaded.bytes == 0 {
+        return Err(HandlerFailure::permanent(
+            "source_reconstruction",
+            "Telegram source reconstruction produced an empty file",
+        ));
+    }
+    match publish_artifact(temporary.path(), &source_path).await {
+        Ok(()) | Err(ArtifactPublicationError::DestinationConflict) => {
+            let existing = read_source_artifact(workspace, &source_path, None).await?;
+            if existing.bytes == 0 {
+                return Err(HandlerFailure::permanent(
+                    "source_reconstruction",
+                    "Telegram source artifact is empty after reconstruction",
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(HandlerFailure::permanent("source_reconstruction", error.to_string()));
+        }
+    }
+    Ok(())
 }
 
 async fn fail_probe(
@@ -458,6 +562,18 @@ async fn normalize_asset(
             &request,
             ingest_request_id,
             &job_attempt,
+        )
+        .await;
+    }
+    if matches!(media_kind, SourceMediaKind::Animation | SourceMediaKind::Audio) {
+        return normalize_exact_asset(
+            inbox,
+            work_root,
+            &request,
+            ingest_request_id,
+            &job_attempt,
+            media_kind,
+            &probe,
         )
         .await;
     }
@@ -625,6 +741,99 @@ async fn normalize_image_asset(
         .await
         .map_err(map_inbox_error)?;
     Ok(())
+}
+
+async fn normalize_exact_asset(
+    inbox: &InboxRepository,
+    work_root: &Path,
+    request: &sooqa_inbox::Ingest,
+    ingest_request_id: Uuid,
+    job_attempt: &sooqa_jobs::JobAttempt,
+    media_kind: SourceMediaKind,
+    probe: &MediaProbe,
+) -> Result<(), HandlerFailure> {
+    let (workspace_id, input_name) = match workspace_input(request) {
+        Ok(value) => value,
+        Err(failure) => {
+            return fail_normalization(inbox, ingest_request_id, job_attempt, failure).await;
+        }
+    };
+    let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                job_attempt,
+                map_workspace_error(error),
+            )
+            .await;
+        }
+    };
+    if let Err(error) = workspace.validate() {
+        return fail_normalization(
+            inbox,
+            ingest_request_id,
+            job_attempt,
+            map_workspace_error(error),
+        )
+        .await;
+    }
+    let input_path = match workspace.path(WorkspaceArea::Source, input_name) {
+        Ok(path) => path,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                job_attempt,
+                map_workspace_error(error),
+            )
+            .await;
+        }
+    };
+    let digest = match sha256_file(&input_path).await {
+        Ok(digest) => digest,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                job_attempt,
+                HandlerFailure::permanent("normalize_exact", error.to_string()),
+            )
+            .await;
+        }
+    };
+    let video = probe.streams.iter().find(|stream| stream.kind == MediaStreamKind::Video);
+    let audio = probe.streams.iter().find(|stream| stream.kind == MediaStreamKind::Audio);
+    let normalization = AssetNormalization {
+        local_work_path: input_path.to_string_lossy().into_owned(),
+        file_size_bytes: digest.bytes,
+        sha256: digest.sha256,
+        media_kind,
+        mime_type: source_mime_type(request),
+        container: probe.container_format.clone(),
+        video_codec: video.and_then(|stream| stream.codec.clone()),
+        audio_codec: audio.and_then(|stream| stream.codec.clone()),
+        width: video.and_then(|stream| stream.width),
+        height: video.and_then(|stream| stream.height),
+        duration_ms: probe.duration_ms,
+        bit_rate: probe.bit_rate,
+        thumbnail: None,
+    };
+    inbox
+        .complete_asset_normalization(ingest_request_id, job_attempt, normalization)
+        .await
+        .map_err(map_inbox_error)?;
+    Ok(())
+}
+
+fn source_mime_type(request: &sooqa_inbox::Ingest) -> Option<String> {
+    let value = if request.kind == IngestKind::Url {
+        request.original_input.get("download").and_then(|value| value.get("mime_type"))
+    } else {
+        request.original_input.get("mime_type")
+    };
+    value.and_then(serde_json::Value::as_str).map(ToOwned::to_owned)
 }
 
 fn normalization_error_is_retryable(error: &NormalizationExecutionError) -> bool {
@@ -834,6 +1043,18 @@ async fn finalize_ingest(
             return fail_finalization(inbox, ingest_request_id, &job_attempt, failure).await;
         }
     };
+    if normalization.media_kind == SourceMediaKind::Video {
+        return fail_finalization(
+            inbox,
+            ingest_request_id,
+            &job_attempt,
+            HandlerFailure::permanent(
+                "invalid_ingest_state",
+                "video finalization is handled by the pre-storage identity gate",
+            ),
+        )
+        .await;
+    }
     let source = source_record_for_request(&request);
     let resolution = match library
         .resolve_media(MediaIngest {
@@ -929,137 +1150,39 @@ async fn compute_fingerprint(
     };
 
     if normalization.media_kind != SourceMediaKind::Video {
-        inbox
-            .complete_ingest_fingerprint(ingest_request_id, &job_attempt, None)
-            .await
-            .map_err(map_inbox_error)?;
-        return Ok(());
-    }
-
-    let duration_ms = match normalization.duration_ms {
-        Some(duration_ms) if duration_ms > 0 => duration_ms,
-        _ => {
-            return fail_fingerprint(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                HandlerFailure::permanent(
-                    "invalid_ingest_state",
-                    "video normalization has no valid canonical duration",
-                ),
-            )
-            .await;
-        }
-    };
-    let workspace_id = match workspace_input(&request) {
-        Ok((workspace_id, _)) => workspace_id,
-        Err(failure) => {
-            return fail_fingerprint(inbox, ingest_request_id, &job_attempt, failure).await;
-        }
-    };
-    let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
-        Ok(workspace) => workspace,
-        Err(error) => {
-            return fail_fingerprint(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                map_workspace_error(error),
-            )
-            .await;
-        }
-    };
-    if let Err(error) = workspace.validate() {
         return fail_fingerprint(
             inbox,
             ingest_request_id,
             &job_attempt,
-            map_workspace_error(error),
+            HandlerFailure::permanent(
+                "invalid_ingest_state",
+                "video fingerprinting was queued for a non-video normalization",
+            ),
         )
         .await;
     }
-    let result = match extractor
-        .extract_from_area_with_cache_key(
-            &workspace,
-            WorkspaceArea::Normalized,
-            "canonical.mp4",
-            &normalization.sha256,
-            duration_ms,
-        )
-        .await
-    {
-        Ok(result) => result,
+
+    let metadata = match normalization_to_media_metadata(&normalization) {
+        Ok(metadata) => metadata,
+        Err(failure) => {
+            return fail_fingerprint(inbox, ingest_request_id, &job_attempt, failure).await;
+        }
+    };
+    let media_ingest = MediaIngest {
+        media: NewMedia {
+            kind: MediaKind::Video,
+            title: request.page_title.clone().or_else(|| request.supplied_caption.clone()),
+            description: None,
+            notes: None,
+        },
+        metadata,
+        source: source_record_for_request(&request),
+        tags: request.supplied_tags.clone(),
+    };
+    let exact_media_exists = match library.resolve_exact_sha(&media_ingest).await {
+        Ok(media_id) => media_id.is_some(),
         Err(error) => {
             return fail_fingerprint(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                map_fingerprint_error(&job, error),
-            )
-            .await;
-        }
-    };
-    let fingerprint =
-        serde_json::to_value(result.fingerprint).expect("video fingerprints are serializable");
-    let media_id = request.media_id.ok_or_else(|| {
-        HandlerFailure::permanent(
-            "invalid_ingest_state",
-            "completed ingest has no media ID for fingerprint persistence",
-        )
-    })?;
-    if let Err(error) = library
-        .record_fingerprint(media_id, FingerprintVersion::FrameDHashV1.as_str(), &fingerprint)
-        .await
-    {
-        return fail_fingerprint(inbox, ingest_request_id, &job_attempt, map_library_error(error))
-            .await;
-    }
-    inbox
-        .complete_ingest_fingerprint(ingest_request_id, &job_attempt, Some(fingerprint))
-        .await
-        .map_err(map_inbox_error)?;
-    Ok(())
-}
-
-async fn check_similarity(
-    inbox: &InboxRepository,
-    library: &LibraryRepository,
-    config: SimilarityConfig,
-    job: Job,
-) -> Result<(), HandlerFailure> {
-    let ingest_request_id = match &job.command {
-        JobCommand::CheckSimilarity(payload) => payload.ingest_id,
-        _ => {
-            return Err(HandlerFailure::permanent(
-                "invalid_payload",
-                "check_similarity handler received a different job command",
-            ));
-        }
-    };
-    let job_attempt = job.attempt().ok_or_else(|| {
-        HandlerFailure::permanent(
-            "invalid_job_state",
-            "check_similarity handler requires a running job lease",
-        )
-    })?;
-    let request = match inbox.begin_ingest_similarity(ingest_request_id, &job_attempt).await {
-        Ok(IngestSimilarityStart::Ready(request)) => request,
-        Ok(IngestSimilarityStart::AlreadyAdvanced(_)) => return Ok(()),
-        Err(error) => return Err(map_inbox_error(error)),
-    };
-    let input = match similarity_input(&request) {
-        Ok(input) => input,
-        Err(failure) => {
-            return fail_similarity(inbox, ingest_request_id, &job_attempt, failure).await;
-        }
-    };
-    let stored = match library
-        .list_stored_video_fingerprints(input.media_id, FingerprintVersion::FrameDHashV1.as_str())
-        .await
-    {
-        Ok(stored) => stored,
-        Err(error) => {
-            return fail_similarity(
                 inbox,
                 ingest_request_id,
                 &job_attempt,
@@ -1068,197 +1191,86 @@ async fn check_similarity(
             .await;
         }
     };
-    for candidate in stored {
-        let fingerprint =
-            match serde_json::from_value::<VideoFingerprint>(candidate.fingerprint.clone()) {
-                Ok(fingerprint) => fingerprint,
-                Err(error) => {
-                    return fail_similarity(
+
+    let fingerprint = if exact_media_exists {
+        None
+    } else {
+        let duration_ms = match normalization.duration_ms {
+            Some(duration_ms) if duration_ms > 0 => duration_ms,
+            _ => {
+                return fail_fingerprint(
                     inbox,
                     ingest_request_id,
                     &job_attempt,
                     HandlerFailure::permanent(
-                        "invalid_similarity_state",
-                        format!(
-                            "stored fingerprint for content item {} could not be decoded: {error}",
-                            candidate.media_id
-                        ),
+                        "invalid_ingest_state",
+                        "video normalization has no valid canonical duration",
                     ),
-                )
-                .await;
-                }
-            };
-        let result = match compare_videos(
-            VideoSimilarityInput {
-                fingerprint: &input.fingerprint,
-                aspect_ratio: input.aspect_ratio,
-                has_audio: input.has_audio,
-            },
-            VideoSimilarityInput {
-                fingerprint: &fingerprint,
-                aspect_ratio: stored_aspect_ratio(&candidate),
-                has_audio: Some(candidate.audio_codec.is_some()),
-            },
-            config,
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                return fail_similarity(
-                    inbox,
-                    ingest_request_id,
-                    &job_attempt,
-                    map_similarity_error(error),
                 )
                 .await;
             }
         };
-        if !matches!(
-            result.classification,
-            SimilarityClassification::LikelyDuplicate | SimilarityClassification::PossibleDuplicate
-        ) {
-            continue;
-        }
-        tracing::info!(
-            ingest_id = %ingest_request_id,
-            existing_media_id = %candidate.media_id,
-            classification = ?result.classification,
-            score_basis_points = result.score_basis_points(),
-            "similar media detected; no duplicate aggregate is persisted in the MVP"
-        );
-    }
-    inbox
-        .complete_ingest_similarity(ingest_request_id, &job_attempt)
-        .await
-        .map_err(map_inbox_error)?;
-    Ok(())
-}
-
-struct SimilarityInput {
-    media_id: uuid::Uuid,
-    fingerprint: VideoFingerprint,
-    aspect_ratio: Option<f64>,
-    has_audio: Option<bool>,
-}
-
-fn similarity_input(request: &sooqa_inbox::Ingest) -> Result<SimilarityInput, HandlerFailure> {
-    let normalization = request
-        .original_input
-        .get("normalization")
-        .cloned()
-        .ok_or_else(|| {
-            HandlerFailure::permanent(
-                "invalid_similarity_state",
-                "ingest request has no stored normalization metadata",
-            )
-        })
-        .and_then(|value| {
-            serde_json::from_value::<AssetNormalization>(value).map_err(|error| {
-                HandlerFailure::permanent(
-                    "invalid_similarity_state",
-                    format!("stored normalization metadata could not be decoded: {error}"),
+        let workspace_id = match workspace_input(&request) {
+            Ok((workspace_id, _)) => workspace_id,
+            Err(failure) => {
+                return fail_fingerprint(inbox, ingest_request_id, &job_attempt, failure).await;
+            }
+        };
+        let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return fail_fingerprint(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    map_workspace_error(error),
                 )
-            })
-        })?;
-    if normalization.media_kind != SourceMediaKind::Video {
-        return Err(HandlerFailure::permanent(
-            "invalid_similarity_state",
-            "similarity input is not a video normalization",
-        ));
-    }
-    let finalization = request
-        .original_input
-        .get("finalization")
-        .cloned()
-        .ok_or_else(|| {
-            HandlerFailure::permanent(
-                "invalid_similarity_state",
-                "ingest request has no stored finalization metadata",
+                .await;
+            }
+        };
+        if let Err(error) = workspace.validate() {
+            return fail_fingerprint(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                map_workspace_error(error),
             )
-        })
-        .and_then(|value| {
-            serde_json::from_value::<IngestFinalization>(value).map_err(|error| {
-                HandlerFailure::permanent(
-                    "invalid_similarity_state",
-                    format!("stored finalization metadata could not be decoded: {error}"),
-                )
-            })
-        })?;
-    let fingerprint = request
-        .original_input
-        .get("fingerprint")
-        .cloned()
-        .ok_or_else(|| {
-            HandlerFailure::permanent(
-                "invalid_similarity_state",
-                "ingest request has no stored fingerprint metadata",
+            .await;
+        }
+        match extractor
+            .extract_video_sequence_from_area_with_cache_key(
+                &workspace,
+                WorkspaceArea::Normalized,
+                "canonical.mp4",
+                &normalization.sha256,
+                duration_ms,
             )
-        })
-        .and_then(|value| {
-            serde_json::from_value::<VideoFingerprint>(value).map_err(|error| {
-                HandlerFailure::permanent(
-                    "invalid_similarity_state",
-                    format!("stored fingerprint metadata could not be decoded: {error}"),
+            .await
+        {
+            Ok(result) => Some(result),
+            Err(error) => {
+                return fail_fingerprint(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    map_fingerprint_error(&job, error),
                 )
-            })
-        })?;
-    Ok(SimilarityInput {
-        media_id: finalization.media_id,
-        fingerprint,
-        aspect_ratio: normalization_aspect_ratio(&normalization)?,
-        has_audio: Some(normalization.audio_codec.is_some()),
-    })
-}
-
-fn normalization_aspect_ratio(
-    normalization: &AssetNormalization,
-) -> Result<Option<f64>, HandlerFailure> {
-    match (normalization.width, normalization.height) {
-        (Some(width), Some(height)) if width > 0 && height > 0 => {
-            Ok(Some(f64::from(width) / f64::from(height)))
+                .await;
+            }
         }
-        (None, None) => Ok(None),
-        _ => Err(HandlerFailure::permanent(
-            "invalid_similarity_state",
-            "video normalization has invalid dimensions",
-        )),
-    }
-}
-
-fn stored_aspect_ratio(candidate: &StoredVideoFingerprint) -> Option<f64> {
-    match (candidate.width, candidate.height) {
-        (Some(width), Some(height)) if width > 0 && height > 0 => {
-            Some(f64::from(width) / f64::from(height))
-        }
-        _ => None,
-    }
-}
-
-fn map_similarity_error(error: SimilarityError) -> HandlerFailure {
-    HandlerFailure::permanent("similarity_failed", error.to_string())
-}
-
-async fn fail_similarity(
-    inbox: &InboxRepository,
-    ingest_request_id: uuid::Uuid,
-    job_attempt: &sooqa_jobs::JobAttempt,
-    failure: HandlerFailure,
-) -> Result<(), HandlerFailure> {
-    let status = if failure.retryable {
-        IngestStatus::FailedRetryable
-    } else {
-        IngestStatus::FailedTerminal
     };
+
     inbox
-        .fail_ingest_similarity(
+        .finalize_video_identity(
             ingest_request_id,
-            job_attempt,
-            status,
-            &failure.class,
-            &failure.message,
+            &job_attempt,
+            media_ingest,
+            fingerprint.as_ref(),
+            SequenceAlignmentConfig::default(),
         )
         .await
         .map_err(map_inbox_error)?;
-    Err(failure)
+    Ok(())
 }
 
 fn map_fingerprint_error(job: &Job, error: FrameExtractionError) -> HandlerFailure {
@@ -1833,13 +1845,17 @@ async fn fail_download(
 fn map_inbox_error(error: InboxRepositoryError) -> HandlerFailure {
     let message = error.to_string();
     match error {
+        InboxRepositoryError::Library(error) => map_library_error(error),
         InboxRepositoryError::ResourceMissing(_)
         | InboxRepositoryError::MissingSourceUrl(_)
         | InboxRepositoryError::InvalidFailureStatus(_)
         | InboxRepositoryError::InvalidStateTransition(_)
         | InboxRepositoryError::UnknownIngestKind(_)
         | InboxRepositoryError::UnknownIngestStatus(_)
-        | InboxRepositoryError::UnknownSubmittedVia(_) => {
+        | InboxRepositoryError::UnknownSubmittedVia(_)
+        | InboxRepositoryError::VideoFinalizationNotAllowed
+        | InboxRepositoryError::DuplicateEvidenceTooManyMatches { .. }
+        | InboxRepositoryError::DuplicateEvidenceTooLarge { .. } => {
             HandlerFailure::permanent("invalid_ingest_state", message)
         }
         _ => HandlerFailure::retryable("database_error", message),

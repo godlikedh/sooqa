@@ -327,15 +327,6 @@ pub enum TagValidationError {
     TooLong { max: usize },
 }
 
-#[derive(Debug, Clone)]
-pub struct StoredVideoFingerprint {
-    pub media_id: Uuid,
-    pub width: Option<i32>,
-    pub height: Option<i32>,
-    pub audio_codec: Option<String>,
-    pub fingerprint: Value,
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct VideoFingerprintCandidate {
     pub media_id: Uuid,
@@ -347,6 +338,56 @@ pub struct VideoFingerprintCandidate {
     pub search_tokens: Vec<i64>,
     pub shared_token_count: i64,
     pub overlap_bps: i64,
+}
+
+/// Bounded evidence retained when the video identity gate needs an explicit
+/// human decision. It deliberately contains scalar alignment results only;
+/// authoritative fingerprint bytes remain on `media`.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VideoDuplicateEvidence {
+    pub algorithm_version: String,
+    pub matches: Vec<VideoDuplicateMatch>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VideoDuplicateMatch {
+    pub media_id: Uuid,
+    pub fingerprint_version: String,
+    pub classification: VideoDuplicateClassification,
+    pub aligned_offset_ms: i64,
+    pub informative_matched_samples: u16,
+    pub incoming_coverage_bps: u16,
+    pub candidate_coverage_bps: u16,
+    pub median_distance_bps: u16,
+    pub high_percentile_distance_bps: u16,
+    pub longest_temporally_consistent_run: u16,
+    pub unmatched_incoming_prefix: u16,
+    pub unmatched_incoming_suffix: u16,
+    pub unmatched_candidate_prefix: u16,
+    pub unmatched_candidate_suffix: u16,
+    pub gap_count: u16,
+    pub score_bps: u16,
+    pub shared_token_count: i64,
+    pub token_overlap_bps: i64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoDuplicateClassification {
+    StrongDuplicate,
+    PartialMatch,
+}
+
+pub const MAX_VIDEO_DUPLICATE_MATCHES: usize = 3;
+pub const MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum VideoIdentityOutcome {
+    ExactDuplicate { media_id: Uuid },
+    NewMedia { media_id: Uuid },
+    DuplicatePending { evidence: VideoDuplicateEvidence },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

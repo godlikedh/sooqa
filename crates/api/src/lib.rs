@@ -69,6 +69,7 @@ pub fn router(settings: ApiSettings, state: ApiState) -> Router {
         .route("/health/live", get(health_live))
         .route("/api/v1/ingests", post(create_ingest))
         .route("/api/v1/ingests/{id}", get(get_ingest))
+        .route("/api/v1/ingests/{id}/force-save", post(force_save))
         .merge(library::routes())
         .merge(publisher::routes())
         .with_state(state);
@@ -163,6 +164,18 @@ async fn get_ingest(
         })?;
 
     Ok((StatusCode::OK, Json(IngestResponse::from_ingest(&request))))
+}
+
+async fn force_save(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<(StatusCode, Json<IngestResponse>), ApiError> {
+    authorize(&state.api_token, &headers, "ingest:force_save").await?;
+    let result =
+        state.inbox.force_save(id).await.map_err(|error| map_repository_error(error, &headers))?;
+    let status = if result.resumed { StatusCode::ACCEPTED } else { StatusCode::OK };
+    Ok((status, Json(IngestResponse::from_ingest(&result.ingest))))
 }
 
 async fn authorize(
@@ -263,6 +276,14 @@ fn map_repository_error(error: InboxRepositoryError, headers: &HeaderMap) -> Api
             "The Idempotency-Key payload conflicts with the original request",
             headers,
         ),
+        InboxRepositoryError::ForceSaveNotAllowed(_) => ApiError::conflict(
+            "force_save_not_allowed",
+            "Force-save is only available for a pending perceptual duplicate",
+            headers,
+        ),
+        InboxRepositoryError::ResourceMissing(_) => {
+            ApiError::not_found("ingest_not_found", "The ingest request was not found", headers)
+        }
         error => {
             error!(error = %error, "ingest API repository operation failed");
             ApiError::internal(headers)
@@ -390,6 +411,9 @@ struct IngestResponse {
     page_title: Option<String>,
     supplied_caption: Option<String>,
     supplied_tags: Vec<String>,
+    media_id: Option<Uuid>,
+    force_save: bool,
+    duplicate_evidence: Option<Value>,
     error_code: Option<String>,
     error_message: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
@@ -412,6 +436,9 @@ impl IngestResponse {
             page_title: request.page_title.clone(),
             supplied_caption: request.supplied_caption.clone(),
             supplied_tags: request.supplied_tags.clone(),
+            media_id: request.media_id,
+            force_save: request.force_save,
+            duplicate_evidence: request.duplicate_evidence.clone(),
             error_code: request.error_code.clone(),
             error_message: request.error_message.clone(),
             created_at: request.created_at,
