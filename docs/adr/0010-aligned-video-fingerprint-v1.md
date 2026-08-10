@@ -29,6 +29,10 @@ Timestamps are `0, interval, 2 * interval, ... < duration_ms`. The interval is
 samples for ordinary videos, expands deterministically above the 2,048-sample
 bound, and uses every distinct timestamp produced by the same generator for
 short videos. The actual interval and duration are stored in the fingerprint.
+For each timestamp, the selected frame is the first decoded input frame whose
+normalized presentation timestamp is at or after that grid point. The grid is
+not rounded to the nearest decoded frame; this distinction is part of the v1
+fingerprint contract.
 
 ### Sample features
 
@@ -143,14 +147,21 @@ byte-identity barrier.
 ### Extraction resource behavior
 
 The active extractor preserves the timestamp grid above with one FFmpeg process
-per canonical video. It uses an `fps=1000/interval:round=near` filter and an
-explicit `-frames:v` cap equal to the exact expected sample count, never above
-2,048. FFmpeg writes a numbered PNG sequence into a fresh extraction-scoped
-directory under the workspace. The worker validates the complete sequence,
-decodes one frame at a time under the existing byte/pixel/working-set limits,
-and feeds an incremental builder that retains only compact samples and the
-previous 32x32 luma plane. The sequence directory is removed on every normal
-exit path and by a synchronous drop guard when the extraction is cancelled.
+per canonical video. It normalizes input PTS with `setpts=PTS-STARTPTS`, then
+uses `select='isnan(prev_selected_pts)+gte(t,selected_n*interval/1000)'` to
+choose the first decoded frame at or after each grid timestamp. An explicit
+`-frames:v` cap equals the exact expected sample count, never above 2,048, and
+`-fps_mode vfr` prevents the output writer from duplicating or rounding the
+selected frames. FFmpeg writes a numbered PNG sequence into a fresh
+extraction-scoped directory under the workspace. A bounded consumer validates
+the numbered sequence, waits for each file to stabilize, decodes it under the
+existing byte/pixel/working-set limits, and deletes it before consuming the
+next frame. The production process runner also monitors the aggregate regular
+file size while FFmpeg is running and aborts the process group over the
+4,294,967,296-byte sequence limit; the consumer and final validation enforce
+the same limit for non-production runners and producer races. The sequence
+directory is removed on every normal exit path and by a synchronous drop guard
+when the extraction is cancelled.
 
 This changes only execution and resource lifetime. The Rust resize, feature,
 transition, binary codec, shortlist-token, and alignment contracts remain the

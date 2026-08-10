@@ -41,7 +41,8 @@ pub use ffprobe::{
     parse_probe_json,
 };
 pub use fingerprint::{
-    FingerprintVersion, FrameDecodeLimits, FrameExtractionError, FrameExtractor, VIDEO_SEQUENCE_V1,
+    DEFAULT_MAX_FRAME_SEQUENCE_BYTES, FingerprintVersion, FrameDecodeLimits, FrameExtractionError,
+    FrameExtractor, VIDEO_SEQUENCE_V1,
 };
 pub use hashing::{FileDigest, HashError, sha256_file};
 pub(crate) use hashing::{sha256_bytes, sha256_file_sync};

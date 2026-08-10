@@ -84,6 +84,20 @@ pub struct ExternalCommandOutput {
 #[async_trait]
 pub trait ExternalCommandRunner: Send + Sync {
     async fn run(&self, command: ExternalCommand) -> Result<ExternalCommandOutput, CommandError>;
+
+    /// Run a command that produces a bounded sequence of files.
+    ///
+    /// The default keeps test and adapter runners compatible. The production
+    /// process runner overrides this to monitor the output directory while
+    /// the child is still running.
+    async fn run_sequence(
+        &self,
+        command: ExternalCommand,
+        _output_directory: &Path,
+        _max_bytes: u64,
+    ) -> Result<ExternalCommandOutput, CommandError> {
+        self.run(command).await
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -92,51 +106,72 @@ pub struct ProcessCommandRunner;
 #[async_trait]
 impl ExternalCommandRunner for ProcessCommandRunner {
     async fn run(&self, command: ExternalCommand) -> Result<ExternalCommandOutput, CommandError> {
-        let program = command.program().to_owned();
-        let mut process = Command::new(command.program());
-        process
-            .args(command.args())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        process.process_group(0);
-        let mut child = process
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|source| CommandError::Spawn { program: program.clone(), source })?;
-        let mut group_cleanup = ProcessGroupCleanup::new(child.id());
+        run_process_command(command, None).await
+    }
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| CommandError::Pipe { program: program.clone(), stream: "stdout" })?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| CommandError::Pipe { program: program.clone(), stream: "stderr" })?;
+    async fn run_sequence(
+        &self,
+        command: ExternalCommand,
+        output_directory: &Path,
+        max_bytes: u64,
+    ) -> Result<ExternalCommandOutput, CommandError> {
+        run_process_command(command, Some((output_directory.to_owned(), max_bytes))).await
+    }
+}
 
-        let max_output_bytes = command.max_output_bytes_limit();
-        let execution = async {
-            let stdout_read = read_bounded(stdout, max_output_bytes);
-            let stderr_read = read_bounded(stderr, max_output_bytes);
-            let wait = child.wait();
-            let (stdout, stderr, status) = tokio::join!(stdout_read, stderr_read, wait);
-            let stdout = stdout.map_err(|source| CommandError::Read {
-                program: program.clone(),
-                stream: "stdout",
-                source,
-            })?;
-            let stderr = stderr.map_err(|source| CommandError::Read {
-                program: program.clone(),
-                stream: "stderr",
-                source,
-            })?;
-            let status =
-                status.map_err(|source| CommandError::Wait { program: program.clone(), source })?;
-            Ok::<_, CommandError>((stdout, stderr, status))
-        };
-        let (stdout, stderr, status) = match timeout(command.timeout_duration(), execution).await {
+async fn run_process_command(
+    command: ExternalCommand,
+    sequence_output: Option<(PathBuf, u64)>,
+) -> Result<ExternalCommandOutput, CommandError> {
+    let program = command.program().to_owned();
+    let mut process = Command::new(command.program());
+    process.args(command.args()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    process.process_group(0);
+    let mut child = process
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|source| CommandError::Spawn { program: program.clone(), source })?;
+    let mut group_cleanup = ProcessGroupCleanup::new(child.id());
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CommandError::Pipe { program: program.clone(), stream: "stdout" })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CommandError::Pipe { program: program.clone(), stream: "stderr" })?;
+
+    let max_output_bytes = command.max_output_bytes_limit();
+    let execution = async {
+        let stdout_read = read_bounded(stdout, max_output_bytes);
+        let stderr_read = read_bounded(stderr, max_output_bytes);
+        let wait = child.wait();
+        let (stdout, stderr, status) = tokio::join!(stdout_read, stderr_read, wait);
+        let stdout = stdout.map_err(|source| CommandError::Read {
+            program: program.clone(),
+            stream: "stdout",
+            source,
+        })?;
+        let stderr = stderr.map_err(|source| CommandError::Read {
+            program: program.clone(),
+            stream: "stderr",
+            source,
+        })?;
+        let status =
+            status.map_err(|source| CommandError::Wait { program: program.clone(), source })?;
+        Ok::<_, CommandError>((stdout, stderr, status))
+    };
+    let monitor_config = sequence_output.clone();
+    let monitor = async move {
+        match monitor_config {
+            Some((directory, max_bytes)) => monitor_sequence_output(directory, max_bytes).await,
+            None => std::future::pending::<Result<(), std::io::Error>>().await,
+        }
+    };
+    let (stdout, stderr, status) = tokio::select! {
+        result = timeout(command.timeout_duration(), execution) => match result {
             Ok(result) => result?,
             Err(_) => {
                 terminate_process_group(&mut child).await;
@@ -146,18 +181,86 @@ impl ExternalCommandRunner for ProcessCommandRunner {
                     timeout: command.timeout_duration(),
                 });
             }
-        };
-        group_cleanup.disarm();
+        },
+        monitor_result = monitor => {
+            match monitor_result {
+                Ok(()) => {
+                    let limit = sequence_output
+                        .as_ref()
+                        .map(|(_, limit)| *limit)
+                        .expect("a sequence monitor has a configured limit");
+                    terminate_process_group(&mut child).await;
+                    group_cleanup.disarm();
+                    return Err(CommandError::OutputLimitExceeded { program, limit });
+                }
+                Err(source) => {
+                    let directory = sequence_output
+                        .as_ref()
+                        .map(|(directory, _)| directory.clone())
+                        .expect("a sequence monitor has an output directory");
+                    terminate_process_group(&mut child).await;
+                    group_cleanup.disarm();
+                    return Err(CommandError::OutputMonitor { program, directory, source });
+                }
+            }
+        }
+    };
+    group_cleanup.disarm();
 
-        Ok(ExternalCommandOutput {
-            success: status.success(),
-            exit_code: status.code(),
-            stdout: stdout.bytes,
-            stderr: stderr.bytes,
-            stdout_truncated: stdout.truncated,
-            stderr_truncated: stderr.truncated,
-        })
+    if let Some((directory, max_bytes)) = sequence_output.as_ref() {
+        let size = sequence_directory_size(directory).await.map_err(|source| {
+            CommandError::OutputMonitor {
+                program: program.clone(),
+                directory: directory.clone(),
+                source,
+            }
+        })?;
+        if size > *max_bytes {
+            return Err(CommandError::OutputLimitExceeded { program, limit: *max_bytes });
+        }
     }
+
+    Ok(ExternalCommandOutput {
+        success: status.success(),
+        exit_code: status.code(),
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+    })
+}
+
+async fn monitor_sequence_output(directory: PathBuf, max_bytes: u64) -> Result<(), std::io::Error> {
+    loop {
+        if sequence_directory_size(&directory).await? > max_bytes {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+pub(crate) async fn sequence_directory_size(directory: &Path) -> Result<u64, std::io::Error> {
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    let mut total = 0_u64;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            // A concurrent bounded consumer may remove a frame between
+            // read_dir and metadata. It is no longer part of the producer
+            // lead, so continue the accounting pass.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() || metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("sequence output contains a non-regular entry: {}", path.display()),
+            ));
+        }
+        total = total.saturating_add(metadata.len());
+    }
+    Ok(total)
 }
 
 #[cfg(unix)]
@@ -255,6 +358,10 @@ pub enum CommandError {
     TimedOut { program: PathBuf, timeout: Duration },
     #[error("could not wait for external command {program}: {source}")]
     Wait { program: PathBuf, source: std::io::Error },
+    #[error("external command {program} sequence output exceeded the {limit}-byte limit")]
+    OutputLimitExceeded { program: PathBuf, limit: u64 },
+    #[error("could not monitor external command {program} output directory {directory}: {source}")]
+    OutputMonitor { program: PathBuf, directory: PathBuf, source: std::io::Error },
 }
 
 impl CommandError {
@@ -363,5 +470,60 @@ mod tests {
             .expect("kill probe should run");
         assert!(!status.success(), "descendant process should have been terminated");
         tokio::fs::remove_file(pid_file).await.expect("PID fixture should be removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_process_runner_kills_and_reaps_descendants() {
+        use std::{os::unix::fs::PermissionsExt, process::Stdio};
+
+        let script =
+            std::env::temp_dir().join(format!("sooqa-cancel-process-{}.sh", uuid::Uuid::new_v4()));
+        let pid_file = script.with_extension("pid");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s' \"$child\" > \"$1\"\nwait \"$child\"\n",
+        )
+        .expect("cancellation fixture should be written");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("cancellation fixture metadata should be readable")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions)
+            .expect("cancellation fixture should be executable");
+
+        let command = ExternalCommand::new(&script)
+            .arg(pid_file.to_string_lossy().into_owned())
+            .timeout(Duration::from_secs(30));
+        let task = tokio::spawn(async move { ProcessCommandRunner.run(command).await });
+        let mut child_pid = None;
+        for _ in 0..100 {
+            if let Ok(pid) = tokio::fs::read_to_string(&pid_file).await {
+                child_pid = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        assert!(task.await.expect_err("runner task should be cancelled").is_cancelled());
+
+        let child_pid = child_pid.expect("fixture should have started its child");
+        let mut terminated = false;
+        for _ in 0..100 {
+            let status = std::process::Command::new("/bin/kill")
+                .arg("-0")
+                .arg(child_pid.trim())
+                .stderr(Stdio::null())
+                .status()
+                .expect("kill probe should run");
+            if !status.success() {
+                terminated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(terminated, "cancellation should kill and reap the descendant");
+        let _ = tokio::fs::remove_file(&pid_file).await;
+        let _ = tokio::fs::remove_file(&script).await;
     }
 }
