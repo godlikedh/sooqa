@@ -945,25 +945,46 @@ mod tests {
             .await
             .expect("workspace should be created");
         let input = workspace.path(WorkspaceArea::Normalized, "canonical.nut").unwrap();
+        let raw_input = workspace.root().join("fixture.rgb");
+        let (width, height) = (96_u32, 64_u32);
+        let mut raw = Vec::with_capacity((width * height * 3 * 14) as usize);
+        for frame in 0..14_u32 {
+            for y in 0..height {
+                for x in 0..width {
+                    raw.extend_from_slice(&[
+                        (frame.wrapping_mul(29).wrapping_add(x.wrapping_mul(3))) as u8,
+                        (frame.wrapping_mul(17).wrapping_add(y.wrapping_mul(5))) as u8,
+                        (x.wrapping_mul(7).wrapping_add(y.wrapping_mul(11))) as u8,
+                    ]);
+                }
+            }
+        }
+        std::fs::write(&raw_input, &raw).expect("raw fixture should be written");
         let fixture = std::process::Command::new("ffmpeg")
             .args([
                 "-hide_banner",
                 "-loglevel",
                 "error",
                 "-f",
-                "lavfi",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                "96x64",
+                "-r",
+                "7",
                 "-i",
-                "testsrc2=size=96x64:rate=7",
+            ])
+            .arg(&raw_input)
+            .args([
                 "-frames:v",
                 "14",
                 "-vf",
                 "setpts=PTS+2/TB",
                 "-c:v",
-                "ffv1",
-                "-level",
-                "3",
+                "rawvideo",
                 "-pix_fmt",
-                "yuv420p",
+                "rgb24",
                 "-f",
                 "nut",
             ])
@@ -975,7 +996,10 @@ mod tests {
         let legacy_dir = workspace.root().join("legacy");
         std::fs::create_dir(&legacy_dir).expect("legacy output directory should be created");
         let mut legacy_builder = VideoSequenceBuilder::new(2_000, 500).unwrap();
-        for (index, timestamp_ms) in [0_u64, 500, 1_000, 1_500].into_iter().enumerate() {
+        let raw_frame_bytes = (width * height * 3) as usize;
+        for (index, (timestamp_ms, expected_frame)) in
+            [(0_u64, 0_usize), (500, 4), (1_000, 7), (1_500, 11)].into_iter().enumerate()
+        {
             let output = legacy_dir.join(format!("frame-{index:04}.png"));
             let seek = format!("{:.3}", timestamp_ms as f64 / 1_000.0);
             let result = std::process::Command::new("ffmpeg")
@@ -990,48 +1014,14 @@ mod tests {
             assert!(result.success(), "legacy ffmpeg sample command should succeed");
             let image = decode_frame(&output, FrameDecodeLimits::default())
                 .expect("legacy sample should decode");
+            let expected_start = expected_frame * raw_frame_bytes;
+            let expected_hash =
+                crate::sha256_bytes(&raw[expected_start..expected_start + raw_frame_bytes]);
+            let actual_hash = crate::sha256_bytes(&image.to_rgb8().into_raw());
+            assert_eq!(actual_hash.sha256, expected_hash.sha256);
             legacy_builder.push_image(&image).unwrap();
         }
         let legacy = legacy_builder.finish().unwrap();
-        let expected = vec![
-            crate::VideoSequenceSample {
-                phash: 3_609_614_429_964_389_197,
-                dhash: 7_378_697_493_798_344_039,
-                mean_luma: 80,
-                mean_chroma_u: -3,
-                mean_chroma_v: 11,
-                information_bps: 2_959,
-                transition_bps: 0,
-            },
-            crate::VideoSequenceSample {
-                phash: 15_174_585_697_520_723_277,
-                dhash: 7_380_251_224_423_454_054,
-                mean_luma: 77,
-                mean_chroma_u: 1,
-                mean_chroma_v: 11,
-                information_bps: 2_839,
-                transition_bps: 601,
-            },
-            crate::VideoSequenceSample {
-                phash: 2_501_737_580_557_207_885,
-                dhash: 16_620_085_157_892_085_094,
-                mean_luma: 79,
-                mean_chroma_u: -2,
-                mean_chroma_v: 10,
-                information_bps: 2_924,
-                transition_bps: 482,
-            },
-            crate::VideoSequenceSample {
-                phash: 12_855_926_773_932_427_629,
-                dhash: 7_954_945_370_745_132_390,
-                mean_luma: 80,
-                mean_chroma_u: 2,
-                mean_chroma_v: 9,
-                information_bps: 2_973,
-                transition_bps: 745,
-            },
-        ];
-        assert_eq!(legacy.samples, expected);
 
         let actual = FrameExtractor::new("ffmpeg", Duration::from_secs(30))
             .extract_video_sequence_from_area(
