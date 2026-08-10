@@ -1157,8 +1157,8 @@ async fn finalize_ingest(
         .resolve_media(MediaIngest {
             media: NewMedia {
                 kind: metadata.kind,
-                title: request.page_title.clone().or_else(|| request.supplied_caption.clone()),
-                description: None,
+                title: request.page_title.clone(),
+                description: request.supplied_description.clone(),
                 notes: None,
             },
             metadata,
@@ -1268,8 +1268,8 @@ async fn compute_fingerprint(
     let media_ingest = MediaIngest {
         media: NewMedia {
             kind: MediaKind::Video,
-            title: request.page_title.clone().or_else(|| request.supplied_caption.clone()),
-            description: None,
+            title: request.page_title.clone(),
+            description: request.supplied_description.clone(),
             notes: None,
         },
         metadata,
@@ -1514,7 +1514,13 @@ fn source_record_for_request(request: &sooqa_inbox::Ingest) -> MediaSourceInput 
         platform_content_id,
         author_name: None,
         title: request.page_title.clone(),
-        description: request.supplied_caption.clone(),
+        description: request.supplied_description.clone().or_else(|| {
+            if request.kind == IngestKind::TelegramMessage {
+                request.supplied_caption.clone()
+            } else {
+                None
+            }
+        }),
         published_at: None,
         metadata: source_provenance_for_request(request),
     }

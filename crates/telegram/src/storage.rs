@@ -2,8 +2,8 @@ use std::{path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use sooqa_library::{
-    MediaKind, StorageReceipt, StorageUploadReservation, StorageUploadReservationRequest,
-    StorageUploadStore,
+    MediaKind, StorageCaptionMetadata, StorageReceipt, StorageUploadReservation,
+    StorageUploadReservationRequest, StorageUploadStore,
 };
 use sooqa_media::sha256_file;
 use teloxide::{
@@ -190,6 +190,12 @@ where
             return Ok(StorageUploadOutcome::Reused(receipt));
         }
 
+        let caption_metadata = self
+            .store
+            .find_storage_caption_metadata(input.media_id)
+            .await
+            .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
+
         let expected_sha256_bytes =
             media.sha256.clone().ok_or(StorageUploadError::MediaMissingSha256(input.media_id))?;
         if expected_sha256_bytes.len() != 32 {
@@ -284,7 +290,7 @@ where
             storage_chat_id: self.storage_chat_id,
             media_kind: media.kind,
             local_work_path,
-            caption: storage_caption(input.media_id, &expected_sha256),
+            caption: storage_caption(&caption_metadata),
         };
         let mut upload = Box::pin(self.api.upload_media(request));
         let mut renewal = tokio::time::interval(STORAGE_UPLOAD_RENEW_INTERVAL);
@@ -360,8 +366,58 @@ where
     }
 }
 
-fn storage_caption(media_id: Uuid, sha256: &str) -> String {
-    format!("media: {media_id}\nsha256: {}", &sha256[..sha256.len().min(12)])
+const MAX_STORAGE_CAPTION_CHARS: usize = 1_024;
+const MAX_STORAGE_CAPTION_TAGS: usize = 32;
+
+fn storage_caption(metadata: &StorageCaptionMetadata) -> String {
+    let mut lines = Vec::new();
+    if let Some(description) = &metadata.description {
+        let description = clean_caption_value(description, 512);
+        if !description.is_empty() {
+            lines.push(format!("description: {description}"));
+        }
+    }
+    if !metadata.tags.is_empty() {
+        let tags = metadata
+            .tags
+            .iter()
+            .take(MAX_STORAGE_CAPTION_TAGS)
+            .map(|tag| clean_caption_value(tag, 64))
+            .filter(|tag| !tag.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !tags.is_empty() {
+            lines.push(format!("tags: {tags}"));
+        }
+    }
+    if let Some(source_url) = &metadata.source_url {
+        let source_url = clean_caption_value(source_url, 512);
+        if !source_url.is_empty() {
+            lines.push(format!("source: {source_url}"));
+        }
+    }
+    let caption = lines.join("\n");
+    if caption.is_empty() {
+        "sooqa".to_owned()
+    } else {
+        truncate_chars(&caption, MAX_STORAGE_CAPTION_CHARS)
+    }
+}
+
+fn clean_caption_value(value: &str, max_chars: usize) -> String {
+    truncate_chars(
+        &value
+            .chars()
+            .map(|character| if character.is_control() { ' ' } else { character })
+            .collect::<String>(),
+        max_chars,
+    )
+    .trim()
+    .to_owned()
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -566,6 +622,17 @@ mod tests {
             Ok(self.canonical.lock().expect("mock mutex should not be poisoned").clone())
         }
 
+        async fn find_storage_caption_metadata(
+            &self,
+            _media_id: Uuid,
+        ) -> Result<StorageCaptionMetadata, Self::Error> {
+            Ok(StorageCaptionMetadata {
+                description: Some("internal note".to_owned()),
+                tags: vec!["cats".to_owned()],
+                source_url: Some("https://example.test/clip.webm".to_owned()),
+            })
+        }
+
         async fn find_storage_receipt(
             &self,
             _media_id: Uuid,
@@ -677,7 +744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uploads_hashed_asset_with_diagnostic_caption_and_reuses_object() {
+    async fn uploads_asset_with_bounded_metadata_caption_and_reuses_object() {
         let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
         tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
         let digest = sha256_file(&path).await.expect("fixture should hash");
@@ -691,8 +758,12 @@ mod tests {
         let outcome = provider.upload(input()).await.expect("upload should succeed");
         assert!(matches!(outcome, StorageUploadOutcome::Uploaded(_)));
         let request = api.requests.lock().unwrap().pop().expect("one upload should be sent");
-        assert!(request.caption.contains("media: 00000000-0000-0000-0000-000000000001"));
-        assert!(request.caption.contains(&digest.sha256[..12]));
+        assert!(request.caption.contains("description: internal note"));
+        assert!(request.caption.contains("tags: cats"));
+        assert!(request.caption.contains("source: https://example.test/clip.webm"));
+        assert!(!request.caption.contains("sha256"));
+        assert!(!request.caption.contains("00000000-0000-0000-0000-000000000001"));
+        assert!(request.caption.chars().count() <= MAX_STORAGE_CAPTION_CHARS);
 
         let outcome = provider.upload(input()).await.expect("stored object should be reused");
         assert!(matches!(outcome, StorageUploadOutcome::Reused(_)));

@@ -127,6 +127,7 @@ async fn create_ingest(
     input.page_url = payload.page_url;
     input.page_title = payload.page_title;
     input.supplied_caption = payload.selected_text;
+    input.supplied_description = payload.description;
     input.supplied_tags = payload.tags;
     input.idempotency_key = Some(idempotency_key.to_owned());
 
@@ -391,6 +392,8 @@ struct IngestCreateRequest {
     #[serde(default)]
     selected_text: Option<String>,
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     tags: Vec<String>,
 }
 
@@ -410,6 +413,7 @@ struct IngestResponse {
     page_url: Option<String>,
     page_title: Option<String>,
     supplied_caption: Option<String>,
+    supplied_description: Option<String>,
     supplied_tags: Vec<String>,
     media_id: Option<Uuid>,
     force_save: bool,
@@ -435,6 +439,7 @@ impl IngestResponse {
             page_url: request.page_url.clone(),
             page_title: request.page_title.clone(),
             supplied_caption: request.supplied_caption.clone(),
+            supplied_description: request.supplied_description.clone(),
             supplied_tags: request.supplied_tags.clone(),
             media_id: request.media_id,
             force_save: request.force_save,

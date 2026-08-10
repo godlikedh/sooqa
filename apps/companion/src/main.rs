@@ -1,7 +1,14 @@
 //! Local capture companion entry point for sooqa.
 
-use std::error::Error;
+use std::{
+    error::Error,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
+use sooqa_companion::serve;
 use sooqa_config::{AppConfig, AppRole, CliOptions};
 
 #[tokio::main]
@@ -22,8 +29,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     sooqa_runtime::init_tracing(&config.observability)?;
-    tracing::info!(role = %config.role, "sooqa companion started");
-    sooqa_runtime::shutdown_signal().await;
+    tracing::info!(
+        role = %config.role,
+        listen_address = %config.companion.listen_address,
+        "sooqa companion started"
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let companion_config = config.companion.clone();
+    let mut server = tokio::task::spawn_blocking(move || serve(&companion_config, &server_stop));
+    tokio::select! {
+        result = &mut server => result??,
+        _ = sooqa_runtime::shutdown_signal() => {
+            stop.store(true, Ordering::Release);
+            server.await??;
+        }
+    }
     tracing::info!(role = %config.role, "sooqa companion stopped");
 
     Ok(())

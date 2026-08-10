@@ -21,6 +21,8 @@ The repository currently provides:
 - an explicit storage-intent reconciliation CLI for ambiguous Telegram
     uploads.
     - Publisher channel/post persistence with cadence slots and fenced sends.
+- a minimal loopback companion at `POST /v1/submit` and a reviewed 2ch
+  Tampermonkey script for direct MP4/WebM attachments;
 
 The composed worker registers `inspect_source` with the SSRF-hardened direct
 HTTP adapter, `download_source` into the shared media workspace, `probe_asset`,
@@ -73,6 +75,11 @@ cargo run -p sooqa-server
 cargo run -p sooqa-worker
 cargo run -p sooqa-companion
 ```
+
+The companion requires its own local token plus the backend API token. Configure
+`SOOQA_COMPANION_LOCAL_TOKEN`, `SOOQA_COMPANION_BACKEND_TOKEN`, and
+`SOOQA_COMPANION_BACKEND_URL`; it never exposes or logs the backend token. The
+userscript stores only the local token in Tampermonkey storage.
 
 `apps/` contains executable processes. `crates/` contains the modular-monolith
 boundaries: configuration/runtime, Inbox, Library, Publisher, Jobs, Media,

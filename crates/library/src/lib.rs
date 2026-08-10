@@ -414,6 +414,13 @@ pub struct StorageUploadInfo {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StorageCaptionMetadata {
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+    pub source_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StorageUploadAttachment {
     pub storage_chat_id: i64,
     pub storage_message_id: i64,
@@ -441,6 +448,11 @@ pub trait StorageUploadStore: Clone + Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
 
     async fn find_media(&self, media_id: Uuid) -> Result<Option<Media>, Self::Error>;
+
+    async fn find_storage_caption_metadata(
+        &self,
+        media_id: Uuid,
+    ) -> Result<StorageCaptionMetadata, Self::Error>;
 
     async fn find_storage_receipt(
         &self,

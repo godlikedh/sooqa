@@ -6,10 +6,18 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 sooqa-config = { path = "../../crates/config" }
 sooqa-runtime = { path = "../../crates/runtime" }
+subtle.workspace = true
+thiserror.workspace = true
+tiny_http = "0.12"
 tokio.workspace = true
 tracing.workspace = true
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+url.workspace = true
 
 [lints]
 workspace = true

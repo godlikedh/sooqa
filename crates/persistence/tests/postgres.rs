@@ -35,7 +35,7 @@ async fn fresh_migration_contains_only_the_five_application_tables() {
         .fetch_one(database.pool())
         .await
         .expect("migration table should exist");
-    assert_eq!(migration_count, 1);
+    assert_eq!(migration_count, 2);
 }
 
 #[tokio::test]

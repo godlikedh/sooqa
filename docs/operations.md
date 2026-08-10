@@ -56,6 +56,32 @@ are streamed or path-based; no file-sized byte buffer is used.
 Polling, downloads, and storage uploads use separate HTTP timeout policies so a
 long upload cannot inherit the long-poll or download-stall deadline.
 
+## Local companion and 2ch capture
+
+Run the companion on the Windows workstation with a loopback listener and two
+different secrets:
+
+```bash
+SOOQA_COMPANION_BACKEND_URL=https://sooqa.example.test \
+SOOQA_COMPANION_LOCAL_TOKEN='random-local-token' \
+SOOQA_COMPANION_BACKEND_TOKEN="$SOOQA_API_TOKEN" \
+cargo run -p sooqa-companion
+```
+
+The companion exposes only `POST http://127.0.0.1:47831/v1/submit`. Its body is
+bounded and contains a direct MP4/WebM URL, page context, an optional internal
+description, tags, and a browser action ID. A successful response means only
+that the backend accepted the ingest request; the userscript does not poll or
+claim that media is already stored. A failed request can be retried with the
+same action ID, preserving backend idempotency.
+
+Install `userscripts/sooqa-2ch-save.user.js` in Tampermonkey. It is matched only
+to `https://2ch.org/*`, discovers direct `.mp4`/`.webm` links and media nodes,
+and observes dynamically added posts. The first run asks for the local token
+and stores it in Tampermonkey's private storage. It never receives or stores
+the backend token. `Save...` prompts for comma-separated tags and an internal
+description; those values become media metadata, not a public Telegram post.
+
 ## Home local Bot API deployment
 
 The development Compose file at the repository root contains only PostgreSQL.

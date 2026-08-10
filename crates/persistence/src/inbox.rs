@@ -44,11 +44,11 @@ impl InboxRepository {
             INSERT INTO ingests (
                 id, input_key, request_hash, input_kind, state, submitted_via,
                 input_json, source_url, page_url, page_title, supplied_caption,
-                supplied_tags, media_id, error_code, error_message, created_at,
+                supplied_description, supplied_tags, media_id, error_code, error_message, created_at,
                 updated_at, completed_at
             )
             VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11,
-                    $12, $13, $14, $15, $16, $17)
+                    $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (input_key) DO NOTHING
             RETURNING id
             "#,
@@ -63,6 +63,7 @@ impl InboxRepository {
         .bind(&request.page_url)
         .bind(&request.page_title)
         .bind(&request.supplied_caption)
+        .bind(&request.supplied_description)
         .bind(&request.supplied_tags)
         .bind(request.media_id)
         .bind(&request.error_code)
@@ -1328,7 +1329,7 @@ async fn load_request(
     let row = sqlx::query_as::<_, IngestRow>(
         r#"
         SELECT id, input_kind, state, submitted_via, input_json, source_url, page_url,
-               page_title, supplied_caption, supplied_tags, input_key, media_id,
+               page_title, supplied_caption, supplied_description, supplied_tags, input_key, media_id,
                force_save, duplicate_evidence, error_code, error_message,
                created_at, updated_at, completed_at
         FROM ingests
@@ -1412,6 +1413,7 @@ struct IngestRow {
     page_url: Option<String>,
     page_title: Option<String>,
     supplied_caption: Option<String>,
+    supplied_description: Option<String>,
     supplied_tags: Vec<String>,
     input_key: String,
     media_id: Option<Uuid>,
@@ -1440,6 +1442,7 @@ impl IngestRow {
             page_url: self.page_url,
             page_title: self.page_title,
             supplied_caption: self.supplied_caption,
+            supplied_description: self.supplied_description,
             supplied_tags: self.supplied_tags,
             idempotency_key: Some(self.input_key),
             media_id: self.media_id,

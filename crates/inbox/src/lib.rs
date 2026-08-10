@@ -249,6 +249,7 @@ pub struct IngestSubmissionInput {
     pub page_url: Option<String>,
     pub page_title: Option<String>,
     pub supplied_caption: Option<String>,
+    pub supplied_description: Option<String>,
     pub supplied_tags: Vec<String>,
     pub idempotency_key: Option<String>,
 }
@@ -272,6 +273,7 @@ impl IngestSubmissionInput {
             page_url: None,
             page_title: None,
             supplied_caption: None,
+            supplied_description: None,
             supplied_tags: Vec::new(),
             idempotency_key: None,
         }
@@ -289,6 +291,7 @@ pub struct IngestSubmission {
     pub page_url: Option<String>,
     pub page_title: Option<String>,
     pub supplied_caption: Option<String>,
+    pub supplied_description: Option<String>,
     pub supplied_tags: Vec<String>,
     pub idempotency_key: Option<String>,
 }
@@ -314,11 +317,13 @@ impl IngestSubmission {
 
         let page_title = normalize_optional_text(input.page_title);
         let supplied_caption = normalize_optional_text(input.supplied_caption);
+        let supplied_description = normalize_optional_text(input.supplied_description);
         let original_input = json!({
             "url": &original_url,
             "page_url": &page_url,
             "page_title": &page_title,
             "selected_text": &supplied_caption,
+            "description": &supplied_description,
             "tags": &supplied_tags,
         });
 
@@ -332,6 +337,7 @@ impl IngestSubmission {
             page_url,
             page_title,
             supplied_caption,
+            supplied_description,
             supplied_tags,
             idempotency_key,
         })
@@ -353,6 +359,7 @@ impl IngestSubmission {
             page_url: None,
             page_title: None,
             supplied_caption: normalize_optional_text(input.supplied_caption),
+            supplied_description: None,
             supplied_tags: Vec::new(),
             idempotency_key,
         })
@@ -380,6 +387,7 @@ pub struct Ingest {
     pub page_url: Option<String>,
     pub page_title: Option<String>,
     pub supplied_caption: Option<String>,
+    pub supplied_description: Option<String>,
     pub supplied_tags: Vec<String>,
     pub idempotency_key: Option<String>,
     pub media_id: Option<Uuid>,
@@ -406,6 +414,7 @@ impl Ingest {
             page_url: submission.page_url.clone(),
             page_title: submission.page_title.clone(),
             supplied_caption: submission.supplied_caption.clone(),
+            supplied_description: submission.supplied_description.clone(),
             supplied_tags: submission.supplied_tags.clone(),
             idempotency_key: submission.idempotency_key.clone(),
             media_id: None,
@@ -587,12 +596,14 @@ mod tests {
         input.supplied_tags = vec![" Cats ".to_owned(), "cats".to_owned(), "FUN".to_owned()];
         input.page_title = Some(" Title ".to_owned());
         input.supplied_caption = Some(" Caption ".to_owned());
+        input.supplied_description = Some(" Internal description ".to_owned());
 
         let value = IngestSubmission::try_new(input).expect("submission should be valid");
 
         assert_eq!(value.supplied_tags, ["cats", "fun"]);
         assert_eq!(value.page_title.as_deref(), Some("Title"));
         assert_eq!(value.supplied_caption.as_deref(), Some("Caption"));
+        assert_eq!(value.supplied_description.as_deref(), Some("Internal description"));
     }
 
     #[test]

@@ -8,6 +8,14 @@ based; PostgreSQL stores no administrator or device-token records. Request
 bodies and timeouts are bounded, and stable errors expose a request ID without
 secrets.
 
+The Windows companion is a loopback-only fixed proxy. It accepts only
+`POST /v1/submit`, requires a separate local bearer token, caps JSON bodies, and
+forwards only the backend ingest route with a bounded timeout and a stable
+`Idempotency-Key`. Its backend URL and backend bearer token are companion-only
+configuration; neither is returned to the browser or written to logs. The
+Tampermonkey script stores only the local token and never contains the backend
+or Telegram token.
+
 Telegram accepts private messages from configured positive administrator IDs.
 Media is staged below UUID-derived workspaces. Direct HTTP rejects credentials,
 private/special destinations, and unsafe redirects. ffmpeg, ffprobe, and
