@@ -44,7 +44,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let database = Database::connect_secret(database_url, config.database.max_connections).await?;
     let mut handlers = HandlerRegistry::new();
     let download_limits = DownloadLimits {
-        max_bytes: config.telegram.max_download_bytes,
+        max_bytes: config.media.source_download_max_bytes,
         ..DownloadLimits::default()
     };
     let source_downloader: Arc<dyn SourceDownloader> = Arc::new(
@@ -58,7 +58,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     &config.telegram.api_base_url,
                     Duration::from_secs(config.telegram.poll_timeout_seconds),
                 )?
-                .with_max_download_bytes(config.telegram.max_download_bytes),
+                .with_source_download_max_bytes(config.telegram.source_download_max_bytes),
             ),
             None => None,
         };
@@ -98,6 +98,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         normalization_planner,
         normalization_executor,
         ImageNormalizer::new(CanonicalImageProfile::default())?,
+        config.media.normalized_storage_max_bytes,
     );
     handlers.register(JobType::NormalizeAsset, move |job| normalize_handler(job));
     tracing::info!("asset normalization handler enabled");
@@ -114,7 +115,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     tracing::info!("ingest finalization handler enabled");
     match (telegram_api, config.telegram.storage_chat_id) {
         (Some(api), Some(storage_chat_id)) => {
-            let provider = StorageUploadProvider::new(api, database.library(), storage_chat_id)?;
+            let provider = StorageUploadProvider::new(api, database.library(), storage_chat_id)?
+                .with_max_storage_bytes(config.media.normalized_storage_max_bytes)
+                .with_work_root(config.media.work_root.clone());
             provider.verify_storage_chat().await?;
             let storage_handler = upload_storage_asset_handler(database.inbox(), provider);
             handlers.register(JobType::UploadStorageAsset, move |job| storage_handler(job));

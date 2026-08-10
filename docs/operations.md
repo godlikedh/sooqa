@@ -34,9 +34,56 @@ when diagnosing a crash.
 ## Telegram and media
 
 Telegram polling is enabled only when its bot token and configured admin IDs
-are present. `SOOQA_TELEGRAM_MAX_DOWNLOAD_BYTES` bounds staged media. The
-server and worker must share `media.work_root`; ffprobe and ffmpeg are needed
-for probing and normalization.
+are present. The three media budgets are intentionally separate:
+
+- `SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES` bounds URL/link source staging and
+  may be larger than 2 GB because normalization can reduce the source;
+- `SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES` bounds Telegram-source staging;
+- `SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES` bounds the canonical normalized
+  object uploaded to Telegram storage. It must remain below the documented
+  2000 MB local Bot API upload limit.
+
+The server and worker must share `media.work_root`; ffprobe and ffmpeg are
+needed for probing and normalization. Source downloads and Telegram uploads
+are streamed or path-based; no file-sized byte buffer is used.
+
+## Home local Bot API deployment
+
+The development Compose file at the repository root contains only PostgreSQL.
+The self-hosted home topology is separate and lives under `deploy/home`; its
+named volumes are therefore separate from development and CI volumes.
+
+Prepare the deployment without committing secrets:
+
+```bash
+cp deploy/home/.env.example deploy/home/.env
+# edit deploy/home/.env
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml build
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml run --rm server migrate
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml up -d
+```
+
+The official `tdlib/telegram-bot-api` source is built at the commit pinned in
+`deploy/telegram-bot-api/Dockerfile`. The local server runs with `--local`,
+stores its working state in the dedicated `home-telegram-bot-api-data` volume,
+and exposes port 8081 only to the Compose network. sooqa reaches it as
+`http://telegram-bot-api:8081`; the server and worker share only the separate
+`home-sooqa-work` volume for sooqa media workspaces.
+
+Do not run this cutover automatically. To move a running bot from the cloud to
+the local server, obtain owner authorization, stop every sooqa poller, call
+`logOut` against the cloud endpoint, start the local Bot API service, wait for
+its health check, verify `getMe`, the configured administrator, and storage
+channel permissions, and only then start the sooqa server/worker. For rollback,
+stop every poller, call `logOut` against the local endpoint, switch the base URL
+back to `https://api.telegram.org`, verify `getMe` and permissions, and start
+the poller again. Never use `down --volumes` as part of either operation.
+
+The official local server accepts HTTP and needs TLS termination if it is ever
+placed behind a remote endpoint; the Compose service here is intentionally
+private. See the [official local Bot API documentation](https://core.telegram.org/bots/api#using-a-local-bot-api-server)
+and [upstream server README](https://github.com/tdlib/telegram-bot-api#usage)
+for Telegram-side requirements.
 
 ## Storage ambiguity
 

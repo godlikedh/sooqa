@@ -39,8 +39,9 @@ pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorizat
 pub const STATUS_RESPONSE: &str = "sooqa is online.";
 pub const UNAUTHORIZED_RESPONSE: &str = "This bot is restricted to its configured administrator.";
 pub const ADD_USAGE_RESPONSE: &str = "Send one http(s) URL after /add, or send a bare URL.";
-pub const DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
+const TELEGRAM_CLOUD_UPLOAD_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
 const DEFAULT_MEDIA_WORK_ROOT_NAME: &str = "sooqa-telegram-work";
 const RESPONSE_RATE_LIMIT: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -333,7 +334,7 @@ pub struct TelegramService<A, S, I = ()> {
     admin_user_ids: Arc<BTreeSet<i64>>,
     response_limiter: Arc<Mutex<HashMap<RateLimitKey, Instant>>>,
     media_work_root: PathBuf,
-    max_download_bytes: u64,
+    source_download_max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -355,7 +356,7 @@ where
             admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
             response_limiter: Arc::new(Mutex::new(HashMap::new())),
             media_work_root: default_media_work_root(),
-            max_download_bytes: DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES,
+            source_download_max_bytes: DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
         }
     }
 }
@@ -379,7 +380,7 @@ where
             admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
             response_limiter: Arc::new(Mutex::new(HashMap::new())),
             media_work_root: default_media_work_root(),
-            max_download_bytes: DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES,
+            source_download_max_bytes: DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
         }
     }
 
@@ -388,8 +389,8 @@ where
         self
     }
 
-    pub fn with_max_download_bytes(mut self, max_download_bytes: u64) -> Self {
-        self.max_download_bytes = max_download_bytes;
+    pub fn with_source_download_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.source_download_max_bytes = max_bytes;
         self
     }
 
@@ -541,10 +542,10 @@ where
             } => (None, file_id, file_unique_id, file_size, mime_type, file_name),
         };
         let response = {
-            if file_size.map(u64::from).is_some_and(|size| size > self.max_download_bytes) {
+            if file_size.map(u64::from).is_some_and(|size| size > self.source_download_max_bytes) {
                 let response = format!(
                     "⚠️ Telegram file exceeds the configured download limit of {} bytes",
-                    self.max_download_bytes
+                    self.source_download_max_bytes
                 );
                 if !self.allow_response(message.user_id, message.chat_id) {
                     self.complete(claim).await?;
@@ -950,7 +951,8 @@ impl CallbackData {
 pub struct TeloxideApi {
     bot: Bot,
     cloud_download_limit_bytes: Option<u64>,
-    max_download_bytes: u64,
+    cloud_upload_limit_bytes: Option<u64>,
+    source_download_max_bytes: u64,
 }
 
 impl TeloxideApi {
@@ -964,13 +966,10 @@ impl TeloxideApi {
         }
         let api_base_url = Url::parse(api_base_url)
             .map_err(|error| TelegramError::InvalidApiBaseUrl(error.to_string()))?;
-        if !matches!(api_base_url.scheme(), "http" | "https")
-            || api_base_url.host_str().is_none()
-            || !api_base_url.username().is_empty()
-            || api_base_url.password().is_some()
-        {
+        if !is_safe_api_base_url(&api_base_url) {
             return Err(TelegramError::InvalidApiBaseUrl(
-                "must be an HTTP(S) URL without credentials".to_owned(),
+                "must be an HTTP(S) URL without credentials; HTTP URLs must use a private host"
+                    .to_owned(),
             ));
         }
         let client_timeout = poll_timeout.checked_add(Duration::from_secs(5)).ok_or_else(|| {
@@ -980,22 +979,56 @@ impl TeloxideApi {
             .timeout(client_timeout)
             .build()
             .map_err(TelegramError::HttpClient)?;
-        let cloud_download_limit_bytes = (api_base_url.host_str() == Some("api.telegram.org"))
-            .then_some(TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES);
+        let is_cloud = api_base_url.host_str() == Some("api.telegram.org");
         Ok(Self {
             bot: Bot::with_client(token, client).set_api_url(api_base_url),
-            cloud_download_limit_bytes,
-            max_download_bytes: DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES,
+            cloud_download_limit_bytes: is_cloud.then_some(TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES),
+            cloud_upload_limit_bytes: is_cloud.then_some(TELEGRAM_CLOUD_UPLOAD_LIMIT_BYTES),
+            source_download_max_bytes: DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
         })
     }
 
-    pub fn with_max_download_bytes(mut self, max_download_bytes: u64) -> Self {
-        self.max_download_bytes = max_download_bytes;
+    pub fn with_source_download_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.source_download_max_bytes = max_bytes;
         self
     }
 
     fn bot(&self) -> Bot {
         self.bot.clone()
+    }
+}
+
+fn is_safe_api_base_url(url: &Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    if url.scheme() == "https" {
+        return true;
+    }
+
+    let Some(host) = url.host_str() else { return false };
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => {
+            !address.is_unspecified()
+                && (address.is_loopback() || address.is_private() || address.is_link_local())
+        }
+        Ok(std::net::IpAddr::V6(address)) => {
+            !address.is_unspecified()
+                && (address.is_loopback()
+                    || address.is_unique_local()
+                    || address.is_unicast_link_local())
+        }
+        Err(_) => {
+            host.eq_ignore_ascii_case("localhost")
+                || !host.contains('.')
+                || host.ends_with(".local")
+        }
     }
 }
 
@@ -1036,8 +1069,8 @@ impl TelegramApi for TeloxideApi {
             .map_err(TelegramApiError::Api)?;
         let size = u64::from(file.meta.size);
         let limit =
-            self.cloud_download_limit_bytes.map_or(self.max_download_bytes, |cloud_limit| {
-                cloud_limit.min(self.max_download_bytes)
+            self.cloud_download_limit_bytes.map_or(self.source_download_max_bytes, |cloud_limit| {
+                cloud_limit.min(self.source_download_max_bytes)
             });
         if size > limit {
             return Err(TelegramApiError::DownloadLimit { size, limit });
@@ -1175,10 +1208,10 @@ where
         self
     }
 
-    pub fn with_max_download_bytes(mut self, max_download_bytes: u64) -> Self {
-        self.api = self.api.with_max_download_bytes(max_download_bytes);
+    pub fn with_source_download_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.api = self.api.with_source_download_max_bytes(max_bytes);
         self.service.api = self.api.clone();
-        self.service = self.service.with_max_download_bytes(max_download_bytes);
+        self.service = self.service.with_source_download_max_bytes(max_bytes);
         self
     }
 
@@ -1665,7 +1698,7 @@ mod tests {
         let ingest = MockIngestService::default();
         let service =
             TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone())
-                .with_max_download_bytes(1024);
+                .with_source_download_max_bytes(1024);
         let message = IncomingMessage {
             update_id: 111,
             message_id: 199,
@@ -1935,13 +1968,15 @@ mod tests {
             TeloxideApi::new("test-token", "https://api.telegram.org", Duration::from_secs(1))
                 .expect("cloud Bot API URL should be accepted");
         assert_eq!(cloud.cloud_download_limit_bytes, Some(20 * 1024 * 1024));
-        assert_eq!(cloud.max_download_bytes, DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES);
+        assert_eq!(cloud.cloud_upload_limit_bytes, Some(50 * 1024 * 1024));
+        assert_eq!(cloud.source_download_max_bytes, DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES);
 
         let local =
             TeloxideApi::new("test-token", "http://telegram-bot-api:8081", Duration::from_secs(1))
                 .expect("Local Bot API URL should be accepted");
         assert_eq!(local.cloud_download_limit_bytes, None);
-        assert_eq!(local.max_download_bytes, DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES);
+        assert_eq!(local.cloud_upload_limit_bytes, None);
+        assert_eq!(local.source_download_max_bytes, DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES);
     }
 
     #[test]

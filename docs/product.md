@@ -25,6 +25,14 @@ The first release is intentionally narrow:
 - searchable stored media with captions/descriptions and normalized tags;
 - immediate publication or a simple per-channel cadence queue.
 
+Large-media capture uses Telegram's official local Bot API server when the home
+deployment is cut over manually. URL/link source downloads, Telegram-source
+downloads, and canonical normalized storage output have separate budgets. The
+source budgets may exceed the cloud Bot API's download limit; only the
+canonical normalized object is uploaded, and its configurable ceiling remains
+below the local server's documented 2000 MB upload maximum. Original inputs
+remain transient workspace artifacts.
+
 ## Target persistence model
 
 The durable application model has four product tables and one technical queue

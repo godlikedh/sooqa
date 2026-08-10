@@ -165,6 +165,16 @@ Exact duplicates reuse the existing media row, strong perceptual matches stop
 at durable `duplicate_pending`, and no-match videos insert one
 `pending_storage` reservation before upload.
 
+The home deployment adds the official `tdlib/telegram-bot-api` service in
+`--local` mode. It is built at a pinned upstream commit, has a dedicated
+persistent working volume, and is reachable only as
+`http://telegram-bot-api:8081` on the Compose network. The application server
+and worker share the sooqa work-root volume with each other; the Bot API data
+volume is separate. Telegram downloads and uploads remain path-based or
+streamed, so large files do not enter JSON or a `Vec<u8>`. Cloud/local bot
+cutover is an owner-authorized operational procedure, never an application
+state transition.
+
 ## Publisher
 
 Channels hold only target identity, enablement, timezone, window, and interval.

@@ -13,6 +13,11 @@ ffmpeg_path = "ffmpeg"
 ffprobe_path = "ffprobe"
 ytdlp_path = "yt-dlp"
 ytdlp_format = "bestvideo*+bestaudio/best"
+# Maximum bytes staged from a URL before normalization. This may exceed 2 GB
+# because the canonical normalized output has its own lower ceiling.
+source_download_max_bytes = 8589934592
+# Must remain below Telegram local Bot API's documented 2000 MB upload limit.
+normalized_storage_max_bytes = 1900000000
 
 [companion]
 listen_address = "127.0.0.1:47831"
@@ -25,7 +30,8 @@ max_connections = 20
 api_base_url = "https://api.telegram.org"
 admin_user_ids = []
 poll_timeout_seconds = 30
-max_download_bytes = 2147483648
+# Telegram-source download budget; the local Bot API has no download limit.
+source_download_max_bytes = 2147483648
 # Private Telegram channel used for durable media storage.
 # storage_chat_id = -1001234567890
 

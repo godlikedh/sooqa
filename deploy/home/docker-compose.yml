@@ -1,0 +1,90 @@
+name: sooqa-home
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sooqa
+      POSTGRES_USER: sooqa
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/home/.env}
+    volumes:
+      - home-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sooqa -d sooqa"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  telegram-bot-api:
+    build:
+      context: ../..
+      dockerfile: deploy/telegram-bot-api/Dockerfile
+      args:
+        TELEGRAM_BOT_API_REF: adfd7f6a8e990272851777eeb3ae0def4216f161
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?set TELEGRAM_API_ID in deploy/home/.env}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH in deploy/home/.env}
+      SOOQA_HEALTH_BOT_TOKEN: ${SOOQA_TELEGRAM_BOT_TOKEN:?set SOOQA_TELEGRAM_BOT_TOKEN in deploy/home/.env}
+    command:
+      - --local
+      - --dir=/var/lib/telegram-bot-api
+      - --http-port=8081
+    expose:
+      - "8081"
+    volumes:
+      - home-telegram-bot-api-data:/var/lib/telegram-bot-api
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:8081/bot$${SOOQA_HEALTH_BOT_TOKEN}/getMe >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  server:
+    image: sooqa:home
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      telegram-bot-api:
+        condition: service_healthy
+    environment: &sooqa-environment
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in deploy/home/.env}
+      SOOQA_API_TOKEN: ${SOOQA_API_TOKEN:?set SOOQA_API_TOKEN in deploy/home/.env}
+      SOOQA_TELEGRAM_BOT_TOKEN: ${SOOQA_TELEGRAM_BOT_TOKEN:?set SOOQA_TELEGRAM_BOT_TOKEN in deploy/home/.env}
+      SOOQA_TELEGRAM_API_BASE_URL: http://telegram-bot-api:8081
+      SOOQA_TELEGRAM_ADMIN_USER_IDS: ${SOOQA_TELEGRAM_ADMIN_USER_IDS:?set SOOQA_TELEGRAM_ADMIN_USER_IDS in deploy/home/.env}
+      SOOQA_TELEGRAM_STORAGE_CHAT_ID: ${SOOQA_TELEGRAM_STORAGE_CHAT_ID:?set SOOQA_TELEGRAM_STORAGE_CHAT_ID in deploy/home/.env}
+      SOOQA_MEDIA_WORK_ROOT: /var/lib/sooqa/work
+      SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES: ${SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES:-8589934592}
+      SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES: ${SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES:-1900000000}
+      SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: ${SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES:-2147483648}
+      SOOQA_SERVER_LISTEN_ADDRESS: 0.0.0.0:8080
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - home-sooqa-work:/var/lib/sooqa/work
+
+  worker:
+    image: sooqa:home
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/sooqa-worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      telegram-bot-api:
+        condition: service_healthy
+    environment: *sooqa-environment
+    volumes:
+      - home-sooqa-work:/var/lib/sooqa/work
+
+volumes:
+  home-postgres-data:
+  home-telegram-bot-api-data:
+  home-sooqa-work:

@@ -2,8 +2,8 @@ use std::{path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use sooqa_library::{
-    MediaKind, StorageReceipt, StorageUploadReservation, StorageUploadReservationRequest,
-    StorageUploadStore,
+    MediaKind, StorageCaptionMetadata, StorageReceipt, StorageUploadReservation,
+    StorageUploadReservationRequest, StorageUploadStore,
 };
 use sooqa_media::sha256_file;
 use teloxide::{
@@ -57,6 +57,10 @@ pub trait TelegramStorageApi: Clone + Send + Sync + 'static {
     async fn verify_storage_chat(&self, chat_id: i64) -> Result<(), Self::Error>;
 
     fn is_ambiguous_error(error: &Self::Error) -> bool;
+
+    fn max_upload_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Debug, Error)]
@@ -87,6 +91,16 @@ pub enum StorageUploadError {
     InvalidSha256Length { actual: usize },
     #[error("media file is not available at {path}")]
     LocalFileUnavailable { path: PathBuf },
+    #[error("media file {path} is outside the configured work root {root}")]
+    LocalFileOutsideWorkRoot { path: PathBuf, root: PathBuf },
+    #[error(
+        "canonical media file is {size} bytes, above the configured storage ceiling of {limit} bytes"
+    )]
+    StorageOutputLimitExceeded { size: u64, limit: u64 },
+    #[error(
+        "canonical media file is {size} bytes, above the Telegram upload limit of {limit} bytes"
+    )]
+    TelegramUploadLimitExceeded { size: u64, limit: u64 },
     #[error("could not hash canonical asset: {0}")]
     Hash(#[source] sooqa_media::HashError),
     #[error("media hash mismatch: expected {expected}, got {actual}")]
@@ -120,6 +134,8 @@ pub struct StorageUploadProvider<A, S> {
     api: A,
     store: S,
     storage_chat_id: i64,
+    max_storage_bytes: Option<u64>,
+    work_root: Option<PathBuf>,
 }
 
 const STORAGE_UPLOAD_LEASE_DURATION: Duration = Duration::from_secs(600);
@@ -134,7 +150,17 @@ where
         if storage_chat_id >= 0 {
             return Err(StorageUploadError::InvalidStorageChatId);
         }
-        Ok(Self { api, store, storage_chat_id })
+        Ok(Self { api, store, storage_chat_id, max_storage_bytes: None, work_root: None })
+    }
+
+    pub fn with_max_storage_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_storage_bytes = Some(max_bytes);
+        self
+    }
+
+    pub fn with_work_root(mut self, work_root: impl Into<PathBuf>) -> Self {
+        self.work_root = Some(work_root.into());
+        self
     }
 
     pub async fn verify_storage_chat(&self) -> Result<(), StorageUploadError> {
@@ -177,11 +203,45 @@ where
             .map(PathBuf::from)
             .ok_or(StorageUploadError::MediaMissingWorkPath(input.media_id))?;
 
+        let symlink_metadata =
+            tokio::fs::symlink_metadata(&local_work_path).await.map_err(|_| {
+                StorageUploadError::LocalFileUnavailable { path: local_work_path.clone() }
+            })?;
+        if !symlink_metadata.is_file() || symlink_metadata.file_type().is_symlink() {
+            return Err(StorageUploadError::LocalFileUnavailable { path: local_work_path.clone() });
+        }
+        if let Some(work_root) = &self.work_root {
+            let canonical_root = tokio::fs::canonicalize(work_root).await.map_err(|_| {
+                StorageUploadError::LocalFileUnavailable { path: work_root.clone() }
+            })?;
+            let canonical_file = tokio::fs::canonicalize(&local_work_path).await.map_err(|_| {
+                StorageUploadError::LocalFileUnavailable { path: local_work_path.clone() }
+            })?;
+            if !canonical_file.starts_with(&canonical_root) {
+                return Err(StorageUploadError::LocalFileOutsideWorkRoot {
+                    path: local_work_path.clone(),
+                    root: canonical_root,
+                });
+            }
+        }
         let metadata = tokio::fs::metadata(&local_work_path).await.map_err(|_| {
             StorageUploadError::LocalFileUnavailable { path: local_work_path.clone() }
         })?;
-        if !metadata.is_file() {
-            return Err(StorageUploadError::LocalFileUnavailable { path: local_work_path.clone() });
+        if let Some(limit) = self.max_storage_bytes
+            && metadata.len() > limit
+        {
+            return Err(StorageUploadError::StorageOutputLimitExceeded {
+                size: metadata.len(),
+                limit,
+            });
+        }
+        if let Some(limit) = self.api.max_upload_bytes()
+            && metadata.len() > limit
+        {
+            return Err(StorageUploadError::TelegramUploadLimitExceeded {
+                size: metadata.len(),
+                limit,
+            });
         }
 
         let expected_sha256 = hex_encode(&expected_sha256_bytes);
@@ -192,6 +252,12 @@ where
                 actual: digest.sha256,
             });
         }
+
+        let caption_metadata = self
+            .store
+            .find_storage_caption(input.media_id)
+            .await
+            .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
 
         let reservation = self
             .store
@@ -224,7 +290,7 @@ where
             storage_chat_id: self.storage_chat_id,
             media_kind: media.kind,
             local_work_path,
-            caption: storage_caption(input.media_id, &expected_sha256),
+            caption: storage_caption(&caption_metadata),
         };
         let mut upload = Box::pin(self.api.upload_media(request));
         let mut renewal = tokio::time::interval(STORAGE_UPLOAD_RENEW_INTERVAL);
@@ -300,8 +366,43 @@ where
     }
 }
 
-fn storage_caption(media_id: Uuid, sha256: &str) -> String {
-    format!("media: {media_id}\nsha256: {}", &sha256[..sha256.len().min(12)])
+const STORAGE_CAPTION_MAX_CHARS: usize = 1_024;
+const STORAGE_CAPTION_FIELD_MAX_CHARS: usize = 512;
+
+fn storage_caption(metadata: &StorageCaptionMetadata) -> String {
+    let mut lines = Vec::new();
+    if let Some(description) = bounded_caption_value(metadata.description.as_deref()) {
+        lines.push(format!("description: {description}"));
+    }
+    if !metadata.tags.is_empty() {
+        let tags = metadata
+            .tags
+            .iter()
+            .filter_map(|tag| bounded_caption_value(Some(tag)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !tags.is_empty() {
+            lines.push(format!("tags: {tags}"));
+        }
+    }
+    if let Some(source) = bounded_caption_value(metadata.source.as_deref()) {
+        lines.push(format!("source: {source}"));
+    }
+    let caption = if lines.is_empty() { "sooqa".to_owned() } else { lines.join("\n") };
+    truncate_chars(&caption, STORAGE_CAPTION_MAX_CHARS)
+}
+
+fn bounded_caption_value(value: Option<&str>) -> Option<String> {
+    let value = value?
+        .chars()
+        .map(|character| if character.is_control() { ' ' } else { character })
+        .collect::<String>();
+    let value = value.trim();
+    (!value.is_empty()).then(|| truncate_chars(value, STORAGE_CAPTION_FIELD_MAX_CHARS))
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -332,6 +433,10 @@ impl TelegramStorageApi for TeloxideApi {
             | StorageUploadApiError::StorageBotNotAdministrator
             | StorageUploadApiError::StorageBotCannotPost => false,
         }
+    }
+
+    fn max_upload_bytes(&self) -> Option<u64> {
+        self.cloud_upload_limit_bytes
     }
 
     async fn upload_media(
@@ -440,6 +545,7 @@ mod tests {
         requests: Arc<Mutex<Vec<StorageUploadRequest>>>,
         fail: Arc<Mutex<bool>>,
         ambiguous: Arc<Mutex<bool>>,
+        upload_limit: Arc<Mutex<Option<u64>>>,
     }
 
     #[derive(Debug, Error)]
@@ -475,6 +581,10 @@ mod tests {
 
         async fn verify_storage_chat(&self, _chat_id: i64) -> Result<(), Self::Error> {
             Ok(())
+        }
+
+        fn max_upload_bytes(&self) -> Option<u64> {
+            *self.upload_limit.lock().expect("mock mutex should not be poisoned")
         }
     }
 
@@ -587,7 +697,7 @@ mod tests {
             kind: MediaKind::Video,
             status: sooqa_library::MediaStatus::Active,
             title: None,
-            description: None,
+            description: Some("internal description".to_owned()),
             notes: None,
             mime_type: Some("video/mp4".to_owned()),
             container: Some("mp4".to_owned()),
@@ -608,7 +718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uploads_hashed_asset_with_diagnostic_caption_and_reuses_object() {
+    async fn uploads_hashed_asset_with_bounded_internal_caption_and_reuses_object() {
         let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
         tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
         let digest = sha256_file(&path).await.expect("fixture should hash");
@@ -622,10 +732,56 @@ mod tests {
         let outcome = provider.upload(input()).await.expect("upload should succeed");
         assert!(matches!(outcome, StorageUploadOutcome::Uploaded(_)));
         let request = api.requests.lock().unwrap().pop().expect("one upload should be sent");
-        assert!(request.caption.contains("media: 00000000-0000-0000-0000-000000000001"));
+        assert_eq!(request.caption, "description: internal description");
+        assert!(!request.caption.contains("00000000-0000-0000-0000-000000000001"));
+        assert!(!request.caption.contains(&digest.sha256));
 
         let outcome = provider.upload(input()).await.expect("stored object should be reused");
         assert!(matches!(outcome, StorageUploadOutcome::Reused(_)));
+        assert!(api.requests.lock().unwrap().is_empty());
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn storage_ceiling_rejects_canonical_asset_before_reservation_or_upload() {
+        let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let digest = sha256_file(&path).await.expect("fixture should hash");
+        let api = MockApi::default();
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
+        let provider = StorageUploadProvider::new(api.clone(), store.clone(), -100123)
+            .expect("storage chat ID should be valid")
+            .with_max_storage_bytes(4);
+
+        assert!(matches!(
+            provider.upload(input()).await,
+            Err(StorageUploadError::StorageOutputLimitExceeded { size: 15, limit: 4 })
+        ));
+        assert!(!*store.reserved.lock().unwrap());
+        assert!(api.requests.lock().unwrap().is_empty());
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn cloud_upload_limit_rejects_canonical_asset_before_reservation_or_upload() {
+        let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let digest = sha256_file(&path).await.expect("fixture should hash");
+        let api = MockApi::default();
+        *api.upload_limit.lock().unwrap() = Some(4);
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
+        let provider = StorageUploadProvider::new(api.clone(), store.clone(), -100123)
+            .expect("storage chat ID should be valid");
+
+        assert!(matches!(
+            provider.upload(input()).await,
+            Err(StorageUploadError::TelegramUploadLimitExceeded { size: 15, limit: 4 })
+        ));
+        assert!(!*store.reserved.lock().unwrap());
         assert!(api.requests.lock().unwrap().is_empty());
         tokio::fs::remove_file(path).await.expect("fixture should be removed");
     }

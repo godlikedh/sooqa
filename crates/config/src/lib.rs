@@ -2,7 +2,7 @@
 
 use std::{
     env, fmt, fs,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -21,7 +21,10 @@ const DEFAULT_YTDLP_FORMAT: &str = "bestvideo*+bestaudio/best";
 const DEFAULT_MEDIA_WORK_ROOT: &str = "/var/lib/sooqa/work";
 const DEFAULT_TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
 const DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS: u64 = 30;
-const DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_NORMALIZED_STORAGE_MAX_BYTES: u64 = 1_900_000_000;
+const TELEGRAM_LOCAL_MAX_UPLOAD_BYTES: u64 = 2_000_000_000;
 const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_LEVEL: &str = "info";
 
@@ -227,6 +230,8 @@ pub struct MediaConfig {
     pub ffprobe_path: PathBuf,
     pub ytdlp_path: PathBuf,
     pub ytdlp_format: String,
+    pub source_download_max_bytes: u64,
+    pub normalized_storage_max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -239,7 +244,7 @@ pub struct TelegramConfig {
     pub api_base_url: String,
     pub admin_user_ids: Vec<i64>,
     pub poll_timeout_seconds: u64,
-    pub max_download_bytes: u64,
+    pub source_download_max_bytes: u64,
     pub storage_chat_id: Option<i64>,
 }
 
@@ -357,6 +362,14 @@ impl AppConfig {
                     .media
                     .ytdlp_format
                     .unwrap_or_else(|| DEFAULT_YTDLP_FORMAT.to_owned()),
+                source_download_max_bytes: raw
+                    .media
+                    .source_download_max_bytes
+                    .unwrap_or(DEFAULT_SOURCE_DOWNLOAD_MAX_BYTES),
+                normalized_storage_max_bytes: raw
+                    .media
+                    .normalized_storage_max_bytes
+                    .unwrap_or(DEFAULT_NORMALIZED_STORAGE_MAX_BYTES),
             },
             companion: CompanionConfig {
                 listen_address: raw
@@ -378,10 +391,10 @@ impl AppConfig {
                     .telegram
                     .poll_timeout_seconds
                     .unwrap_or(DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS),
-                max_download_bytes: raw
+                source_download_max_bytes: raw
                     .telegram
-                    .max_download_bytes
-                    .unwrap_or(DEFAULT_TELEGRAM_MAX_DOWNLOAD_BYTES),
+                    .source_download_max_bytes
+                    .unwrap_or(DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES),
                 storage_chat_id: raw.telegram.storage_chat_id,
             },
             observability: ObservabilityConfig { log_format, log_level },
@@ -395,7 +408,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.max_download_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -408,13 +421,15 @@ impl AppConfig {
             self.media.ffprobe_path.display(),
             self.media.ytdlp_path.display(),
             self.media.ytdlp_format,
+            self.media.source_download_max_bytes,
+            self.media.normalized_storage_max_bytes,
             self.companion.listen_address,
             self.database.url_env,
             self.database.max_connections,
             self.telegram.api_base_url,
             self.telegram.admin_user_ids.len(),
             self.telegram.poll_timeout_seconds,
-            self.telegram.max_download_bytes,
+            self.telegram.source_download_max_bytes,
             self.telegram.storage_chat_id,
             self.observability.log_format,
             self.observability.log_level,
@@ -457,6 +472,20 @@ impl AppConfig {
         if let Some(value) = optional_env_string("SOOQA_MEDIA_YTDLP_FORMAT")? {
             self.media.ytdlp_format = value;
         }
+        if let Some(value) = optional_env_string("SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES")? {
+            self.media.source_download_max_bytes =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
+        }
+        if let Some(value) = optional_env_string("SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES")? {
+            self.media.normalized_storage_max_bytes =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
+        }
         if let Some(value) = optional_env_string("SOOQA_COMPANION_LISTEN_ADDRESS")? {
             self.companion.listen_address = value;
         }
@@ -498,10 +527,10 @@ impl AppConfig {
                     reason: "expected a positive integer",
                 })?;
         }
-        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_MAX_DOWNLOAD_BYTES")? {
-            self.telegram.max_download_bytes =
+        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES")? {
+            self.telegram.source_download_max_bytes =
                 value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_TELEGRAM_MAX_DOWNLOAD_BYTES".to_owned(),
+                    name: "SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES".to_owned(),
                     reason: "expected a positive integer",
                 })?;
         }
@@ -561,14 +590,10 @@ impl AppConfig {
                 reason: "must be a valid HTTP(S) URL",
             }
         })?;
-        if !matches!(api_base_url.scheme(), "http" | "https")
-            || api_base_url.host_str().is_none()
-            || !api_base_url.username().is_empty()
-            || api_base_url.password().is_some()
-        {
+        if !is_safe_telegram_api_base_url(&api_base_url) {
             return Err(ConfigError::InvalidValue {
                 name: "telegram.api_base_url".to_owned(),
-                reason: "must be an HTTP(S) URL without credentials",
+                reason: "must be an HTTP(S) URL without credentials; HTTP URLs must use a private host",
             });
         }
         if self.telegram.poll_timeout_seconds == 0 {
@@ -577,10 +602,28 @@ impl AppConfig {
                 reason: "must be greater than zero",
             });
         }
-        if self.telegram.max_download_bytes == 0 {
+        if self.telegram.source_download_max_bytes == 0 {
             return Err(ConfigError::InvalidValue {
-                name: "telegram.max_download_bytes".to_owned(),
+                name: "telegram.source_download_max_bytes".to_owned(),
                 reason: "must be greater than zero",
+            });
+        }
+        if self.media.source_download_max_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.source_download_max_bytes".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.media.normalized_storage_max_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.normalized_storage_max_bytes".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.media.normalized_storage_max_bytes >= TELEGRAM_LOCAL_MAX_UPLOAD_BYTES {
+            return Err(ConfigError::InvalidValue {
+                name: "media.normalized_storage_max_bytes".to_owned(),
+                reason: "must be below Telegram's 2000 MB local upload limit",
             });
         }
         if self.telegram.storage_chat_id.is_some_and(|id| id >= 0) {
@@ -653,7 +696,7 @@ struct RawTelegramConfig {
     api_base_url: Option<String>,
     admin_user_ids: Vec<i64>,
     poll_timeout_seconds: Option<u64>,
-    max_download_bytes: Option<u64>,
+    source_download_max_bytes: Option<u64>,
     storage_chat_id: Option<i64>,
 }
 
@@ -687,6 +730,8 @@ struct RawMediaConfig {
     ffprobe_path: Option<String>,
     ytdlp_path: Option<String>,
     ytdlp_format: Option<String>,
+    source_download_max_bytes: Option<u64>,
+    normalized_storage_max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -762,6 +807,40 @@ fn parse_socket_address(name: &str, value: &str) -> Result<SocketAddr, ConfigErr
         name: name.to_owned(),
         reason: "expected an IP address and port such as 127.0.0.1:8080",
     })
+}
+
+fn is_safe_telegram_api_base_url(url: &url::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    if url.scheme() == "https" {
+        return true;
+    }
+
+    let Some(host) = url.host_str() else { return false };
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            !address.is_unspecified()
+                && (address.is_loopback() || address.is_private() || address.is_link_local())
+        }
+        Ok(IpAddr::V6(address)) => {
+            !address.is_unspecified()
+                && (address.is_loopback()
+                    || address.is_unique_local()
+                    || address.is_unicast_link_local())
+        }
+        Err(_) => {
+            host.eq_ignore_ascii_case("localhost")
+                || !host.contains('.')
+                || host.ends_with(".local")
+        }
+    }
 }
 
 fn parse_log_format(value: &str) -> Result<LogFormat, ConfigError> {
@@ -954,7 +1033,12 @@ mod tests {
         assert_eq!(config.telegram.api_base_url, "http://telegram-bot-api:8081");
         assert_eq!(config.telegram.admin_user_ids, vec![123456789]);
         assert_eq!(config.telegram.poll_timeout_seconds, 45);
-        assert_eq!(config.telegram.max_download_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            config.telegram.source_download_max_bytes,
+            DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES
+        );
+        assert_eq!(config.media.source_download_max_bytes, DEFAULT_SOURCE_DOWNLOAD_MAX_BYTES);
+        assert_eq!(config.media.normalized_storage_max_bytes, DEFAULT_NORMALIZED_STORAGE_MAX_BYTES);
         assert_eq!(config.telegram.storage_chat_id, Some(-1001234567890));
     }
 
@@ -980,6 +1064,56 @@ mod tests {
 
         let error = config.validate().expect_err("Telegram API credentials must fail");
         assert!(error.to_string().contains("without credentials"));
+    }
+
+    #[test]
+    fn public_http_telegram_api_url_is_rejected() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Server,
+            None,
+            "[telegram]\napi_base_url = \"http://api.example.test:8081\"\n",
+        )
+        .expect("TOML should parse");
+
+        let error = config.validate().expect_err("public HTTP URL must fail");
+        assert!(error.to_string().contains("private host"));
+    }
+
+    #[test]
+    fn limits_reject_zero_and_unsafe_normalized_output() {
+        let zero = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media]\nsource_download_max_bytes = 0\n",
+        )
+        .expect("TOML should parse");
+        assert!(matches!(
+            zero.validate(),
+            Err(ConfigError::InvalidValue { name, .. }) if name == "media.source_download_max_bytes"
+        ));
+
+        let too_large = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media]\nnormalized_storage_max_bytes = 2000000000\n",
+        )
+        .expect("TOML should parse");
+        assert!(matches!(
+            too_large.validate(),
+            Err(ConfigError::InvalidValue { name, .. }) if name == "media.normalized_storage_max_bytes"
+        ));
+    }
+
+    #[test]
+    fn source_limit_can_exceed_two_gigabytes_but_output_stays_below_local_upload_limit() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media]\nsource_download_max_bytes = 3221225472\nnormalized_storage_max_bytes = 1900000000\n[telegram]\nsource_download_max_bytes = 3221225472\n",
+        )
+        .expect("TOML should parse");
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]
