@@ -14,6 +14,11 @@ const DEFAULT_SERVER_LISTEN_ADDRESS: &str = "0.0.0.0:8080";
 const DEFAULT_WORKER_POLL_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_WORKER_LEASE_DURATION_SECONDS: u64 = 60;
 const DEFAULT_COMPANION_LISTEN_ADDRESS: &str = "127.0.0.1:47831";
+const DEFAULT_COMPANION_BACKEND_URL: &str = "http://127.0.0.1:8080";
+const DEFAULT_COMPANION_REQUEST_BODY_LIMIT_BYTES: usize = 64 * 1024;
+const DEFAULT_COMPANION_REQUEST_TIMEOUT_SECONDS: u64 = 15;
+const MAX_COMPANION_REQUEST_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+const MAX_COMPANION_REQUEST_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
 const DEFAULT_FFPROBE_PATH: &str = "ffprobe";
 const DEFAULT_YTDLP_PATH: &str = "yt-dlp";
@@ -239,9 +244,28 @@ pub struct MediaConfig {
     pub normalized_storage_max_bytes: u64,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CompanionConfig {
     pub listen_address: String,
+    pub backend_url: String,
+    pub local_token: SecretString,
+    pub backend_token: SecretString,
+    pub request_body_limit_bytes: usize,
+    pub request_timeout_seconds: u64,
+}
+
+impl fmt::Debug for CompanionConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompanionConfig")
+            .field("listen_address", &self.listen_address)
+            .field("backend_url", &"[REDACTED]")
+            .field("local_token", &self.local_token)
+            .field("backend_token", &self.backend_token)
+            .field("request_body_limit_bytes", &self.request_body_limit_bytes)
+            .field("request_timeout_seconds", &self.request_timeout_seconds)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -386,6 +410,20 @@ impl AppConfig {
                     .companion
                     .listen_address
                     .unwrap_or_else(|| DEFAULT_COMPANION_LISTEN_ADDRESS.to_owned()),
+                backend_url: raw
+                    .companion
+                    .backend_url
+                    .unwrap_or_else(|| DEFAULT_COMPANION_BACKEND_URL.to_owned()),
+                local_token: SecretString::new(raw.companion.local_token.unwrap_or_default()),
+                backend_token: SecretString::new(raw.companion.backend_token.unwrap_or_default()),
+                request_body_limit_bytes: raw
+                    .companion
+                    .request_body_limit_bytes
+                    .unwrap_or(DEFAULT_COMPANION_REQUEST_BODY_LIMIT_BYTES),
+                request_timeout_seconds: raw
+                    .companion
+                    .request_timeout_seconds
+                    .unwrap_or(DEFAULT_COMPANION_REQUEST_TIMEOUT_SECONDS),
             },
             database: DatabaseConfig {
                 url_env: raw.database.url_env.unwrap_or_else(|| "DATABASE_URL".to_owned()),
@@ -422,7 +460,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} companion.listen_address={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} companion.listen_address={} companion.request_body_limit_bytes={} companion.request_timeout_seconds={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -439,6 +477,8 @@ impl AppConfig {
             self.media.source_download_max_bytes,
             self.media.normalized_storage_max_bytes,
             self.companion.listen_address,
+            self.companion.request_body_limit_bytes,
+            self.companion.request_timeout_seconds,
             self.database.url_env,
             self.database.max_connections,
             self.telegram.api_base_url,
@@ -512,6 +552,29 @@ impl AppConfig {
         if let Some(value) = optional_env_string("SOOQA_COMPANION_LISTEN_ADDRESS")? {
             self.companion.listen_address = value;
         }
+        if let Some(value) = optional_env_string("SOOQA_COMPANION_BACKEND_URL")? {
+            self.companion.backend_url = value;
+        }
+        if let Some(value) = optional_env_string("SOOQA_COMPANION_LOCAL_TOKEN")? {
+            self.companion.local_token = SecretString::new(value);
+        }
+        if let Some(value) = optional_env_string("SOOQA_COMPANION_BACKEND_TOKEN")? {
+            self.companion.backend_token = SecretString::new(value);
+        }
+        if let Some(value) = optional_env_string("SOOQA_COMPANION_REQUEST_BODY_LIMIT_BYTES")? {
+            self.companion.request_body_limit_bytes =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_COMPANION_REQUEST_BODY_LIMIT_BYTES".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
+        }
+        if let Some(value) = optional_env_string("SOOQA_COMPANION_REQUEST_TIMEOUT_SECONDS")? {
+            self.companion.request_timeout_seconds =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_COMPANION_REQUEST_TIMEOUT_SECONDS".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
+        }
         if let Some(value) = optional_env_string("SOOQA_OBSERVABILITY_LOG_FORMAT")? {
             self.observability.log_format = parse_log_format(&value)?;
         }
@@ -583,6 +646,50 @@ impl AppConfig {
                 name: "companion.listen_address".to_owned(),
                 reason: "must use a loopback address",
             });
+        }
+        let companion_backend_url = url::Url::parse(&self.companion.backend_url).map_err(|_| {
+            ConfigError::InvalidValue {
+                name: "companion.backend_url".to_owned(),
+                reason: "must be a valid HTTP(S) URL",
+            }
+        })?;
+        if !is_safe_companion_backend_url(&companion_backend_url) {
+            return Err(ConfigError::InvalidValue {
+                name: "companion.backend_url".to_owned(),
+                reason: "must be an HTTP(S) URL without credentials, query, or fragment; HTTP URLs must use a private host",
+            });
+        }
+        if self.role == AppRole::Companion {
+            if !self.companion.local_token.is_configured() {
+                return Err(ConfigError::MissingSecret("Companion local token"));
+            }
+            if !self.companion.backend_token.is_configured() {
+                return Err(ConfigError::MissingSecret("Companion backend token"));
+            }
+            if self.companion.local_token.expose_secret()
+                == self.companion.backend_token.expose_secret()
+            {
+                return Err(ConfigError::InvalidValue {
+                    name: "companion.local_token".to_owned(),
+                    reason: "must be distinct from the backend token",
+                });
+            }
+            if self.companion.request_body_limit_bytes == 0
+                || self.companion.request_body_limit_bytes > MAX_COMPANION_REQUEST_BODY_LIMIT_BYTES
+            {
+                return Err(ConfigError::InvalidValue {
+                    name: "companion.request_body_limit_bytes".to_owned(),
+                    reason: "must be greater than zero and at most 1 MiB",
+                });
+            }
+            if self.companion.request_timeout_seconds == 0
+                || self.companion.request_timeout_seconds > MAX_COMPANION_REQUEST_TIMEOUT_SECONDS
+            {
+                return Err(ConfigError::InvalidValue {
+                    name: "companion.request_timeout_seconds".to_owned(),
+                    reason: "must be greater than zero and at most 60 seconds",
+                });
+            }
         }
         if self.worker.poll_interval_seconds == 0 {
             return Err(ConfigError::InvalidValue {
@@ -794,6 +901,11 @@ struct RawMediaConfig {
 #[serde(default)]
 struct RawCompanionConfig {
     listen_address: Option<String>,
+    backend_url: Option<String>,
+    local_token: Option<String>,
+    backend_token: Option<String>,
+    request_body_limit_bytes: Option<usize>,
+    request_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -899,6 +1011,40 @@ fn is_safe_telegram_api_base_url(url: &url::Url) -> bool {
     }
 }
 
+fn is_safe_companion_backend_url(url: &url::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    if url.scheme() == "https" {
+        return true;
+    }
+
+    let Some(host) = url.host_str() else { return false };
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            !address.is_unspecified()
+                && (address.is_loopback() || address.is_private() || address.is_link_local())
+        }
+        Ok(IpAddr::V6(address)) => {
+            !address.is_unspecified()
+                && (address.is_loopback()
+                    || address.is_unique_local()
+                    || address.is_unicast_link_local())
+        }
+        Err(_) => {
+            host.eq_ignore_ascii_case("localhost")
+                || !host.contains('.')
+                || host.ends_with(".local")
+        }
+    }
+}
+
 fn parse_log_format(value: &str) -> Result<LogFormat, ConfigError> {
     match value.to_ascii_lowercase().as_str() {
         "json" => Ok(LogFormat::Json),
@@ -934,11 +1080,51 @@ mod tests {
 
     #[test]
     fn defaults_are_valid_for_each_role() {
-        for role in [AppRole::Server, AppRole::Worker, AppRole::Companion] {
+        for role in [AppRole::Server, AppRole::Worker] {
             let config =
                 AppConfig::from_toml_str(role, None, "").expect("defaults should parse").validate();
             assert!(config.is_ok());
         }
+    }
+
+    #[test]
+    fn companion_requires_both_tokens() {
+        let config =
+            AppConfig::from_toml_str(AppRole::Companion, None, "").expect("defaults should parse");
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::MissingSecret("Companion local token"))
+        ));
+    }
+
+    #[test]
+    fn companion_accepts_private_backend_with_configured_tokens() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Companion,
+            None,
+            "[companion]\nlocal_token = \"local\"\nbackend_token = \"backend\"\n",
+        )
+        .expect("TOML should parse");
+
+        assert!(config.validate().is_ok());
+        assert!(!config.summary().contains("backend"));
+        assert!(!config.summary().contains("local"));
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("127.0.0.1:8080"));
+        assert!(!debug.contains("\"backend\""));
+        assert!(!debug.contains("\"local\""));
+    }
+
+    #[test]
+    fn companion_rejects_public_http_backend() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Companion,
+            None,
+            "[companion]\nbackend_url = \"http://example.com\"\nlocal_token = \"local\"\nbackend_token = \"backend\"\n",
+        )
+        .expect("TOML should parse");
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

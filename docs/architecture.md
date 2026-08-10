@@ -2,8 +2,10 @@
 
 sooqa is a modular monolith. `apps/server` owns HTTP and Telegram composition,
 `apps/worker` owns durable-job execution, and `apps/companion` is an optional
-local capture process. The crates are compile-time boundaries inside those
-processes; they are not separate network services.
+local capture process. The companion exposes one authenticated loopback
+submission route and has no database, media, Telegram, or job dependencies.
+The crates are compile-time boundaries inside those processes; they are not
+separate network services.
 
 ## Durable model
 

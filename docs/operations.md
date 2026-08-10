@@ -56,6 +56,54 @@ are streamed or path-based; no file-sized byte buffer is used.
 Polling, downloads, and storage uploads use separate HTTP timeout policies so a
 long upload cannot inherit the long-poll or download-stall deadline.
 
+## Local companion and 2ch capture
+
+For Windows, download `sooqa-companion-windows-x86_64.exe` and its
+`.sha256` checksum from a GitHub Release. The executable is self-contained;
+Windows users do not need Rust or a checkout of this repository. Verify the
+checksum in PowerShell before starting it:
+
+```powershell
+$exe = ".\sooqa-companion-windows-x86_64.exe"
+$expected = (Get-Content "$exe.sha256").Split()[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "companion checksum mismatch" }
+```
+
+Start the companion on the Windows workstation with a loopback listener and
+two different secrets:
+
+```powershell
+$env:SOOQA_COMPANION_BACKEND_URL = "https://sooqa.example.test"
+$env:SOOQA_COMPANION_LOCAL_TOKEN = [guid]::NewGuid().ToString("N")
+$env:SOOQA_COMPANION_BACKEND_TOKEN = "replace-with-the-sooqa-api-token"
+.\sooqa-companion-windows-x86_64.exe
+```
+
+For local development, the equivalent source build is:
+
+```bash
+SOOQA_COMPANION_BACKEND_URL=https://sooqa.example.test \
+SOOQA_COMPANION_LOCAL_TOKEN='random-local-token' \
+SOOQA_COMPANION_BACKEND_TOKEN="$SOOQA_API_TOKEN" \
+cargo run -p sooqa-companion
+```
+
+The companion exposes only `POST http://127.0.0.1:47831/v1/submit`. Its body is
+bounded and contains a direct MP4/WebM URL, page context, an optional internal
+description, tags, and a browser action ID. A successful response means only
+that the backend accepted the ingest request; the userscript does not poll or
+claim that media is already stored. A failed request can be retried with the
+same action ID, preserving backend idempotency.
+
+Install `userscripts/sooqa-2ch-save.user.js` in Tampermonkey. It is matched only
+to `https://2ch.su/*`, `https://2ch.org/*`, and `https://2ch.life/*`,
+discovers direct `.mp4`/`.webm` links and media nodes, and observes
+dynamically added posts. The first run asks for the local token and stores it in
+Tampermonkey's private storage. It never receives or stores the backend token.
+`Save...` opens one metadata dialog for comma-separated tags and an internal
+description; those values become media metadata, not a public Telegram post.
+
 ## Home local Bot API deployment
 
 The development Compose file at the repository root contains only PostgreSQL.

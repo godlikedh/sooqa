@@ -23,6 +23,10 @@ normalized_storage_max_bytes = 1900000000
 
 [companion]
 listen_address = "127.0.0.1:47831"
+backend_url = "http://127.0.0.1:8080"
+request_body_limit_bytes = 65536
+request_timeout_seconds = 15
+# Inject SOOQA_COMPANION_LOCAL_TOKEN and SOOQA_COMPANION_BACKEND_TOKEN.
 
 [database]
 url_env = "DATABASE_URL"

@@ -7,7 +7,7 @@ use sooqa_library::{
     MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, Media, MediaCursor,
     MediaDetails, MediaIngest, MediaKind, MediaMetadata, MediaPage, MediaSearchQuery, MediaSource,
     MediaSourceInput, MediaStatus, MediaStorageState, MediaSummary, MediaUpdate, NewTag,
-    SourceKind, StorageReceipt, StorageUploadAttachment, StorageUploadInfo,
+    SourceKind, StorageCaptionMetadata, StorageReceipt, StorageUploadAttachment, StorageUploadInfo,
     StorageUploadReservation, StorageUploadReservationRequest, StorageUploadStore, Tag,
     VideoDuplicateClassification, VideoDuplicateEvidence, VideoDuplicateMatch,
     VideoIdentityOutcome,
@@ -64,6 +64,13 @@ struct MediaRow {
 }
 
 #[derive(Debug, Clone, FromRow)]
+struct StorageCaptionMetadataRow {
+    description: Option<String>,
+    tags: Vec<String>,
+    source_url: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
 struct VideoFingerprintCandidateRow {
     media_id: Uuid,
     width: Option<i32>,
@@ -99,6 +106,24 @@ impl LibraryRepository {
 
     pub async fn find_media(&self, id: Uuid) -> Result<Option<Media>, LibraryRepositoryError> {
         self.load(id).await?.map(MediaRow::into_media).transpose()
+    }
+
+    pub async fn find_storage_caption_metadata(
+        &self,
+        id: Uuid,
+    ) -> Result<StorageCaptionMetadata, LibraryRepositoryError> {
+        let row = sqlx::query_as::<_, StorageCaptionMetadataRow>(
+            "SELECT description, tags, source_url FROM media WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        Ok(StorageCaptionMetadata {
+            description: row.description,
+            tags: row.tags,
+            source_url: row.source_url,
+        })
     }
 
     pub async fn find_media_details(
@@ -292,7 +317,7 @@ impl LibraryRepository {
                 .await?;
                 let merged_tags = merge_tags(&row.tags, &ingest.tags);
                 let row = sqlx::query_as::<_, MediaRow>(
-                    "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = COALESCE(description, $4), source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1 RETURNING *",
+                    "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE description END, source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1 RETURNING *",
                 )
                 .bind(row.id)
                 .bind(merged_tags)
@@ -371,7 +396,7 @@ impl LibraryRepository {
         {
             let merged_tags = merge_tags(&row.tags, &ingest.tags);
             sqlx::query(
-                "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = COALESCE(description, $4), source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1",
+                "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE description END, source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1",
             )
             .bind(row.id)
             .bind(merged_tags)
@@ -872,6 +897,13 @@ impl StorageUploadStore for LibraryRepository {
 
     async fn find_media(&self, media_id: Uuid) -> Result<Option<Media>, Self::Error> {
         LibraryRepository::find_media(self, media_id).await
+    }
+
+    async fn find_storage_caption_metadata(
+        &self,
+        media_id: Uuid,
+    ) -> Result<StorageCaptionMetadata, Self::Error> {
+        LibraryRepository::find_storage_caption_metadata(self, media_id).await
     }
 
     async fn find_storage_receipt(

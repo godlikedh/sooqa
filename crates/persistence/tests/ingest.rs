@@ -183,15 +183,15 @@ async fn source_inspection_completion_commits_job_success_with_transition() {
 #[ignore = "requires PostgreSQL"]
 async fn duplicate_pending_force_save_is_durable_and_idempotent() {
     let database = database().await;
+    let mut submission_input = IngestSubmissionInput::new(
+        format!("https://example.test/duplicate-{}", Uuid::new_v4()),
+        SubmittedVia::Companion,
+    );
+    submission_input.supplied_description = Some("keep this internal note".to_owned());
+    submission_input.supplied_tags = vec!["cats".to_owned(), "reaction".to_owned()];
     let ingest = database
         .inbox()
-        .create_ingest(
-            IngestSubmission::try_new(IngestSubmissionInput::new(
-                format!("https://example.test/duplicate-{}", Uuid::new_v4()),
-                SubmittedVia::Api,
-            ))
-            .unwrap(),
-        )
+        .create_ingest(IngestSubmission::try_new(submission_input).unwrap())
         .await
         .unwrap();
     sqlx::query(
@@ -220,6 +220,8 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent() {
     assert_eq!(resumed.ingest.status, IngestStatus::Queued);
     assert!(resumed.ingest.force_save);
     assert!(resumed.ingest.duplicate_evidence.is_none());
+    assert_eq!(resumed.ingest.supplied_description.as_deref(), Some("keep this internal note"));
+    assert_eq!(resumed.ingest.supplied_tags, ["cats", "reaction"]);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM queue.jobs WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",

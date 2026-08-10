@@ -502,6 +502,10 @@ components:
         url: { type: string, format: uri }
         page_url: { type: string, format: uri, nullable: true }
         page_title: { type: string, nullable: true }
+        description:
+          type: string
+          nullable: true
+          description: Internal description stored on new media; never treated as public post text.
         selected_text: { type: string, nullable: true }
         tags:
           type: array
@@ -528,6 +532,7 @@ components:
             page_url: { type: string, nullable: true }
             page_title: { type: string, nullable: true }
             supplied_caption: { type: string, nullable: true }
+            supplied_description: { type: string, nullable: true }
             supplied_tags: { type: array, items: { type: string } }
             media_id: { type: string, format: uuid, nullable: true }
             force_save: { type: boolean }

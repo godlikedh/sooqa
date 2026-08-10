@@ -1,0 +1,110 @@
+name: Windows companion
+
+on:
+  pull_request:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Windows companion build
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-pc-windows-msvc
+
+      - name: Configure static MSVC runtime
+        shell: pwsh
+        run: |
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static" >> $env:GITHUB_ENV
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-1.97.1-windows-companion
+
+      - name: Build Windows companion
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p sooqa-companion
+
+      - name: Check size and prepare release assets
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:GITHUB_WORKSPACE "target\x86_64-pc-windows-msvc\release\sooqa-companion.exe"
+          if (-not (Test-Path -LiteralPath $binary)) {
+            throw "Windows companion executable was not produced: $binary"
+          }
+
+          $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+          if (-not $dumpbin) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+            if (Test-Path -LiteralPath $vswhere) {
+              $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+              if ($installationPath) {
+                $dumpbin = Get-ChildItem -LiteralPath (Join-Path $installationPath "VC\Tools\MSVC") -Filter dumpbin.exe -Recurse | Select-Object -First 1
+              }
+            }
+          }
+          if (-not $dumpbin) {
+            throw "dumpbin.exe is required to inspect the Windows companion PE imports"
+          }
+
+          $dumpbinPath = $dumpbin.Source
+          if (-not $dumpbinPath) {
+            $dumpbinPath = $dumpbin.FullName
+          }
+          $dependencies = (& $dumpbinPath /dependents $binary 2>&1 | Out-String)
+          Write-Output $dependencies
+          if ($dependencies -match '(?i)VCRUNTIME\d*\.dll|MSVCP\d*\.dll') {
+            throw "Windows companion imports the dynamic MSVC runtime; static CRT was not applied"
+          }
+
+          $size = (Get-Item -LiteralPath $binary).Length
+          $maxBytes = 10 * 1024 * 1024
+          Write-Output "sooqa-companion.exe size: $size bytes"
+          if ($size -gt $maxBytes) {
+            throw "sooqa-companion.exe exceeds the 10 MiB limit: $size bytes"
+          }
+
+          $assetDirectory = Join-Path $env:GITHUB_WORKSPACE "release-assets"
+          New-Item -ItemType Directory -Path $assetDirectory -Force | Out-Null
+          $assetName = "sooqa-companion-windows-x86_64.exe"
+          $assetPath = Join-Path $assetDirectory $assetName
+          Copy-Item -LiteralPath $binary -Destination $assetPath
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $assetPath).Hash.ToLowerInvariant()
+          "$hash  $assetName" | Set-Content -LiteralPath "$assetPath.sha256" -Encoding ascii -NoNewline
+
+      - name: Upload Windows companion artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sooqa-companion-windows-x86_64-${{ github.sha }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  release:
+    name: Windows companion release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows companion assets
+        uses: actions/download-artifact@v4
+        with:
+          name: sooqa-companion-windows-x86_64-${{ github.sha }}
+          path: release-assets
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "sooqa $GITHUB_REF_NAME" --generate-notes --verify-tag release-assets/sooqa-companion-windows-x86_64.exe release-assets/sooqa-companion-windows-x86_64.exe.sha256

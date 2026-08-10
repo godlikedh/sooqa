@@ -153,6 +153,38 @@ async fn exact_sha_dedup_preserves_primary_source_metadata() {
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
+async fn exact_duplicate_unions_tags_and_replaces_explicit_description() {
+    let database = database().await;
+    let repository = database.library();
+    let mut first_ingest = ingest(vec![70_u8; 32], "https://example.test/metadata-first");
+    first_ingest.media.description = Some("first internal note".to_owned());
+    let first = repository.resolve_media(first_ingest).await.unwrap();
+
+    let mut second_ingest = ingest(vec![70_u8; 32], "https://example.test/metadata-second");
+    second_ingest.media.description = Some("replacement internal note".to_owned());
+    second_ingest.tags = vec!["reaction".to_owned()];
+    let second = repository.resolve_media(second_ingest).await.unwrap();
+    assert!(!second.media_created);
+
+    let (description, tags) = sqlx::query_as::<_, (Option<String>, Vec<String>)>(
+        "SELECT description, tags FROM media WHERE id = $1",
+    )
+    .bind(first.media.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(description.as_deref(), Some("replacement internal note"));
+    assert_eq!(tags, ["rust", "reaction"]);
+
+    sqlx::query("DELETE FROM media WHERE id = $1")
+        .bind(first.media.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
 async fn non_video_media_uses_exact_sha_without_fingerprint_data() {
     let database = database().await;
     let repository = database.library();
