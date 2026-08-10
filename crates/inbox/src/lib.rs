@@ -210,6 +210,7 @@ impl IngestStatus {
                 | (Self::Fingerprinting, Self::DuplicatePending)
                 | (Self::Fingerprinting, Self::Completed)
                 | (Self::DuplicatePending, Self::Queued)
+                | (Self::DuplicatePending, Self::Storing)
                 | (Self::FailedRetryable, Self::Storing)
                 | (Self::FailedRetryable, Self::Fingerprinting)
                 | (Self::Storing, Self::Fingerprinting)
@@ -665,6 +666,22 @@ mod tests {
             .transition_to(IngestStatus::Storing)
             .expect("fingerprinted content should wait for storage");
         storing.transition_to(IngestStatus::Completed).expect("stored content should complete");
+
+        let mut duplicate =
+            Ingest::from_submission(Uuid::now_v7(), &submission("https://example.com"));
+        for status in [
+            IngestStatus::Queued,
+            IngestStatus::Downloading,
+            IngestStatus::Probing,
+            IngestStatus::Normalizing,
+            IngestStatus::Fingerprinting,
+            IngestStatus::DuplicatePending,
+        ] {
+            duplicate.transition_to(status).expect("duplicate review transition should be valid");
+        }
+        duplicate
+            .transition_to(IngestStatus::Storing)
+            .expect("accepted duplicate should join storage");
 
         assert!(request.transition_to(IngestStatus::Queued).is_err());
 

@@ -69,6 +69,7 @@ pub fn router(settings: ApiSettings, state: ApiState) -> Router {
         .route("/health/live", get(health_live))
         .route("/api/v1/ingests", post(create_ingest))
         .route("/api/v1/ingests/{id}", get(get_ingest))
+        .route("/api/v1/ingests/{id}/accept-duplicate", post(accept_duplicate))
         .route("/api/v1/ingests/{id}/force-save", post(force_save))
         .merge(library::routes())
         .merge(publisher::routes())
@@ -179,6 +180,33 @@ async fn force_save(
     Ok((status, Json(IngestResponse::from_ingest(&result.ingest))))
 }
 
+async fn accept_duplicate(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: Result<JsonExtractor<AcceptDuplicateRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<IngestResponse>), ApiError> {
+    authorize(&state.api_token, &headers, "ingest:accept_duplicate").await?;
+    let JsonExtractor(payload) = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::payload_too_large(&headers)
+        } else {
+            ApiError::bad_request("invalid_json", "The request body must be valid JSON", &headers)
+        }
+    })?;
+    let result = state
+        .inbox
+        .accept_duplicate(id, payload.media_id)
+        .await
+        .map_err(|error| map_repository_error(error, &headers))?;
+    let status = if result.ingest.status == sooqa_inbox::IngestStatus::Storing {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(IngestResponse::from_ingest(&result.ingest))))
+}
+
 async fn authorize(
     expected_token: &str,
     headers: &HeaderMap,
@@ -280,6 +308,23 @@ fn map_repository_error(error: InboxRepositoryError, headers: &HeaderMap) -> Api
         InboxRepositoryError::ForceSaveNotAllowed(_) => ApiError::conflict(
             "force_save_not_allowed",
             "Force-save is only available for a pending perceptual duplicate",
+            headers,
+        ),
+        InboxRepositoryError::DuplicateDecisionNotAllowed(_) => ApiError::conflict(
+            "duplicate_decision_not_allowed",
+            "The ingest is no longer waiting for a duplicate decision",
+            headers,
+        ),
+        InboxRepositoryError::DuplicateEvidenceMissing(_)
+        | InboxRepositoryError::DuplicateCandidateNotEvidenced(_) => ApiError::conflict(
+            "duplicate_candidate_not_evidenced",
+            "The selected media is not one of the persisted duplicate candidates",
+            headers,
+        ),
+        InboxRepositoryError::DuplicateCandidateMissing(_)
+        | InboxRepositoryError::DuplicateCandidateUnavailable { .. } => ApiError::conflict(
+            "duplicate_candidate_unavailable",
+            "The selected duplicate candidate is no longer available",
             headers,
         ),
         InboxRepositoryError::ResourceMissing(_) => {
@@ -395,6 +440,11 @@ struct IngestCreateRequest {
     description: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptDuplicateRequest {
+    media_id: Uuid,
 }
 
 #[derive(Debug, Serialize)]

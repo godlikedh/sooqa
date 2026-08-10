@@ -56,6 +56,13 @@ are streamed or path-based; no file-sized byte buffer is used.
 Polling, downloads, and storage uploads use separate HTTP timeout policies so a
 long upload cannot inherit the long-poll or download-stall deadline.
 
+In the administrator's private bot chat, `/duplicates` lists up to three
+pending duplicate ingests at a time. Ready candidates link to their Telegram
+storage message; `Use this` reuses the existing media item, while `Save anyway`
+starts the normal force-save pipeline. A pending-storage candidate remains on
+the existing media upload lifecycle. The HTTP equivalent and bearer scope are
+documented in `docs/openapi.yaml`.
+
 ## Local companion and 2ch capture
 
 For Windows, download `sooqa-companion-windows-x86_64.exe` and its

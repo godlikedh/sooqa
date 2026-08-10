@@ -2266,6 +2266,7 @@ name = "sooqa-telegram"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "reqwest",
  "serde_json",
  "sooqa-library",
