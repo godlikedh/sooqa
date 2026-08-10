@@ -60,15 +60,11 @@ impl VideoSequenceFingerprint {
         interval_ms: u32,
         images: &[DynamicImage],
     ) -> Result<Self, VideoSequenceError> {
-        let mut samples = Vec::with_capacity(images.len());
-        let mut previous_luma = None;
+        let mut builder = VideoSequenceBuilder::new(duration_ms, interval_ms)?;
         for image in images {
-            let normalized = normalize_image(image);
-            let sample = sample_features(&normalized, previous_luma.as_deref());
-            previous_luma = Some(normalized.luma);
-            samples.push(sample);
+            builder.push_image(image)?;
         }
-        Self::new(duration_ms, interval_ms, samples)
+        builder.finish()
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, VideoSequenceError> {
@@ -170,6 +166,67 @@ impl VideoSequenceFingerprint {
             return None;
         }
         Some(u64::from(self.interval_ms) * index as u64)
+    }
+}
+
+/// Incrementally builds a v1 fingerprint while retaining only the compact
+/// samples and the previous normalized luma plane needed for transitions.
+#[derive(Debug)]
+pub struct VideoSequenceBuilder {
+    duration_ms: u64,
+    interval_ms: u32,
+    expected_samples: usize,
+    samples: Vec<VideoSequenceSample>,
+    previous_luma: Option<Vec<u8>>,
+}
+
+impl VideoSequenceBuilder {
+    pub fn new(duration_ms: u64, interval_ms: u32) -> Result<Self, VideoSequenceError> {
+        if duration_ms == 0 {
+            return Err(VideoSequenceError::InvalidDuration);
+        }
+        if interval_ms == 0 {
+            return Err(VideoSequenceError::InvalidInterval);
+        }
+        let expected_interval_ms = video_sequence_interval_ms(duration_ms)
+            .ok_or(VideoSequenceError::InvalidTimestampGrid)?;
+        if interval_ms != expected_interval_ms {
+            return Err(VideoSequenceError::InvalidTimestampGrid);
+        }
+        let expected_samples = select_video_sequence_timestamps(duration_ms).len();
+        Ok(Self {
+            duration_ms,
+            interval_ms,
+            expected_samples,
+            samples: Vec::with_capacity(expected_samples),
+            previous_luma: None,
+        })
+    }
+
+    pub fn push_image(&mut self, image: &DynamicImage) -> Result<(), VideoSequenceError> {
+        if self.samples.len() >= self.expected_samples {
+            return Err(VideoSequenceError::InvalidSampleCount(self.samples.len() + 1));
+        }
+        let normalized = normalize_image(image);
+        let sample = sample_features(&normalized, self.previous_luma.as_deref());
+        self.previous_luma = Some(normalized.luma);
+        self.samples.push(sample);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    pub fn finish(self) -> Result<VideoSequenceFingerprint, VideoSequenceError> {
+        if self.samples.len() != self.expected_samples {
+            return Err(VideoSequenceError::InvalidTimestampGrid);
+        }
+        VideoSequenceFingerprint::new(self.duration_ms, self.interval_ms, self.samples)
     }
 }
 
@@ -551,6 +608,40 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn incremental_builder_matches_the_slice_based_builder() {
+        let images = vec![
+            DynamicImage::ImageRgb8(ImageBuffer::from_fn(64, 64, |x, y| {
+                Rgb([x as u8, y as u8, 40])
+            })),
+            DynamicImage::ImageRgb8(ImageBuffer::from_fn(64, 64, |x, y| {
+                Rgb([255 - x as u8, y as u8, 80])
+            })),
+        ];
+        let expected = VideoSequenceFingerprint::from_images(1_000, 500, &images)
+            .expect("slice-based fingerprint should build");
+        let mut builder =
+            VideoSequenceBuilder::new(1_000, 500).expect("incremental builder should initialize");
+        assert!(builder.is_empty());
+        for image in &images {
+            builder.push_image(image).expect("image should be accepted");
+        }
+        assert_eq!(builder.len(), 2);
+        assert_eq!(builder.finish().expect("incremental fingerprint should build"), expected);
+    }
+
+    #[test]
+    fn incremental_builder_rejects_incomplete_and_excess_samples() {
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(32, 32, Rgb([1, 2, 3])));
+        let mut incomplete = VideoSequenceBuilder::new(1_000, 500).unwrap();
+        incomplete.push_image(&image).unwrap();
+        assert_eq!(incomplete.finish(), Err(VideoSequenceError::InvalidTimestampGrid));
+
+        let mut full = VideoSequenceBuilder::new(500, 500).unwrap();
+        full.push_image(&image).unwrap();
+        assert_eq!(full.push_image(&image), Err(VideoSequenceError::InvalidSampleCount(2)));
     }
 
     #[test]

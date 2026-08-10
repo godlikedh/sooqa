@@ -1335,11 +1335,10 @@ async fn compute_fingerprint(
             .await;
         }
         match extractor
-            .extract_video_sequence_from_area_with_cache_key(
+            .extract_video_sequence_from_area(
                 &workspace,
                 WorkspaceArea::Normalized,
                 "canonical.mp4",
-                &normalization.sha256,
                 duration_ms,
             )
             .await

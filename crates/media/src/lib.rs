@@ -61,8 +61,8 @@ pub use sooqa_inbox::{SourceInspection, SourceMediaKind};
 pub use video_sequence::{
     VIDEO_SEQUENCE_BASE_INTERVAL_MS, VIDEO_SEQUENCE_CODEC_V1, VIDEO_SEQUENCE_MAGIC,
     VIDEO_SEQUENCE_MAX_ANCHORS, VIDEO_SEQUENCE_MAX_SAMPLES, VIDEO_SEQUENCE_MAX_TOKENS,
-    VideoSequenceError, VideoSequenceFingerprint, VideoSequenceSample, derive_search_tokens,
-    select_video_sequence_timestamps, video_sequence_interval_ms,
+    VideoSequenceBuilder, VideoSequenceError, VideoSequenceFingerprint, VideoSequenceSample,
+    derive_search_tokens, select_video_sequence_timestamps, video_sequence_interval_ms,
 };
 pub use workspace::{
     ManifestEntry, MediaWorkspace, WorkspaceArea, WorkspaceError, WorkspaceManifest,

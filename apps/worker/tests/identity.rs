@@ -339,7 +339,15 @@ struct IdentityFrameRunner {
 impl ExternalCommandRunner for IdentityFrameRunner {
     async fn run(&self, command: ExternalCommand) -> Result<ExternalCommandOutput, CommandError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        let path = PathBuf::from(command.args().last().expect("frame output argument"));
+        let output_pattern = command.args().last().expect("frame output argument");
+        let output_pattern = output_pattern.to_string_lossy();
+        let frame_count = command
+            .args()
+            .windows(2)
+            .find_map(|args| (args[0] == "-frames:v").then(|| args[1].to_string_lossy()))
+            .expect("frame count argument")
+            .parse::<usize>()
+            .expect("frame count should be numeric");
         let variant = self.variant;
         let image = ImageBuffer::from_fn(64, 64, |x, y| {
             let (x, y) = if variant == 0 { (x, y) } else { (y, x) };
@@ -349,9 +357,12 @@ impl ExternalCommandRunner for IdentityFrameRunner {
                 ((x + y).saturating_mul(2) % 256) as u8,
             ])
         });
-        DynamicImage::ImageRgb8(image)
-            .save_with_format(&path, image::ImageFormat::Png)
-            .expect("fake extractor should write a frame");
+        for index in 0..frame_count {
+            let path = PathBuf::from(output_pattern.replace("%04d", &format!("{index:04}")));
+            DynamicImage::ImageRgb8(image.clone())
+                .save_with_format(&path, image::ImageFormat::Png)
+                .expect("fake extractor should write a frame");
+        }
         Ok(ExternalCommandOutput {
             success: true,
             exit_code: Some(0),
@@ -441,11 +452,10 @@ async fn composed_identity_worker_has_bounded_storage_effects() {
         64 * 1024,
         Arc::new(strong_runner.clone()),
     )
-    .extract_video_sequence_from_area_with_cache_key(
+    .extract_video_sequence_from_area(
         &candidate_workspace,
         WorkspaceArea::Normalized,
         "canonical.mp4",
-        "candidate",
         4_000,
     )
     .await

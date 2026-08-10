@@ -140,6 +140,24 @@ SHAs must observe the first in-progress reservation before either can enqueue
 a storage upload. The canonical SHA unique constraint remains the final
 byte-identity barrier.
 
+### Extraction resource behavior
+
+The active extractor preserves the timestamp grid above with one FFmpeg process
+per canonical video. It uses an `fps=1000/interval:round=near` filter and an
+explicit `-frames:v` cap equal to the exact expected sample count, never above
+2,048. FFmpeg writes a numbered PNG sequence into a fresh extraction-scoped
+directory under the workspace. The worker validates the complete sequence,
+decodes one frame at a time under the existing byte/pixel/working-set limits,
+and feeds an incremental builder that retains only compact samples and the
+previous 32x32 luma plane. The sequence directory is removed on every normal
+exit path and by a synchronous drop guard when the extraction is cancelled.
+
+This changes only execution and resource lifetime. The Rust resize, feature,
+transition, binary codec, shortlist-token, and alignment contracts remain the
+accepted v1 semantics. A future streaming raw-frame implementation would need
+the same framing, backpressure, and cleanup guarantees; it is not required by
+this decision.
+
 The authorized `POST /api/v1/ingests/{id}/force-save` route is idempotent. It
 is accepted only from `duplicate_pending`, persists `force_save = true`, clears
 derived pipeline artifacts, and restarts a durable source-to-normalization

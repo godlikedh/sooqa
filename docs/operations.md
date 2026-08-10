@@ -38,8 +38,11 @@ are present. The media budgets and processing deadline are intentionally
 separate:
 
 - `SOOQA_MEDIA_PROCESSING_TIMEOUT_SECONDS` bounds one ffmpeg normalization or
-  video-frame extraction command. It defaults to one hour and is capped at 24
-  hours so large canonical media can finish without an unbounded subprocess;
+  complete video-fingerprint extraction command. Fingerprinting starts one
+  ffmpeg child per video, samples the canonical input sequentially into a
+  fresh extraction-scoped directory, and then decodes one bounded frame at a
+  time. It defaults to one hour and is capped at 24 hours so large canonical
+  media can finish without an unbounded subprocess;
 - `SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES` bounds URL/link source staging and
   may be larger than 2 GB because normalization can reduce the source;
 - `SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES` bounds Telegram-source staging;
@@ -55,6 +58,14 @@ needed for probing and normalization. Source downloads and Telegram uploads
 are streamed or path-based; no file-sized byte buffer is used.
 Polling, downloads, and storage uploads use separate HTTP timeout policies so a
 long upload cannot inherit the long-poll or download-stall deadline.
+
+Video fingerprint extraction uses the `video_sequence_v1` grid without a
+per-sample subprocess or permanent frame cache. FFmpeg's `fps` filter is set to
+the exact rational interval and `round=near`, and output is capped at the
+calculated sample count (at most 2,048). The worker validates the numbered
+sequence, decodes each frame under the configured limits, retains only compact
+features and the previous normalized luma plane, and removes the temporary
+sequence on success, failure, timeout, or cancellation.
 
 ## Local companion and 2ch capture
 

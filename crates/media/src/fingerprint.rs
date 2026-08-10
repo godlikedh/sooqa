@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -11,8 +12,8 @@ use uuid::Uuid;
 
 use crate::{
     CommandError, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommand, ExternalCommandRunner, MediaWorkspace,
-    VideoSequenceFingerprint, WorkspaceArea, WorkspaceError, select_video_sequence_timestamps,
-    sha256_bytes, video_sequence_interval_ms,
+    VideoSequenceBuilder, VideoSequenceFingerprint, WorkspaceArea, WorkspaceError,
+    select_video_sequence_timestamps, video_sequence_interval_ms,
 };
 
 const DEFAULT_MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
@@ -20,11 +21,6 @@ const DEFAULT_MAX_FRAME_PIXELS: u64 = 16_000_000;
 const DEFAULT_MAX_FRAME_WORKING_BYTES: u64 = 128 * 1024 * 1024;
 
 pub const VIDEO_SEQUENCE_V1: &str = "video_sequence_v1";
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct FrameTimestamp {
-    pub timestamp_ms: u64,
-}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FingerprintVersion {
@@ -100,12 +96,11 @@ impl FrameExtractor {
         self
     }
 
-    pub async fn extract_video_sequence_from_area_with_cache_key(
+    pub async fn extract_video_sequence_from_area(
         &self,
         workspace: &MediaWorkspace,
         area: WorkspaceArea,
         input_name: &str,
-        cache_key: &str,
         duration_ms: u64,
     ) -> Result<VideoSequenceFingerprint, FrameExtractionError> {
         if duration_ms == 0 {
@@ -121,84 +116,15 @@ impl FrameExtractor {
         }
         let interval_ms = video_sequence_interval_ms(duration_ms)
             .ok_or(FrameExtractionError::VideoSequenceIntervalTooLarge)?;
-        let frame_cache_key =
-            sha256_bytes(format!("video-sequence-v1:{cache_key}:{duration_ms}").as_bytes()).sha256;
         let timestamps = select_video_sequence_timestamps(duration_ms);
-        let mut frame_paths = Vec::with_capacity(timestamps.len());
-        for (index, timestamp_ms) in timestamps.iter().copied().enumerate() {
-            let frame_name = format!("frame-video-sequence-v1-{frame_cache_key}-{index:04}.png");
-            let output_path = workspace.path(WorkspaceArea::Frames, &frame_name)?;
-            let cached = match tokio::fs::symlink_metadata(&output_path).await {
-                Ok(metadata) => {
-                    if metadata.file_type().is_symlink() || !metadata.is_file() {
-                        return Err(FrameExtractionError::InvalidOutput { path: output_path });
-                    }
-                    if metadata.len() == 0 {
-                        tokio::fs::remove_file(&output_path).await.map_err(|source| {
-                            FrameExtractionError::OutputFile { path: output_path.clone(), source }
-                        })?;
-                        false
-                    } else {
-                        existing_frame_is_valid(&output_path, self.decode_limits).await?
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(source) => {
-                    return Err(FrameExtractionError::OutputFile { path: output_path, source });
-                }
-            };
-            if !cached {
-                self.extract_frame(&input_path, &output_path, FrameTimestamp { timestamp_ms })
-                    .await?;
-            }
-            frame_paths.push(output_path);
-        }
-
-        let paths_for_decode = frame_paths.clone();
-        let decode_limits = self.decode_limits;
-        let images = tokio::task::spawn_blocking(move || {
-            paths_for_decode
-                .iter()
-                .map(|path| decode_frame(path, decode_limits))
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .await
-        .map_err(FrameExtractionError::TaskJoin)??;
-        Ok(VideoSequenceFingerprint::from_images(duration_ms, interval_ms, &images)?)
-    }
-
-    async fn extract_frame(
-        &self,
-        input_path: &Path,
-        output_path: &Path,
-        timestamp: FrameTimestamp,
-    ) -> Result<(), FrameExtractionError> {
-        match tokio::fs::symlink_metadata(output_path).await {
-            Ok(_) => {
-                return Err(FrameExtractionError::OutputExists { path: output_path.to_owned() });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(FrameExtractionError::OutputFile {
-                    path: output_path.to_owned(),
-                    source,
-                });
-            }
-        }
-        let file_name =
-            output_path.file_name().ok_or_else(|| FrameExtractionError::OutputFile {
-                path: output_path.to_owned(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "output has no file name",
-                ),
-            })?;
-        let temporary_path = output_path.with_file_name(format!(
-            ".{}-{}.png",
-            file_name.to_string_lossy(),
-            Uuid::new_v4()
-        ));
-        let _temporary_path_guard = TemporaryPath(temporary_path.clone());
+        let expected_count = timestamps.len();
+        let extraction_name = format!(".sooqa-video-sequence-{}", Uuid::new_v4());
+        let extraction_dir = workspace.path(WorkspaceArea::Frames, &extraction_name)?;
+        tokio::fs::create_dir(&extraction_dir).await.map_err(|source| {
+            FrameExtractionError::OutputDirectory { path: extraction_dir.clone(), source }
+        })?;
+        let extraction_guard = ExtractionDirectoryGuard::new(extraction_dir.clone());
+        let output_pattern = extraction_dir.join("frame-%04d.png");
         let command = ExternalCommand::new(self.ffmpeg_executable.clone())
             .arg("-hide_banner")
             .arg("-loglevel")
@@ -208,16 +134,19 @@ impl FrameExtractor {
             .arg(input_path.as_os_str())
             .arg("-map")
             .arg("0:v:0")
-            .arg("-ss")
-            .arg(format_timestamp(timestamp.timestamp_ms))
+            .arg("-vf")
+            .arg(format!("fps=1000/{interval_ms}:round=near"))
             .arg("-frames:v")
-            .arg("1")
+            .arg(expected_count.to_string())
             .arg("-an")
+            .arg("-start_number")
+            .arg("0")
             .arg("-f")
             .arg("image2")
-            .arg(temporary_path.as_os_str())
+            .arg(output_pattern.as_os_str())
             .timeout(self.timeout)
             .max_output_bytes(self.max_output_bytes);
+        let decode_limits = self.decode_limits;
         let result = async {
             let output = self.runner.run(command).await?;
             if output.stdout_truncated || output.stderr_truncated {
@@ -231,70 +160,120 @@ impl FrameExtractor {
                     stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
                 });
             }
-            let metadata =
-                tokio::fs::symlink_metadata(&temporary_path).await.map_err(|source| {
-                    FrameExtractionError::OutputFile { path: temporary_path.clone(), source }
-                })?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
-                return Err(FrameExtractionError::InvalidOutput { path: temporary_path.clone() });
+            let frame_paths = list_extracted_frames(&extraction_dir, expected_count).await?;
+            let mut builder = VideoSequenceBuilder::new(duration_ms, interval_ms)?;
+            for path in frame_paths {
+                let decode_path = path.clone();
+                let image =
+                    tokio::task::spawn_blocking(move || decode_frame(&decode_path, decode_limits))
+                        .await
+                        .map_err(FrameExtractionError::TaskJoin)??;
+                builder.push_image(&image)?;
             }
-            match tokio::fs::hard_link(&temporary_path, output_path).await {
-                Ok(()) => {
-                    let _ = tokio::fs::remove_file(&temporary_path).await;
-                    Ok(())
-                }
-                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if existing_frame_is_valid(output_path, self.decode_limits).await? {
-                        let _ = tokio::fs::remove_file(&temporary_path).await;
-                        Ok(())
-                    } else {
-                        Err(FrameExtractionError::OutputExists { path: output_path.to_owned() })
-                    }
-                }
-                Err(source) => {
-                    Err(FrameExtractionError::OutputFile { path: output_path.to_owned(), source })
-                }
-            }
+            Ok(builder.finish()?)
         }
         .await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&temporary_path).await;
+        match (result, extraction_guard.cleanup().await) {
+            (Ok(fingerprint), Ok(())) => Ok(fingerprint),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(_cleanup_error)) => Err(error),
+        }
+    }
+}
+
+struct ExtractionDirectoryGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl ExtractionDirectoryGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    async fn cleanup(mut self) -> Result<(), FrameExtractionError> {
+        let result = match tokio::fs::symlink_metadata(&self.path).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(FrameExtractionError::Workspace(WorkspaceError::Symlink(self.path.clone())))
+            }
+            Ok(metadata) if !metadata.is_dir() => Err(FrameExtractionError::Workspace(
+                WorkspaceError::NotDirectory(self.path.clone()),
+            )),
+            Ok(_) => tokio::fs::remove_dir_all(&self.path).await.map_err(|source| {
+                FrameExtractionError::OutputDirectory { path: self.path.clone(), source }
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => {
+                Err(FrameExtractionError::OutputDirectory { path: self.path.clone(), source })
+            }
+        };
+        if result.is_ok() {
+            self.armed = false;
         }
         result
     }
 }
 
-struct TemporaryPath(PathBuf);
-
-impl Drop for TemporaryPath {
+impl Drop for ExtractionDirectoryGuard {
     fn drop(&mut self) {
-        // This also runs when the async extraction future is dropped while
-        // ffmpeg is still running. The operation is one unlink, not media I/O.
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-fn format_timestamp(timestamp_ms: u64) -> String {
-    format!("{}.{:03}", timestamp_ms / 1_000, timestamp_ms % 1_000)
-}
-
-async fn existing_frame_is_valid(
-    path: &Path,
-    limits: FrameDecodeLimits,
-) -> Result<bool, FrameExtractionError> {
-    let path = path.to_owned();
-    let decode_path = path.clone();
-    match tokio::task::spawn_blocking(move || decode_frame(&decode_path, limits).map(|_| ())).await
-    {
-        Ok(Ok(())) => Ok(true),
-        Ok(Err(_)) => {
-            tokio::fs::remove_file(&path).await.map_err(|source| {
-                FrameExtractionError::OutputFile { path: path.clone(), source }
-            })?;
-            Ok(false)
+        if !self.armed {
+            return;
         }
-        Err(error) => Err(FrameExtractionError::TaskJoin(error)),
+        let Ok(metadata) = fs::symlink_metadata(&self.path) else { return };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return;
+        }
+        let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+async fn list_extracted_frames(
+    directory: &Path,
+    expected_count: usize,
+) -> Result<Vec<PathBuf>, FrameExtractionError> {
+    let mut paths = vec![None; expected_count];
+    let mut entries = tokio::fs::read_dir(directory).await.map_err(|source| {
+        FrameExtractionError::OutputDirectory { path: directory.to_owned(), source }
+    })?;
+    while let Some(entry) = entries.next_entry().await.map_err(|source| {
+        FrameExtractionError::OutputDirectory { path: directory.to_owned(), source }
+    })? {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(FrameExtractionError::UnexpectedOutput { path });
+        };
+        let Some(index_text) =
+            name.strip_prefix("frame-").and_then(|name| name.strip_suffix(".png"))
+        else {
+            return Err(FrameExtractionError::UnexpectedOutput { path });
+        };
+        let Ok(index) = index_text.parse::<usize>() else {
+            return Err(FrameExtractionError::UnexpectedOutput { path });
+        };
+        if index >= expected_count || format!("frame-{index:04}.png") != name {
+            return Err(FrameExtractionError::UnexpectedOutput { path });
+        }
+        let metadata = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(|source| FrameExtractionError::OutputFile { path: path.clone(), source })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+            return Err(FrameExtractionError::InvalidOutput { path });
+        }
+        if paths[index].replace(path.clone()).is_some() {
+            return Err(FrameExtractionError::UnexpectedOutput { path });
+        }
+    }
+
+    let actual_count = paths.iter().filter(|path| path.is_some()).count();
+    if actual_count != expected_count {
+        return Err(FrameExtractionError::InvalidFrameCount {
+            expected: expected_count,
+            actual: actual_count,
+        });
+    }
+    Ok(paths.into_iter().map(Option::unwrap).collect())
 }
 
 fn decode_frame(
@@ -364,12 +343,16 @@ pub enum FrameExtractionError {
     OutputLimitExceeded { limit: usize },
     #[error("ffmpeg frame extraction failed with status {exit_code:?}: {stderr}")]
     ProcessFailed { exit_code: Option<i32>, stderr: String },
-    #[error("frame output already exists: {path}")]
-    OutputExists { path: PathBuf },
     #[error("could not inspect frame output {path}: {source}")]
     OutputFile { path: PathBuf, source: std::io::Error },
+    #[error("could not inspect frame output directory {path}: {source}")]
+    OutputDirectory { path: PathBuf, source: std::io::Error },
     #[error("frame output is missing, empty, or a symlink: {path}")]
     InvalidOutput { path: PathBuf },
+    #[error("frame output sequence has {actual} files; expected {expected}")]
+    InvalidFrameCount { expected: usize, actual: usize },
+    #[error("frame output sequence contains an unexpected entry: {path}")]
+    UnexpectedOutput { path: PathBuf },
     #[error("could not read extracted frame {path}: {source}")]
     InputFile { path: PathBuf, source: std::io::Error },
     #[error("video input is not a regular file: {path}")]
@@ -392,7 +375,10 @@ pub enum FrameExtractionError {
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
     use async_trait::async_trait;
@@ -407,19 +393,40 @@ mod tests {
         commands: Arc<Mutex<VecDeque<ExternalCommand>>>,
     }
 
+    fn command_frame_count(command: &ExternalCommand) -> usize {
+        command
+            .args()
+            .windows(2)
+            .find_map(|args| (args[0] == "-frames:v").then(|| args[1].to_string_lossy()))
+            .expect("frame count argument exists")
+            .parse::<usize>()
+            .expect("frame count should be numeric")
+    }
+
+    fn command_frame_path(command: &ExternalCommand, index: usize) -> PathBuf {
+        let output_pattern = command.args().last().expect("output argument exists");
+        PathBuf::from(output_pattern.to_string_lossy().replace("%04d", &format!("{index:04}")))
+    }
+
+    fn write_fake_frames(command: &ExternalCommand, count: usize) {
+        let image = ImageBuffer::from_fn(18, 16, |x, y| {
+            Rgb([x.saturating_mul(10) as u8, y.saturating_mul(10) as u8, 80])
+        });
+        for index in 0..count {
+            let output = command_frame_path(command, index);
+            DynamicImage::ImageRgb8(image.clone())
+                .save_with_format(&output, image::ImageFormat::Png)
+                .expect("fake ffmpeg should write a frame");
+        }
+    }
+
     #[async_trait]
     impl ExternalCommandRunner for RecordingRunner {
         async fn run(
             &self,
             command: ExternalCommand,
         ) -> Result<ExternalCommandOutput, CommandError> {
-            let output = PathBuf::from(command.args().last().expect("output argument exists"));
-            let image = ImageBuffer::from_fn(18, 16, |x, y| {
-                Rgb([x.saturating_mul(10) as u8, y.saturating_mul(10) as u8, 80])
-            });
-            DynamicImage::ImageRgb8(image)
-                .save_with_format(&output, image::ImageFormat::Png)
-                .expect("fake ffmpeg should write a frame");
+            write_fake_frames(&command, command_frame_count(&command));
             self.commands.lock().expect("runner lock should not be poisoned").push_back(command);
             Ok(ExternalCommandOutput {
                 success: true,
@@ -439,7 +446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequence_extraction_uses_deterministic_sampling_and_cache() {
+    async fn sequence_extraction_is_single_pass_and_bounded() {
         let workspace = MediaWorkspace::create(temp_path("sequence-workspace"), Uuid::new_v4())
             .await
             .expect("workspace should be created");
@@ -454,11 +461,10 @@ mod tests {
         );
 
         let first = extractor
-            .extract_video_sequence_from_area_with_cache_key(
+            .extract_video_sequence_from_area(
                 &workspace,
                 WorkspaceArea::Normalized,
                 "canonical.mp4",
-                "digest-a",
                 10_000,
             )
             .await
@@ -466,20 +472,258 @@ mod tests {
         assert_eq!(first.version.as_str(), VIDEO_SEQUENCE_V1);
         assert_eq!(first.interval_ms, 500);
         assert_eq!(first.samples.len(), 20);
-        assert_eq!(runner.commands.lock().unwrap().len(), 20);
+        assert_eq!(runner.commands.lock().unwrap().len(), 1);
+        assert_eq!(
+            runner.commands.lock().unwrap()[0]
+                .args()
+                .windows(2)
+                .find(|args| args[0] == "-vf")
+                .expect("fps filter should be configured")[1],
+            "fps=1000/500:round=near"
+        );
+        assert_eq!(
+            runner.commands.lock().unwrap()[0]
+                .args()
+                .windows(2)
+                .find(|args| args[0] == "-frames:v")
+                .expect("frame cap should be configured")[1],
+            "20"
+        );
+        assert_eq!(
+            std::fs::read_dir(workspace.root().join("frames")).unwrap().count(),
+            0,
+            "the extraction directory should be removed after success"
+        );
 
         let second = extractor
-            .extract_video_sequence_from_area_with_cache_key(
+            .extract_video_sequence_from_area(
                 &workspace,
                 WorkspaceArea::Normalized,
                 "canonical.mp4",
-                "digest-a",
                 10_000,
             )
             .await
             .expect("cached sequence should be decoded");
         assert_eq!(second, first);
-        assert_eq!(runner.commands.lock().unwrap().len(), 20);
+        assert_eq!(runner.commands.lock().unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_dir(workspace.root().join("frames")).unwrap().count(),
+            0,
+            "the second extraction should also clean its directory"
+        );
+        workspace.cleanup().await.expect("workspace should be removed");
+    }
+
+    #[derive(Clone, Copy)]
+    struct MissingFrameRunner;
+
+    #[async_trait]
+    impl ExternalCommandRunner for MissingFrameRunner {
+        async fn run(
+            &self,
+            command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            let count = command_frame_count(&command);
+            write_fake_frames(&command, count.saturating_sub(1));
+            Ok(ExternalCommandOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct UnexpectedOutputRunner;
+
+    #[async_trait]
+    impl ExternalCommandRunner for UnexpectedOutputRunner {
+        async fn run(
+            &self,
+            command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            write_fake_frames(&command, command_frame_count(&command));
+            std::fs::write(
+                command_frame_path(&command, command_frame_count(&command))
+                    .with_file_name("unexpected.txt"),
+                b"unexpected",
+            )
+            .expect("fake ffmpeg should write its unexpected output");
+            Ok(ExternalCommandOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct TimedOutRunner;
+
+    #[async_trait]
+    impl ExternalCommandRunner for TimedOutRunner {
+        async fn run(
+            &self,
+            command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            Err(CommandError::TimedOut {
+                program: command.program().to_owned(),
+                timeout: command.timeout_duration(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingRunner {
+        started: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ExternalCommandRunner for BlockingRunner {
+        async fn run(
+            &self,
+            _command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            self.started.store(true, Ordering::Release);
+            std::future::pending().await
+        }
+    }
+
+    async fn workspace_with_input(stem: &str) -> (MediaWorkspace, PathBuf) {
+        let workspace = MediaWorkspace::create(temp_path(stem), Uuid::new_v4())
+            .await
+            .expect("workspace should be created");
+        let input = workspace.path(WorkspaceArea::Normalized, "canonical.mp4").unwrap();
+        std::fs::write(&input, b"fake video").expect("fake input should be written");
+        (workspace, input)
+    }
+
+    #[tokio::test]
+    async fn malformed_sequence_output_is_rejected_and_cleaned() {
+        for (stem, runner, expected_error) in [
+            (
+                "missing-frame",
+                Arc::new(MissingFrameRunner) as Arc<dyn ExternalCommandRunner>,
+                "frame output sequence has",
+            ),
+            (
+                "unexpected-frame",
+                Arc::new(UnexpectedOutputRunner) as Arc<dyn ExternalCommandRunner>,
+                "frame output sequence contains",
+            ),
+        ] {
+            let (workspace, _) = workspace_with_input(stem).await;
+            let extractor = FrameExtractor::with_runner(
+                "/usr/bin/ffmpeg",
+                Duration::from_secs(5),
+                1024,
+                runner,
+            );
+            let error = extractor
+                .extract_video_sequence_from_area(
+                    &workspace,
+                    WorkspaceArea::Normalized,
+                    "canonical.mp4",
+                    1_000,
+                )
+                .await
+                .expect_err("malformed output should fail");
+            assert!(error.to_string().starts_with(expected_error));
+            assert_eq!(std::fs::read_dir(workspace.root().join("frames")).unwrap().count(), 0);
+            workspace.cleanup().await.expect("workspace should be removed");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_sequence_extraction_removes_its_temporary_directory() {
+        let (workspace, _) = workspace_with_input("cancelled-sequence").await;
+        let started = Arc::new(AtomicBool::new(false));
+        let extractor = FrameExtractor::with_runner(
+            "/usr/bin/ffmpeg",
+            Duration::from_secs(5),
+            1024,
+            Arc::new(BlockingRunner { started: Arc::clone(&started) }),
+        );
+        let workspace_for_task = workspace.clone();
+        let task = tokio::spawn(async move {
+            extractor
+                .extract_video_sequence_from_area(
+                    &workspace_for_task,
+                    WorkspaceArea::Normalized,
+                    "canonical.mp4",
+                    1_000,
+                )
+                .await
+        });
+        for _ in 0..100 {
+            if started.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(started.load(Ordering::Acquire), "runner should have started");
+        task.abort();
+        assert!(task.await.expect_err("task should be cancelled").is_cancelled());
+        assert_eq!(
+            std::fs::read_dir(workspace.root().join("frames")).unwrap().count(),
+            0,
+            "cancellation should remove the extraction directory"
+        );
+        workspace.cleanup().await.expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn timed_out_sequence_extraction_removes_its_temporary_directory() {
+        let (workspace, _) = workspace_with_input("timed-out-sequence").await;
+        let extractor = FrameExtractor::with_runner(
+            "/usr/bin/ffmpeg",
+            Duration::from_secs(5),
+            1024,
+            Arc::new(TimedOutRunner),
+        );
+        let error = extractor
+            .extract_video_sequence_from_area(
+                &workspace,
+                WorkspaceArea::Normalized,
+                "canonical.mp4",
+                1_000,
+            )
+            .await
+            .expect_err("timeout should fail");
+        assert!(matches!(error, FrameExtractionError::Command(error) if error.is_timeout()));
+        assert_eq!(std::fs::read_dir(workspace.root().join("frames")).unwrap().count(), 0);
+        workspace.cleanup().await.expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn sequence_extraction_honors_the_2048_sample_cap() {
+        let (workspace, _) = workspace_with_input("maximum-sequence").await;
+        let runner = RecordingRunner::default();
+        let extractor = FrameExtractor::with_runner(
+            "/usr/bin/ffmpeg",
+            Duration::from_secs(30),
+            1024,
+            Arc::new(runner.clone()),
+        );
+        let fingerprint = extractor
+            .extract_video_sequence_from_area(
+                &workspace,
+                WorkspaceArea::Normalized,
+                "canonical.mp4",
+                2_000_000,
+            )
+            .await
+            .expect("maximum sequence should be extracted");
+        assert_eq!(fingerprint.samples.len(), 2_048);
+        assert_eq!(runner.commands.lock().unwrap().len(), 1);
+        assert_eq!(command_frame_count(&runner.commands.lock().unwrap()[0]), 2_048);
+        assert_eq!(std::fs::read_dir(workspace.root().join("frames")).unwrap().count(), 0);
         workspace.cleanup().await.expect("workspace should be removed");
     }
 }
