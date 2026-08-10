@@ -436,26 +436,11 @@ pub enum StorageUploadReservation {
     StaleGeneration { current_generation: i32 },
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct StorageCaptionMetadata {
-    pub description: Option<String>,
-    pub tags: Vec<String>,
-    pub source: Option<String>,
-}
-
 #[async_trait]
 pub trait StorageUploadStore: Clone + Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
 
     async fn find_media(&self, media_id: Uuid) -> Result<Option<Media>, Self::Error>;
-
-    async fn find_storage_caption(
-        &self,
-        media_id: Uuid,
-    ) -> Result<StorageCaptionMetadata, Self::Error> {
-        let description = self.find_media(media_id).await?.and_then(|media| media.description);
-        Ok(StorageCaptionMetadata { description, ..StorageCaptionMetadata::default() })
-    }
 
     async fn find_storage_receipt(
         &self,

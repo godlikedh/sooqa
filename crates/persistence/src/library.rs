@@ -7,7 +7,7 @@ use sooqa_library::{
     MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, Media, MediaCursor,
     MediaDetails, MediaIngest, MediaKind, MediaMetadata, MediaPage, MediaSearchQuery, MediaSource,
     MediaSourceInput, MediaStatus, MediaStorageState, MediaSummary, MediaUpdate, NewTag,
-    SourceKind, StorageCaptionMetadata, StorageReceipt, StorageUploadAttachment, StorageUploadInfo,
+    SourceKind, StorageReceipt, StorageUploadAttachment, StorageUploadInfo,
     StorageUploadReservation, StorageUploadReservationRequest, StorageUploadStore, Tag,
     VideoDuplicateClassification, VideoDuplicateEvidence, VideoDuplicateMatch,
     VideoIdentityOutcome,
@@ -872,22 +872,6 @@ impl StorageUploadStore for LibraryRepository {
 
     async fn find_media(&self, media_id: Uuid) -> Result<Option<Media>, Self::Error> {
         LibraryRepository::find_media(self, media_id).await
-    }
-
-    async fn find_storage_caption(
-        &self,
-        media_id: Uuid,
-    ) -> Result<StorageCaptionMetadata, Self::Error> {
-        let Some(details) = LibraryRepository::find_media_details(self, media_id).await? else {
-            return Ok(StorageCaptionMetadata::default());
-        };
-        let source =
-            details.source.and_then(|source| source.original_url.or(source.normalized_url));
-        Ok(StorageCaptionMetadata {
-            description: details.media.description,
-            tags: details.tags.into_iter().map(|tag| tag.display_name).collect(),
-            source,
-        })
     }
 
     async fn find_storage_receipt(

@@ -42,6 +42,8 @@ pub const ADD_USAGE_RESPONSE: &str = "Send one http(s) URL after /add, or send a
 pub const DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 const TELEGRAM_CLOUD_UPLOAD_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
+const TELEGRAM_MEDIA_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const TELEGRAM_MEDIA_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MEDIA_WORK_ROOT_NAME: &str = "sooqa-telegram-work";
 const RESPONSE_RATE_LIMIT: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -949,7 +951,8 @@ impl CallbackData {
 
 #[derive(Clone)]
 pub struct TeloxideApi {
-    bot: Bot,
+    control_bot: Bot,
+    media_bot: Bot,
     cloud_download_limit_bytes: Option<u64>,
     cloud_upload_limit_bytes: Option<u64>,
     source_download_max_bytes: u64,
@@ -975,13 +978,21 @@ impl TeloxideApi {
         let client_timeout = poll_timeout.checked_add(Duration::from_secs(5)).ok_or_else(|| {
             TelegramError::InvalidApiBaseUrl("poll timeout is too large".to_owned())
         })?;
-        let client = reqwest::Client::builder()
+        let token = token.into();
+        let control_client = reqwest::Client::builder()
             .timeout(client_timeout)
+            .build()
+            .map_err(TelegramError::HttpClient)?;
+        let media_client = reqwest::Client::builder()
+            .connect_timeout(TELEGRAM_MEDIA_CONNECT_TIMEOUT)
+            .read_timeout(TELEGRAM_MEDIA_READ_TIMEOUT)
             .build()
             .map_err(TelegramError::HttpClient)?;
         let is_cloud = api_base_url.host_str() == Some("api.telegram.org");
         Ok(Self {
-            bot: Bot::with_client(token, client).set_api_url(api_base_url),
+            control_bot: Bot::with_client(token.clone(), control_client)
+                .set_api_url(api_base_url.clone()),
+            media_bot: Bot::with_client(token, media_client).set_api_url(api_base_url),
             cloud_download_limit_bytes: is_cloud.then_some(TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES),
             cloud_upload_limit_bytes: is_cloud.then_some(TELEGRAM_CLOUD_UPLOAD_LIMIT_BYTES),
             source_download_max_bytes: DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
@@ -994,7 +1005,18 @@ impl TeloxideApi {
     }
 
     fn bot(&self) -> Bot {
-        self.bot.clone()
+        self.control_bot.clone()
+    }
+
+    fn media_bot(&self) -> Bot {
+        self.media_bot.clone()
+    }
+
+    #[cfg(test)]
+    fn with_test_cloud_limits(mut self, limit: u64) -> Self {
+        self.cloud_download_limit_bytes = Some(limit);
+        self.cloud_upload_limit_bytes = Some(limit);
+        self
     }
 }
 
@@ -1053,7 +1075,7 @@ impl TelegramApi for TeloxideApi {
     }
 
     async fn send_text(&self, chat_id: i64, text: &str) -> Result<(), Self::Error> {
-        self.bot
+        self.bot()
             .send_message(ChatId(chat_id), text.to_owned())
             .await
             .map(|_| ())
@@ -1062,7 +1084,7 @@ impl TelegramApi for TeloxideApi {
 
     async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), Self::Error> {
         let file = self
-            .bot()
+            .media_bot()
             .get_file(FileId(file_id.to_owned()))
             .send()
             .await
@@ -1086,7 +1108,7 @@ impl TelegramApi for TeloxideApi {
         let (download_result, exceeded, written) = {
             let mut limited_output = LimitedWriter::new(&mut output, limit);
             let download_result = teloxide::net::Download::download_file(
-                &self.bot(),
+                &self.media_bot(),
                 &file.path,
                 &mut limited_output,
             )
@@ -1323,8 +1345,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        net::{TcpListener, TcpStream},
     };
 
     use super::*;
@@ -1931,6 +1953,195 @@ mod tests {
         assert_eq!(api.messages.lock().unwrap().len(), 1);
     }
 
+    #[derive(Debug)]
+    struct HttpRequestSummary {
+        target: String,
+        body_bytes: u64,
+    }
+
+    async fn read_http_request(
+        reader: &mut BufReader<TcpStream>,
+    ) -> std::io::Result<HttpRequestSummary> {
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).await?;
+        if line.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "request line is missing",
+            ));
+        }
+        let request_line = String::from_utf8_lossy(&line);
+        let mut parts = request_line.split_whitespace();
+        let _method = parts.next().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "request method is missing")
+        })?;
+        let target = parts
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "request path is missing")
+            })?
+            .to_owned();
+
+        let mut content_length = None;
+        let mut chunked = false;
+        loop {
+            line.clear();
+            reader.read_until(b'\n', &mut line).await?;
+            if line == b"\r\n" || line == b"\n" {
+                break;
+            }
+            let header = String::from_utf8_lossy(&line);
+            let Some((name, value)) = header.split_once(':') else { continue };
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(value.trim().parse::<u64>().map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                })?);
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                chunked = value
+                    .split(',')
+                    .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"));
+            }
+        }
+
+        let body_bytes = if chunked {
+            read_chunked_body(reader).await?
+        } else if let Some(content_length) = content_length {
+            read_exact_bytes(reader, content_length).await?
+        } else {
+            0
+        };
+        Ok(HttpRequestSummary { target, body_bytes })
+    }
+
+    async fn read_exact_bytes(
+        reader: &mut BufReader<TcpStream>,
+        mut remaining: u64,
+    ) -> std::io::Result<u64> {
+        let mut buffer = [0_u8; 8 * 1024];
+        let mut read = 0_u64;
+        while remaining > 0 {
+            let chunk = remaining.min(buffer.len() as u64) as usize;
+            reader.read_exact(&mut buffer[..chunk]).await?;
+            remaining -= chunk as u64;
+            read += chunk as u64;
+        }
+        Ok(read)
+    }
+
+    async fn read_chunked_body(reader: &mut BufReader<TcpStream>) -> std::io::Result<u64> {
+        let mut line = Vec::new();
+        let mut read = 0_u64;
+        loop {
+            line.clear();
+            reader.read_until(b'\n', &mut line).await?;
+            let size = String::from_utf8_lossy(&line);
+            let size = size.split(';').next().unwrap_or_default().trim();
+            let size = u64::from_str_radix(size, 16)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if size == 0 {
+                loop {
+                    line.clear();
+                    reader.read_until(b'\n', &mut line).await?;
+                    if line == b"\r\n" || line == b"\n" {
+                        return Ok(read);
+                    }
+                }
+            }
+            read += read_exact_bytes(reader, size).await?;
+            let mut line_end = [0_u8; 2];
+            reader.read_exact(&mut line_end).await?;
+        }
+    }
+
+    async fn write_http_response(
+        stream: &mut TcpStream,
+        content_type: &str,
+        body: &[u8],
+    ) -> std::io::Result<()> {
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).await?;
+        stream.write_all(body).await
+    }
+
+    async fn serve_file_metadata(listener: TcpListener, file_size: usize) -> String {
+        let (stream, _) = listener.accept().await.expect("fake API should accept getFile");
+        let mut reader = BufReader::new(stream);
+        let request = read_http_request(&mut reader).await.expect("getFile should be readable");
+        let response = format!(
+            r#"{{"ok":true,"result":{{"file_id":"file-id","file_unique_id":"file-unique-id","file_size":{},"file_path":"/var/lib/telegram-bot-api/files/payload.bin"}}}}"#,
+            file_size
+        );
+        let mut stream = reader.into_inner();
+        write_http_response(&mut stream, "application/json", response.as_bytes())
+            .await
+            .expect("getFile response should be writable");
+        stream.shutdown().await.expect("getFile connection should close");
+        request.target
+    }
+
+    async fn serve_download(
+        listener: TcpListener,
+        payload: Vec<u8>,
+        delay_before_payload: Duration,
+    ) -> (String, String) {
+        let (stream, _) = listener.accept().await.expect("fake API should accept getFile");
+        let mut reader = BufReader::new(stream);
+        let get_file = read_http_request(&mut reader).await.expect("getFile should be readable");
+        let file_response = format!(
+            r#"{{"ok":true,"result":{{"file_id":"file-id","file_unique_id":"file-unique-id","file_size":{},"file_path":"/var/lib/telegram-bot-api/files/payload.bin"}}}}"#,
+            payload.len()
+        );
+        let mut stream = reader.into_inner();
+        write_http_response(&mut stream, "application/json", file_response.as_bytes())
+            .await
+            .expect("getFile response should be writable");
+        stream.shutdown().await.expect("getFile connection should close");
+
+        let (stream, _) = listener.accept().await.expect("fake API should accept file download");
+        let mut reader = BufReader::new(stream);
+        let file_download =
+            read_http_request(&mut reader).await.expect("file download should be readable");
+        let mut stream = reader.into_inner();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(headers.as_bytes()).await.expect("file headers should be writable");
+        if !delay_before_payload.is_zero() {
+            tokio::time::sleep(delay_before_payload).await;
+        }
+        for chunk in payload.chunks(3) {
+            stream.write_all(chunk).await.expect("file payload should be writable");
+        }
+        (get_file.target, file_download.target)
+    }
+
+    async fn serve_upload(listener: TcpListener) -> HttpRequestSummary {
+        let (stream, _) = listener.accept().await.expect("fake API should accept upload");
+        let mut reader = BufReader::new(stream);
+        let request = read_http_request(&mut reader).await.expect("upload should be readable");
+        let mut stream = reader.into_inner();
+        let response = br#"{"ok":true,"result":{"message_id":7,"date":0,"chat":{"id":-100123,"type":"channel","title":"Storage"},"video":{"file_id":"stored-file-id","file_unique_id":"stored-file-unique-id","width":1,"height":1,"duration":1,"file_size":21,"mime_type":"video/mp4"}}}"#;
+        let response_value: serde_json::Value =
+            serde_json::from_slice(response).expect("upload fixture should deserialize");
+        let video: teloxide::types::Video =
+            serde_json::from_value(response_value["result"]["video"].clone())
+                .expect("video fixture should deserialize");
+        assert_eq!(video.file.id.0, "stored-file-id");
+        let message: teloxide::types::Message = serde_json::from_value(
+            response_value.get("result").expect("upload fixture should contain a result").clone(),
+        )
+        .expect("upload result fixture should deserialize");
+        assert!(message.video().is_some(), "upload fixture should contain a video: {message:?}");
+        write_http_response(&mut stream, "application/json", response)
+            .await
+            .expect("upload response should be writable");
+        request
+    }
+
     #[tokio::test]
     async fn teloxide_api_uses_configured_bot_api_url() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
@@ -1960,6 +2171,136 @@ mod tests {
                 && request.contains("\"text\":\"hello\""),
             "unexpected request: {request}"
         );
+    }
+
+    #[tokio::test]
+    async fn local_bot_api_downloads_absolute_file_path_above_cloud_ceiling() {
+        const PAYLOAD: &[u8] = b"local transfer payload";
+        const SOURCE_LIMIT: u64 = 64;
+        const REDUCED_CLOUD_CEILING: u64 = 4;
+        assert!(PAYLOAD.len() as u64 > REDUCED_CLOUD_CEILING);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(serve_download(listener, PAYLOAD.to_vec(), Duration::ZERO));
+        let directory = std::env::temp_dir().join(format!("sooqa-telegram-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.expect("test directory should be created");
+        let destination = directory.join("download.webm");
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted")
+                .with_source_download_max_bytes(SOURCE_LIMIT);
+
+        api.download_file("file-id", &destination)
+            .await
+            .expect("local Bot API download should succeed");
+        assert_eq!(
+            tokio::fs::read(&destination).await.expect("download should be readable"),
+            PAYLOAD
+        );
+        let mut entries =
+            tokio::fs::read_dir(&directory).await.expect("directory should be readable");
+        while let Some(entry) =
+            entries.next_entry().await.expect("directory entry should be readable")
+        {
+            let name = entry.file_name();
+            assert!(!name.to_string_lossy().starts_with(".sooqa-download-"));
+        }
+        let (get_file_target, download_target) = server.await.expect("fake API task should finish");
+        assert!(get_file_target.contains("/bottest-token/GetFile"));
+        assert!(download_target.contains("/file/bottest-token/"));
+        tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn cloud_download_limit_rejects_before_streaming_file() {
+        const PAYLOAD_SIZE: u64 = 21;
+        const REDUCED_CLOUD_CEILING: u64 = 4;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(serve_file_metadata(listener, PAYLOAD_SIZE as usize));
+        let destination = std::env::temp_dir().join(format!("sooqa-telegram-{}", Uuid::new_v4()));
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted")
+                .with_source_download_max_bytes(64)
+                .with_test_cloud_limits(REDUCED_CLOUD_CEILING);
+
+        assert!(matches!(
+            api.download_file("file-id", &destination).await,
+            Err(TelegramApiError::DownloadLimit {
+                size: PAYLOAD_SIZE,
+                limit: REDUCED_CLOUD_CEILING
+            })
+        ));
+        let request_target = server.await.expect("fake API task should finish");
+        assert!(request_target.contains("/bottest-token/GetFile"));
+        assert!(tokio::fs::metadata(&destination).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn media_download_does_not_use_poll_timeout_for_slow_transfer() {
+        const PAYLOAD: &[u8] = b"slow transfer";
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server =
+            tokio::spawn(serve_download(listener, PAYLOAD.to_vec(), Duration::from_secs(6)));
+        let directory = std::env::temp_dir().join(format!("sooqa-telegram-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.expect("test directory should be created");
+        let destination = directory.join("slow.webm");
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_millis(1))
+                .expect("fake API URL should be accepted")
+                .with_source_download_max_bytes(64);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            api.download_file("file-id", &destination),
+        )
+        .await
+        .expect("media transfer should finish within the test deadline");
+        result.expect("media transfer should not inherit the polling timeout");
+        assert_eq!(
+            tokio::fs::read(&destination).await.expect("download should be readable"),
+            PAYLOAD
+        );
+        server.await.expect("fake API task should finish");
+        tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn local_bot_api_uploads_file_through_configured_endpoint_without_buffering() {
+        const PAYLOAD: &[u8] = b"large upload payload";
+        const REDUCED_CLOUD_CEILING: u64 = 4;
+        assert!(PAYLOAD.len() as u64 > REDUCED_CLOUD_CEILING);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(serve_upload(listener));
+        let directory = std::env::temp_dir().join(format!("sooqa-telegram-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.expect("test directory should be created");
+        let path = directory.join("canonical.mp4");
+        tokio::fs::write(&path, PAYLOAD).await.expect("upload fixture should be written");
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted");
+
+        let result = api
+            .upload_media(StorageUploadRequest {
+                storage_chat_id: -100123,
+                media_kind: MediaKind::Video,
+                local_work_path: path,
+                caption: "sooqa".to_owned(),
+            })
+            .await
+            .expect("local Bot API upload should succeed");
+        assert_eq!(result.storage_message_id, 7);
+        assert_eq!(result.telegram_file_id, "stored-file-id");
+        let request = server.await.expect("fake API task should finish");
+        assert!(request.target.contains("/bottest-token/SendVideo"));
+        assert!(request.body_bytes > REDUCED_CLOUD_CEILING);
+        assert!(request.body_bytes >= PAYLOAD.len() as u64);
+        tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
     }
 
     #[test]
