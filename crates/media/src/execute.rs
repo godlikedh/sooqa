@@ -142,6 +142,10 @@ impl FfmpegExecutor {
         Self { runner, ffprobe, timeout, max_output_bytes }
     }
 
+    pub fn timeout_duration(&self) -> Duration {
+        self.timeout
+    }
+
     pub async fn execute<F>(
         &self,
         plan: &NormalizationPlan,
@@ -191,21 +195,29 @@ impl FfmpegExecutor {
             _ = &mut cancellation => return Err(NormalizationExecutionError::Cancelled),
         };
 
-        if command_output.stdout_truncated || command_output.stderr_truncated {
-            return Err(NormalizationExecutionError::OutputLimitExceeded {
-                limit: self.max_output_bytes,
-            });
-        }
         if !command_output.success {
             return Err(NormalizationExecutionError::ProcessFailed {
                 exit_code: command_output.exit_code,
                 stderr: bounded_text(&command_output.stderr),
             });
         }
-        let progress = parse_ffmpeg_progress(&command_output.stdout)?;
-        if progress.state != FfmpegProgressState::End {
-            return Err(NormalizationExecutionError::ProgressDidNotEnd);
+        if command_output.stderr_truncated {
+            return Err(NormalizationExecutionError::OutputLimitExceeded {
+                limit: self.max_output_bytes,
+            });
         }
+        // Progress is advisory. The stream remains bounded and fully drained by
+        // the command runner; a successful process with truncated progress is
+        // accepted only after the output is validated below.
+        let progress = if command_output.stdout_truncated {
+            FfmpegProgress { frame: None, out_time_ms: None, state: FfmpegProgressState::End }
+        } else {
+            let progress = parse_ffmpeg_progress(&command_output.stdout)?;
+            if progress.state != FfmpegProgressState::End {
+                return Err(NormalizationExecutionError::ProgressDidNotEnd);
+            }
+            progress
+        };
 
         let metadata = tokio::fs::metadata(output_path).await.map_err(|source| {
             NormalizationExecutionError::OutputFile { path: output_path.to_owned(), source }
@@ -536,6 +548,78 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ffmpeg_args.windows(2).any(|pair| pair == ["-progress", "pipe:1"]));
         tokio::fs::remove_file(output_path).await.expect("output should be removed");
+    }
+
+    #[tokio::test]
+    async fn truncated_progress_is_non_fatal_for_a_successful_valid_output() {
+        let output_path = std::env::temp_dir()
+            .join(format!("sooqa-truncated-progress-{}.mp4", uuid::Uuid::new_v4()));
+        let runner = Arc::new(SequenceRunner::new(vec![
+            Ok(ExternalCommandOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: vec![b'x'; DEFAULT_MAX_OUTPUT_BYTES + 1],
+                stderr: Vec::new(),
+                stdout_truncated: true,
+                stderr_truncated: false,
+            }),
+            success(PROBE_JSON),
+        ]));
+        let ffprobe = FfprobeAdapter::with_runner(
+            "ffprobe",
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+        );
+        let executor = FfmpegExecutor::with_runner(
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            ffprobe,
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        let plan = planner().plan("input.mp4", &output_path, &probe()).expect("plan should build");
+
+        let result = executor
+            .execute(&plan, std::future::pending())
+            .await
+            .expect("valid output should survive truncated progress capture");
+        assert_eq!(result.progress.state, FfmpegProgressState::End);
+        assert_eq!(result.digest.bytes, b"canonical output".len() as u64);
+        tokio::fs::remove_file(output_path).await.expect("output should be removed");
+    }
+
+    #[tokio::test]
+    async fn truncated_stderr_remains_fatal_after_a_successful_process() {
+        let output_path = std::env::temp_dir()
+            .join(format!("sooqa-truncated-stderr-{}.mp4", uuid::Uuid::new_v4()));
+        let runner = Arc::new(SequenceRunner::new(vec![Ok(ExternalCommandOutput {
+            success: true,
+            exit_code: Some(0),
+            stdout: b"frame=1\nout_time_ms=1000\nprogress=end\n".to_vec(),
+            stderr: vec![b'x'; DEFAULT_MAX_OUTPUT_BYTES + 1],
+            stdout_truncated: false,
+            stderr_truncated: true,
+        })]));
+        let ffprobe = FfprobeAdapter::with_runner(
+            "ffprobe",
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+        );
+        let executor = FfmpegExecutor::with_runner(
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            ffprobe,
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        let plan = planner().plan("input.mp4", &output_path, &probe()).expect("plan should build");
+
+        let error = executor
+            .execute(&plan, std::future::pending())
+            .await
+            .expect_err("truncated stderr should remain fatal");
+        assert!(matches!(error, NormalizationExecutionError::OutputLimitExceeded { .. }));
+        assert!(!output_path.exists());
     }
 
     #[tokio::test]

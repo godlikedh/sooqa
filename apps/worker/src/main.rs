@@ -6,9 +6,8 @@ use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
 use sooqa_jobs::JobType;
 use sooqa_media::{
     BinaryCheck, CanonicalImageProfile, CanonicalVideoProfile, DirectHttpDownloader,
-    DownloadLimits, FfmpegExecutor, FfprobeAdapter, FrameExtractor, ImageNormalizer,
-    MediaWorkspace, NormalizationPlanner, ProcessCommandRunner, SourceDownloader,
-    SourceDownloaderRouter, diagnose_binaries,
+    DownloadLimits, FfprobeAdapter, ImageNormalizer, MediaWorkspace, NormalizationPlanner,
+    ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter, diagnose_binaries,
 };
 use sooqa_persistence::Database;
 use uuid::Uuid;
@@ -17,7 +16,7 @@ use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
 use sooqa_worker::{
     HandlerRegistry, TelegramSourceDownloader, Worker, compute_fingerprint_handler,
     download_source_handler, finalize_ingest_handler, inspect_source_handler,
-    normalize_asset_handler, probe_asset_handler_with_telegram_source,
+    media_processing_components, normalize_asset_handler, probe_asset_handler_with_telegram_source,
     upload_storage_asset_handler,
 };
 
@@ -44,7 +43,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let database = Database::connect_secret(database_url, config.database.max_connections).await?;
     let mut handlers = HandlerRegistry::new();
     let download_limits = DownloadLimits {
-        max_bytes: config.telegram.max_download_bytes,
+        max_bytes: config.media.source_download_max_bytes,
         ..DownloadLimits::default()
     };
     let source_downloader: Arc<dyn SourceDownloader> = Arc::new(
@@ -53,12 +52,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let telegram_api =
         match config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured()) {
             Some(token) => Some(
-                TeloxideApi::new(
+                TeloxideApi::new_with_upload_timeout(
                     token.expose_secret(),
                     &config.telegram.api_base_url,
                     Duration::from_secs(config.telegram.poll_timeout_seconds),
+                    Duration::from_secs(config.telegram.upload_timeout_seconds),
                 )?
-                .with_max_download_bytes(config.telegram.max_download_bytes),
+                .with_source_download_max_bytes(config.telegram.source_download_max_bytes),
             ),
             None => None,
         };
@@ -83,14 +83,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     handlers.register(JobType::ProbeAsset, move |job| probe_handler(job));
     tracing::info!("Telegram and upload ingest probe job handler enabled");
+    let processing_timeout = Duration::from_secs(config.media.processing_timeout_seconds);
     let normalization_planner = NormalizationPlanner::new(
         config.media.ffmpeg_path.clone(),
         CanonicalVideoProfile::default(),
     )?;
-    let normalization_executor = FfmpegExecutor::new(
-        Arc::new(ProcessCommandRunner),
+    let (normalization_executor, frame_extractor) = media_processing_components(
+        config.media.ffmpeg_path.clone(),
         config.media.ffprobe_path.clone(),
-        Duration::from_secs(300),
+        processing_timeout,
     );
     let normalize_handler = normalize_asset_handler(
         database.inbox(),
@@ -98,6 +99,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         normalization_planner,
         normalization_executor,
         ImageNormalizer::new(CanonicalImageProfile::default())?,
+        config.media.normalized_storage_max_bytes,
     );
     handlers.register(JobType::NormalizeAsset, move |job| normalize_handler(job));
     tracing::info!("asset normalization handler enabled");
@@ -105,7 +107,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         database.inbox(),
         database.library(),
         config.media.work_root.clone(),
-        FrameExtractor::new(config.media.ffmpeg_path.clone(), Duration::from_secs(300)),
+        frame_extractor,
     );
     handlers.register(JobType::ComputeFingerprint, move |job| fingerprint_handler(job));
     tracing::info!("video fingerprint handler enabled");
@@ -114,7 +116,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     tracing::info!("ingest finalization handler enabled");
     match (telegram_api, config.telegram.storage_chat_id) {
         (Some(api), Some(storage_chat_id)) => {
-            let provider = StorageUploadProvider::new(api, database.library(), storage_chat_id)?;
+            let provider = StorageUploadProvider::new(api, database.library(), storage_chat_id)?
+                .with_max_storage_bytes(config.media.normalized_storage_max_bytes)
+                .with_work_root(config.media.work_root.clone());
             provider.verify_storage_chat().await?;
             let storage_handler = upload_storage_asset_handler(database.inbox(), provider);
             handlers.register(JobType::UploadStorageAsset, move |job| storage_handler(job));

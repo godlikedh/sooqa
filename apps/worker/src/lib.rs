@@ -50,6 +50,21 @@ use uuid::Uuid;
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFailure>> + Send + 'static>>;
 pub type HandlerFn = Arc<dyn Fn(Job) -> HandlerFuture + Send + Sync>;
 
+pub fn media_processing_components(
+    ffmpeg_executable: impl Into<PathBuf>,
+    ffprobe_executable: impl Into<PathBuf>,
+    timeout: Duration,
+) -> (FfmpegExecutor, FrameExtractor) {
+    (
+        FfmpegExecutor::new(
+            Arc::new(sooqa_media::ProcessCommandRunner),
+            ffprobe_executable,
+            timeout,
+        ),
+        FrameExtractor::new(ffmpeg_executable, timeout),
+    )
+}
+
 #[async_trait]
 pub trait TelegramSourceDownloader: Send + Sync {
     async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), HandlerFailure>;
@@ -226,6 +241,7 @@ pub fn normalize_asset_handler(
     planner: NormalizationPlanner,
     executor: FfmpegExecutor,
     image_normalizer: ImageNormalizer,
+    max_normalized_storage_bytes: u64,
 ) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
@@ -234,7 +250,16 @@ pub fn normalize_asset_handler(
         let planner = planner.clone();
         let executor = executor.clone();
         Box::pin(async move {
-            normalize_asset(&inbox, &work_root, &planner, &executor, image_normalizer, job).await
+            normalize_asset(
+                &inbox,
+                &work_root,
+                &planner,
+                &executor,
+                image_normalizer,
+                max_normalized_storage_bytes,
+                job,
+            )
+            .await
         })
     })
 }
@@ -488,6 +513,7 @@ async fn normalize_asset(
     planner: &NormalizationPlanner,
     executor: &FfmpegExecutor,
     image_normalizer: ImageNormalizer,
+    max_normalized_storage_bytes: u64,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
@@ -562,6 +588,7 @@ async fn normalize_asset(
             &request,
             ingest_request_id,
             &job_attempt,
+            max_normalized_storage_bytes,
         )
         .await;
     }
@@ -572,8 +599,7 @@ async fn normalize_asset(
             &request,
             ingest_request_id,
             &job_attempt,
-            media_kind,
-            &probe,
+            ExactNormalizationSpec { media_kind, probe: &probe, max_normalized_storage_bytes },
         )
         .await;
     }
@@ -665,6 +691,11 @@ async fn normalize_asset(
             return fail_normalization(inbox, ingest_request_id, &job_attempt, failure).await;
         }
     };
+    if let Some(failure) =
+        normalized_storage_limit_failure(result.digest.bytes, max_normalized_storage_bytes)
+    {
+        return fail_normalization(inbox, ingest_request_id, &job_attempt, failure).await;
+    }
     let normalization = normalization_metadata(result);
     inbox
         .complete_asset_normalization(ingest_request_id, &job_attempt, normalization)
@@ -680,6 +711,7 @@ async fn normalize_image_asset(
     request: &sooqa_inbox::Ingest,
     ingest_request_id: Uuid,
     job_attempt: &sooqa_jobs::JobAttempt,
+    max_normalized_storage_bytes: u64,
 ) -> Result<(), HandlerFailure> {
     let (workspace_id, input_name) = match workspace_input(request) {
         Ok(value) => value,
@@ -732,6 +764,12 @@ async fn normalize_image_asset(
             .await;
         }
     };
+    if let Some(failure) = normalized_storage_limit_failure(
+        result.canonical_digest.bytes,
+        max_normalized_storage_bytes,
+    ) {
+        return fail_normalization(inbox, ingest_request_id, job_attempt, failure).await;
+    }
     inbox
         .complete_asset_normalization(
             ingest_request_id,
@@ -743,15 +781,21 @@ async fn normalize_image_asset(
     Ok(())
 }
 
+struct ExactNormalizationSpec<'a> {
+    media_kind: SourceMediaKind,
+    probe: &'a MediaProbe,
+    max_normalized_storage_bytes: u64,
+}
+
 async fn normalize_exact_asset(
     inbox: &InboxRepository,
     work_root: &Path,
     request: &sooqa_inbox::Ingest,
     ingest_request_id: Uuid,
     job_attempt: &sooqa_jobs::JobAttempt,
-    media_kind: SourceMediaKind,
-    probe: &MediaProbe,
+    spec: ExactNormalizationSpec<'_>,
 ) -> Result<(), HandlerFailure> {
+    let ExactNormalizationSpec { media_kind, probe, max_normalized_storage_bytes } = spec;
     let (workspace_id, input_name) = match workspace_input(request) {
         Ok(value) => value,
         Err(failure) => {
@@ -791,7 +835,44 @@ async fn normalize_exact_asset(
             .await;
         }
     };
-    let digest = match sha256_file(&input_path).await {
+    let canonical_name = match media_kind {
+        SourceMediaKind::Animation => "canonical.animation",
+        SourceMediaKind::Audio => "canonical.audio",
+        SourceMediaKind::Video | SourceMediaKind::Image | SourceMediaKind::Unknown => {
+            "canonical.media"
+        }
+    };
+    let canonical_path = match workspace.path(WorkspaceArea::Normalized, canonical_name) {
+        Ok(path) => path,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                job_attempt,
+                map_workspace_error(error),
+            )
+            .await;
+        }
+    };
+    match source_artifact_exists(&canonical_path).await {
+        Ok(true) => {}
+        Ok(false) => match publish_artifact(&input_path, &canonical_path).await {
+            Ok(()) | Err(ArtifactPublicationError::DestinationConflict) => {}
+            Err(error) => {
+                return fail_normalization(
+                    inbox,
+                    ingest_request_id,
+                    job_attempt,
+                    HandlerFailure::permanent("normalize_exact", error.to_string()),
+                )
+                .await;
+            }
+        },
+        Err(failure) => {
+            return fail_normalization(inbox, ingest_request_id, job_attempt, failure).await;
+        }
+    }
+    let digest = match sha256_file(&canonical_path).await {
         Ok(digest) => digest,
         Err(error) => {
             return fail_normalization(
@@ -803,10 +884,15 @@ async fn normalize_exact_asset(
             .await;
         }
     };
+    if let Some(failure) =
+        normalized_storage_limit_failure(digest.bytes, max_normalized_storage_bytes)
+    {
+        return fail_normalization(inbox, ingest_request_id, job_attempt, failure).await;
+    }
     let video = probe.streams.iter().find(|stream| stream.kind == MediaStreamKind::Video);
     let audio = probe.streams.iter().find(|stream| stream.kind == MediaStreamKind::Audio);
     let normalization = AssetNormalization {
-        local_work_path: input_path.to_string_lossy().into_owned(),
+        local_work_path: canonical_path.to_string_lossy().into_owned(),
         file_size_bytes: digest.bytes,
         sha256: digest.sha256,
         media_kind,
@@ -957,6 +1043,17 @@ fn image_normalization_metadata(
             height: Some(result.thumbnail_height),
         }),
     }
+}
+
+fn normalized_storage_limit_failure(bytes: u64, limit: u64) -> Option<HandlerFailure> {
+    (bytes > limit).then(|| {
+        HandlerFailure::permanent(
+            "normalized_storage_too_large",
+            format!(
+                "canonical normalized media is {bytes} bytes, above the configured storage ceiling of {limit} bytes"
+            ),
+        )
+    })
 }
 
 async fn fail_normalization(
@@ -2284,6 +2381,16 @@ mod tests {
     }
 
     #[test]
+    fn media_processing_components_use_configured_timeout() {
+        let timeout = Duration::from_secs(301);
+        let (normalization, fingerprint) =
+            media_processing_components("ffmpeg", "ffprobe", timeout);
+
+        assert_eq!(normalization.timeout_duration(), timeout);
+        assert_eq!(fingerprint.timeout_duration(), timeout);
+    }
+
+    #[test]
     fn sha256_decoder_accepts_hex_and_rejects_malformed_utf8_without_panicking() {
         let digest = decode_sha256(&"ab".repeat(32)).expect("hex digest should decode");
         assert_eq!(digest, vec![0xab; 32]);
@@ -2312,5 +2419,16 @@ mod tests {
         let exhausted = map_fingerprint_error(&running_compute_job(5, 5), timeout_error());
         assert!(!exhausted.retryable);
         assert_eq!(exhausted.class, "fingerprint_failed");
+    }
+
+    #[test]
+    fn normalized_storage_limit_failure_is_terminal_and_descriptive() {
+        let failure = normalized_storage_limit_failure(101, 100)
+            .expect("an oversized canonical artifact should fail");
+        assert!(!failure.retryable);
+        assert_eq!(failure.class, "normalized_storage_too_large");
+        assert!(failure.message.contains("101 bytes"));
+        assert!(failure.message.contains("100 bytes"));
+        assert!(normalized_storage_limit_failure(100, 100).is_none());
     }
 }

@@ -98,8 +98,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
             config.telegram.storage_chat_id,
             DatabaseIngestService { repository: database.inbox() },
         )?
+        .with_upload_timeout(std::time::Duration::from_secs(
+            config.telegram.upload_timeout_seconds,
+        ))?
         .with_media_work_root(config.media.work_root.clone())
-        .with_max_download_bytes(config.telegram.max_download_bytes);
+        .with_source_download_max_bytes(config.telegram.source_download_max_bytes);
         tracing::info!(api_base_url = %config.telegram.api_base_url, "Telegram bot polling enabled");
         tokio::select! {
             result = server => result?,

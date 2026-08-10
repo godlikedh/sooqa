@@ -90,6 +90,11 @@ docker context use colima
 docker compose up -d postgres
 ```
 
+The root Compose file is development-only. The separate self-hosted home
+topology, including the pinned official local Telegram Bot API server, is
+documented in [operations.md](docs/operations.md) and configured under
+`deploy/home`.
+
 Apply forward-only migrations:
 
 ```bash

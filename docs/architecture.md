@@ -74,6 +74,8 @@ this baseline.
 - `sooqa-media` owns direct HTTP, ffprobe, ffmpeg, image normalization,
   hashing, fingerprints, workspaces, and subprocess safety.
 - `sooqa-telegram` owns Telegram protocol mapping and storage upload effects.
+  Polling, downloads, and storage uploads use separate HTTP clients and
+  timeout policies.
 - `sooqa-persistence` owns migrations and short database transactions.
 - `sooqa-api` owns HTTP routing, one configured bearer secret, limits, and
   stable request-ID errors.
@@ -164,6 +166,16 @@ alignment produces at most three scalar evidence matches, capped at 16 KiB.
 Exact duplicates reuse the existing media row, strong perceptual matches stop
 at durable `duplicate_pending`, and no-match videos insert one
 `pending_storage` reservation before upload.
+
+The home deployment adds the official `tdlib/telegram-bot-api` service in
+`--local` mode. It is built at a pinned upstream commit, has a dedicated
+persistent working volume, and is reachable only as
+`http://telegram-bot-api:8081` on the Compose network. The application server
+and worker share the sooqa work-root volume with each other; the Bot API data
+volume is separate. Telegram downloads and uploads remain path-based or
+streamed, so large files do not enter JSON or a `Vec<u8>`. Cloud/local bot
+cutover is an owner-authorized operational procedure, never an application
+state transition.
 
 ## Publisher
 
