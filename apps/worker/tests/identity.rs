@@ -315,7 +315,7 @@ async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
     let request = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
     assert_eq!(request.status, IngestStatus::Normalizing);
     assert_eq!(source.calls.load(Ordering::Relaxed), 1);
-    let workspace = MediaWorkspace::create(&work_root, workspace_id).await.unwrap();
+    let workspace = MediaWorkspace::create(&work_root, request.workspace_id).await.unwrap();
     let source_path = workspace.path(WorkspaceArea::Source, "telegram-input.bin").unwrap();
     assert_eq!(fs::read(&source_path).await.unwrap(), b"telegram-reconstructed");
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "probe_asset").await, 1);
