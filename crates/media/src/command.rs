@@ -20,11 +20,14 @@ use tokio::{
 
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+pub const DEFAULT_COMMAND_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExternalCommand {
     program: PathBuf,
     args: Vec<OsString>,
+    clear_environment: bool,
+    environment: Vec<(OsString, OsString)>,
     timeout: Duration,
     max_output_bytes: usize,
 }
@@ -34,6 +37,8 @@ impl ExternalCommand {
         Self {
             program: program.into(),
             args: Vec::new(),
+            clear_environment: false,
+            environment: Vec::new(),
             timeout: DEFAULT_COMMAND_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
@@ -41,6 +46,16 @@ impl ExternalCommand {
 
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());
+        self
+    }
+
+    pub fn clear_environment(mut self) -> Self {
+        self.clear_environment = true;
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.environment.push((key.into(), value.into()));
         self
     }
 
@@ -60,6 +75,14 @@ impl ExternalCommand {
 
     pub fn args(&self) -> &[OsString] {
         &self.args
+    }
+
+    pub fn clears_environment(&self) -> bool {
+        self.clear_environment
+    }
+
+    pub fn environment(&self) -> &[(OsString, OsString)] {
+        &self.environment
     }
 
     pub fn timeout_duration(&self) -> Duration {
@@ -126,6 +149,12 @@ async fn run_process_command(
     let program = command.program().to_owned();
     let mut process = Command::new(command.program());
     process.args(command.args()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if command.clears_environment() {
+        process.env_clear();
+        for (key, value) in command.environment() {
+            process.env(key, value);
+        }
+    }
     #[cfg(unix)]
     process.process_group(0);
     let mut child = process

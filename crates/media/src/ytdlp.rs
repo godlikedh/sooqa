@@ -12,15 +12,19 @@ use uuid::Uuid;
 
 use crate::publication::{PublishOutcome, TempArtifact, publish_or_reuse};
 use crate::{
-    CommandError, DEFAULT_MAX_OUTPUT_BYTES, DownloadError, DownloadLimits, DownloadedSource,
-    ExternalCommand, ExternalCommandOutput, ExternalCommandRunner, SourceDownloader, SourceInput,
-    SourceInspection, SourceMediaKind,
+    CommandError, DEFAULT_COMMAND_PATH, DEFAULT_MAX_OUTPUT_BYTES, DownloadError, DownloadLimits,
+    DownloadedSource, ExternalCommand, ExternalCommandOutput, ExternalCommandRunner,
+    SourceDownloader, SourceInput, SourceInspection, SourceMediaKind,
 };
+
+const DEFAULT_DENO_PATH: &str = "deno";
+const MIN_SUPPORTED_DENO_VERSION: (u32, u32, u32) = (2, 3, 0);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct YtDlpConfig {
     executable: PathBuf,
     format_selection: String,
+    deno_path: PathBuf,
     max_output_bytes: usize,
 }
 
@@ -34,14 +38,38 @@ impl YtDlpConfig {
         Ok(Self {
             executable: executable.into(),
             format_selection,
+            deno_path: PathBuf::from(DEFAULT_DENO_PATH),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         })
+    }
+
+    pub fn with_deno_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.deno_path = path.into();
+        self
+    }
+
+    pub fn deno_path(&self) -> &Path {
+        &self.deno_path
     }
 
     pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
         self.max_output_bytes = max_output_bytes;
         self
     }
+}
+
+pub fn is_supported_deno_version(version_line: &str) -> bool {
+    let Some(version) = version_line
+        .split_whitespace()
+        .find(|part| part.chars().next().is_some_and(|character| character.is_ascii_digit()))
+    else {
+        return false;
+    };
+    let mut components = version.split('.').map(|component| component.parse::<u32>().ok());
+    let Some(major) = components.next().flatten() else { return false };
+    let Some(minor) = components.next().flatten() else { return false };
+    let patch = components.next().flatten().unwrap_or(0);
+    (major, minor, patch) >= MIN_SUPPORTED_DENO_VERSION
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -92,7 +120,9 @@ impl YtDlpDownloader {
             .into_iter()
             .fold(ExternalCommand::new(self.config.executable.clone()), |command, arg| {
                 command.arg(arg)
-            });
+            })
+            .clear_environment()
+            .env("PATH", DEFAULT_COMMAND_PATH);
         let command = command.timeout(timeout).max_output_bytes(self.config.max_output_bytes);
         let output = self.runner.run(command).await.map_err(map_command_error)?;
         if output.stdout_truncated || output.stderr_truncated {
@@ -109,6 +139,16 @@ impl YtDlpDownloader {
         }
         Ok(output)
     }
+
+    fn security_args(&self) -> [String; 5] {
+        [
+            "--ignore-config".to_owned(),
+            "--no-plugin-dirs".to_owned(),
+            "--no-remote-components".to_owned(),
+            "--js-runtimes".to_owned(),
+            format!("deno:{}", self.config.deno_path.display()),
+        ]
+    }
 }
 
 #[async_trait]
@@ -116,23 +156,21 @@ impl SourceDownloader for YtDlpDownloader {
     async fn inspect(&self, source: &SourceInput) -> Result<SourceInspection, DownloadError> {
         validate_limits(&self.inspection_limits, self.inspection_limits.timeout)?;
         let source_url = validate_source_url(&source.source_url)?;
-        let output = self
-            .run(
-                vec![
-                    "--dump-single-json".to_owned(),
-                    "--skip-download".to_owned(),
-                    "--no-playlist".to_owned(),
-                    "--no-warnings".to_owned(),
-                    "--no-progress".to_owned(),
-                    "--format".to_owned(),
-                    self.config.format_selection.clone(),
-                    "--".to_owned(),
-                    source_url.clone(),
-                ],
-                self.inspection_limits.timeout,
-                &source_url,
-            )
-            .await?;
+        let mut args = vec![
+            "--dump-single-json".to_owned(),
+            "--skip-download".to_owned(),
+            "--no-playlist".to_owned(),
+            "--no-warnings".to_owned(),
+            "--no-progress".to_owned(),
+        ];
+        args.extend(self.security_args());
+        args.extend([
+            "--format".to_owned(),
+            self.config.format_selection.clone(),
+            "--".to_owned(),
+            source_url.clone(),
+        ]);
+        let output = self.run(args, self.inspection_limits.timeout, &source_url).await?;
         let metadata = parse_metadata(&output.stdout, &source_url)?;
         if metadata.filesize_bytes.is_some_and(|bytes| bytes > self.inspection_limits.max_bytes) {
             return Err(DownloadError::terminal(
@@ -172,8 +210,7 @@ impl SourceDownloader for YtDlpDownloader {
         limits: &DownloadLimits,
     ) -> Result<DownloadedSource, DownloadError> {
         validate_limits(limits, limits.timeout)?;
-        let source_url = inspection.resolved_url.as_deref().unwrap_or(&inspection.source_url);
-        let source_url = validate_source_url(source_url)?;
+        let source_url = validate_source_url(&inspection.source_url)?;
         let temporary = destination.with_file_name(format!(".sooqa-ytdlp-{}.tmp", Uuid::new_v4()));
         let mut temporary = TempArtifact::reserve(temporary).await.map_err(|source| {
             DownloadError::terminal(
@@ -182,27 +219,25 @@ impl SourceDownloader for YtDlpDownloader {
             )
         })?;
 
-        let result = self
-            .run(
-                vec![
-                    "--no-playlist".to_owned(),
-                    "--no-warnings".to_owned(),
-                    "--no-progress".to_owned(),
-                    "--no-part".to_owned(),
-                    "--force-overwrites".to_owned(),
-                    "--max-filesize".to_owned(),
-                    limits.max_bytes.to_string(),
-                    "--format".to_owned(),
-                    self.config.format_selection.clone(),
-                    "--output".to_owned(),
-                    temporary.path().to_string_lossy().into_owned(),
-                    "--".to_owned(),
-                    source_url.clone(),
-                ],
-                limits.timeout,
-                &source_url,
-            )
-            .await;
+        let mut args = vec![
+            "--no-playlist".to_owned(),
+            "--no-warnings".to_owned(),
+            "--no-progress".to_owned(),
+            "--no-part".to_owned(),
+            "--force-overwrites".to_owned(),
+        ];
+        args.extend(self.security_args());
+        args.extend([
+            "--max-filesize".to_owned(),
+            limits.max_bytes.to_string(),
+            "--format".to_owned(),
+            self.config.format_selection.clone(),
+            "--output".to_owned(),
+            temporary.path().to_string_lossy().into_owned(),
+            "--".to_owned(),
+            source_url.clone(),
+        ]);
+        let result = self.run(args, limits.timeout, &source_url).await;
         result?;
 
         let metadata = match tokio::fs::metadata(temporary.path()).await {
@@ -367,8 +402,25 @@ fn validate_source_url(value: &str) -> Result<String, DownloadError> {
             "source URL must not contain embedded credentials",
         ));
     }
-    if url.host_str().is_none() {
+    let default_port = match url.scheme() {
+        "http" => 80,
+        "https" => 443,
+        _ => unreachable!("scheme was checked above"),
+    };
+    if url.port().is_some_and(|port| port != default_port) {
+        return Err(DownloadError::terminal(
+            "source_port_not_allowed",
+            "yt-dlp page URLs must use the default HTTP or HTTPS port",
+        ));
+    }
+    let Some(host) = url.host() else {
         return Err(DownloadError::terminal("missing_source_host", "source URL has no host"));
+    };
+    if !matches!(host, url::Host::Domain(_)) {
+        return Err(DownloadError::terminal(
+            "source_host_not_allowed",
+            "yt-dlp page URL host must be a configured DNS hostname",
+        ));
     }
     Ok(url.to_string())
 }
@@ -472,7 +524,7 @@ mod tests {
         let executable = root.join("fake-yt-dlp.sh");
         let args_log = root.join("args.log");
         let script = format!(
-            "#!/bin/sh\nset -eu\nlog={args_log:?}\n: > \"$log\"\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$log\"; done\nif [ \"$1\" = \"--dump-single-json\" ]; then printf '%s\\n' '{{\"id\":\"abc\",\"title\":\"Example\",\"webpage_url\":\"https://example.test/watch?v=abc\",\"extractor\":\"generic\",\"duration\":3.5,\"filesize\":17,\"width\":1280,\"height\":720,\"ext\":\"mp4\",\"vcodec\":\"h264\",\"acodec\":\"aac\",\"format_id\":\"best\"}}'; else output=; previous=; for arg in \"$@\"; do if [ \"$previous\" = \"--output\" ]; then output=\"$arg\"; fi; previous=\"$arg\"; done; printf 'fake-media' > \"$output\"; fi\n",
+            "#!/bin/sh\nset -eu\nif [ -n \"${{DATABASE_URL-}}\" ] || [ -n \"${{SOOQA_API_TOKEN-}}\" ] || [ -n \"${{SOOQA_TELEGRAM_BOT_TOKEN-}}\" ]; then exit 91; fi\nlog={args_log:?}\n: > \"$log\"\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$log\"; done\nif [ \"$1\" = \"--dump-single-json\" ]; then printf '%s\\n' '{{\"id\":\"abc\",\"title\":\"Example\",\"webpage_url\":\"https://example.test/watch?v=abc\",\"extractor\":\"generic\",\"duration\":3.5,\"filesize\":17,\"width\":1280,\"height\":720,\"ext\":\"mp4\",\"vcodec\":\"h264\",\"acodec\":\"aac\",\"format_id\":\"best\"}}'; else output=; previous=; for arg in \"$@\"; do if [ \"$previous\" = \"--output\" ]; then output=\"$arg\"; fi; previous=\"$arg\"; done; printf 'fake-media' > \"$output\"; fi\n",
             args_log = args_log.display()
         );
         tokio::fs::write(&executable, script).await.expect("fake executable should be written");
@@ -507,6 +559,18 @@ mod tests {
         let inspect_args =
             tokio::fs::read_to_string(&args_log).await.expect("inspect arguments should be logged");
         assert!(inspect_args.lines().any(|line| line == "bestvideo*+bestaudio/best"));
+        for argument in [
+            "--ignore-config",
+            "--no-plugin-dirs",
+            "--no-remote-components",
+            "--js-runtimes",
+            "deno:deno",
+        ] {
+            assert!(
+                inspect_args.lines().any(|line| line == argument),
+                "missing argument: {argument}"
+            );
+        }
         assert!(
             inspect_args
                 .lines()
@@ -540,7 +604,11 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(".sooqa-ytdlp-") && name.ends_with(".tmp"))
         );
-        assert!(download_args.lines().any(|line| line == "https://example.test/watch?v=abc"));
+        assert!(
+            download_args
+                .lines()
+                .any(|line| line == "https://example.test/watch?v=abc&title=hello%20world")
+        );
 
         let replayed = downloader
             .download(&inspection, &destination, &limits)
@@ -672,5 +740,13 @@ exit 1
                 .expect_err("empty format must be rejected"),
             YtDlpConfigError::EmptyFormatSelection
         );
+    }
+
+    #[test]
+    fn deno_version_must_meet_yt_dlp_runtime_minimum() {
+        assert!(!is_supported_deno_version("deno 2.2.9"));
+        assert!(is_supported_deno_version("deno 2.3.0 (stable, release)"));
+        assert!(is_supported_deno_version("deno 2.8.1"));
+        assert!(!is_supported_deno_version("deno unknown"));
     }
 }

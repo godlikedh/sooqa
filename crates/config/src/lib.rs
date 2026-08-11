@@ -23,6 +23,8 @@ const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
 const DEFAULT_FFPROBE_PATH: &str = "ffprobe";
 const DEFAULT_YTDLP_PATH: &str = "yt-dlp";
 const DEFAULT_YTDLP_FORMAT: &str = "bestvideo*+bestaudio/best";
+const MAX_YTDLP_ALLOWED_HOSTS: usize = 32;
+const MAX_YTDLP_ALLOWED_HOST_LENGTH: usize = 253;
 const DEFAULT_MEDIA_WORK_ROOT: &str = "/var/lib/sooqa/work";
 const DEFAULT_MEDIA_PROCESSING_TIMEOUT_SECONDS: u64 = 3_600;
 const MAX_MEDIA_PROCESSING_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
@@ -239,6 +241,7 @@ pub struct MediaConfig {
     pub ffprobe_path: PathBuf,
     pub ytdlp_path: PathBuf,
     pub ytdlp_format: String,
+    pub ytdlp_allowed_hosts: Vec<String>,
     pub processing_timeout_seconds: u64,
     pub source_download_max_bytes: u64,
     pub normalized_storage_max_bytes: u64,
@@ -392,6 +395,10 @@ impl AppConfig {
                     .media
                     .ytdlp_format
                     .unwrap_or_else(|| DEFAULT_YTDLP_FORMAT.to_owned()),
+                ytdlp_allowed_hosts: parse_ytdlp_allowed_hosts(
+                    "media.ytdlp_allowed_hosts",
+                    raw.media.ytdlp_allowed_hosts,
+                )?,
                 processing_timeout_seconds: raw
                     .media
                     .processing_timeout_seconds
@@ -460,7 +467,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} companion.listen_address={} companion.request_body_limit_bytes={} companion.request_timeout_seconds={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.ytdlp_allowed_hosts={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} companion.listen_address={} companion.request_body_limit_bytes={} companion.request_timeout_seconds={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -473,6 +480,7 @@ impl AppConfig {
             self.media.ffprobe_path.display(),
             self.media.ytdlp_path.display(),
             self.media.ytdlp_format,
+            self.media.ytdlp_allowed_hosts.join(","),
             self.media.processing_timeout_seconds,
             self.media.source_download_max_bytes,
             self.media.normalized_storage_max_bytes,
@@ -527,6 +535,15 @@ impl AppConfig {
         }
         if let Some(value) = optional_env_string("SOOQA_MEDIA_YTDLP_FORMAT")? {
             self.media.ytdlp_format = value;
+        }
+        if let Some(value) = optional_env_string("SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS")? {
+            let values = if value.trim().is_empty() {
+                Vec::new()
+            } else {
+                value.split(',').map(str::to_owned).collect()
+            };
+            self.media.ytdlp_allowed_hosts =
+                parse_ytdlp_allowed_hosts("SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS", values)?;
         }
         if let Some(value) = optional_env_string("SOOQA_MEDIA_PROCESSING_TIMEOUT_SECONDS")? {
             self.media.processing_timeout_seconds =
@@ -787,6 +804,10 @@ impl AppConfig {
                 reason: "must be below Telegram's 2000 MB local upload limit",
             });
         }
+        parse_ytdlp_allowed_hosts(
+            "media.ytdlp_allowed_hosts",
+            self.media.ytdlp_allowed_hosts.clone(),
+        )?;
         if self.telegram.storage_chat_id.is_some_and(|id| id >= 0) {
             return Err(ConfigError::InvalidValue {
                 name: "telegram.storage_chat_id".to_owned(),
@@ -892,6 +913,7 @@ struct RawMediaConfig {
     ffprobe_path: Option<String>,
     ytdlp_path: Option<String>,
     ytdlp_format: Option<String>,
+    ytdlp_allowed_hosts: Vec<String>,
     processing_timeout_seconds: Option<u64>,
     source_download_max_bytes: Option<u64>,
     normalized_storage_max_bytes: Option<u64>,
@@ -955,6 +977,89 @@ fn optional_env_string(name: &str) -> Result<Option<String>, ConfigError> {
             .map_err(|_| ConfigError::InvalidEnvironmentEncoding { name: name.to_owned() }),
         None => Ok(None),
     }
+}
+
+fn parse_ytdlp_allowed_hosts(name: &str, values: Vec<String>) -> Result<Vec<String>, ConfigError> {
+    if values.len() > MAX_YTDLP_ALLOWED_HOSTS {
+        return Err(ConfigError::InvalidValue {
+            name: name.to_owned(),
+            reason: "must contain at most 32 host entries",
+        });
+    }
+
+    let mut normalized = Vec::with_capacity(values.len());
+    for raw in values {
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                name: name.to_owned(),
+                reason: "must not contain empty host entries",
+            });
+        }
+        if value.len() > MAX_YTDLP_ALLOWED_HOST_LENGTH
+            || value.chars().any(char::is_control)
+            || value.contains('*')
+            || value.contains('/')
+            || value.contains('?')
+            || value.contains('#')
+        {
+            return Err(ConfigError::InvalidValue {
+                name: name.to_owned(),
+                reason: "entries must be bounded hostnames without wildcards, paths, or control characters",
+            });
+        }
+
+        let parsed = url::Url::parse(&format!("https://{value}")).map_err(|_| {
+            ConfigError::InvalidValue {
+                name: name.to_owned(),
+                reason: "entries must be valid hostnames",
+            }
+        })?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.path() != "/"
+        {
+            return Err(ConfigError::InvalidValue {
+                name: name.to_owned(),
+                reason: "entries must be hostnames without credentials, paths, queries, or fragments",
+            });
+        }
+        let default_port = match parsed.scheme() {
+            "http" => 80,
+            "https" => 443,
+            _ => unreachable!("the parser input always uses https"),
+        };
+        if parsed.port().is_some_and(|port| port != default_port) {
+            return Err(ConfigError::InvalidValue {
+                name: name.to_owned(),
+                reason: "entries must not use a non-default port",
+            });
+        }
+
+        let host = parsed.host_str().ok_or_else(|| ConfigError::InvalidValue {
+            name: name.to_owned(),
+            reason: "entries must contain a hostname",
+        })?;
+        let host = host.strip_suffix('.').unwrap_or(host);
+        if host.is_empty()
+            || host.len() > MAX_YTDLP_ALLOWED_HOST_LENGTH
+            || host.ends_with('.')
+            || !matches!(parsed.host(), Some(url::Host::Domain(_)))
+            || host.split('.').any(|label| label.is_empty())
+        {
+            return Err(ConfigError::InvalidValue {
+                name: name.to_owned(),
+                reason: "entries must be non-empty DNS hostnames, not IP literals",
+            });
+        }
+        normalized.push(host.to_ascii_lowercase());
+    }
+
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 fn parse_admin_user_ids(name: &str, value: &str) -> Result<Vec<i64>, ConfigError> {
@@ -1260,7 +1365,70 @@ mod tests {
         assert_eq!(config.media.ffprobe_path, PathBuf::from("/opt/bin/ffprobe"));
         assert_eq!(config.media.ytdlp_path, PathBuf::from("yt-dlp"));
         assert_eq!(config.media.ytdlp_format, "bestvideo*+bestaudio/best");
+        assert!(config.media.ytdlp_allowed_hosts.is_empty());
         assert_eq!(config.media.processing_timeout_seconds, 7200);
+    }
+
+    #[test]
+    fn ytdlp_allowed_hosts_normalize_and_sort() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media]\nytdlp_allowed_hosts = [\"WWW.YouTube.COM.\", \"youtu.be\", \"youtube.com\"]\n",
+        )
+        .expect("TOML should parse");
+
+        assert_eq!(
+            config.media.ytdlp_allowed_hosts,
+            ["www.youtube.com", "youtu.be", "youtube.com"]
+        );
+        assert!(
+            config
+                .summary()
+                .contains("media.ytdlp_allowed_hosts=www.youtube.com,youtu.be,youtube.com")
+        );
+    }
+
+    #[test]
+    fn ytdlp_allowed_hosts_normalize_idna() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media]\nytdlp_allowed_hosts = [\"BÜCHER.example\"]\n",
+        )
+        .expect("TOML should parse");
+
+        assert_eq!(config.media.ytdlp_allowed_hosts, ["xn--bcher-kva.example"]);
+    }
+
+    #[test]
+    fn ytdlp_allowed_hosts_reject_unsafe_entries() {
+        for value in [
+            "",
+            "*.youtube.com",
+            "youtube.com/path",
+            "youtube.com..",
+            "youtube.com:8443",
+            "127.0.0.1",
+            "[::1]",
+            "user:password@youtube.com",
+            "https://youtube.com",
+        ] {
+            let contents = format!("[media]\nytdlp_allowed_hosts = [\"{value}\"]\n");
+            assert!(
+                AppConfig::from_toml_str(AppRole::Worker, None, &contents).is_err(),
+                "unsafe host entry should fail: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ytdlp_allowed_hosts_are_bounded() {
+        let values =
+            (0..=MAX_YTDLP_ALLOWED_HOSTS).map(|index| format!("host{index}.example")).collect();
+        let error = parse_ytdlp_allowed_hosts("media.ytdlp_allowed_hosts", values)
+            .expect_err("too many host entries must fail");
+        assert!(error.to_string().contains("at most 32"));
     }
 
     #[test]
