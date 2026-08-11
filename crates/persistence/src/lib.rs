@@ -31,6 +31,10 @@ pub struct Database {
 }
 
 impl Database {
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
     pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self, DatabaseError> {
         if database_url.is_empty() {
             return Err(DatabaseError::MissingUrl);

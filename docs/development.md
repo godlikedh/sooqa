@@ -17,7 +17,28 @@ just openapi-validate
 ## PostgreSQL tests
 
 Integration tests are marked `#[ignore]` because they need a real PostgreSQL
-server. Cargo's separator is intentional:
+server. Every PostgreSQL integration test uses SQLx's `#[sqlx::test]` support
+with the repository migrations and receives its own `PgPool`. SQLx uses the
+database named by `DATABASE_URL` as a test-control database: before creating
+per-test databases, it writes bookkeeping state to the `_sqlx_test`
+schema/table there. Each test then gets a fresh database with the repository
+migrations. A successful test result causes SQLx to drop that database
+automatically. A failed or panicking test intentionally leaves its database
+behind for diagnosis; a later run of the same test path can reclaim it, or it
+must be dropped explicitly. This keeps Rust's default parallel test execution
+safe and intentional.
+
+The PostgreSQL role in `DATABASE_URL` must own or be allowed to write to the
+test-control database and must be allowed to create databases (`CREATEDB`, or a
+superuser role in local development). The `sooqa` database in the command below
+is intentionally the disposable local/CI test-control database. Do not point
+this URL at the runtime or home database; use a separate test-control database
+name if those environments also use `sooqa`. Use a dedicated development/CI
+PostgreSQL account, never a runtime or production database account, for the
+test suite. One legacy-migration test creates an additional uniquely named
+database and therefore also requires the account to create databases directly.
+
+Cargo's separator is intentional:
 
 ```bash
 DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa \
@@ -25,13 +46,15 @@ DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa \
 ```
 
 The first `--` belongs to Cargo; `--ignored` is passed to the test harness and
-causes ignored tests to run. `just test-integration` runs the focused persistence,
-API, and worker integration commands.
+causes ignored tests to run. `just test-integration` runs the focused
+persistence, API, and worker integration commands. Do not add
+`--test-threads=1`; isolation is provided by SQLx and serialization would hide
+missing isolation while slowing the suite.
 
-The reset is intentionally clean. Tests start from the five-table migration;
-they do not copy rows from a previous schema and no command resets a Docker
-volume automatically. If a local database still has the old model, recreate it
-explicitly before migrating.
+The reset is intentionally clean. SQLx test databases start from the five-table
+migration; they do not copy rows from a previous schema, and no command resets
+a Docker volume automatically. If a local runtime database still has the old
+model, recreate it explicitly before migrating.
 
 ## OpenAPI and binaries
 

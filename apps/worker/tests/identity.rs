@@ -36,13 +36,6 @@ use thiserror::Error;
 use tokio::fs;
 use uuid::Uuid;
 
-async fn database() -> Database {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL");
-    let database = Database::connect(&url, 10).await.expect("database should connect");
-    database.migrate().await.expect("migration should apply");
-    database
-}
-
 #[derive(Clone)]
 struct ReconstructingDirectSource {
     inspection_calls: Arc<AtomicUsize>,
@@ -125,10 +118,10 @@ impl ExternalCommandRunner for StaticProbeRunner {
     }
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn force_save_reconstructs_url_after_workspace_cleanup() {
-    let database = database().await;
+async fn force_save_reconstructs_url_after_workspace_cleanup(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let work_root = std::env::temp_dir().join(format!("sooqa-worker-url-{}", Uuid::new_v4()));
     let ingest = database
         .inbox()
@@ -188,14 +181,13 @@ async fn force_save_reconstructs_url_after_workspace_cleanup() {
     assert_eq!(source.download_calls.load(Ordering::Relaxed), 1);
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "probe_asset").await, 1);
 
-    cleanup_ingest(&database, ingest.ingest.id).await;
     let _ = fs::remove_dir_all(work_root).await;
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn cleanup_handler_removes_only_the_claimed_workspace() {
-    let database = database().await;
+async fn cleanup_handler_removes_only_the_claimed_workspace(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let work_root = std::env::temp_dir().join(format!("sooqa-worker-cleanup-{}", Uuid::new_v4()));
     let ingest = database
         .inbox()
@@ -244,23 +236,13 @@ async fn cleanup_handler_removes_only_the_claimed_workspace() {
     database.jobs().complete_lease(&claimed.lease().unwrap()).await.unwrap();
     assert!(!workspace.root().exists());
 
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(ingest.ingest.id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest.ingest.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
     let _ = fs::remove_dir_all(work_root).await;
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
-    let database = database().await;
+async fn force_save_reconstructs_telegram_source_after_workspace_cleanup(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let work_root = std::env::temp_dir().join(format!("sooqa-worker-telegram-{}", Uuid::new_v4()));
     let ingest = database
         .inbox()
@@ -320,14 +302,13 @@ async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "probe_asset").await, 1);
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "normalize_asset").await, 1);
 
-    cleanup_ingest(&database, ingest.ingest.id).await;
     let _ = fs::remove_dir_all(work_root).await;
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn non_video_normalization_queues_finalization_without_fingerprint_job() {
-    let database = database().await;
+async fn non_video_normalization_queues_finalization_without_fingerprint_job(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let ingest = database
         .inbox()
         .create_ingest(
@@ -390,8 +371,6 @@ async fn non_video_normalization_queues_finalization_without_fingerprint_job() {
     assert_eq!(completed.status, IngestStatus::Storing);
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "compute_fingerprint").await, 0);
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "finalize_ingest").await, 1);
-
-    cleanup_ingest(&database, ingest.ingest.id).await;
 }
 
 #[derive(Clone)]
@@ -473,16 +452,15 @@ impl TelegramStorageApi for CountingStorageApi {
     }
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn composed_identity_worker_has_bounded_storage_effects() {
-    let database = database().await;
+async fn composed_identity_worker_has_bounded_storage_effects(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let work_root = std::env::temp_dir().join(format!("sooqa-worker-identity-{}", Uuid::new_v4()));
     let calls = Arc::new(AtomicUsize::new(0));
     let storage_api = CountingStorageApi { calls: Arc::clone(&calls) };
 
     let exact = prepare_fingerprint_request(&database, &work_root, "exact", b"exact-bytes").await;
-    let exact_id = exact.ingest_id;
     let exact_sha = hex_bytes(&exact.normalization.sha256);
     let exact_media = database
         .library()
@@ -602,25 +580,7 @@ async fn composed_identity_worker_has_bounded_storage_effects() {
         IngestStatus::Completed
     );
 
-    cleanup_ingest(&database, exact_id).await;
-    cleanup_ingest(&database, strong_request.id).await;
-    cleanup_ingest(&database, no_match_id).await;
     fs::remove_dir_all(&work_root).await.unwrap();
-    let _ = sqlx::query("DELETE FROM media WHERE id = $1 OR id = $2")
-        .bind(exact_media.media.id)
-        .bind(strong_candidate_id)
-        .execute(database.pool())
-        .await;
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'media_id' = $1")
-        .bind(media_id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(media_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
 async fn prepare_fingerprint_request(
@@ -778,19 +738,6 @@ async fn count_ingest_jobs(database: &Database, ingest_id: Uuid, kind: &str) -> 
     .fetch_one(database.pool())
     .await
     .unwrap()
-}
-
-async fn cleanup_ingest(database: &Database, ingest_id: Uuid) {
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(ingest_id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
 async fn mark_media_ready(database: &Database, media_id: Uuid) {

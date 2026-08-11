@@ -1,5 +1,3 @@
-use std::env;
-
 use serde_json::json;
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
 use sooqa_jobs::{JobAttempt, NewJob};
@@ -10,13 +8,6 @@ use sooqa_media::{MediaWorkspace, WorkspaceArea};
 use sooqa_persistence::{Database, LibraryRepositoryError, WorkspaceCleanupStart};
 use tokio::fs;
 use uuid::Uuid;
-
-async fn database() -> Database {
-    let url = env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL");
-    let database = Database::connect(&url, 10).await.expect("database should connect");
-    database.migrate().await.expect("migration should apply");
-    database
-}
 
 fn media_ingest(source: &str) -> MediaIngest {
     media_ingest_with_sha(source, vec![17_u8; 32])
@@ -107,27 +98,6 @@ async fn prepare_completed_storage(
     (ingest.ingest.id, media.media.id, workspace_id)
 }
 
-async fn remove_storage_fixture(database: &Database, ingest_id: Uuid, media_id: Uuid) {
-    sqlx::query(
-        "DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1 OR payload->>'media_id' = $2",
-    )
-    .bind(ingest_id.to_string())
-    .bind(media_id.to_string())
-    .execute(database.pool())
-    .await
-    .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(media_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-}
-
 async fn mark_cleanup_running(database: &Database, job_id: Uuid, worker_id: &str) -> JobAttempt {
     let lease_token = Uuid::new_v4();
     sqlx::query(
@@ -148,10 +118,10 @@ async fn mark_cleanup_running(database: &Database, job_id: Uuid, worker_id: &str
     }
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn ready_storage_clears_local_bytes_and_coalesces_cleanup() {
-    let database = database().await;
+async fn ready_storage_clears_local_bytes_and_coalesces_cleanup(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let source = format!("https://example.test/workspace-{}", Uuid::new_v4());
     let media = database.library().resolve_media(media_ingest(&source)).await.unwrap();
     let ingest = database
@@ -241,31 +211,12 @@ async fn ready_storage_clears_local_bytes_and_coalesces_cleanup() {
         database.library().reset_storage_upload(media.media.id).await,
         Err(LibraryRepositoryError::WorkspaceReclaimed(id)) if id == media.media.id
     ));
-
-    sqlx::query(
-        "DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1 OR payload->>'media_id' = $2",
-    )
-    .bind(ingest_id.to_string())
-    .bind(media.media.id.to_string())
-    .execute(database.pool())
-    .await
-    .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(media.media.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn storage_reset_wins_and_cleanup_defers_on_the_durable_fence() {
-    let database = database().await;
+async fn storage_reset_wins_and_cleanup_defers_on_the_durable_fence(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let source = format!("https://example.test/workspace-reset-wins-{}", Uuid::new_v4());
     let (ingest_id, media_id, workspace_id) =
         prepare_completed_storage(&database, &source, 31).await;
@@ -302,13 +253,12 @@ async fn storage_reset_wins_and_cleanup_defers_on_the_durable_fence() {
         .unwrap(),
         1
     );
-    remove_storage_fixture(&database, ingest_id, media_id).await;
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn cleanup_claim_wins_and_storage_reset_requires_reconstruction() {
-    let database = database().await;
+async fn cleanup_claim_wins_and_storage_reset_requires_reconstruction(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let source = format!("https://example.test/workspace-cleanup-wins-{}", Uuid::new_v4());
     let (ingest_id, media_id, workspace_id) =
         prepare_completed_storage(&database, &source, 32).await;
@@ -371,13 +321,12 @@ async fn cleanup_claim_wins_and_storage_reset_requires_reconstruction() {
         .unwrap(),
         0
     );
-    remove_storage_fixture(&database, ingest_id, media_id).await;
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn cleanup_reclaim_marker_survives_lease_recovery() {
-    let database = database().await;
+async fn cleanup_reclaim_marker_survives_lease_recovery(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let source = format!("https://example.test/workspace-cleanup-recovery-{}", Uuid::new_v4());
     let (ingest_id, media_id, workspace_id) =
         prepare_completed_storage(&database, &source, 33).await;
@@ -440,13 +389,12 @@ async fn cleanup_reclaim_marker_survives_lease_recovery() {
         0
     );
     let _ = fs::remove_dir_all(&work_root).await;
-    remove_storage_fixture(&database, ingest_id, media_id).await;
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn stale_cleanup_attempt_cannot_delete_after_storage_reset_wins() {
-    let database = database().await;
+async fn stale_cleanup_attempt_cannot_delete_after_storage_reset_wins(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let source = format!("https://example.test/workspace-stale-cleanup-{}", Uuid::new_v4());
     let (ingest_id, media_id, workspace_id) =
         prepare_completed_storage(&database, &source, 34).await;
@@ -512,13 +460,12 @@ async fn stale_cleanup_attempt_cannot_delete_after_storage_reset_wins() {
     );
     MediaWorkspace::cleanup_existing(&work_root, workspace_id).await.unwrap();
     let _ = fs::remove_dir_all(&work_root).await;
-    remove_storage_fixture(&database, ingest_id, media_id).await;
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn force_save_changes_workspace_generation_before_old_cleanup_runs() {
-    let database = database().await;
+async fn force_save_changes_workspace_generation_before_old_cleanup_runs(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let source = format!("https://example.test/force-save-workspace-{}", Uuid::new_v4());
     let ingest = database
         .inbox()
@@ -574,15 +521,4 @@ async fn force_save_changes_workspace_generation_before_old_cleanup_runs() {
             .unwrap()
             .contains(&resumed.ingest.workspace_id)
     );
-
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(ingest_id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
