@@ -107,6 +107,12 @@ topology, including the pinned official local Telegram Bot API server, is
 documented in [operations.md](docs/operations.md) and configured under
 `deploy/home`.
 
+PostgreSQL integration tests use SQLx-managed isolated databases. The
+`DATABASE_URL` account used for `just test-integration` must have `CREATEDB`
+privilege so SQLx can create and drop each test database; use a dedicated
+development or CI account, never the runtime/production account. Tests remain
+parallel and do not require `--test-threads=1`.
+
 Apply forward-only migrations:
 
 ```bash

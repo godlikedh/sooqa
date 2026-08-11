@@ -17,7 +17,19 @@ just openapi-validate
 ## PostgreSQL tests
 
 Integration tests are marked `#[ignore]` because they need a real PostgreSQL
-server. Cargo's separator is intentional:
+server. Every PostgreSQL integration test uses SQLx's `#[sqlx::test]` support
+with the repository migrations and receives its own `PgPool`. SQLx creates a
+fresh database, applies the migrations, and drops that database when the test
+finishes, so Rust's default parallel test execution is safe and intentional.
+
+The PostgreSQL role in `DATABASE_URL` must be allowed to create and drop test
+databases (`CREATEDB`, or a superuser role in local development). Point this
+URL at a dedicated development/CI PostgreSQL account; never use a runtime or
+production database account for the test suite. One legacy-migration test
+creates an additional uniquely named database and therefore also requires the
+account to create databases directly.
+
+Cargo's separator is intentional:
 
 ```bash
 DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa \
@@ -25,13 +37,15 @@ DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa \
 ```
 
 The first `--` belongs to Cargo; `--ignored` is passed to the test harness and
-causes ignored tests to run. `just test-integration` runs the focused persistence,
-API, and worker integration commands.
+causes ignored tests to run. `just test-integration` runs the focused
+persistence, API, and worker integration commands. Do not add
+`--test-threads=1`; isolation is provided by SQLx and serialization would hide
+missing isolation while slowing the suite.
 
-The reset is intentionally clean. Tests start from the five-table migration;
-they do not copy rows from a previous schema and no command resets a Docker
-volume automatically. If a local database still has the old model, recreate it
-explicitly before migrating.
+The reset is intentionally clean. SQLx test databases start from the five-table
+migration; they do not copy rows from a previous schema, and no command resets
+a Docker volume automatically. If a local runtime database still has the old
+model, recreate it explicitly before migrating.
 
 ## OpenAPI and binaries
 

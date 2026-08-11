@@ -6,13 +6,6 @@ use sqlx::postgres::PgPoolOptions;
 use url::Url;
 use uuid::Uuid;
 
-async fn database() -> Database {
-    let url = env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL");
-    let database = Database::connect(&url, 5).await.expect("database should connect");
-    database.migrate().await.expect("migration should apply");
-    database
-}
-
 async fn create_legacy_upgrade_database() -> (sqlx::PgPool, sqlx::PgPool, Url, String) {
     let base_url =
         Url::parse(&env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL"))
@@ -40,10 +33,10 @@ async fn create_legacy_upgrade_database() -> (sqlx::PgPool, sqlx::PgPool, Url, S
     (admin_pool, target_pool, target_url, database_name)
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn fresh_migration_contains_only_the_five_application_tables() {
-    let database = database().await;
+async fn fresh_migration_contains_only_the_five_application_tables(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema IN ('public', 'queue') AND NOT (table_schema = 'public' AND table_name = '_sqlx_migrations') ORDER BY table_schema, table_name",
     )
@@ -69,10 +62,10 @@ async fn fresh_migration_contains_only_the_five_application_tables() {
     assert_eq!(migration_count, 3);
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn database_constraints_fence_running_jobs_and_bound_media_digests() {
-    let database = database().await;
+async fn database_constraints_fence_running_jobs_and_bound_media_digests(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let invalid_digest =
         sqlx::query("INSERT INTO media (kind, canonical_sha256) VALUES ('video', $1)")
             .bind(vec![1_u8; 31])
@@ -92,11 +85,6 @@ async fn database_constraints_fence_running_jobs_and_bound_media_digests() {
             .execute(database.pool())
             .await;
     assert!(running_without_lease.is_err());
-    sqlx::query("DELETE FROM queue.jobs WHERE id = $1")
-        .bind(job_id)
-        .execute(database.pool())
-        .await
-        .expect("fixture should clean");
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use std::{env, time::Duration};
+use std::time::Duration;
 
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
 use sooqa_jobs::{JobStatus, JobType, NewJob};
@@ -6,17 +6,10 @@ use sooqa_persistence::Database;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-async fn database() -> Database {
-    let url = env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL");
-    let database = Database::connect(&url, 10).await.expect("database should connect");
-    database.migrate().await.expect("migration should apply");
-    database
-}
-
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn claim_retry_and_fencing_use_the_queue_jobs_row() {
-    let database = database().await;
+async fn claim_retry_and_fencing_use_the_queue_jobs_row(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let repository = database.jobs();
     let ingest_id = Uuid::new_v4();
     let workspace_id = Uuid::new_v4();
@@ -50,7 +43,7 @@ async fn claim_retry_and_fencing_use_the_queue_jobs_row() {
         .complete_lease(&retried_claim.lease().expect("retried job should have a lease"))
         .await
         .expect("retried job should complete with its current lease");
-    let bounded = repository
+    let _bounded = repository
         .enqueue(
             NewJob::cleanup_workspace(Uuid::new_v4(), Uuid::new_v4())
                 .max_attempts(1)
@@ -80,22 +73,12 @@ async fn claim_retry_and_fencing_use_the_queue_jobs_row() {
             .expect("exhausted job query should succeed")
             .is_none()
     );
-    sqlx::query("DELETE FROM queue.jobs WHERE id = $1")
-        .bind(job.id)
-        .execute(database.pool())
-        .await
-        .expect("fixture should clean");
-    sqlx::query("DELETE FROM queue.jobs WHERE id = $1")
-        .bind(bounded.id)
-        .execute(database.pool())
-        .await
-        .expect("bounded fixture should clean");
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn expired_final_attempt_reconciles_ingest_and_fences_all_mutations() {
-    let database = database().await;
+async fn expired_final_attempt_reconciles_ingest_and_fences_all_mutations(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let ingest = database
         .inbox()
         .create_ingest(
@@ -150,15 +133,4 @@ async fn expired_final_attempt_reconciles_ingest_and_fences_all_mutations() {
     let request = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
     assert_eq!(request.status.as_str(), "failed_terminal");
     assert_eq!(request.error_code.as_deref(), Some("job_lease_expired"));
-
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(ingest.ingest.id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest.ingest.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
