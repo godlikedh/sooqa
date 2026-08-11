@@ -1561,6 +1561,8 @@ fn source_record_for_request(request: &sooqa_inbox::Ingest) -> MediaSourceInput 
 #[derive(Debug, serde::Serialize)]
 struct SourceProvenance {
     #[serde(skip_serializing_if = "Option::is_none")]
+    page_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     media_kind: Option<SourceMediaKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mime_type: Option<String>,
@@ -1574,6 +1576,8 @@ struct SourceProvenance {
     telegram_message_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     telegram_file_unique_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    two_ch_mirror: Option<serde_json::Value>,
 }
 
 fn source_provenance_for_request(request: &sooqa_inbox::Ingest) -> serde_json::Value {
@@ -1593,7 +1597,13 @@ fn source_provenance_for_request(request: &sooqa_inbox::Ingest) -> serde_json::V
     } else {
         input.get("file_size").and_then(serde_json::Value::as_u64)
     };
+    let two_ch_mirror = input
+        .get("inspection")
+        .and_then(|value| value.get("metadata"))
+        .and_then(|value| value.get("two_ch_mirror"))
+        .cloned();
     let provenance = SourceProvenance {
+        page_url: request.page_url.clone(),
         media_kind,
         mime_type,
         source_size_bytes,
@@ -1604,6 +1614,7 @@ fn source_provenance_for_request(request: &sooqa_inbox::Ingest) -> serde_json::V
             .get("telegram_file_unique_id")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned),
+        two_ch_mirror,
     };
     serde_json::to_value(provenance).expect("source provenance is serializable")
 }
@@ -2364,6 +2375,7 @@ fn validate_timing(poll_interval: Duration, lease_duration: Duration) -> Result<
 mod tests {
     use std::path::PathBuf;
 
+    use sooqa_inbox::{Ingest, IngestSubmission, IngestSubmissionInput, SubmittedVia};
     use sooqa_media::CommandError;
 
     use super::*;
@@ -2468,5 +2480,28 @@ mod tests {
         assert!(failure.message.contains("101 bytes"));
         assert!(failure.message.contains("100 bytes"));
         assert!(normalized_storage_limit_failure(100, 100).is_none());
+    }
+
+    #[test]
+    fn source_provenance_keeps_page_context_and_selected_2ch_mirror() {
+        let mut input =
+            IngestSubmissionInput::new("https://2ch.life/b/src/clip.webm", SubmittedVia::Companion);
+        input.page_url = Some("https://2ch.life/b/res/123".to_owned());
+        let submission = IngestSubmission::try_new(input).expect("submission should validate");
+        let mut request = Ingest::from_submission(Uuid::new_v4(), &submission);
+        request.original_input["inspection"] = serde_json::json!({
+            "metadata": {
+                "two_ch_mirror": {
+                    "submitted_host": "2ch.life",
+                    "selected_host": "2ch.org",
+                    "selected_url": "https://2ch.org/b/src/clip.webm"
+                }
+            }
+        });
+
+        let metadata = source_provenance_for_request(&request);
+        assert_eq!(metadata["page_url"], "https://2ch.life/b/res/123");
+        assert_eq!(metadata["two_ch_mirror"]["submitted_host"], "2ch.life");
+        assert_eq!(metadata["two_ch_mirror"]["selected_host"], "2ch.org");
     }
 }
