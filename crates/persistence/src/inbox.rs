@@ -726,11 +726,15 @@ impl InboxRepository {
 
     pub async fn begin_workspace_cleanup(
         &self,
-        job_id: Uuid,
+        attempt: &JobAttempt,
         ingest_id: Uuid,
         workspace_id: Uuid,
     ) -> Result<WorkspaceCleanupStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
+        if !lock_current_job_attempt(&mut transaction, attempt).await? {
+            transaction.commit().await?;
+            return Ok(WorkspaceCleanupStart::AlreadyAdvanced);
+        }
         let fence_id =
             sqlx::query_scalar::<_, Option<Uuid>>("SELECT media_id FROM ingests WHERE id = $1")
                 .bind(ingest_id)
@@ -768,7 +772,7 @@ impl InboxRepository {
                   )
             )",
         )
-        .bind(job_id)
+        .bind(attempt.job_id)
         .bind(ingest_id.to_string())
         .bind(row.2.map(|media_id| media_id.to_string()))
         .fetch_one(&mut *transaction)
@@ -796,6 +800,18 @@ impl InboxRepository {
             "completed" | "duplicate_pending" | "failed_terminal" | "cancelled" | "storing"
         );
         let result = if state_allows_cleanup && storage_ready {
+            if let Some(media_id) = row.2 {
+                // The cleanup claim is the durable hand-off to the filesystem.
+                // Clear the path before committing so a later reset cannot
+                // recreate an upload job after the worker has deleted bytes,
+                // even if this cleanup lease succeeds or is recovered.
+                sqlx::query(
+                    "UPDATE media SET local_work_path = NULL, updated_at = now() WHERE id = $1 AND storage_state IN ('ready', 'missing') AND local_work_path IS NOT NULL",
+                )
+                .bind(media_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
             WorkspaceCleanupStart::Ready
         } else {
             WorkspaceCleanupStart::Deferred
@@ -1093,6 +1109,7 @@ pub enum IngestFingerprintStart {
 pub enum WorkspaceCleanupStart {
     Ready,
     Deferred,
+    AlreadyAdvanced,
 }
 
 #[derive(Debug, Clone)]

@@ -317,23 +317,26 @@ async fn cleanup_workspace(
             ));
         }
     };
-    if job.attempt().is_none() {
-        return Err(HandlerFailure::permanent(
+    let job_attempt = job.attempt().ok_or_else(|| {
+        HandlerFailure::permanent(
             "invalid_job_state",
             "cleanup_workspace handler requires a running job lease",
-        ));
-    }
-    let job_id = job.id;
+        )
+    })?;
     let start = inbox
-        .begin_workspace_cleanup(job_id, ingest_id, workspace_id)
+        .begin_workspace_cleanup(&job_attempt, ingest_id, workspace_id)
         .await
         .map_err(map_inbox_error)?;
-    if matches!(start, WorkspaceCleanupStart::Deferred) {
-        return Err(HandlerFailure::defer(
-            "workspace_protected",
-            "workspace is still protected by durable ingest or storage state",
-            OffsetDateTime::now_utc() + TimeDuration::minutes(1),
-        ));
+    match start {
+        WorkspaceCleanupStart::Deferred => {
+            return Err(HandlerFailure::defer(
+                "workspace_protected",
+                "workspace is still protected by durable ingest or storage state",
+                OffsetDateTime::now_utc() + TimeDuration::minutes(1),
+            ));
+        }
+        WorkspaceCleanupStart::AlreadyAdvanced => return Ok(()),
+        WorkspaceCleanupStart::Ready => {}
     }
 
     if let Err(error) = MediaWorkspace::cleanup_existing(work_root, workspace_id).await {

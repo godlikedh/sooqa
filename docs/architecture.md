@@ -85,13 +85,14 @@ this baseline.
 
 Workspace lifecycle is shared across the ingest, jobs, persistence, media, and
 worker boundaries. Persistence owns the durable generation ID and cleanup-job
-enqueue/state fence. A running cleanup job is authoritative during the
-database-to-filesystem gap: storage reset either commits first and makes
-cleanup defer, or observes the running claim and returns an explicit
-reconstruction-required result. `sooqa-media` validates and removes a whole
-workspace without following symlinks. Reconciliation protects every workspace
-ID still current on an ingest, so only old force-save generations are orphan
-candidates.
+enqueue/state fence. A valid cleanup attempt clears the current media
+local-work-path marker before committing its `Ready` decision, so storage reset
+remains reconstruction-required after cleanup success or lease recovery.
+Storage reset either commits first and makes cleanup defer, or observes the
+durable reclaimed marker; a stale attempt is rejected before it can touch the
+filesystem. `sooqa-media` validates and removes a whole workspace without
+following symlinks. Reconciliation protects every workspace ID still current
+on an ingest, so only old force-save generations are orphan candidates.
 
 ## Ingest and worker flow
 
