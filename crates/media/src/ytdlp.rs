@@ -19,6 +19,18 @@ use crate::{
 
 const DEFAULT_DENO_PATH: &str = "deno";
 const MIN_SUPPORTED_DENO_VERSION: (u32, u32, u32) = (2, 3, 0);
+pub const DEFAULT_YTDLP_METADATA_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const RUNTIME_FIXTURE: &[u8] = br#"{
+  "id": "sooqa-runtime-fixture",
+  "title": "sooqa runtime fixture",
+  "extractor": "generic",
+  "webpage_url": "https://example.test/sooqa-runtime-fixture",
+  "url": "https://example.test/sooqa-runtime-fixture.mp4",
+  "ext": "mp4",
+  "vcodec": "h264",
+  "acodec": "none"
+}
+"#;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct YtDlpConfig {
@@ -26,6 +38,7 @@ pub struct YtDlpConfig {
     format_selection: String,
     deno_path: PathBuf,
     max_output_bytes: usize,
+    metadata_max_output_bytes: usize,
 }
 
 impl YtDlpConfig {
@@ -40,6 +53,7 @@ impl YtDlpConfig {
             format_selection,
             deno_path: PathBuf::from(DEFAULT_DENO_PATH),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            metadata_max_output_bytes: DEFAULT_YTDLP_METADATA_MAX_OUTPUT_BYTES,
         })
     }
 
@@ -54,6 +68,11 @@ impl YtDlpConfig {
 
     pub fn with_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
         self.max_output_bytes = max_output_bytes;
+        self
+    }
+
+    pub fn with_metadata_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
+        self.metadata_max_output_bytes = max_output_bytes;
         self
     }
 }
@@ -104,11 +123,12 @@ impl YtDlpDownloader {
         Self { config, inspection_limits, runner }
     }
 
-    async fn run(
+    async fn run_with_output_limit(
         &self,
         args: Vec<String>,
         timeout: Duration,
         source_url: &str,
+        max_output_bytes: usize,
     ) -> Result<ExternalCommandOutput, DownloadError> {
         if timeout.is_zero() {
             return Err(DownloadError::terminal(
@@ -123,8 +143,52 @@ impl YtDlpDownloader {
             })
             .clear_environment()
             .env("PATH", DEFAULT_COMMAND_PATH);
-        let command = command.timeout(timeout).max_output_bytes(self.config.max_output_bytes);
-        let output = self.runner.run(command).await.map_err(map_command_error)?;
+        let command = command.timeout(timeout).max_output_bytes(max_output_bytes);
+        let output = self
+            .runner
+            .run(command)
+            .await
+            .map_err(|error| map_command_error(error, "ytdlp_output_limit"))?;
+        if output.stdout_truncated || output.stderr_truncated {
+            return Err(DownloadError::terminal(
+                "ytdlp_output_limit",
+                format!("yt-dlp output exceeded the {}-byte capture limit", max_output_bytes),
+            ));
+        }
+        if !output.success {
+            return Err(map_process_failure(&output, source_url));
+        }
+        Ok(output)
+    }
+
+    async fn run_file(
+        &self,
+        args: Vec<String>,
+        timeout: Duration,
+        source_url: &str,
+        output_file: &Path,
+        max_bytes: u64,
+    ) -> Result<ExternalCommandOutput, DownloadError> {
+        if timeout.is_zero() {
+            return Err(DownloadError::terminal(
+                "invalid_download_limits",
+                "download timeout must be greater than zero",
+            ));
+        }
+        let command = args
+            .into_iter()
+            .fold(ExternalCommand::new(self.config.executable.clone()), |command, arg| {
+                command.arg(arg)
+            })
+            .clear_environment()
+            .env("PATH", DEFAULT_COMMAND_PATH)
+            .timeout(timeout)
+            .max_output_bytes(self.config.max_output_bytes);
+        let output = self
+            .runner
+            .run_file(command, output_file, max_bytes)
+            .await
+            .map_err(|error| map_command_error(error, "source_too_large"))?;
         if output.stdout_truncated || output.stderr_truncated {
             return Err(DownloadError::terminal(
                 "ytdlp_output_limit",
@@ -138,6 +202,107 @@ impl YtDlpDownloader {
             return Err(map_process_failure(&output, source_url));
         }
         Ok(output)
+    }
+
+    /// Verifies the pinned standalone runtime without contacting a provider.
+    ///
+    /// The local info fixture makes yt-dlp initialize its normal extractor
+    /// process with the configured EJS/runtime flags, while the verbose
+    /// diagnostics confirm that the bundled EJS package and Deno provider are
+    /// discoverable. A separate Deno eval proves that the configured runtime
+    /// can actually execute code before the worker accepts page jobs.
+    pub async fn verify_runtime(&self, timeout: Duration) -> Result<(), String> {
+        if timeout.is_zero() {
+            return Err("yt-dlp runtime check timeout must be greater than zero".to_owned());
+        }
+
+        let fixture_path =
+            std::env::temp_dir().join(format!(".sooqa-ytdlp-runtime-{}.json", Uuid::new_v4()));
+        if let Err(error) = tokio::fs::write(&fixture_path, RUNTIME_FIXTURE).await {
+            return Err(format!("could not write yt-dlp runtime fixture: {error}"));
+        }
+
+        let result = self.verify_runtime_with_fixture(&fixture_path, timeout).await;
+        let _ = tokio::fs::remove_file(&fixture_path).await;
+        result
+    }
+
+    async fn verify_runtime_with_fixture(
+        &self,
+        fixture_path: &Path,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let mut args = vec![
+            "--verbose".to_owned(),
+            "--dump-single-json".to_owned(),
+            "--skip-download".to_owned(),
+            "--no-playlist".to_owned(),
+        ];
+        args.extend(self.security_args());
+        args.extend(["--load-info-json".to_owned(), fixture_path.display().to_string()]);
+        let command = args
+            .into_iter()
+            .fold(ExternalCommand::new(self.config.executable.clone()), |command, arg| {
+                command.arg(arg)
+            })
+            .clear_environment()
+            .env("PATH", DEFAULT_COMMAND_PATH)
+            .timeout(timeout)
+            .max_output_bytes(DEFAULT_YTDLP_METADATA_MAX_OUTPUT_BYTES);
+        let output = self
+            .runner
+            .run(command)
+            .await
+            .map_err(|error| format!("yt-dlp runtime probe failed: {error}"))?;
+        if !output.success {
+            return Err(format!(
+                "yt-dlp runtime probe exited unsuccessfully: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        if output.stdout_truncated || output.stderr_truncated {
+            return Err(format!(
+                "yt-dlp runtime probe exceeded the {DEFAULT_YTDLP_METADATA_MAX_OUTPUT_BYTES}-byte output limit"
+            ));
+        }
+        let diagnostics = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !diagnostics.contains("yt_dlp_ejs") {
+            return Err("yt-dlp runtime probe did not discover bundled yt-dlp-ejs".to_owned());
+        }
+        if !diagnostics.contains("JS runtimes: deno-") {
+            return Err(
+                "yt-dlp runtime probe did not discover the configured Deno runtime".to_owned()
+            );
+        }
+
+        let deno_command = ExternalCommand::new(self.config.deno_path.clone())
+            .arg("eval")
+            .arg("--no-config")
+            .arg("console.log('sooqa-deno-runtime-ok')")
+            .clear_environment()
+            .env("PATH", DEFAULT_COMMAND_PATH)
+            .timeout(timeout)
+            .max_output_bytes(1024);
+        let deno_output = self
+            .runner
+            .run(deno_command)
+            .await
+            .map_err(|error| format!("Deno runtime probe failed: {error}"))?;
+        if !deno_output.success
+            || deno_output.stdout_truncated
+            || deno_output.stderr_truncated
+            || !String::from_utf8_lossy(&deno_output.stdout).contains("sooqa-deno-runtime-ok")
+        {
+            return Err(format!(
+                "configured Deno runtime probe failed: {}",
+                String::from_utf8_lossy(&deno_output.stderr).trim()
+            ));
+        }
+        Ok(())
     }
 
     fn security_args(&self) -> [String; 5] {
@@ -170,7 +335,14 @@ impl SourceDownloader for YtDlpDownloader {
             "--".to_owned(),
             source_url.clone(),
         ]);
-        let output = self.run(args, self.inspection_limits.timeout, &source_url).await?;
+        let output = self
+            .run_with_output_limit(
+                args,
+                self.inspection_limits.timeout,
+                &source_url,
+                self.config.metadata_max_output_bytes,
+            )
+            .await?;
         let metadata = parse_metadata(&output.stdout, &source_url)?;
         if metadata.filesize_bytes.is_some_and(|bytes| bytes > self.inspection_limits.max_bytes) {
             return Err(DownloadError::terminal(
@@ -237,7 +409,9 @@ impl SourceDownloader for YtDlpDownloader {
             "--".to_owned(),
             source_url.clone(),
         ]);
-        let result = self.run(args, limits.timeout, &source_url).await;
+        let result = self
+            .run_file(args, limits.timeout, &source_url, temporary.path(), limits.max_bytes)
+            .await;
         result?;
 
         let metadata = match tokio::fs::metadata(temporary.path()).await {
@@ -435,9 +609,11 @@ fn validate_limits(limits: &DownloadLimits, timeout: Duration) -> Result<(), Dow
     Ok(())
 }
 
-fn map_command_error(error: CommandError) -> DownloadError {
+fn map_command_error(error: CommandError, output_limit_class: &str) -> DownloadError {
     if error.is_timeout() {
         DownloadError::retryable("ytdlp_timeout", error.to_string())
+    } else if error.is_output_limit_exceeded() {
+        DownloadError::terminal(output_limit_class, error.to_string())
     } else {
         DownloadError::terminal("ytdlp_command", error.to_string())
     }
@@ -513,9 +689,71 @@ fn mime_type_for_ext(ext: Option<&str>) -> Option<String> {
 #[cfg(unix)]
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use super::*;
+
+    struct RuntimeProbeRunner {
+        calls: Mutex<Vec<ExternalCommand>>,
+    }
+
+    #[async_trait]
+    impl ExternalCommandRunner for RuntimeProbeRunner {
+        async fn run(
+            &self,
+            command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            let is_deno =
+                command.args().iter().any(|argument| argument.to_string_lossy() == "eval");
+            self.calls.lock().expect("test mutex should not be poisoned").push(command);
+            Ok(if is_deno {
+                ExternalCommandOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: b"sooqa-deno-runtime-ok\n".to_vec(),
+                    stderr: Vec::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                }
+            } else {
+                ExternalCommandOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: b"{}\n".to_vec(),
+                    stderr: b"[debug] Optional libraries: yt_dlp_ejs-0.8.0\n[debug] JS runtimes: deno-2.8.1\n".to_vec(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_probe_requires_bundled_ejs_and_executes_deno() {
+        let runner = Arc::new(RuntimeProbeRunner { calls: Mutex::new(Vec::new()) });
+        let downloader = YtDlpDownloader::with_runner(
+            YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
+            DownloadLimits::default(),
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+        );
+
+        downloader
+            .verify_runtime(Duration::from_secs(1))
+            .await
+            .expect("runtime fixture should pass");
+
+        let calls = runner.calls.lock().expect("test mutex should not be poisoned");
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].clears_environment());
+        assert_eq!(calls[0].max_output_bytes_limit(), DEFAULT_YTDLP_METADATA_MAX_OUTPUT_BYTES);
+        assert!(calls[0].args().iter().any(|arg| arg == "--load-info-json"));
+        assert!(calls[1].clears_environment());
+        assert_eq!(calls[1].args()[0], "eval");
+    }
 
     #[tokio::test]
     async fn fake_executable_inspects_and_downloads_without_shell_interpolation() {
@@ -620,6 +858,60 @@ mod tests {
             b"fake-media"
         );
 
+        tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
+    }
+
+    #[tokio::test]
+    async fn download_enforces_the_output_limit_while_yt_dlp_is_running() {
+        let root =
+            std::env::temp_dir().join(format!("sooqa-ytdlp-size-limit-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.expect("test root should be created");
+        let executable = root.join("fake-yt-dlp-size-limit.sh");
+        let script = r#"#!/bin/sh
+set -eu
+output=
+previous=
+for arg in "$@"; do
+    if [ "$previous" = "--output" ]; then output="$arg"; fi
+    previous="$arg"
+done
+while :; do
+    printf '0123456789' >> "$output"
+    sleep 0.01
+done
+"#;
+        tokio::fs::write(&executable, script).await.expect("fake executable should be written");
+        let mut permissions = tokio::fs::metadata(&executable)
+            .await
+            .expect("fake executable metadata should be available")
+            .permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&executable, permissions)
+            .await
+            .expect("fake executable should be executable");
+
+        let downloader = YtDlpDownloader::new(
+            YtDlpConfig::new(&executable, "best").expect("format selection should be valid"),
+        );
+        let destination = root.join("source.mp4");
+        let inspection = SourceInspection {
+            adapter: "yt_dlp".to_owned(),
+            source_url: "https://example.test/video".to_owned(),
+            resolved_url: None,
+            media_kind: SourceMediaKind::Video,
+            mime_type: Some("video/mp4".to_owned()),
+            content_length_bytes: None,
+            title: None,
+            metadata: serde_json::json!({}),
+        };
+        let limits =
+            DownloadLimits { max_bytes: 32, max_redirects: 0, timeout: Duration::from_secs(5) };
+        let error = downloader
+            .download(&inspection, &destination, &limits)
+            .await
+            .expect_err("yt-dlp output should be stopped at the byte limit");
+        assert_eq!(error.class(), "source_too_large");
+        assert!(!destination.exists());
         tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
     }
 

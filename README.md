@@ -152,8 +152,9 @@ The server and worker must share `media.work_root`. The current production
 worker preflights only binaries required by its registered handlers; the
 composed probe and normalization handlers require `ffprobe` and `ffmpeg`. When
 the yt-dlp allowlist is non-empty, startup also requires the pinned `yt-dlp`
-and Deno binaries and verifies the supported Deno version. The image in
-`Dockerfile` contains the pinned official distributions.
+and Deno binaries, verifies the supported Deno version, and runs an offline
+yt-dlp/EJS fixture plus a Deno execution probe. The image in `Dockerfile`
+contains the pinned official distributions.
 
 The project is licensed under Apache-2.0. See [LICENSE](LICENSE) and
 [ADR 0006](docs/adr/0006-license.md).

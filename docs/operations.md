@@ -82,10 +82,13 @@ media are intentionally outside this setup.
 The home image downloads the official standalone `yt-dlp` distribution, which
 contains the bundled `yt-dlp-ejs` component, and a pinned Deno runtime. The
 current Dockerfile pins yt-dlp `2026.06.09` and Deno `2.8.1` with architecture-
-specific SHA-256 checksums. To update either dependency, change its version,
-asset names if needed, and every matching checksum together; build the home
-image and verify the startup diagnostics before doing an owner smoke test.
-CI uses fake executables and does not contact YouTube.
+specific SHA-256 checksums. When the allowlist is enabled, worker startup runs
+an offline local-info fixture through yt-dlp with the configured EJS/Deno
+flags, checks that the bundled EJS component is discoverable, and executes a
+small Deno probe. To update either dependency, change its version, asset names
+if needed, and every matching checksum together; build the home image and
+verify the startup diagnostics before doing an owner smoke test. CI uses fake
+executables and does not contact YouTube.
 
 The server and worker must share `media.work_root`; ffprobe and ffmpeg are
 needed for probing and normalization. Source downloads and Telegram uploads

@@ -28,7 +28,9 @@ are rejected. Its child environment is cleared and rebuilt with only a fixed
 disabled. The home image pins the official yt-dlp and Deno distributions by
 version and SHA-256 checksum. yt-dlp may follow provider redirects and fetch
 provider/CDN URLs after an allowlisted page is accepted, which is part of the
-single-admin deployment's explicit trust boundary.
+single-admin deployment's explicit trust boundary. The worker monitors the
+yt-dlp output file while the child is running, not only after it exits, and
+refuses to enable the adapter if the offline EJS/Deno startup probes fail.
 
 The local Telegram Bot API service is a private Compose-network dependency. Its
 `api_id`, `api_hash`, and bot token are deployment secrets; the service has a

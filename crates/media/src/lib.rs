@@ -221,16 +221,16 @@ impl SourceDownloaderRouter {
         &self,
         source: &SourceInput,
     ) -> Result<SourceInspection, DownloadError> {
-        if self.ytdlp.is_none() {
-            return Err(DownloadError::terminal(
-                "unsupported_source",
-                "direct HTTP did not recognize a supported media response",
-            ));
-        }
         if !is_allowed_ytdlp_source(&source.source_url, &self.ytdlp_allowed_hosts)? {
             return Err(DownloadError::terminal(
                 "source_host_not_allowed",
                 "page URL host is not enabled for yt-dlp",
+            ));
+        }
+        if self.ytdlp.is_none() {
+            return Err(DownloadError::terminal(
+                "unsupported_source",
+                "direct HTTP did not recognize a supported media response",
             ));
         }
 
@@ -572,7 +572,7 @@ mod tests {
 
         assert!(matches!(
             router.inspect(&source()).await,
-            Err(DownloadError::Terminal { class, .. }) if class == "unsupported_source"
+            Err(DownloadError::Terminal { class, .. }) if class == "source_host_not_allowed"
         ));
     }
 }
