@@ -596,7 +596,13 @@ async fn storage_reconciliation_reopens_and_completes_linked_ingest() {
         )
         .await
         .unwrap();
-    assert_eq!(database.inbox().complete_storage_for_media(media.media.id).await.unwrap(), 1);
+    // Storage completion now completes linked ingests and enqueues cleanup in
+    // the same transaction as the durable ready transition. The compatibility
+    // helper is intentionally idempotent when called by the worker afterward.
+    assert_eq!(database.inbox().complete_storage_for_media(media.media.id).await.unwrap(), 0);
+    let media_details =
+        database.library().find_media_details(media.media.id).await.unwrap().unwrap();
+    assert!(media_details.media.local_work_path.is_none());
     let initially_ready =
         database.library().find_storage_receipt(media.media.id).await.unwrap().unwrap();
     assert_eq!(initially_ready.storage_message_id, 40);

@@ -1,6 +1,6 @@
 //! Durable job worker entry point for sooqa.
 
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{error::Error, path::PathBuf, sync::Arc, time::Duration};
 
 use sooqa_config::{AppConfig, AppRole, CliOptions, ConfigError};
 use sooqa_jobs::JobType;
@@ -9,15 +9,15 @@ use sooqa_media::{
     DownloadLimits, FfprobeAdapter, ImageNormalizer, MediaWorkspace, NormalizationPlanner,
     ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter, diagnose_binaries,
 };
-use sooqa_persistence::Database;
+use sooqa_persistence::{Database, JobRepository, WORKSPACE_CLEANUP_RETENTION};
 use uuid::Uuid;
 
 use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
 use sooqa_worker::{
-    HandlerRegistry, TelegramSourceDownloader, Worker, compute_fingerprint_handler,
-    download_source_handler, finalize_ingest_handler, inspect_source_handler,
-    media_processing_components, normalize_asset_handler, probe_asset_handler_with_telegram_source,
-    upload_storage_asset_handler,
+    HandlerRegistry, TelegramSourceDownloader, Worker, cleanup_workspace_handler,
+    compute_fingerprint_handler, download_source_handler, finalize_ingest_handler,
+    inspect_source_handler, media_processing_components, normalize_asset_handler,
+    probe_asset_handler_with_telegram_source, upload_storage_asset_handler,
 };
 
 #[tokio::main]
@@ -114,6 +114,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let finalize_handler = finalize_ingest_handler(database.inbox(), database.library());
     handlers.register(JobType::FinalizeIngest, move |job| finalize_handler(job));
     tracing::info!("ingest finalization handler enabled");
+    let cleanup_handler =
+        cleanup_workspace_handler(database.inbox(), config.media.work_root.clone());
+    handlers.register(JobType::CleanupWorkspace, move |job| cleanup_handler(job));
+    tracing::info!("workspace cleanup handler enabled");
     match (telegram_api, config.telegram.storage_chat_id) {
         (Some(api), Some(storage_chat_id)) => {
             let provider = StorageUploadProvider::new(api, database.library(), storage_chat_id)?
@@ -133,17 +137,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
     let capabilities = handlers.job_types();
     ensure_work_root(&config.media.work_root).await?;
-    let live_job_ids = database.jobs().live_job_ids().await?;
-    let stale_artifact_age =
-        Duration::from_secs(config.worker.lease_duration_seconds.saturating_add(5 * 60));
-    let removed_artifacts = MediaWorkspace::scavenge_stale_artifacts(
+    let removed_workspaces = reconcile_workspaces(
+        database.jobs(),
         &config.media.work_root,
-        stale_artifact_age,
-        &live_job_ids,
+        WORKSPACE_CLEANUP_RETENTION,
+        128,
     )
     .await?;
-    if removed_artifacts > 0 {
-        tracing::info!(removed_artifacts, "removed stale media workspace artifacts");
+    if removed_workspaces > 0 {
+        tracing::info!(removed_workspaces, "removed stale media workspaces");
     }
     let mut binary_checks = Vec::new();
     if capabilities.contains(&JobType::ProbeAsset) {
@@ -210,10 +212,70 @@ async fn run() -> Result<(), Box<dyn Error>> {
     )?;
 
     tracing::info!(role = %config.role, worker_id = %worker.worker_id(), "sooqa worker starting");
-    worker.run(sooqa_runtime::shutdown_signal()).await?;
+    let (stop_reconciliation, reconciliation_signal) = tokio::sync::watch::channel(false);
+    let reconciliation_repository = database.jobs();
+    let reconciliation_work_root = config.media.work_root.clone();
+    let reconciliation_task = tokio::spawn(async move {
+        reconcile_workspaces_periodically(
+            reconciliation_repository,
+            reconciliation_work_root,
+            WORKSPACE_CLEANUP_RETENTION,
+            reconciliation_signal,
+        )
+        .await;
+    });
+    let worker_result = worker.run(sooqa_runtime::shutdown_signal()).await;
+    let _ = stop_reconciliation.send(true);
+    if let Err(error) = reconciliation_task.await {
+        tracing::warn!(?error, "workspace reconciliation task stopped unexpectedly");
+    }
+    worker_result?;
     tracing::info!(role = %config.role, "sooqa worker stopped");
 
     Ok(())
+}
+
+async fn reconcile_workspaces(
+    jobs: JobRepository,
+    work_root: &std::path::Path,
+    max_age: time::Duration,
+    limit: usize,
+) -> Result<u64, Box<dyn Error>> {
+    let protected = jobs.protected_workspace_ids().await?;
+    Ok(MediaWorkspace::scavenge_completed_workspaces(
+        work_root,
+        max_age.unsigned_abs(),
+        &protected,
+        limit,
+    )
+    .await?)
+}
+
+async fn reconcile_workspaces_periodically(
+    jobs: JobRepository,
+    work_root: PathBuf,
+    max_age: time::Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let interval = Duration::from_secs(5 * 60);
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(interval) => {
+                match reconcile_workspaces(jobs.clone(), &work_root, max_age, 128).await {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(removed, "periodic workspace reconciliation removed stale workspaces");
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(?error, "periodic workspace reconciliation failed"),
+                }
+            }
+        }
+    }
 }
 
 async fn ensure_work_root(path: &std::path::Path) -> Result<(), Box<dyn Error>> {

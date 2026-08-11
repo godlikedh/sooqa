@@ -1,4 +1,8 @@
 use crate::library::LibraryRepositoryError;
+use crate::{
+    WORKSPACE_CLEANUP_RETENTION,
+    cleanup::{enqueue_workspace_cleanup, enqueue_workspace_cleanup_for_media},
+};
 use serde_json::json;
 use sooqa_inbox::{
     AssetNormalization, Ingest, IngestFinalization, IngestKind, IngestStateError, IngestStatus,
@@ -36,6 +40,12 @@ impl InboxRepository {
         request
             .transition_to(IngestStatus::Queued)
             .expect("received ingest requests must be queueable");
+        request.workspace_id = request
+            .original_input
+            .get("telegram_workspace_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap_or(request.id);
         let input_key = submission.idempotency_key.clone().unwrap_or_else(|| {
             format!("{}:{}", submission.kind.as_str(), submission.normalized_url)
         });
@@ -44,11 +54,11 @@ impl InboxRepository {
             INSERT INTO ingests (
                 id, input_key, request_hash, input_kind, state, submitted_via,
                 input_json, source_url, page_url, page_title, supplied_caption,
-                supplied_description, supplied_tags, media_id, error_code, error_message, created_at,
-                updated_at, completed_at
+                supplied_description, supplied_tags, workspace_id, media_id, error_code,
+                error_message, created_at, updated_at, completed_at
             )
             VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11,
-                    $12, $13, $14, $15, $16, $17, $18)
+                    $12, $13, $14, $15, $16, $17, $18, $19)
             ON CONFLICT (input_key) DO NOTHING
             RETURNING id
             "#,
@@ -65,6 +75,7 @@ impl InboxRepository {
         .bind(&request.supplied_caption)
         .bind(&request.supplied_description)
         .bind(&request.supplied_tags)
+        .bind(request.workspace_id)
         .bind(request.media_id)
         .bind(&request.error_code)
         .bind(&request.error_message)
@@ -302,6 +313,13 @@ impl InboxRepository {
             request.completed_at = Some(OffsetDateTime::now_utc());
             request.updated_at = OffsetDateTime::now_utc();
             update_ingest_state(&mut transaction, &request).await?;
+            enqueue_workspace_cleanup(
+                &mut transaction,
+                request.id,
+                request.workspace_id,
+                OffsetDateTime::now_utc() + WORKSPACE_CLEANUP_RETENTION,
+            )
+            .await?;
             succeed_current_job_attempt(&mut transaction, attempt).await?;
             transaction.commit().await?;
             return Ok(request);
@@ -576,6 +594,13 @@ impl InboxRepository {
                 request.error_code = None;
                 request.error_message = None;
                 request.completed_at = None;
+                enqueue_workspace_cleanup(
+                    &mut transaction,
+                    request.id,
+                    request.workspace_id,
+                    OffsetDateTime::now_utc() + WORKSPACE_CLEANUP_RETENTION,
+                )
+                .await?;
             }
             VideoIdentityOutcome::ExactDuplicate { media_id }
             | VideoIdentityOutcome::NewMedia { media_id } => {
@@ -597,6 +622,7 @@ impl InboxRepository {
         match request.status {
             IngestStatus::DuplicatePending => {
                 request.force_save = true;
+                request.workspace_id = Uuid::now_v7();
                 request.duplicate_evidence = None;
                 clear_pipeline_artifacts(&mut request);
                 request.transition_to(IngestStatus::Queued)?;
@@ -632,13 +658,22 @@ impl InboxRepository {
         media_id: Uuid,
     ) -> Result<u64, InboxRepositoryError> {
         let now = OffsetDateTime::now_utc();
+        let mut transaction = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE ingests SET state = 'completed', completed_at = $2, error_code = NULL, error_message = NULL, updated_at = $2 WHERE media_id = $1 AND EXISTS (SELECT 1 FROM media WHERE id = $1 AND storage_state = 'ready') AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
         )
         .bind(media_id)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        sqlx::query(
+            "UPDATE media SET local_work_path = NULL WHERE id = $1 AND storage_state = 'ready'",
+        )
+        .bind(media_id)
+        .execute(&mut *transaction)
+        .await?;
+        enqueue_workspace_cleanup_for_media(&mut transaction, media_id, now).await?;
+        transaction.commit().await?;
         Ok(updated.rows_affected())
     }
 
@@ -654,6 +689,7 @@ impl InboxRepository {
         }
         let now = OffsetDateTime::now_utc();
         let completed_at = (status == IngestStatus::FailedTerminal).then_some(now);
+        let mut transaction = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE ingests SET state = $2, error_code = $3, error_message = $4, completed_at = $5, updated_at = $6 WHERE media_id = $1 AND (state = 'storing' OR (state = 'failed_retryable' AND error_code = 'storage_upload'))",
         )
@@ -663,9 +699,86 @@ impl InboxRepository {
         .bind(error_message)
         .bind(completed_at)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        if status == IngestStatus::FailedTerminal {
+            let media_changed = sqlx::query(
+                "UPDATE media SET storage_state = 'missing', storage_token = NULL, storage_started_at = NULL, updated_at = $2 WHERE id = $1 AND storage_state = 'pending_storage'",
+            )
+            .bind(media_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await?;
+            if media_changed.rows_affected() > 0 {
+                enqueue_workspace_cleanup_for_media(
+                    &mut transaction,
+                    media_id,
+                    now + WORKSPACE_CLEANUP_RETENTION,
+                )
+                .await?;
+            }
+        }
+        transaction.commit().await?;
         Ok(updated.rows_affected())
+    }
+
+    pub async fn begin_workspace_cleanup(
+        &self,
+        job_id: Uuid,
+        ingest_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<WorkspaceCleanupStart, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(
+            "SELECT workspace_id, state, media_id FROM ingests WHERE id = $1 FOR UPDATE",
+        )
+        .bind(ingest_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(InboxRepositoryError::ResourceMissing(ingest_id))?;
+
+        // A force-save changes the workspace ID before it queues the new
+        // generation. The old cleanup job is then safe to finish against its
+        // orphaned directory without inspecting the replacement generation.
+        if row.0 != workspace_id {
+            transaction.commit().await?;
+            return Ok(WorkspaceCleanupStart::Ready);
+        }
+
+        let has_active_job = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM queue.jobs WHERE id <> $1 AND state IN ('queued', 'running') AND payload->>'ingest_id' = $2 AND kind <> 'cleanup_workspace')",
+        )
+        .bind(job_id)
+        .bind(ingest_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if has_active_job {
+            transaction.commit().await?;
+            return Ok(WorkspaceCleanupStart::Deferred);
+        }
+
+        let storage_state = match row.2 {
+            Some(media_id) => {
+                sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1")
+                    .bind(media_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+            }
+            None => None,
+        };
+        let storage_ready =
+            storage_state.as_deref().is_none_or(|state| matches!(state, "ready" | "missing"));
+        let state_allows_cleanup = matches!(
+            row.1.as_str(),
+            "completed" | "duplicate_pending" | "failed_terminal" | "cancelled" | "storing"
+        );
+        let result = if state_allows_cleanup && storage_ready {
+            WorkspaceCleanupStart::Ready
+        } else {
+            WorkspaceCleanupStart::Deferred
+        };
+        transaction.commit().await?;
+        Ok(result)
     }
 
     pub async fn fail_ingest_fingerprint(
@@ -903,6 +1016,15 @@ impl InboxRepository {
             (status == IngestStatus::FailedTerminal).then(OffsetDateTime::now_utc);
         request.updated_at = OffsetDateTime::now_utc();
         update_ingest_state(&mut transaction, &request).await?;
+        if status == IngestStatus::FailedTerminal {
+            enqueue_workspace_cleanup(
+                &mut transaction,
+                request.id,
+                request.workspace_id,
+                OffsetDateTime::now_utc() + WORKSPACE_CLEANUP_RETENTION,
+            )
+            .await?;
+        }
         transaction.commit().await?;
         Ok(request)
     }
@@ -944,6 +1066,12 @@ pub enum IngestFingerprintStart {
     AlreadyAdvanced(Ingest),
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum WorkspaceCleanupStart {
+    Ready,
+    Deferred,
+}
+
 #[derive(Debug, Clone)]
 pub struct ForceSaveResult {
     pub ingest: Ingest,
@@ -971,19 +1099,21 @@ async fn update_ingest_state(
         UPDATE ingests
         SET state = $2,
             input_json = $3,
-            media_id = $4,
-            force_save = $5,
-            duplicate_evidence = $6,
-            error_code = $7,
-            error_message = $8,
-            updated_at = $9,
-            completed_at = $10
+            workspace_id = $4,
+            media_id = $5,
+            force_save = $6,
+            duplicate_evidence = $7,
+            error_code = $8,
+            error_message = $9,
+            updated_at = $10,
+            completed_at = $11
         WHERE id = $1
         "#,
     )
     .bind(request.id)
     .bind(request.status.as_str())
     .bind(&request.original_input)
+    .bind(request.workspace_id)
     .bind(request.media_id)
     .bind(request.force_save)
     .bind(&request.duplicate_evidence)
@@ -1016,6 +1146,13 @@ async fn advance_after_media_processing(
         "ready" => {
             request.transition_to(IngestStatus::Completed)?;
             request.completed_at = Some(OffsetDateTime::now_utc());
+            enqueue_workspace_cleanup(
+                transaction,
+                request.id,
+                request.workspace_id,
+                OffsetDateTime::now_utc(),
+            )
+            .await?;
         }
         "pending_storage" => {
             request.transition_to(IngestStatus::Storing)?;
@@ -1029,6 +1166,13 @@ async fn advance_after_media_processing(
                     .to_owned(),
             );
             request.completed_at = Some(OffsetDateTime::now_utc());
+            enqueue_workspace_cleanup(
+                transaction,
+                request.id,
+                request.workspace_id,
+                OffsetDateTime::now_utc() + WORKSPACE_CLEANUP_RETENTION,
+            )
+            .await?;
         }
         state => return Err(InboxRepositoryError::UnknownStorageState(state.to_owned())),
     }
@@ -1329,8 +1473,8 @@ async fn load_request(
     let row = sqlx::query_as::<_, IngestRow>(
         r#"
         SELECT id, input_kind, state, submitted_via, input_json, source_url, page_url,
-               page_title, supplied_caption, supplied_description, supplied_tags, input_key, media_id,
-               force_save, duplicate_evidence, error_code, error_message,
+               page_title, supplied_caption, supplied_description, supplied_tags, input_key,
+               workspace_id, media_id, force_save, duplicate_evidence, error_code, error_message,
                created_at, updated_at, completed_at
         FROM ingests
         WHERE id = $1
@@ -1416,6 +1560,7 @@ struct IngestRow {
     supplied_description: Option<String>,
     supplied_tags: Vec<String>,
     input_key: String,
+    workspace_id: Uuid,
     media_id: Option<Uuid>,
     force_save: bool,
     duplicate_evidence: Option<serde_json::Value>,
@@ -1430,6 +1575,7 @@ impl IngestRow {
     fn into_ingest(self) -> Result<Ingest, InboxRepositoryError> {
         Ok(Ingest {
             id: self.id,
+            workspace_id: self.workspace_id,
             kind: IngestKind::try_from(self.input_kind.as_str())
                 .map_err(InboxRepositoryError::UnknownIngestKind)?,
             status: IngestStatus::try_from(self.state.as_str())

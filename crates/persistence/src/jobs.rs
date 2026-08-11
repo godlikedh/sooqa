@@ -1,3 +1,4 @@
+use crate::{WORKSPACE_CLEANUP_RETENTION, cleanup::enqueue_workspace_cleanup};
 use std::time::Duration;
 
 use sooqa_jobs::{Job, JobCommand, JobLease, JobPayloadError, JobStatus, JobType, NewJob};
@@ -292,6 +293,49 @@ impl JobRepository {
             .fetch_all(&self.pool)
             .await?)
     }
+
+    pub async fn protected_workspace_ids(&self) -> Result<Vec<Uuid>, JobRepositoryError> {
+        Ok(sqlx::query_scalar(
+            r#"
+            WITH protected AS (
+                SELECT workspace_id
+                FROM ingests
+                WHERE state IN (
+                    'received', 'queued', 'downloading', 'probing',
+                    'exact_dedup_check', 'normalizing', 'fingerprinting',
+                    'storing', 'failed_retryable'
+                )
+                UNION
+                SELECT i.workspace_id
+                FROM ingests AS i
+                WHERE i.state = 'duplicate_pending'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM queue.jobs AS cleanup
+                      WHERE cleanup.kind = 'cleanup_workspace'
+                        AND cleanup.state = 'succeeded'
+                        AND cleanup.payload->>'ingest_id' = i.id::text
+                        AND cleanup.payload->>'workspace_id' = i.workspace_id::text
+                  )
+                UNION
+                SELECT i.workspace_id
+                FROM ingests AS i
+                JOIN media AS m ON m.id = i.media_id
+                WHERE m.storage_state IN ('pending_storage', 'storage_unknown')
+                UNION
+                SELECT i.workspace_id
+                FROM queue.jobs AS cleanup
+                JOIN ingests AS i ON cleanup.payload->>'ingest_id' = i.id::text
+                WHERE cleanup.kind = 'cleanup_workspace'
+                  AND cleanup.state IN ('queued', 'running')
+            )
+            SELECT DISTINCT workspace_id
+            FROM protected
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
 }
 
 fn lease_seconds(duration: Duration) -> Result<f64, JobRepositoryError> {
@@ -361,6 +405,20 @@ async fn reconcile_exhausted_job(
             .bind(ingest_id)
             .execute(&mut **transaction)
             .await?;
+            if let Some(workspace_id) =
+                sqlx::query_scalar::<_, Uuid>("SELECT workspace_id FROM ingests WHERE id = $1")
+                    .bind(ingest_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+            {
+                enqueue_workspace_cleanup(
+                    transaction,
+                    ingest_id,
+                    workspace_id,
+                    OffsetDateTime::now_utc() + WORKSPACE_CLEANUP_RETENTION,
+                )
+                .await?;
+            }
         }
         return Ok(());
     }

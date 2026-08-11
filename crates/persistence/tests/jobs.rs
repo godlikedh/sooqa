@@ -18,8 +18,13 @@ async fn database() -> Database {
 async fn claim_retry_and_fencing_use_the_queue_jobs_row() {
     let database = database().await;
     let repository = database.jobs();
+    let ingest_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
     let job = repository
-        .enqueue(NewJob::cleanup_workspace().dedupe_key(format!("test:{}", Uuid::new_v4())))
+        .enqueue(
+            NewJob::cleanup_workspace(ingest_id, workspace_id)
+                .dedupe_key(format!("test:{}", Uuid::new_v4())),
+        )
         .await
         .expect("job should enqueue");
     assert_eq!(job.job_type(), JobType::CleanupWorkspace);
@@ -47,7 +52,7 @@ async fn claim_retry_and_fencing_use_the_queue_jobs_row() {
         .expect("retried job should complete with its current lease");
     let bounded = repository
         .enqueue(
-            NewJob::cleanup_workspace()
+            NewJob::cleanup_workspace(Uuid::new_v4(), Uuid::new_v4())
                 .max_attempts(1)
                 .dedupe_key(format!("bounded-test:{}", Uuid::new_v4())),
         )

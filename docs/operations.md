@@ -75,6 +75,31 @@ addition to the 16 MiB per-frame decode limit. The worker retains only compact
 features and the previous normalized luma plane, and removes the temporary
 sequence on success, failure, timeout, or cancellation.
 
+## Workspace lifecycle
+
+Every ingest generation owns one workspace at
+`<SOOQA_MEDIA_WORK_ROOT>/jobs/<workspace-id>`. The workspace ID is persisted on
+the ingest row; a force-save receives a new ID before its replacement pipeline
+is queued. Cleanup jobs carry both the ingest ID and that generation-scoped ID,
+so a delayed cleanup can remove only an orphaned generation and cannot remove
+the force-save replacement.
+
+Cleanup is durable and replay-safe:
+
+- ready storage completes linked ingests, clears `media.local_work_path`, and
+  queues immediate cleanup;
+- duplicate, terminal-failure, and other deferred paths queue cleanup after a
+  one-day retention period;
+- pending storage, ambiguous storage, active leases, retryable stages, and
+  queued/running work protect their workspace;
+- cleanup is confined to the configured `jobs` directory and UUID-named roots.
+
+The worker reconciles a bounded batch at startup and every five minutes from
+the protected workspace IDs derived from PostgreSQL. It can therefore repair a
+crash between a state commit and filesystem deletion without treating queue
+job IDs as workspace ownership. The batch limit is 128 workspaces; a failed
+filesystem operation remains retryable or is picked up by later reconciliation.
+
 ## Local companion and 2ch capture
 
 For Windows, download `sooqa-companion-windows-x86_64.exe` and its

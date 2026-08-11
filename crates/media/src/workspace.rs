@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, FileType},
     io,
     path::{Component, Path, PathBuf},
@@ -206,6 +207,74 @@ impl MediaWorkspace {
         Ok(())
     }
 
+    /// Remove one validated workspace without creating it first. The ID is a
+    /// UUID supplied by a typed durable job, never an arbitrary filesystem
+    /// path.
+    pub async fn cleanup_existing(
+        work_root: impl AsRef<Path>,
+        workspace_id: Uuid,
+    ) -> Result<(), WorkspaceError> {
+        let Some(jobs_root) = existing_jobs_root(work_root.as_ref()).await? else {
+            return Ok(());
+        };
+        let workspace_root = jobs_root.join(workspace_id.to_string());
+        remove_workspace_root(&jobs_root, &workspace_root).await
+    }
+
+    /// Reconcile old whole workspaces in a bounded batch. The caller supplies
+    /// workspace IDs currently protected by durable ingest/media/job state;
+    /// unprotected directories older than the retention age are safe orphan
+    /// candidates after a worker crash.
+    pub async fn scavenge_completed_workspaces(
+        work_root: impl AsRef<Path>,
+        max_age: Duration,
+        protected_workspace_ids: &[Uuid],
+        limit: usize,
+    ) -> Result<u64, WorkspaceError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let Some(jobs_root) = existing_jobs_root(work_root.as_ref()).await? else {
+            return Ok(0);
+        };
+        let protected_workspace_ids =
+            protected_workspace_ids.iter().copied().collect::<HashSet<_>>();
+        let cutoff = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut entries = async_fs::read_dir(&jobs_root)
+            .await
+            .map_err(|source| WorkspaceError::Io { path: jobs_root.clone(), source })?;
+        let mut removed = 0;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| WorkspaceError::Io { path: jobs_root.clone(), source })?
+        {
+            let Some(workspace_id) = entry.file_name().to_str().and_then(|name| name.parse().ok())
+            else {
+                continue;
+            };
+            if protected_workspace_ids.contains(&workspace_id) {
+                continue;
+            }
+            let workspace_root = entry.path();
+            let metadata = async_fs::symlink_metadata(&workspace_root)
+                .await
+                .map_err(|source| WorkspaceError::Io { path: workspace_root.clone(), source })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
+            if metadata.modified().ok().is_none_or(|modified| modified > cutoff) {
+                continue;
+            }
+            remove_workspace_root(&jobs_root, &workspace_root).await?;
+            removed += 1;
+            if removed >= limit as u64 {
+                break;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Remove only stale temporary artifacts from UUID-named job workspaces.
     /// Live jobs are supplied by the database caller and are never scanned.
     pub async fn scavenge_stale_artifacts(
@@ -307,6 +376,58 @@ impl MediaWorkspace {
         }
 
         Ok(removed)
+    }
+}
+
+async fn existing_jobs_root(work_root: &Path) -> Result<Option<PathBuf>, WorkspaceError> {
+    let work_root_metadata = match async_fs::symlink_metadata(work_root).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(WorkspaceError::Io { path: work_root.to_owned(), source });
+        }
+    };
+    ensure_directory_metadata(
+        work_root,
+        work_root_metadata.file_type(),
+        work_root_metadata.is_dir(),
+    )?;
+    let jobs_root = work_root.join("jobs");
+    let jobs_metadata = match async_fs::symlink_metadata(&jobs_root).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(WorkspaceError::Io { path: jobs_root, source }),
+    };
+    ensure_directory_metadata(&jobs_root, jobs_metadata.file_type(), jobs_metadata.is_dir())?;
+    Ok(Some(jobs_root))
+}
+
+async fn remove_workspace_root(
+    jobs_root: &Path,
+    workspace_root: &Path,
+) -> Result<(), WorkspaceError> {
+    if workspace_root.parent() != Some(jobs_root) {
+        return Err(WorkspaceError::OutsideConfiguredRoot(workspace_root.to_owned()));
+    }
+    let metadata = match async_fs::symlink_metadata(workspace_root).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(WorkspaceError::Io { path: workspace_root.to_owned(), source });
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(WorkspaceError::Symlink(workspace_root.to_owned()));
+    }
+    if !metadata.is_dir() {
+        return Err(WorkspaceError::NotDirectory(workspace_root.to_owned()));
+    }
+    match async_fs::remove_dir_all(workspace_root).await {
+        Ok(()) => Ok(()),
+        // Another cleanup worker may win the race after our metadata check.
+        // The desired postcondition is already true in that case.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(WorkspaceError::Io { path: workspace_root.to_owned(), source }),
     }
 }
 
@@ -488,6 +609,76 @@ mod tests {
         stale_workspace.cleanup().await.expect("stale workspace should clean up");
         live_workspace.cleanup().await.expect("live workspace should clean up");
         async_fs::remove_dir_all(work_root).await.expect("test root should be removed");
+    }
+
+    #[tokio::test]
+    async fn whole_workspace_cleanup_is_idempotent_and_scavenger_is_bounded() {
+        let work_root = test_root();
+        let stale = MediaWorkspace::create(&work_root, Uuid::new_v4())
+            .await
+            .expect("stale workspace should be created");
+        let protected = MediaWorkspace::create(&work_root, Uuid::new_v4())
+            .await
+            .expect("protected workspace should be created");
+        async_fs::write(
+            stale.path(WorkspaceArea::Source, "source.bin").expect("stale source path"),
+            b"stale",
+        )
+        .await
+        .expect("stale source should be written");
+        async_fs::write(
+            protected
+                .path(WorkspaceArea::Normalized, "canonical.mp4")
+                .expect("protected normalized path"),
+            b"protected",
+        )
+        .await
+        .expect("protected output should be written");
+
+        let removed = MediaWorkspace::scavenge_completed_workspaces(
+            &work_root,
+            Duration::ZERO,
+            &[protected.job_id()],
+            1,
+        )
+        .await
+        .expect("workspace reconciliation should succeed");
+        assert_eq!(removed, 1);
+        assert!(!stale.root().exists());
+        assert!(protected.root().exists());
+
+        let (first_cleanup, second_cleanup) = tokio::join!(
+            MediaWorkspace::cleanup_existing(&work_root, protected.job_id()),
+            MediaWorkspace::cleanup_existing(&work_root, protected.job_id()),
+        );
+        first_cleanup.expect("first cleanup should succeed");
+        second_cleanup.expect("racing cleanup should be harmless");
+        assert!(!protected.root().exists());
+        async_fs::remove_dir_all(work_root).await.expect("test root should be removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn whole_workspace_scavenger_never_follows_a_symlinked_root() {
+        use std::os::unix::fs::symlink;
+
+        let work_root = test_root();
+        let outside = test_root();
+        async_fs::create_dir_all(&outside).await.expect("outside root should be created");
+        async_fs::create_dir_all(work_root.join("jobs")).await.expect("jobs root should exist");
+        let workspace_id = Uuid::new_v4();
+        symlink(&outside, work_root.join("jobs").join(workspace_id.to_string()))
+            .expect("workspace symlink should be created");
+
+        let removed =
+            MediaWorkspace::scavenge_completed_workspaces(&work_root, Duration::ZERO, &[], 10)
+                .await
+                .expect("symlink should be ignored");
+        assert_eq!(removed, 0);
+        assert!(outside.exists());
+
+        async_fs::remove_dir_all(work_root).await.expect("test root should be removed");
+        async_fs::remove_dir_all(outside).await.expect("outside root should be removed");
     }
 
     #[tokio::test]
