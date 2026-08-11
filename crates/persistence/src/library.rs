@@ -1,4 +1,4 @@
-use crate::cleanup::enqueue_workspace_cleanup_for_media;
+use crate::cleanup::{enqueue_workspace_cleanup_for_media, lock_workspace_fence};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -703,6 +703,7 @@ impl LibraryRepository {
 
     pub async fn reset_storage_upload(&self, id: Uuid) -> Result<(), LibraryRepositoryError> {
         let mut transaction = self.pool.begin().await?;
+        lock_workspace_fence(&mut transaction, id).await?;
         let row = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -710,6 +711,29 @@ impl LibraryRepository {
             .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
         if row.storage_token.is_some() {
             return Err(LibraryRepositoryError::StorageUploadActive(id));
+        }
+        if row.local_work_path.is_none() {
+            return Err(LibraryRepositoryError::WorkspaceReclaimed(id));
+        }
+        let cleanup_running = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM queue.jobs AS cleanup
+                JOIN ingests AS ingest
+                  ON cleanup.payload->>'ingest_id' = ingest.id::text
+                 AND cleanup.payload->>'workspace_id' = ingest.workspace_id::text
+                WHERE cleanup.kind = 'cleanup_workspace'
+                  AND cleanup.state = 'running'
+                  AND ingest.media_id = $1
+            )
+            "#,
+        )
+        .bind(id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if cleanup_running {
+            return Err(LibraryRepositoryError::WorkspaceReclaimed(id));
         }
         let generation = row
             .storage_generation
@@ -1376,6 +1400,8 @@ pub enum LibraryRepositoryError {
     InvalidNumber { field: &'static str },
     #[error("storage upload for media {0} is active")]
     StorageUploadActive(Uuid),
+    #[error("media {0} workspace was reclaimed; reconstruction is required before storage reset")]
+    WorkspaceReclaimed(Uuid),
     #[error("storage generation for media {0} overflowed")]
     StorageGenerationOverflow(Uuid),
     #[error("storage upload for media {0} is not unknown")]

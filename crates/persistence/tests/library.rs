@@ -8,7 +8,7 @@ use sooqa_library::{
     StorageUploadReservationRequest, StorageUploadStore, VideoIdentityOutcome,
 };
 use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint, VideoSequenceSample};
-use sooqa_persistence::Database;
+use sooqa_persistence::{Database, LibraryRepositoryError};
 
 async fn database() -> Database {
     let url = env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL");
@@ -642,40 +642,22 @@ async fn storage_reconciliation_reopens_and_completes_linked_ingest() {
     let attached = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
     assert_eq!(attached.status.as_str(), "completed");
 
-    database.library().reset_storage_upload(media.media.id).await.unwrap();
-    let reopened = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
-    assert_eq!(reopened.status.as_str(), "storing");
-    let reservation = database
-        .library()
-        .reserve_storage_upload(StorageUploadReservationRequest {
-            media_id: media.media.id,
-            generation: 1,
-        })
-        .await
-        .unwrap();
-    let owner_token = match reservation {
-        StorageUploadReservation::Reserved { owner_token, .. } => owner_token,
-        other => panic!("expected a fresh storage reservation, got {other:?}"),
-    };
-    database
-        .library()
-        .complete_storage_upload(
-            media.media.id,
-            owner_token,
-            StorageUploadAttachment {
-                storage_chat_id: -100123,
-                storage_message_id: 42,
-                telegram_file_id: Some("file-42".to_owned()),
-                telegram_file_unique_id: Some("unique-42".to_owned()),
-            },
+    assert!(matches!(
+        database.library().reset_storage_upload(media.media.id).await,
+        Err(LibraryRepositoryError::WorkspaceReclaimed(id)) if id == media.media.id
+    ));
+    let still_ready = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
+    assert_eq!(still_ready.status.as_str(), "completed");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' = $1",
         )
+        .bind(media.media.id.to_string())
+        .fetch_one(database.pool())
         .await
-        .unwrap();
-    database.inbox().complete_storage_for_media(media.media.id).await.unwrap();
-    let completed = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
-    assert_eq!(completed.status.as_str(), "completed");
-    let receipt = database.library().find_storage_receipt(media.media.id).await.unwrap().unwrap();
-    assert_eq!(receipt.storage_message_id, 42);
+        .unwrap(),
+        0
+    );
 
     sqlx::query(
         "DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1 OR payload->>'media_id' = $2",

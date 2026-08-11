@@ -297,40 +297,12 @@ impl JobRepository {
     pub async fn protected_workspace_ids(&self) -> Result<Vec<Uuid>, JobRepositoryError> {
         Ok(sqlx::query_scalar(
             r#"
-            WITH protected AS (
-                SELECT workspace_id
-                FROM ingests
-                WHERE state IN (
-                    'received', 'queued', 'downloading', 'probing',
-                    'exact_dedup_check', 'normalizing', 'fingerprinting',
-                    'storing', 'failed_retryable'
-                )
-                UNION
-                SELECT i.workspace_id
-                FROM ingests AS i
-                WHERE i.state = 'duplicate_pending'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM queue.jobs AS cleanup
-                      WHERE cleanup.kind = 'cleanup_workspace'
-                        AND cleanup.state = 'succeeded'
-                        AND cleanup.payload->>'ingest_id' = i.id::text
-                        AND cleanup.payload->>'workspace_id' = i.workspace_id::text
-                  )
-                UNION
-                SELECT i.workspace_id
-                FROM ingests AS i
-                JOIN media AS m ON m.id = i.media_id
-                WHERE m.storage_state IN ('pending_storage', 'storage_unknown')
-                UNION
-                SELECT i.workspace_id
-                FROM queue.jobs AS cleanup
-                JOIN ingests AS i ON cleanup.payload->>'ingest_id' = i.id::text
-                WHERE cleanup.kind = 'cleanup_workspace'
-                  AND cleanup.state IN ('queued', 'running')
-            )
+            -- Reconciliation runs from a snapshot and deletes after this
+            -- query commits. Protect every workspace that is still current
+            -- for an ingest, not only active pipeline states, so a storage
+            -- reset cannot reopen bytes between the snapshot and deletion.
             SELECT DISTINCT workspace_id
-            FROM protected
+            FROM ingests
             "#,
         )
         .fetch_all(&self.pool)
