@@ -1,14 +1,16 @@
 //! Database connection and migration boundaries for sooqa.
 
+mod cleanup;
 mod inbox;
 mod jobs;
 mod library;
 mod publisher;
 
+pub use cleanup::WORKSPACE_CLEANUP_RETENTION;
 pub use inbox::{
     AssetNormalizationStart, AssetProbeStart, CreateIngestResult, ForceSaveResult, InboxRepository,
     InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart, SourceDownloadStart,
-    SourceInspectionStart,
+    SourceInspectionStart, WorkspaceCleanupStart,
 };
 pub use jobs::{JobRepository, JobRepositoryError};
 pub use library::{LibraryRepository, LibraryRepositoryError, VideoFingerprintCandidate};

@@ -34,6 +34,7 @@ use sooqa_persistence::{
     AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
     IngestFinalizationStart, IngestFingerprintStart, JobRepository, JobRepositoryError,
     LibraryRepository, LibraryRepositoryError, SourceDownloadStart, SourceInspectionStart,
+    WorkspaceCleanupStart,
 };
 use sooqa_telegram::StorageUploadError;
 use sooqa_telegram::{StorageUploadInput, StorageUploadProvider, TelegramApi, TelegramStorageApi};
@@ -290,6 +291,65 @@ pub fn compute_fingerprint_handler(
     })
 }
 
+pub fn cleanup_workspace_handler(
+    inbox: InboxRepository,
+    work_root: impl Into<PathBuf>,
+) -> HandlerFn {
+    let work_root = work_root.into();
+    Arc::new(move |job| {
+        let inbox = inbox.clone();
+        let work_root = work_root.clone();
+        Box::pin(async move { cleanup_workspace(&inbox, &work_root, job).await })
+    })
+}
+
+async fn cleanup_workspace(
+    inbox: &InboxRepository,
+    work_root: &Path,
+    job: Job,
+) -> Result<(), HandlerFailure> {
+    let (ingest_id, workspace_id) = match &job.command {
+        JobCommand::CleanupWorkspace(payload) => (payload.ingest_id, payload.workspace_id),
+        _ => {
+            return Err(HandlerFailure::permanent(
+                "invalid_payload",
+                "cleanup_workspace handler received a different job command",
+            ));
+        }
+    };
+    let job_attempt = job.attempt().ok_or_else(|| {
+        HandlerFailure::permanent(
+            "invalid_job_state",
+            "cleanup_workspace handler requires a running job lease",
+        )
+    })?;
+    let start = inbox
+        .begin_workspace_cleanup(&job_attempt, ingest_id, workspace_id)
+        .await
+        .map_err(map_inbox_error)?;
+    match start {
+        WorkspaceCleanupStart::Deferred => {
+            return Err(HandlerFailure::defer(
+                "workspace_protected",
+                "workspace is still protected by durable ingest or storage state",
+                OffsetDateTime::now_utc() + TimeDuration::minutes(1),
+            ));
+        }
+        WorkspaceCleanupStart::AlreadyAdvanced => return Ok(()),
+        WorkspaceCleanupStart::Ready => {}
+    }
+
+    if let Err(error) = MediaWorkspace::cleanup_existing(work_root, workspace_id).await {
+        let message = error.to_string();
+        return Err(if matches!(error, WorkspaceError::Io { .. }) {
+            HandlerFailure::retryable("workspace_cleanup", message)
+        } else {
+            HandlerFailure::permanent("workspace_cleanup", message)
+        });
+    }
+    Ok(())
+}
+
 async fn probe_asset(
     inbox: &InboxRepository,
     work_root: &std::path::Path,
@@ -319,27 +379,9 @@ async fn probe_asset(
         Err(error) => return Err(map_inbox_error(error)),
     };
     let (workspace_id, input_name) = if request.kind == IngestKind::Url {
-        (request.id, "source.bin")
+        (request.workspace_id, "source.bin")
     } else {
-        let workspace_id = match request.original_input["telegram_workspace_id"]
-            .as_str()
-            .and_then(|value| value.parse().ok())
-        {
-            Some(workspace_id) => workspace_id,
-            None => {
-                return fail_probe(
-                    inbox,
-                    ingest_request_id,
-                    &job_attempt,
-                    HandlerFailure::permanent(
-                        "invalid_ingest_state",
-                        "Telegram ingest request has no valid workspace ID",
-                    ),
-                )
-                .await;
-            }
-        };
-        (workspace_id, "telegram-input.bin")
+        (request.workspace_id, "telegram-input.bin")
     };
     let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
         Ok(workspace) => workspace,
@@ -982,18 +1024,9 @@ fn probe_media_kind(probe: &MediaProbe) -> Option<SourceMediaKind> {
 
 fn workspace_input(request: &sooqa_inbox::Ingest) -> Result<(Uuid, &'static str), HandlerFailure> {
     if request.kind == IngestKind::Url {
-        return Ok((request.id, "source.bin"));
+        return Ok((request.workspace_id, "source.bin"));
     }
-    request.original_input["telegram_workspace_id"]
-        .as_str()
-        .and_then(|value| value.parse().ok())
-        .map(|workspace_id| (workspace_id, "telegram-input.bin"))
-        .ok_or_else(|| {
-            HandlerFailure::permanent(
-                "invalid_ingest_state",
-                "Telegram ingest request has no valid workspace ID",
-            )
-        })
+    Ok((request.workspace_id, "telegram-input.bin"))
 }
 
 fn normalization_metadata(result: sooqa_media::NormalizationResult) -> AssetNormalization {

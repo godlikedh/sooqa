@@ -14,7 +14,7 @@ use sooqa_inbox::{
     AssetNormalization, IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection,
     SourceMediaKind, SubmittedVia, TelegramSubmissionInput,
 };
-use sooqa_jobs::JobType;
+use sooqa_jobs::{JobType, NewJob};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
@@ -28,8 +28,9 @@ use sooqa_telegram::{
     StorageUploadProvider, StorageUploadRequest, StorageUploadResult, TelegramStorageApi,
 };
 use sooqa_worker::{
-    TelegramSourceDownloader, compute_fingerprint_handler, download_source_handler,
-    inspect_source_handler, probe_asset_handler_with_telegram_source, upload_storage_asset_handler,
+    TelegramSourceDownloader, cleanup_workspace_handler, compute_fingerprint_handler,
+    download_source_handler, inspect_source_handler, probe_asset_handler_with_telegram_source,
+    upload_storage_asset_handler,
 };
 use thiserror::Error;
 use tokio::fs;
@@ -193,6 +194,71 @@ async fn force_save_reconstructs_url_after_workspace_cleanup() {
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
+async fn cleanup_handler_removes_only_the_claimed_workspace() {
+    let database = database().await;
+    let work_root = std::env::temp_dir().join(format!("sooqa-worker-cleanup-{}", Uuid::new_v4()));
+    let ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/cleanup-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let workspace = MediaWorkspace::create(&work_root, ingest.ingest.workspace_id).await.unwrap();
+    let source_path = workspace.path(WorkspaceArea::Source, "source.bin").unwrap();
+    fs::write(&source_path, b"cleanup-me").await.unwrap();
+    sqlx::query("UPDATE ingests SET state = 'completed', completed_at = now() WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'succeeded', completed_at = now() WHERE payload->>'ingest_id' = $1",
+    )
+    .bind(ingest.ingest.id.to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let cleanup_job = database
+        .jobs()
+        .enqueue(
+            NewJob::cleanup_workspace(ingest.ingest.id, ingest.ingest.workspace_id)
+                .dedupe_key(format!("test:cleanup-handler:{}", ingest.ingest.id)),
+        )
+        .await
+        .unwrap();
+    let claimed = database
+        .jobs()
+        .claim_next("cleanup-handler", Duration::from_secs(30), &[JobType::CleanupWorkspace])
+        .await
+        .unwrap()
+        .expect("cleanup job should be claimable");
+    assert_eq!(claimed.id, cleanup_job.id);
+    let handler = cleanup_workspace_handler(database.inbox(), work_root.clone());
+    handler(claimed.clone()).await.unwrap();
+    database.jobs().complete_lease(&claimed.lease().unwrap()).await.unwrap();
+    assert!(!workspace.root().exists());
+
+    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
+        .bind(ingest.ingest.id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let _ = fs::remove_dir_all(work_root).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
 async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
     let database = database().await;
     let work_root = std::env::temp_dir().join(format!("sooqa-worker-telegram-{}", Uuid::new_v4()));
@@ -249,7 +315,7 @@ async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
     let request = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
     assert_eq!(request.status, IngestStatus::Normalizing);
     assert_eq!(source.calls.load(Ordering::Relaxed), 1);
-    let workspace = MediaWorkspace::create(&work_root, workspace_id).await.unwrap();
+    let workspace = MediaWorkspace::create(&work_root, request.workspace_id).await.unwrap();
     let source_path = workspace.path(WorkspaceArea::Source, "telegram-input.bin").unwrap();
     assert_eq!(fs::read(&source_path).await.unwrap(), b"telegram-reconstructed");
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "probe_asset").await, 1);

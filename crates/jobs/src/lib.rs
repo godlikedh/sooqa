@@ -144,6 +144,15 @@ pub struct PublishPostPayload {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CleanupWorkspacePayload {
+    pub ingest_id: Uuid,
+    /// The workspace ID is generation-scoped: a force-save receives a new ID,
+    /// so an old cleanup job can never remove the new generation's workspace.
+    pub workspace_id: Uuid,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmptyJobPayload {}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -156,7 +165,7 @@ pub enum JobCommand {
     FinalizeIngest(IngestJobPayload),
     UploadStorageAsset(MediaJobPayload),
     PublishPost(PublishPostPayload),
-    CleanupWorkspace(EmptyJobPayload),
+    CleanupWorkspace(CleanupWorkspacePayload),
     RecoverStaleJobs(EmptyJobPayload),
 }
 
@@ -191,7 +200,7 @@ impl JobCommand {
             JobType::FinalizeIngest => decode!(IngestJobPayload, FinalizeIngest),
             JobType::UploadStorageAsset => decode!(MediaJobPayload, UploadStorageAsset),
             JobType::PublishPost => decode!(PublishPostPayload, PublishPost),
-            JobType::CleanupWorkspace => decode!(EmptyJobPayload, CleanupWorkspace),
+            JobType::CleanupWorkspace => decode!(CleanupWorkspacePayload, CleanupWorkspace),
             JobType::RecoverStaleJobs => decode!(EmptyJobPayload, RecoverStaleJobs),
         }
     }
@@ -283,8 +292,8 @@ impl NewJob {
         Self::new(JobCommand::FinalizeIngest(IngestJobPayload { ingest_id }))
     }
 
-    pub fn cleanup_workspace() -> Self {
-        Self::new(JobCommand::CleanupWorkspace(EmptyJobPayload {}))
+    pub fn cleanup_workspace(ingest_id: Uuid, workspace_id: Uuid) -> Self {
+        Self::new(JobCommand::CleanupWorkspace(CleanupWorkspacePayload { ingest_id, workspace_id }))
     }
 
     pub fn command(&self) -> &JobCommand {
@@ -409,6 +418,18 @@ mod tests {
         let job = NewJob::publish_post(post_id);
         let command = JobCommand::from_payload(job.job_type(), job.payload_json()).unwrap();
         assert_eq!(command, JobCommand::PublishPost(PublishPostPayload { post_id }));
+    }
+
+    #[test]
+    fn cleanup_payload_carries_its_generation_scoped_workspace() {
+        let ingest_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let job = NewJob::cleanup_workspace(ingest_id, workspace_id);
+        let command = JobCommand::from_payload(job.job_type(), job.payload_json()).unwrap();
+        assert_eq!(
+            command,
+            JobCommand::CleanupWorkspace(CleanupWorkspacePayload { ingest_id, workspace_id })
+        );
     }
 
     #[test]

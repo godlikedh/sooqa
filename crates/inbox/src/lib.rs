@@ -378,6 +378,9 @@ impl IngestSubmission {
 #[derive(Debug, Clone, Serialize)]
 pub struct Ingest {
     pub id: Uuid,
+    /// The filesystem workspace for this processing generation. A force-save
+    /// receives a new ID so delayed cleanup cannot remove its replacement.
+    pub workspace_id: Uuid,
     pub kind: IngestKind,
     pub status: IngestStatus,
     pub submitted_via: SubmittedVia,
@@ -405,6 +408,7 @@ impl Ingest {
         let now = time::OffsetDateTime::now_utc();
         Self {
             id,
+            workspace_id: id,
             kind: submission.kind,
             status: IngestStatus::Received,
             submitted_via: submission.submitted_via,
