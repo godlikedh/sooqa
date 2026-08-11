@@ -107,11 +107,21 @@ topology, including the pinned official local Telegram Bot API server, is
 documented in [operations.md](docs/operations.md) and configured under
 `deploy/home`.
 
-PostgreSQL integration tests use SQLx-managed isolated databases. The
-`DATABASE_URL` account used for `just test-integration` must have `CREATEDB`
-privilege so SQLx can create and drop each test database; use a dedicated
-development or CI account, never the runtime/production account. Tests remain
-parallel and do not require `--test-threads=1`.
+PostgreSQL integration tests use SQLx-managed isolated databases. The database
+named by `DATABASE_URL` is a test-control database: SQLx writes its
+`_sqlx_test` bookkeeping state there before creating per-test databases. A
+successful test is cleaned up automatically; a failed or panicking test may
+leave its database behind for diagnosis, after which a later run of the same
+test path can reclaim it or it must be dropped explicitly. The `sooqa` database
+used by the test command is intentionally disposable local/CI test-control
+state, not the runtime/home database. Use a separate test-control database if
+the runtime also uses `sooqa`.
+
+The `DATABASE_URL` role used for `just test-integration` must own or be allowed
+to write to that control database and have `CREATEDB` privilege so SQLx can
+create test databases. Use a dedicated development or CI account, never the
+runtime/production account. Tests remain parallel and do not require
+`--test-threads=1`.
 
 Apply forward-only migrations:
 

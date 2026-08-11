@@ -18,16 +18,25 @@ just openapi-validate
 
 Integration tests are marked `#[ignore]` because they need a real PostgreSQL
 server. Every PostgreSQL integration test uses SQLx's `#[sqlx::test]` support
-with the repository migrations and receives its own `PgPool`. SQLx creates a
-fresh database, applies the migrations, and drops that database when the test
-finishes, so Rust's default parallel test execution is safe and intentional.
+with the repository migrations and receives its own `PgPool`. SQLx uses the
+database named by `DATABASE_URL` as a test-control database: before creating
+per-test databases, it writes bookkeeping state to the `_sqlx_test`
+schema/table there. Each test then gets a fresh database with the repository
+migrations. A successful test result causes SQLx to drop that database
+automatically. A failed or panicking test intentionally leaves its database
+behind for diagnosis; a later run of the same test path can reclaim it, or it
+must be dropped explicitly. This keeps Rust's default parallel test execution
+safe and intentional.
 
-The PostgreSQL role in `DATABASE_URL` must be allowed to create and drop test
-databases (`CREATEDB`, or a superuser role in local development). Point this
-URL at a dedicated development/CI PostgreSQL account; never use a runtime or
-production database account for the test suite. One legacy-migration test
-creates an additional uniquely named database and therefore also requires the
-account to create databases directly.
+The PostgreSQL role in `DATABASE_URL` must own or be allowed to write to the
+test-control database and must be allowed to create databases (`CREATEDB`, or a
+superuser role in local development). The `sooqa` database in the command below
+is intentionally the disposable local/CI test-control database. Do not point
+this URL at the runtime or home database; use a separate test-control database
+name if those environments also use `sooqa`. Use a dedicated development/CI
+PostgreSQL account, never a runtime or production database account, for the
+test suite. One legacy-migration test creates an additional uniquely named
+database and therefore also requires the account to create databases directly.
 
 Cargo's separator is intentional:
 
