@@ -97,11 +97,14 @@ Cleanup is durable and replay-safe:
   already succeeded; only old generation directories are scavenger orphans;
 - cleanup is confined to the configured `jobs` directory and UUID-named roots.
 
-Cleanup jobs are also a database-backed deletion fence. While a cleanup job is
-running, a storage reset for its current workspace fails with an explicit
-“workspace reclaimed; reconstruction is required” result. If reset wins first,
-the cleanup job observes the durable storage job and defers. A ready or attached
-media item whose local path has already been reclaimed follows the same explicit
+Cleanup jobs are also a database-backed deletion fence. Before a valid cleanup
+attempt returns `Ready`, it clears the current media row's local work path in
+the same transaction. A storage reset therefore fails with an explicit
+“workspace reclaimed; reconstruction is required” result even after cleanup
+succeeds or its lease is recovered for retry. If reset wins first, the cleanup
+job observes the durable storage job and defers; a stale recovered attempt is
+also rejected before it can touch the filesystem. A ready or attached media
+item whose local path has already been reclaimed follows the same explicit
 reconstruction path; it never queues an upload job that cannot find bytes.
 
 The worker reconciles a bounded batch at startup and every five minutes from

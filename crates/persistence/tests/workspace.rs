@@ -2,11 +2,13 @@ use std::env;
 
 use serde_json::json;
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
-use sooqa_jobs::NewJob;
+use sooqa_jobs::{JobAttempt, NewJob};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
+use sooqa_media::{MediaWorkspace, WorkspaceArea};
 use sooqa_persistence::{Database, LibraryRepositoryError, WorkspaceCleanupStart};
+use tokio::fs;
 use uuid::Uuid;
 
 async fn database() -> Database {
@@ -126,6 +128,26 @@ async fn remove_storage_fixture(database: &Database, ingest_id: Uuid, media_id: 
         .unwrap();
 }
 
+async fn mark_cleanup_running(database: &Database, job_id: Uuid, worker_id: &str) -> JobAttempt {
+    let lease_token = Uuid::new_v4();
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'running', lease_token = $2, lease_owner = $3, lease_expires_at = now() + interval '30 seconds', last_heartbeat_at = now(), attempt_count = 1 WHERE id = $1",
+    )
+    .bind(job_id)
+    .bind(lease_token)
+    .bind(worker_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    JobAttempt {
+        job_id,
+        attempt_number: 1,
+        worker_id: worker_id.to_owned(),
+        lease_owner: worker_id.to_owned(),
+        lease_token,
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn ready_storage_clears_local_bytes_and_coalesces_cleanup() {
@@ -159,14 +181,6 @@ async fn ready_storage_clears_local_bytes_and_coalesces_cleanup() {
     .await
     .unwrap();
 
-    assert_eq!(
-        database
-            .inbox()
-            .begin_workspace_cleanup(Uuid::new_v4(), ingest_id, workspace_id)
-            .await
-            .unwrap(),
-        WorkspaceCleanupStart::Deferred
-    );
     assert!(database.jobs().protected_workspace_ids().await.unwrap().contains(&workspace_id));
 
     sqlx::query(
@@ -265,12 +279,9 @@ async fn storage_reset_wins_and_cleanup_defers_on_the_durable_fence() {
         .unwrap();
 
     database.library().reset_storage_upload(media_id).await.unwrap();
+    let attempt = mark_cleanup_running(&database, cleanup.id, "workspace-reset-wins").await;
     assert_eq!(
-        database
-            .inbox()
-            .begin_workspace_cleanup(cleanup.id, ingest_id, workspace_id)
-            .await
-            .unwrap(),
+        database.inbox().begin_workspace_cleanup(&attempt, ingest_id, workspace_id).await.unwrap(),
         WorkspaceCleanupStart::Deferred
     );
     assert_eq!(
@@ -309,22 +320,110 @@ async fn cleanup_claim_wins_and_storage_reset_requires_reconstruction() {
         )
         .await
         .unwrap();
-    let lease_token = Uuid::new_v4();
+    let work_root =
+        std::env::temp_dir().join(format!("sooqa-persistence-cleanup-{}", Uuid::new_v4()));
+    let workspace = MediaWorkspace::create(&work_root, workspace_id).await.unwrap();
+    let source_path = workspace.path(WorkspaceArea::Source, "source.bin").unwrap();
+    fs::write(&source_path, b"cleanup-me").await.unwrap();
+    sqlx::query("UPDATE media SET local_work_path = $2 WHERE id = $1")
+        .bind(media_id)
+        .bind(source_path.to_string_lossy().as_ref())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let attempt = mark_cleanup_running(&database, cleanup.id, "workspace-cleanup-race").await;
+    assert_eq!(
+        database.inbox().begin_workspace_cleanup(&attempt, ingest_id, workspace_id).await.unwrap(),
+        WorkspaceCleanupStart::Ready
+    );
+    assert!(
+        database
+            .library()
+            .find_media_details(media_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .media
+            .local_work_path
+            .is_none()
+    );
+    MediaWorkspace::cleanup_existing(&work_root, workspace_id).await.unwrap();
+    assert!(!workspace.root().exists());
     sqlx::query(
-        "UPDATE queue.jobs SET state = 'running', lease_token = $2, lease_owner = 'workspace-cleanup-race', lease_expires_at = now() + interval '30 seconds', last_heartbeat_at = now(), attempt_count = 1 WHERE id = $1",
+        "UPDATE queue.jobs SET state = 'succeeded', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, last_heartbeat_at = NULL, completed_at = now() WHERE id = $1",
     )
     .bind(cleanup.id)
-    .bind(lease_token)
+    .execute(database.pool())
+    .await
+        .unwrap();
+    let _ = fs::remove_dir_all(&work_root).await;
+    assert!(matches!(
+        database.library().reset_storage_upload(media_id).await,
+        Err(LibraryRepositoryError::WorkspaceReclaimed(id)) if id == media_id
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' = $1",
+        )
+        .bind(media_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    remove_storage_fixture(&database, ingest_id, media_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn cleanup_reclaim_marker_survives_lease_recovery() {
+    let database = database().await;
+    let source = format!("https://example.test/workspace-cleanup-recovery-{}", Uuid::new_v4());
+    let (ingest_id, media_id, workspace_id) =
+        prepare_completed_storage(&database, &source, 33).await;
+    let work_root =
+        std::env::temp_dir().join(format!("sooqa-persistence-cleanup-recovery-{}", Uuid::new_v4()));
+    let workspace = MediaWorkspace::create(&work_root, workspace_id).await.unwrap();
+    let source_path = workspace.path(WorkspaceArea::Source, "source.bin").unwrap();
+    fs::write(&source_path, b"cleanup-recovery").await.unwrap();
+    sqlx::query("UPDATE media SET local_work_path = $2 WHERE id = $1")
+        .bind(media_id)
+        .bind(source_path.to_string_lossy().as_ref())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let cleanup = database
+        .jobs()
+        .enqueue(
+            NewJob::cleanup_workspace(ingest_id, workspace_id)
+                .dedupe_key(format!("test:cleanup-recovery:{ingest_id}")),
+        )
+        .await
+        .unwrap();
+    let attempt = mark_cleanup_running(&database, cleanup.id, "workspace-cleanup-recovery").await;
+    assert_eq!(
+        database.inbox().begin_workspace_cleanup(&attempt, ingest_id, workspace_id).await.unwrap(),
+        WorkspaceCleanupStart::Ready
+    );
+    MediaWorkspace::cleanup_existing(&work_root, workspace_id).await.unwrap();
+    assert!(!workspace.root().exists());
+
+    sqlx::query(
+        "UPDATE queue.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(cleanup.id)
     .execute(database.pool())
     .await
     .unwrap();
+    database.jobs().recover_stale_leases().await.unwrap();
     assert_eq!(
-        database
-            .inbox()
-            .begin_workspace_cleanup(cleanup.id, ingest_id, workspace_id)
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(cleanup.id)
+            .fetch_one(database.pool())
             .await
             .unwrap(),
-        WorkspaceCleanupStart::Ready
+        "queued"
     );
     assert!(matches!(
         database.library().reset_storage_upload(media_id).await,
@@ -340,13 +439,79 @@ async fn cleanup_claim_wins_and_storage_reset_requires_reconstruction() {
         .unwrap(),
         0
     );
+    let _ = fs::remove_dir_all(&work_root).await;
+    remove_storage_fixture(&database, ingest_id, media_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn stale_cleanup_attempt_cannot_delete_after_storage_reset_wins() {
+    let database = database().await;
+    let source = format!("https://example.test/workspace-stale-cleanup-{}", Uuid::new_v4());
+    let (ingest_id, media_id, workspace_id) =
+        prepare_completed_storage(&database, &source, 34).await;
+    let work_root =
+        std::env::temp_dir().join(format!("sooqa-persistence-stale-cleanup-{}", Uuid::new_v4()));
+    let workspace = MediaWorkspace::create(&work_root, workspace_id).await.unwrap();
+    let source_path = workspace.path(WorkspaceArea::Source, "source.bin").unwrap();
+    fs::write(&source_path, b"stale-cleanup").await.unwrap();
+    sqlx::query("UPDATE media SET local_work_path = $2 WHERE id = $1")
+        .bind(media_id)
+        .bind(source_path.to_string_lossy().as_ref())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let cleanup = database
+        .jobs()
+        .enqueue(
+            NewJob::cleanup_workspace(ingest_id, workspace_id)
+                .dedupe_key(format!("test:stale-cleanup:{ingest_id}")),
+        )
+        .await
+        .unwrap();
+    let stale_attempt =
+        mark_cleanup_running(&database, cleanup.id, "stale-workspace-cleanup").await;
     sqlx::query(
-        "UPDATE queue.jobs SET state = 'succeeded', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, last_heartbeat_at = NULL, completed_at = now() WHERE id = $1",
+        "UPDATE queue.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
     )
     .bind(cleanup.id)
     .execute(database.pool())
     .await
     .unwrap();
+    database.jobs().recover_stale_leases().await.unwrap();
+
+    database.library().reset_storage_upload(media_id).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1")
+            .bind(media_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "pending_storage"
+    );
+    assert_eq!(
+        database
+            .inbox()
+            .begin_workspace_cleanup(&stale_attempt, ingest_id, workspace_id)
+            .await
+            .unwrap(),
+        WorkspaceCleanupStart::AlreadyAdvanced
+    );
+    assert!(workspace.root().exists());
+    assert!(
+        database
+            .library()
+            .find_media_details(media_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .media
+            .local_work_path
+            .is_some()
+    );
+    MediaWorkspace::cleanup_existing(&work_root, workspace_id).await.unwrap();
+    let _ = fs::remove_dir_all(&work_root).await;
     remove_storage_fixture(&database, ingest_id, media_id).await;
 }
 
@@ -392,10 +557,11 @@ async fn force_save_changes_workspace_generation_before_old_cleanup_runs() {
     let resumed = database.inbox().force_save(ingest_id).await.unwrap();
     assert!(resumed.resumed);
     assert_ne!(resumed.ingest.workspace_id, old_workspace_id);
+    let attempt = mark_cleanup_running(&database, old_cleanup.id, "old-workspace-cleanup").await;
     assert_eq!(
         database
             .inbox()
-            .begin_workspace_cleanup(old_cleanup.id, ingest_id, old_workspace_id)
+            .begin_workspace_cleanup(&attempt, ingest_id, old_workspace_id)
             .await
             .unwrap(),
         WorkspaceCleanupStart::Ready
