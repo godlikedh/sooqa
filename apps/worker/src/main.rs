@@ -7,7 +7,8 @@ use sooqa_jobs::JobType;
 use sooqa_media::{
     BinaryCheck, CanonicalImageProfile, CanonicalVideoProfile, DirectHttpDownloader,
     DownloadLimits, FfprobeAdapter, ImageNormalizer, MediaWorkspace, NormalizationPlanner,
-    ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter, diagnose_binaries,
+    ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter, TwoChMirrorDownloader,
+    diagnose_binaries,
 };
 use sooqa_persistence::{Database, JobRepository, WORKSPACE_CLEANUP_RETENTION};
 use uuid::Uuid;
@@ -46,9 +47,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
         max_bytes: config.media.source_download_max_bytes,
         ..DownloadLimits::default()
     };
-    let source_downloader: Arc<dyn SourceDownloader> = Arc::new(
-        SourceDownloaderRouter::direct_only(Arc::new(DirectHttpDownloader::new(download_limits))),
-    );
+    let source_downloader: Arc<dyn SourceDownloader> =
+        Arc::new(SourceDownloaderRouter::direct_only(Arc::new(TwoChMirrorDownloader::new(
+            DirectHttpDownloader::new(download_limits),
+        ))));
     let telegram_api =
         match config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured()) {
             Some(token) => Some(
@@ -66,7 +68,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         telegram_api.clone().map(|api| Arc::new(api) as Arc<dyn TelegramSourceDownloader>);
     let inspect_handler = inspect_source_handler(database.inbox(), Arc::clone(&source_downloader));
     handlers.register(JobType::InspectSource, move |job| inspect_handler(job));
-    tracing::info!("source inspection handler enabled (direct HTTP only)");
+    tracing::info!("source inspection handler enabled (direct HTTP with 2ch mirrors)");
     let download_handler = download_source_handler(
         database.inbox(),
         config.media.work_root.clone(),

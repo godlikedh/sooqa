@@ -879,6 +879,15 @@ impl InboxRepository {
             return Ok(request);
         }
 
+        let inspection_value = serde_json::to_value(&inspection)?;
+        if let Some(object) = request.original_input.as_object_mut() {
+            object.insert("inspection".to_owned(), inspection_value);
+        } else {
+            request.original_input = json!({
+                "source": request.original_input,
+                "inspection": inspection_value,
+            });
+        }
         request.transition_to(IngestStatus::Downloading)?;
         request.error_code = None;
         request.error_message = None;
@@ -1340,7 +1349,14 @@ fn stage_dedupe_key(request: &Ingest, initial_key: &str) -> String {
 
 fn clear_pipeline_artifacts(request: &mut Ingest) {
     if let Some(object) = request.original_input.as_object_mut() {
-        for key in ["download", "probe", "probed_media_kind", "normalization", "finalization"] {
+        for key in [
+            "inspection",
+            "download",
+            "probe",
+            "probed_media_kind",
+            "normalization",
+            "finalization",
+        ] {
             object.remove(key);
         }
     }

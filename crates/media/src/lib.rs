@@ -22,6 +22,7 @@ mod image_normalize;
 mod normalize;
 mod publication;
 mod sequence_alignment;
+mod two_ch;
 mod video_sequence;
 mod workspace;
 mod ytdlp;
@@ -59,6 +60,7 @@ pub use sequence_alignment::{
     SequenceEvidence, align_video_sequences,
 };
 pub use sooqa_inbox::{SourceInspection, SourceMediaKind};
+pub use two_ch::{TWO_CH_MIRROR_HOSTS, TwoChMirrorDownloader};
 pub use video_sequence::{
     VIDEO_SEQUENCE_BASE_INTERVAL_MS, VIDEO_SEQUENCE_CODEC_V1, VIDEO_SEQUENCE_MAGIC,
     VIDEO_SEQUENCE_MAX_ANCHORS, VIDEO_SEQUENCE_MAX_SAMPLES, VIDEO_SEQUENCE_MAX_TOKENS,

@@ -74,7 +74,7 @@ this baseline.
 - `sooqa-publisher` defines channels, posts, and publication transitions.
 - `sooqa-jobs` defines typed job kinds and payloads. Persistence decodes the
   JSON envelope once; handlers receive a typed `JobCommand`.
-- `sooqa-media` owns direct HTTP, ffprobe, ffmpeg, image normalization,
+- `sooqa-media` owns direct HTTP, the exact-host 2ch mirror adapter, ffprobe, ffmpeg, image normalization,
   hashing, fingerprints, workspaces, and subprocess safety.
 - `sooqa-telegram` owns Telegram protocol mapping and storage upload effects.
   Polling, worker-side source downloads, and storage uploads use separate HTTP

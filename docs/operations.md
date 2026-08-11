@@ -177,6 +177,16 @@ Tampermonkey's private storage. It never receives or stores the backend token.
 `Save...` opens one metadata dialog for comma-separated tags and an internal
 description; those values become media metadata, not a public Telegram post.
 
+For those three exact hosts, the worker's 2ch media adapter inspects official
+mirrors in the fixed order `2ch.org`, `2ch.su`, `2ch.life`, preserving the
+submitted path and query. It falls through only for DNS/connection/TLS
+failures or non-success HTTP responses. Unsupported media and source-size
+policy failures remain terminal. The successful mirror URL is retained in the
+inspection and library source metadata, while the submitted URL and page
+context remain the provenance; the later download reuses that selected URL.
+This policy is not applied to other direct HTTP sources or to arbitrary
+subdomains.
+
 ## Home local Bot API deployment
 
 The development Compose file at the repository root contains only PostgreSQL.

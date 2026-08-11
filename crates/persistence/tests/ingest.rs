@@ -140,12 +140,26 @@ async fn source_inspection_completion_commits_job_success_with_transition() {
                 mime_type: Some("video/webm".to_owned()),
                 content_length_bytes: Some(1),
                 title: None,
-                metadata: json!({}),
+                metadata: json!({
+                    "two_ch_mirror": {
+                        "submitted_host": "2ch.life",
+                        "selected_host": "2ch.org",
+                        "selected_url": "https://2ch.org/b/src/inspected.webm"
+                    }
+                }),
             },
         )
         .await
         .unwrap();
     assert_eq!(completed.status, IngestStatus::Downloading);
+    let stored_inspection = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT input_json->'inspection' FROM ingests WHERE id = $1",
+    )
+    .bind(ingest.ingest.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored_inspection["metadata"]["two_ch_mirror"]["selected_host"], "2ch.org");
 
     let job_state = sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
         .bind(claimed.id)
@@ -213,6 +227,20 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent() {
     .execute(database.pool())
     .await
     .unwrap();
+    sqlx::query("UPDATE ingests SET input_json = input_json || $2 WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .bind(json!({
+            "inspection": {
+                "metadata": {
+                    "two_ch_mirror": {
+                        "selected_host": "2ch.org"
+                    }
+                }
+            }
+        }))
+        .execute(database.pool())
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE queue.jobs SET state = 'succeeded', completed_at = now() WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",
     )
@@ -231,6 +259,7 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent() {
     assert_eq!(resumed.ingest.status, IngestStatus::Queued);
     assert!(resumed.ingest.force_save);
     assert!(resumed.ingest.duplicate_evidence.is_none());
+    assert!(resumed.ingest.original_input.get("inspection").is_none());
     assert_eq!(resumed.ingest.supplied_description.as_deref(), Some("keep this internal note"));
     assert_eq!(resumed.ingest.supplied_tags, ["cats", "reaction"]);
     assert_eq!(
