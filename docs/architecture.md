@@ -77,8 +77,9 @@ this baseline.
 - `sooqa-media` owns direct HTTP, ffprobe, ffmpeg, image normalization,
   hashing, fingerprints, workspaces, and subprocess safety.
 - `sooqa-telegram` owns Telegram protocol mapping and storage upload effects.
-  Polling, downloads, and storage uploads use separate HTTP clients and
-  timeout policies.
+  Polling, worker-side source downloads, and storage uploads use separate HTTP
+  clients and timeout policies. Telegram file acceptance is metadata-only;
+  source bytes are reconstructed by the worker from the durable file ID.
 - `sooqa-persistence` owns migrations and short database transactions.
 - `sooqa-api` owns HTTP routing, one configured bearer secret, limits, and
   stable request-ID errors.
@@ -145,6 +146,13 @@ while an identity transaction is open. Stage metadata is
 bounded JSON input metadata; it is decoded into typed Rust structs at the
 handler boundary. Storage completion/failure is applied by `media_id`, and
 attach/reset/mark-unknown reconcile the linked ingest rows.
+
+Telegram file messages follow the same durable boundary: the polling server
+validates the administrator and advertised size, persists the Telegram file
+metadata, and acknowledges only after the ingest transaction commits. It does
+not create a workspace or call Telegram file download. The worker creates the
+workspace and downloads from the persisted file ID during the probe job, so a
+slow or replayed Telegram file cannot block later polling acceptance.
 
 When storage is durably ready, the storage transition, linked-ingest
 completion, `local_work_path = NULL`, and cleanup enqueue commit together. A

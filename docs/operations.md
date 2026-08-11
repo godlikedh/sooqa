@@ -100,6 +100,22 @@ crash between a state commit and filesystem deletion without treating queue
 job IDs as workspace ownership. The batch limit is 128 workspaces; a failed
 filesystem operation remains retryable or is picked up by later reconciliation.
 
+## Telegram file acceptance
+
+For a supported private Telegram file message, the polling server performs
+authorization, metadata/size validation, and the PostgreSQL ingest transaction
+only. It persists the Telegram `file_id`, `file_unique_id`, message identity,
+caption, media kind, MIME type, name, and advertised size, then acknowledges
+the update. It does not create a workspace or download media bytes.
+
+The worker creates the generation workspace while probing and reconstructs the
+source from the durable `file_id`. The download is streamed into the private
+workspace with `SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES`, then probed and
+processed under the normal durable lease/retry flow. A replayed update uses the
+same Telegram update idempotency key, so it returns the existing ingest without
+another acceptance job or eager download. This keeps the polling loop
+responsive while a large worker download is running.
+
 ## Local companion and 2ch capture
 
 For Windows, download `sooqa-companion-windows-x86_64.exe` and its
