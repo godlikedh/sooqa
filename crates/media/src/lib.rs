@@ -41,7 +41,8 @@ pub use ffprobe::{
     parse_probe_json,
 };
 pub use fingerprint::{
-    FingerprintVersion, FrameDecodeLimits, FrameExtractionError, FrameExtractor, VIDEO_SEQUENCE_V1,
+    DEFAULT_MAX_FRAME_SEQUENCE_BYTES, FingerprintVersion, FrameDecodeLimits, FrameExtractionError,
+    FrameExtractor, VIDEO_SEQUENCE_V1,
 };
 pub use hashing::{FileDigest, HashError, sha256_file};
 pub(crate) use hashing::{sha256_bytes, sha256_file_sync};
@@ -61,8 +62,8 @@ pub use sooqa_inbox::{SourceInspection, SourceMediaKind};
 pub use video_sequence::{
     VIDEO_SEQUENCE_BASE_INTERVAL_MS, VIDEO_SEQUENCE_CODEC_V1, VIDEO_SEQUENCE_MAGIC,
     VIDEO_SEQUENCE_MAX_ANCHORS, VIDEO_SEQUENCE_MAX_SAMPLES, VIDEO_SEQUENCE_MAX_TOKENS,
-    VideoSequenceError, VideoSequenceFingerprint, VideoSequenceSample, derive_search_tokens,
-    select_video_sequence_timestamps, video_sequence_interval_ms,
+    VideoSequenceBuilder, VideoSequenceError, VideoSequenceFingerprint, VideoSequenceSample,
+    derive_search_tokens, select_video_sequence_timestamps, video_sequence_interval_ms,
 };
 pub use workspace::{
     ManifestEntry, MediaWorkspace, WorkspaceArea, WorkspaceError, WorkspaceManifest,

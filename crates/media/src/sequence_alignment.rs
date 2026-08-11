@@ -562,11 +562,10 @@ mod tests {
 
         let extractor = FrameExtractor::new("ffmpeg", Duration::from_secs(30));
         let reference = extractor
-            .extract_video_sequence_from_area_with_cache_key(
+            .extract_video_sequence_from_area(
                 &reference_workspace,
                 WorkspaceArea::Normalized,
                 "canonical.mp4",
-                "reference",
                 8_000,
             )
             .await
@@ -594,11 +593,10 @@ mod tests {
                 .expect("case path should be safe");
             render_case(name, &path, &reference_path);
             let fingerprint = extractor
-                .extract_video_sequence_from_area_with_cache_key(
+                .extract_video_sequence_from_area(
                     &workspace,
                     WorkspaceArea::Normalized,
                     "canonical.mp4",
-                    name,
                     duration_ms,
                 )
                 .await

@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, sync::OnceLock};
 
 use serde_json::json;
 use sooqa_inbox::{
@@ -20,9 +20,18 @@ async fn database() -> Database {
     database
 }
 
+// These tests share the CI database; a test claiming "any inspect_source" job
+// must not steal the job another test just created.
+static TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn test_lock() -> &'static tokio::sync::Mutex<()> {
+    TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn input_key_replays_identical_ingests_and_rejects_conflicts() {
+    let _guard = test_lock().lock().await;
     let database = database().await;
     let key = format!("test-ingest-{}", Uuid::new_v4());
     let mut input = IngestSubmissionInput::new("https://example.test/video", SubmittedVia::Api);
@@ -86,6 +95,7 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn source_inspection_completion_commits_job_success_with_transition() {
+    let _guard = test_lock().lock().await;
     let database = database().await;
     let ingest = database
         .inbox()
@@ -182,6 +192,7 @@ async fn source_inspection_completion_commits_job_success_with_transition() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn duplicate_pending_force_save_is_durable_and_idempotent() {
+    let _guard = test_lock().lock().await;
     let database = database().await;
     let mut submission_input = IngestSubmissionInput::new(
         format!("https://example.test/duplicate-{}", Uuid::new_v4()),
@@ -263,6 +274,7 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL"]
 async fn stale_video_identity_finalizer_cannot_mutate_after_lease_recovery() {
+    let _guard = test_lock().lock().await;
     let database = database().await;
     let ingest = database
         .inbox()

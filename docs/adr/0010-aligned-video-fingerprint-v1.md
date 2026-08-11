@@ -29,6 +29,10 @@ Timestamps are `0, interval, 2 * interval, ... < duration_ms`. The interval is
 samples for ordinary videos, expands deterministically above the 2,048-sample
 bound, and uses every distinct timestamp produced by the same generator for
 short videos. The actual interval and duration are stored in the fingerprint.
+For each timestamp, the selected frame is the first decoded input frame whose
+normalized presentation timestamp is at or after that grid point. The grid is
+not rounded to the nearest decoded frame; this distinction is part of the v1
+fingerprint contract.
 
 ### Sample features
 
@@ -139,6 +143,35 @@ single stable lock key is intentional: equivalent re-encodes with different
 SHAs must observe the first in-progress reservation before either can enqueue
 a storage upload. The canonical SHA unique constraint remains the final
 byte-identity barrier.
+
+### Extraction resource behavior
+
+The active extractor preserves the timestamp grid above with one FFmpeg process
+per canonical video. It normalizes input PTS with `setpts=PTS-STARTPTS`, pads
+the terminal decoded frame with `tpad=stop_mode=clone` for one sample interval,
+and then uses
+`select='isnan(prev_selected_pts)+gte(t,selected_n*interval/1000)'` to choose
+the first decoded frame at or after each grid timestamp. The padding makes a
+final grid point available when container or audio duration extends just beyond
+the video stream; the exact sample-count validation remains in force. An
+explicit `-frames:v` cap equals the exact expected sample count, never above
+2,048, and `-fps_mode vfr` prevents the output writer from duplicating or
+rounding the selected frames. FFmpeg writes a numbered PNG sequence into a fresh
+extraction-scoped directory under the workspace. A bounded consumer validates
+the numbered sequence, waits for each file to stabilize, decodes it under the
+existing byte/pixel/working-set limits, and deletes it before consuming the
+next frame. The production process runner also monitors the aggregate regular
+file size while FFmpeg is running and aborts the process group over the
+4,294,967,296-byte sequence limit; the consumer and final validation enforce
+the same limit for non-production runners and producer races. The sequence
+directory is removed on every normal exit path and by a synchronous drop guard
+when the extraction is cancelled.
+
+This changes only execution and resource lifetime. The Rust resize, feature,
+transition, binary codec, shortlist-token, and alignment contracts remain the
+accepted v1 semantics. A future streaming raw-frame implementation would need
+the same framing, backpressure, and cleanup guarantees; it is not required by
+this decision.
 
 The authorized `POST /api/v1/ingests/{id}/force-save` route is idempotent. It
 is accepted only from `duplicate_pending`, persists `force_save = true`, clears
