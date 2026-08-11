@@ -36,6 +36,11 @@ Telegram storage uploads also use a separate bounded deadline suitable for
 2 GB-class transfers; it is independent from polling and download stall
 timeouts.
 
+Telegram file acceptance is metadata-only: the polling server validates and
+queues the file ID before acknowledging the update. The worker performs the
+bounded source download asynchronously from that durable file ID, and replayed
+updates reuse the same ingest key.
+
 ## Target persistence model
 
 The durable application model has four product tables and one technical queue

@@ -262,7 +262,6 @@ async fn cleanup_handler_removes_only_the_claimed_workspace() {
 async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
     let database = database().await;
     let work_root = std::env::temp_dir().join(format!("sooqa-worker-telegram-{}", Uuid::new_v4()));
-    let workspace_id = Uuid::new_v4();
     let ingest = database
         .inbox()
         .create_ingest(
@@ -272,7 +271,6 @@ async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
                 submitted_by_admin_id: None,
                 original_input: json!({
                     "source_type": "telegram",
-                    "telegram_workspace_id": workspace_id.to_string(),
                     "telegram_file_id": "durable-file-id",
                     "telegram_file_unique_id": "durable-unique-id",
                     "media_kind": "video"
@@ -284,13 +282,14 @@ async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
         )
         .await
         .unwrap();
-    let workspace = MediaWorkspace::create(&work_root, workspace_id).await.unwrap();
+    let workspace = MediaWorkspace::create(&work_root, ingest.ingest.workspace_id).await.unwrap();
     let source_path = workspace.path(WorkspaceArea::Source, "telegram-input.bin").unwrap();
     fs::write(&source_path, b"old-telegram-source").await.unwrap();
     workspace.cleanup().await.unwrap();
     mark_duplicate_pending(&database, ingest.ingest.id).await;
 
-    database.inbox().force_save(ingest.ingest.id).await.unwrap();
+    let resumed = database.inbox().force_save(ingest.ingest.id).await.unwrap();
+    assert_ne!(resumed.ingest.workspace_id, ingest.ingest.workspace_id);
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "probe_asset").await, 1);
     let source = ReconstructingTelegramSource { calls: Arc::new(AtomicUsize::new(0)) };
     let probe_handler = probe_asset_handler_with_telegram_source(
