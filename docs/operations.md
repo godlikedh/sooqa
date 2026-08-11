@@ -61,10 +61,13 @@ long upload cannot inherit the long-poll or download-stall deadline.
 
 Video fingerprint extraction uses the `video_sequence_v1` grid without a
 per-sample subprocess or permanent frame cache. One FFmpeg process first
-normalizes timestamps to zero and uses a `select` expression to choose the
-first decoded frame at or after each grid timestamp; variable-frame-rate PNG
-output preserves that selection instead of applying a rounding policy. Output
-is capped at the calculated sample count (at most 2,048). A bounded consumer
+normalizes timestamps to zero, pads the final decoded frame for one sample
+interval, and uses a `select` expression to choose the first decoded frame at
+or after each grid timestamp. The padding preserves the final grid point when
+container or audio duration extends just beyond the video stream; variable-
+frame-rate PNG output preserves that selection instead of applying a rounding
+policy. Output is capped at the calculated sample count (at most 2,048). A
+bounded consumer
 decodes stable numbered PNGs as they arrive and deletes each one, while the
 producer monitors the extraction directory. The configured aggregate
 temporary sequence limit is 4 GiB (`DEFAULT_MAX_FRAME_SEQUENCE_BYTES`), in

@@ -147,7 +147,7 @@ impl FrameExtractor {
             .arg("0:v:0")
             .arg("-vf")
             .arg(format!(
-                "setpts=PTS-STARTPTS,select='isnan(prev_selected_pts)+gte(t,selected_n*{interval_ms}/1000)'"
+                "setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={interval_ms}ms,select='isnan(prev_selected_pts)+gte(t,selected_n*{interval_ms}/1000)'"
             ))
             .arg("-frames:v")
             .arg(expected_count.to_string())
@@ -681,7 +681,7 @@ mod tests {
                 .windows(2)
                 .find(|args| args[0] == "-vf")
                 .expect("timestamp selector should be configured")[1],
-            "setpts=PTS-STARTPTS,select='isnan(prev_selected_pts)+gte(t,selected_n*500/1000)'"
+            "setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration=500ms,select='isnan(prev_selected_pts)+gte(t,selected_n*500/1000)'"
         );
         assert_eq!(
             runner.commands.lock().unwrap()[0]
@@ -1039,6 +1039,126 @@ mod tests {
         assert_eq!(actual.samples, legacy.samples);
         assert_eq!(actual.interval_ms, 500);
         assert_eq!(actual.samples.len(), 4);
+        assert_eq!(std::fs::read_dir(workspace.root().join("frames")).unwrap().count(), 0);
+        workspace.cleanup().await.expect("workspace should be removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe; validates tail padding at a duration boundary"]
+    async fn tail_padding_completes_a_grid_when_audio_outlives_video() {
+        let workspace = MediaWorkspace::create(temp_path("tail-padding"), Uuid::new_v4())
+            .await
+            .expect("workspace should be created");
+        let input = workspace.path(WorkspaceArea::Normalized, "canonical.mkv").unwrap();
+        let raw_input = workspace.root().join("fixture.rgb");
+        let (width, height) = (96_u32, 64_u32);
+        let mut raw = Vec::with_capacity((width * height * 3 * 14) as usize);
+        for frame in 0..14_u32 {
+            for y in 0..height {
+                for x in 0..width {
+                    raw.extend_from_slice(&[
+                        (frame.wrapping_mul(29).wrapping_add(x.wrapping_mul(3))) as u8,
+                        (frame.wrapping_mul(17).wrapping_add(y.wrapping_mul(5))) as u8,
+                        (x.wrapping_mul(7).wrapping_add(y.wrapping_mul(11))) as u8,
+                    ]);
+                }
+            }
+        }
+        std::fs::write(&raw_input, &raw).expect("raw fixture should be written");
+        let fixture = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                "96x64",
+                "-r",
+                "7",
+                "-i",
+            ])
+            .arg(&raw_input)
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=mono:sample_rate=48000",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-t",
+                "2.25",
+                "-c:v",
+                "ffv1",
+                "-level",
+                "3",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "pcm_s16le",
+                "-f",
+                "matroska",
+            ])
+            .arg(&input)
+            .status()
+            .expect("ffmpeg tail fixture command should start");
+        assert!(fixture.success(), "ffmpeg tail fixture command should succeed");
+
+        let probe = crate::FfprobeAdapter::new("ffprobe", Duration::from_secs(10))
+            .probe(&input)
+            .await
+            .expect("tail fixture should probe");
+        let duration_ms = probe.duration_ms.expect("tail fixture should have a duration");
+        let interval_ms =
+            video_sequence_interval_ms(duration_ms).expect("tail fixture interval should fit");
+        let timestamps = select_video_sequence_timestamps(duration_ms);
+        assert_eq!(duration_ms, 2_250);
+        assert_eq!(interval_ms, 500);
+        assert_eq!(timestamps, [0, 500, 1_000, 1_500, 2_000]);
+
+        let legacy_dir = workspace.root().join("legacy");
+        std::fs::create_dir(&legacy_dir).expect("legacy output directory should be created");
+        let mut legacy_images = Vec::new();
+        for (index, timestamp_ms) in timestamps.iter().copied().take(4).enumerate() {
+            let output = legacy_dir.join(format!("frame-{index:04}.png"));
+            let seek = format!("{:.3}", timestamp_ms as f64 / 1_000.0);
+            let result = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+                .arg(&input)
+                .args(["-map", "0:v:0", "-ss"])
+                .arg(seek)
+                .args(["-frames:v", "1", "-an", "-f", "image2"])
+                .arg(&output)
+                .status()
+                .expect("legacy tail sample command should start");
+            assert!(result.success(), "legacy tail sample command should succeed");
+            legacy_images.push(
+                decode_frame(&output, FrameDecodeLimits::default())
+                    .expect("legacy tail sample should decode"),
+            );
+        }
+        let mut legacy_builder = VideoSequenceBuilder::new(2_000, interval_ms).unwrap();
+        for image in &legacy_images {
+            legacy_builder.push_image(image).unwrap();
+        }
+        let legacy = legacy_builder.finish().unwrap();
+
+        let actual = FrameExtractor::new("ffmpeg", Duration::from_secs(30))
+            .extract_video_sequence_from_area(
+                &workspace,
+                WorkspaceArea::Normalized,
+                "canonical.mkv",
+                duration_ms,
+            )
+            .await
+            .expect("tail-padded extraction should succeed");
+        assert_eq!(actual.samples.len(), timestamps.len());
+        assert_eq!(&actual.samples[..4], legacy.samples.as_slice());
         assert_eq!(std::fs::read_dir(workspace.root().join("frames")).unwrap().count(), 0);
         workspace.cleanup().await.expect("workspace should be removed");
     }

@@ -147,12 +147,16 @@ byte-identity barrier.
 ### Extraction resource behavior
 
 The active extractor preserves the timestamp grid above with one FFmpeg process
-per canonical video. It normalizes input PTS with `setpts=PTS-STARTPTS`, then
-uses `select='isnan(prev_selected_pts)+gte(t,selected_n*interval/1000)'` to
-choose the first decoded frame at or after each grid timestamp. An explicit
-`-frames:v` cap equals the exact expected sample count, never above 2,048, and
-`-fps_mode vfr` prevents the output writer from duplicating or rounding the
-selected frames. FFmpeg writes a numbered PNG sequence into a fresh
+per canonical video. It normalizes input PTS with `setpts=PTS-STARTPTS`, pads
+the terminal decoded frame with `tpad=stop_mode=clone` for one sample interval,
+and then uses
+`select='isnan(prev_selected_pts)+gte(t,selected_n*interval/1000)'` to choose
+the first decoded frame at or after each grid timestamp. The padding makes a
+final grid point available when container or audio duration extends just beyond
+the video stream; the exact sample-count validation remains in force. An
+explicit `-frames:v` cap equals the exact expected sample count, never above
+2,048, and `-fps_mode vfr` prevents the output writer from duplicating or
+rounding the selected frames. FFmpeg writes a numbered PNG sequence into a fresh
 extraction-scoped directory under the workspace. A bounded consumer validates
 the numbered sequence, waits for each file to stabilize, decodes it under the
 existing byte/pixel/working-set limits, and deletes it before consuming the
