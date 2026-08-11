@@ -92,7 +92,17 @@ Cleanup is durable and replay-safe:
   one-day retention period;
 - pending storage, ambiguous storage, active leases, retryable stages, and
   queued/running work protect their workspace;
+- every workspace ID still referenced by an ingest is protected from periodic
+  reconciliation, including completed ingests whose explicit cleanup job has
+  already succeeded; only old generation directories are scavenger orphans;
 - cleanup is confined to the configured `jobs` directory and UUID-named roots.
+
+Cleanup jobs are also a database-backed deletion fence. While a cleanup job is
+running, a storage reset for its current workspace fails with an explicit
+“workspace reclaimed; reconstruction is required” result. If reset wins first,
+the cleanup job observes the durable storage job and defers. A ready or attached
+media item whose local path has already been reclaimed follows the same explicit
+reconstruction path; it never queues an upload job that cannot find bytes.
 
 The worker reconciles a bounded batch at startup and every five minutes from
 the protected workspace IDs derived from PostgreSQL. It can therefore repair a

@@ -6,7 +6,7 @@ use sooqa_jobs::NewJob;
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
-use sooqa_persistence::{Database, WorkspaceCleanupStart};
+use sooqa_persistence::{Database, LibraryRepositoryError, WorkspaceCleanupStart};
 use uuid::Uuid;
 
 async fn database() -> Database {
@@ -17,6 +17,10 @@ async fn database() -> Database {
 }
 
 fn media_ingest(source: &str) -> MediaIngest {
+    media_ingest_with_sha(source, vec![17_u8; 32])
+}
+
+fn media_ingest_with_sha(source: &str, sha256: Vec<u8>) -> MediaIngest {
     MediaIngest {
         media: NewMedia {
             kind: MediaKind::Video,
@@ -35,7 +39,7 @@ fn media_ingest(source: &str) -> MediaIngest {
             duration_ms: Some(1_000),
             bit_rate: Some(100_000),
             file_size_bytes: Some(1_024),
-            sha256: Some(vec![17_u8; 32]),
+            sha256: Some(sha256),
             local_work_path: Some("/tmp/workspace-test.mp4".to_owned()),
         },
         source: MediaSourceInput {
@@ -53,6 +57,73 @@ fn media_ingest(source: &str) -> MediaIngest {
         },
         tags: Vec::new(),
     }
+}
+
+async fn prepare_completed_storage(
+    database: &Database,
+    source: &str,
+    sha_seed: u8,
+) -> (Uuid, Uuid, Uuid) {
+    let media = database
+        .library()
+        .resolve_media(media_ingest_with_sha(source, vec![sha_seed; 32]))
+        .await
+        .unwrap();
+    let ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(source, SubmittedVia::Api))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let workspace_id = ingest.ingest.workspace_id;
+    sqlx::query(
+        "UPDATE ingests SET media_id = $2, state = 'completed', completed_at = now() WHERE id = $1",
+    )
+    .bind(ingest.ingest.id)
+    .bind(media.media.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = -100123, telegram_storage_message_id = $2, telegram_file_id = $3, local_work_path = '/tmp/workspace-test.mp4' WHERE id = $1",
+    )
+    .bind(media.media.id)
+    .bind(700_i64 + i64::from(sha_seed))
+    .bind(format!("workspace-ready-{sha_seed}"))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'succeeded', completed_at = now() WHERE payload->>'ingest_id' = $1",
+    )
+    .bind(ingest.ingest.id.to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    (ingest.ingest.id, media.media.id, workspace_id)
+}
+
+async fn remove_storage_fixture(database: &Database, ingest_id: Uuid, media_id: Uuid) {
+    sqlx::query(
+        "DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1 OR payload->>'media_id' = $2",
+    )
+    .bind(ingest_id.to_string())
+    .bind(media_id.to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(ingest_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM media WHERE id = $1")
+        .bind(media_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -148,7 +219,14 @@ async fn ready_storage_clears_local_bytes_and_coalesces_cleanup() {
         .execute(database.pool())
         .await
         .unwrap();
-    assert!(!database.jobs().protected_workspace_ids().await.unwrap().contains(&workspace_id));
+    // Reconciliation protects current workspace IDs even after the explicit
+    // cleanup job succeeds. This closes the snapshot-to-delete race with a
+    // later storage reset; only old generations become scavenger orphans.
+    assert!(database.jobs().protected_workspace_ids().await.unwrap().contains(&workspace_id));
+    assert!(matches!(
+        database.library().reset_storage_upload(media.media.id).await,
+        Err(LibraryRepositoryError::WorkspaceReclaimed(id)) if id == media.media.id
+    ));
 
     sqlx::query(
         "DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1 OR payload->>'media_id' = $2",
@@ -168,6 +246,108 @@ async fn ready_storage_clears_local_bytes_and_coalesces_cleanup() {
         .execute(database.pool())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn storage_reset_wins_and_cleanup_defers_on_the_durable_fence() {
+    let database = database().await;
+    let source = format!("https://example.test/workspace-reset-wins-{}", Uuid::new_v4());
+    let (ingest_id, media_id, workspace_id) =
+        prepare_completed_storage(&database, &source, 31).await;
+    let cleanup = database
+        .jobs()
+        .enqueue(
+            NewJob::cleanup_workspace(ingest_id, workspace_id)
+                .dedupe_key(format!("test:cleanup-reset-wins:{ingest_id}")),
+        )
+        .await
+        .unwrap();
+
+    database.library().reset_storage_upload(media_id).await.unwrap();
+    assert_eq!(
+        database
+            .inbox()
+            .begin_workspace_cleanup(cleanup.id, ingest_id, workspace_id)
+            .await
+            .unwrap(),
+        WorkspaceCleanupStart::Deferred
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1")
+            .bind(media_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "pending_storage"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' = $1",
+        )
+        .bind(media_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    remove_storage_fixture(&database, ingest_id, media_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn cleanup_claim_wins_and_storage_reset_requires_reconstruction() {
+    let database = database().await;
+    let source = format!("https://example.test/workspace-cleanup-wins-{}", Uuid::new_v4());
+    let (ingest_id, media_id, workspace_id) =
+        prepare_completed_storage(&database, &source, 32).await;
+    let cleanup = database
+        .jobs()
+        .enqueue(
+            NewJob::cleanup_workspace(ingest_id, workspace_id)
+                .dedupe_key(format!("test:cleanup-cleanup-wins:{ingest_id}")),
+        )
+        .await
+        .unwrap();
+    let lease_token = Uuid::new_v4();
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'running', lease_token = $2, lease_owner = 'workspace-cleanup-race', lease_expires_at = now() + interval '30 seconds', last_heartbeat_at = now(), attempt_count = 1 WHERE id = $1",
+    )
+    .bind(cleanup.id)
+    .bind(lease_token)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        database
+            .inbox()
+            .begin_workspace_cleanup(cleanup.id, ingest_id, workspace_id)
+            .await
+            .unwrap(),
+        WorkspaceCleanupStart::Ready
+    );
+    assert!(matches!(
+        database.library().reset_storage_upload(media_id).await,
+        Err(LibraryRepositoryError::WorkspaceReclaimed(id)) if id == media_id
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' = $1",
+        )
+        .bind(media_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'succeeded', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, last_heartbeat_at = NULL, completed_at = now() WHERE id = $1",
+    )
+    .bind(cleanup.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    remove_storage_fixture(&database, ingest_id, media_id).await;
 }
 
 #[tokio::test]

@@ -1,7 +1,9 @@
 use crate::library::LibraryRepositoryError;
 use crate::{
     WORKSPACE_CLEANUP_RETENTION,
-    cleanup::{enqueue_workspace_cleanup, enqueue_workspace_cleanup_for_media},
+    cleanup::{
+        enqueue_workspace_cleanup, enqueue_workspace_cleanup_for_media, lock_workspace_fence,
+    },
 };
 use serde_json::json;
 use sooqa_inbox::{
@@ -729,6 +731,14 @@ impl InboxRepository {
         workspace_id: Uuid,
     ) -> Result<WorkspaceCleanupStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
+        let fence_id =
+            sqlx::query_scalar::<_, Option<Uuid>>("SELECT media_id FROM ingests WHERE id = $1")
+                .bind(ingest_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .flatten()
+                .unwrap_or(ingest_id);
+        lock_workspace_fence(&mut transaction, fence_id).await?;
         let row = sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(
             "SELECT workspace_id, state, media_id FROM ingests WHERE id = $1 FOR UPDATE",
         )
@@ -746,10 +756,21 @@ impl InboxRepository {
         }
 
         let has_active_job = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM queue.jobs WHERE id <> $1 AND state IN ('queued', 'running') AND payload->>'ingest_id' = $2 AND kind <> 'cleanup_workspace')",
+            "SELECT EXISTS (
+                SELECT 1
+                FROM queue.jobs
+                WHERE id <> $1
+                  AND state IN ('queued', 'running')
+                  AND kind <> 'cleanup_workspace'
+                  AND (
+                      payload->>'ingest_id' = $2
+                      OR ($3 IS NOT NULL AND payload->>'media_id' = $3)
+                  )
+            )",
         )
         .bind(job_id)
         .bind(ingest_id.to_string())
+        .bind(row.2.map(|media_id| media_id.to_string()))
         .fetch_one(&mut *transaction)
         .await?;
         if has_active_job {
@@ -759,10 +780,12 @@ impl InboxRepository {
 
         let storage_state = match row.2 {
             Some(media_id) => {
-                sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1")
-                    .bind(media_id)
-                    .fetch_optional(&mut *transaction)
-                    .await?
+                sqlx::query_scalar::<_, String>(
+                    "SELECT storage_state FROM media WHERE id = $1 FOR UPDATE",
+                )
+                .bind(media_id)
+                .fetch_optional(&mut *transaction)
+                .await?
             }
             None => None,
         };

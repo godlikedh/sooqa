@@ -8,6 +8,21 @@ use uuid::Uuid;
 /// fallback retention window and the delay used for duplicate/terminal work.
 pub const WORKSPACE_CLEANUP_RETENTION: Duration = Duration::days(1);
 
+/// Serializes database decisions that affect a media workspace. The advisory
+/// key is a hash rather than a filesystem path, so it remains valid across
+/// workers and cannot be bypassed by a second process. Hash collisions only
+/// add serialization; they cannot permit an unsafe concurrent mutation.
+pub(crate) async fn lock_workspace_fence(
+    transaction: &mut Transaction<'_, Postgres>,
+    resource_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(resource_id.to_string())
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
 pub(crate) async fn enqueue_workspace_cleanup(
     transaction: &mut Transaction<'_, Postgres>,
     ingest_id: Uuid,
