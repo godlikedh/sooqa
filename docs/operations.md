@@ -38,8 +38,11 @@ are present. The media budgets and processing deadline are intentionally
 separate:
 
 - `SOOQA_MEDIA_PROCESSING_TIMEOUT_SECONDS` bounds one ffmpeg normalization or
-  video-frame extraction command. It defaults to one hour and is capped at 24
-  hours so large canonical media can finish without an unbounded subprocess;
+  complete video-fingerprint extraction command. Fingerprinting starts one
+  ffmpeg child per video, samples the canonical input sequentially into a
+  fresh extraction-scoped directory, and then decodes one bounded frame at a
+  time. It defaults to one hour and is capped at 24 hours so large canonical
+  media can finish without an unbounded subprocess;
 - `SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES` bounds URL/link source staging and
   may be larger than 2 GB because normalization can reduce the source;
 - `SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES` bounds Telegram-source staging;
@@ -49,6 +52,49 @@ separate:
 - `SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES` bounds the canonical normalized
   object uploaded to Telegram storage. It must remain below the documented
   2000 MB local Bot API upload limit.
+
+### Allowlisted YouTube pages
+
+The worker is direct-only when `SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS` is empty. To
+enable public YouTube video and Shorts pages, set it to a comma-separated list
+such as:
+
+```bash
+SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS=youtube.com,youtu.be
+```
+
+Entries are normalized as DNS hostnames. `youtube.com` also allows its
+dot-delimited subdomains; `youtu.be` is an exact host entry. Credentials, IP
+literals, wildcards, paths, and non-default ports are rejected. Direct MP4 and
+WebM responses continue to use the direct HTTP adapter even when their host is
+not in this list. The worker logs whether yt-dlp is disabled or enabled and
+fails startup if an enabled yt-dlp or Deno capability is missing or too old.
+
+The home Compose deployment uses `youtube.com,youtu.be` when the variable is
+unset; set it to an empty value in `deploy/home/.env` for direct-only operation.
+The initial URL host is the allowlist decision point. yt-dlp is run without
+configuration files, browser cookies, netrc, plugins, or remote components, but
+an accepted provider page can still follow provider redirects and fetch its
+CDN media URLs. The supported home path is public regular videos and Shorts;
+private, members-only, age-restricted, geo-bypassed, and cookie-authenticated
+media are intentionally outside this setup.
+
+The home image downloads the official standalone `yt-dlp` distribution, which
+contains the bundled `yt-dlp-ejs` component, and a pinned Deno runtime. The
+current Dockerfile pins yt-dlp `2026.06.09` and Deno `2.8.1` with architecture-
+specific SHA-256 checksums. When the allowlist is enabled, worker startup runs
+an offline local-info fixture through yt-dlp with the configured EJS/Deno
+flags, checks that the bundled EJS component is discoverable, and executes a
+small Deno probe. Each yt-dlp download runs inside a unique attempt directory:
+its relative final output, temporary fragments, split streams, merge
+intermediates, and disabled-cache state are confined there. The worker monitors
+the aggregate attempt directory with a three-times-final-size budget to allow
+video/audio merging, while the final published file remains bounded by
+`SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES`; a successful attempt must contain
+exactly one regular media file. To update either dependency, change its version, asset names
+if needed, and every matching checksum together; build the home image and
+verify the startup diagnostics before doing an owner smoke test. CI uses fake
+executables and does not contact YouTube.
 
 The server and worker must share `media.work_root`; ffprobe and ffmpeg are
 needed for probing and normalization. Source downloads and Telegram uploads
@@ -62,6 +108,76 @@ storage message; `Use this` reuses the existing media item, while `Save anyway`
 starts the normal force-save pipeline. A pending-storage candidate remains on
 the existing media upload lifecycle. The HTTP equivalent and bearer scope are
 documented in `docs/openapi.yaml`.
+
+Video fingerprint extraction uses the `video_sequence_v1` grid without a
+per-sample subprocess or permanent frame cache. One FFmpeg process first
+normalizes timestamps to zero, pads the final decoded frame for one sample
+interval, and uses a `select` expression to choose the first decoded frame at
+or after each grid timestamp. The padding preserves the final grid point when
+container or audio duration extends just beyond the video stream; variable-
+frame-rate PNG output preserves that selection instead of applying a rounding
+policy. Output is capped at the calculated sample count (at most 2,048). A
+bounded consumer
+decodes stable numbered PNGs as they arrive and deletes each one, while the
+producer monitors the extraction directory. The configured aggregate
+temporary sequence limit is 4 GiB (`DEFAULT_MAX_FRAME_SEQUENCE_BYTES`), in
+addition to the 16 MiB per-frame decode limit. The worker retains only compact
+features and the previous normalized luma plane, and removes the temporary
+sequence on success, failure, timeout, or cancellation.
+
+## Workspace lifecycle
+
+Every ingest generation owns one workspace at
+`<SOOQA_MEDIA_WORK_ROOT>/jobs/<workspace-id>`. The workspace ID is persisted on
+the ingest row; a force-save receives a new ID before its replacement pipeline
+is queued. Cleanup jobs carry both the ingest ID and that generation-scoped ID,
+so a delayed cleanup can remove only an orphaned generation and cannot remove
+the force-save replacement.
+
+Cleanup is durable and replay-safe:
+
+- ready storage completes linked ingests, clears `media.local_work_path`, and
+  queues immediate cleanup;
+- duplicate, terminal-failure, and other deferred paths queue cleanup after a
+  one-day retention period;
+- pending storage, ambiguous storage, active leases, retryable stages, and
+  queued/running work protect their workspace;
+- every workspace ID still referenced by an ingest is protected from periodic
+  reconciliation, including completed ingests whose explicit cleanup job has
+  already succeeded; only old generation directories are scavenger orphans;
+- cleanup is confined to the configured `jobs` directory and UUID-named roots.
+
+Cleanup jobs are also a database-backed deletion fence. Before a valid cleanup
+attempt returns `Ready`, it clears the current media row's local work path in
+the same transaction. A storage reset therefore fails with an explicit
+“workspace reclaimed; reconstruction is required” result even after cleanup
+succeeds or its lease is recovered for retry. If reset wins first, the cleanup
+job observes the durable storage job and defers; a stale recovered attempt is
+also rejected before it can touch the filesystem. A ready or attached media
+item whose local path has already been reclaimed follows the same explicit
+reconstruction path; it never queues an upload job that cannot find bytes.
+
+The worker reconciles a bounded batch at startup and every five minutes from
+the protected workspace IDs derived from PostgreSQL. It can therefore repair a
+crash between a state commit and filesystem deletion without treating queue
+job IDs as workspace ownership. The batch limit is 128 workspaces; a failed
+filesystem operation remains retryable or is picked up by later reconciliation.
+
+## Telegram file acceptance
+
+For a supported private Telegram file message, the polling server performs
+authorization, metadata/size validation, and the PostgreSQL ingest transaction
+only. It persists the Telegram `file_id`, `file_unique_id`, message identity,
+caption, media kind, MIME type, name, and advertised size, then acknowledges
+the update. It does not create a workspace or download media bytes.
+
+The worker creates the generation workspace while probing and reconstructs the
+source from the durable `file_id`. The download is streamed into the private
+workspace with `SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES`, then probed and
+processed under the normal durable lease/retry flow. A replayed update uses the
+same Telegram update idempotency key, so it returns the existing ingest without
+another acceptance job or eager download. This keeps the polling loop
+responsive while a large worker download is running.
 
 ## Local companion and 2ch capture
 
@@ -111,6 +227,16 @@ Tampermonkey's private storage. It never receives or stores the backend token.
 `Save...` opens one metadata dialog for comma-separated tags and an internal
 description; those values become media metadata, not a public Telegram post.
 
+For those three exact hosts, the worker's 2ch media adapter inspects official
+mirrors in the fixed order `2ch.org`, `2ch.su`, `2ch.life`, preserving the
+submitted path and query. It falls through only for DNS/connection/TLS
+failures or non-success HTTP responses. Unsupported media and source-size
+policy failures remain terminal. The successful mirror URL is retained in the
+inspection and library source metadata, while the submitted URL and page
+context remain the provenance; the later download reuses that selected URL.
+This policy is not applied to other direct HTTP sources or to arbitrary
+subdomains.
+
 ## Home local Bot API deployment
 
 The development Compose file at the repository root contains only PostgreSQL.
@@ -148,6 +274,14 @@ placed behind a remote endpoint; the Compose service here is intentionally
 private. See the [official local Bot API documentation](https://core.telegram.org/bots/api#using-a-local-bot-api-server)
 and [upstream server README](https://github.com/tdlib/telegram-bot-api#usage)
 for Telegram-side requirements.
+
+Canonical videos are uploaded to the private storage channel with Telegram's
+`supports_streaming=true` `sendVideo` flag. The canonical video profile already
+produces MP4/H.264 video with optional AAC audio and fast-start metadata, so
+newly stored videos can begin playback before the full file is downloaded by a
+client. Images, animations, and audio use their existing upload methods and do
+not receive this video-only flag. This does not change existing storage
+messages; it applies to new uploads after deployment.
 
 ## Storage ambiguity
 

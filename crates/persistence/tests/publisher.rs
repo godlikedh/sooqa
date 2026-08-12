@@ -1,5 +1,3 @@
-use std::env;
-
 use serde_json::json;
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
@@ -8,13 +6,6 @@ use sooqa_persistence::Database;
 use sooqa_publisher::{NewChannel, NewPost, PostSchedule, PostState, PostUpdate};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
-
-async fn database() -> Database {
-    let url = env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL");
-    let database = Database::connect(&url, 10).await.expect("database should connect");
-    database.migrate().await.expect("migration should apply");
-    database
-}
 
 async fn stored_media(database: &Database) -> Uuid {
     let media = database
@@ -60,10 +51,10 @@ async fn stored_media(database: &Database) -> Uuid {
     media.media.id
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn post_schedule_uses_one_row_and_channel_cadence() {
-    let database = database().await;
+async fn post_schedule_uses_one_row_and_channel_cadence(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let channel = database
         .publisher()
         .create_channel(
@@ -173,20 +164,4 @@ async fn post_schedule_uses_one_row_and_channel_cadence() {
             .await
             .unwrap();
     assert_eq!(queued_run_at, rescheduled.scheduled_at);
-    sqlx::query("DELETE FROM posts WHERE id IN ($1, $2)")
-        .bind(created.post.id)
-        .bind(second.post.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM channels WHERE id = $1")
-        .bind(channel.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(media_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }

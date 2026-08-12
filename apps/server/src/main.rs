@@ -102,7 +102,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .with_upload_timeout(std::time::Duration::from_secs(
             config.telegram.upload_timeout_seconds,
         ))?
-        .with_media_work_root(config.media.work_root.clone())
         .with_source_download_max_bytes(config.telegram.source_download_max_bytes);
         tracing::info!(api_base_url = %config.telegram.api_base_url, "Telegram bot polling enabled");
         tokio::select! {
@@ -235,14 +234,12 @@ impl IngestService for DatabaseIngestService {
             "telegram_chat_id": command.chat_id,
             "telegram_message_id": command.message_id,
             "telegram_user_id": command.submitted_by_user_id,
-            "telegram_workspace_id": command.workspace_id,
             "telegram_file_id": command.file_id,
             "telegram_file_unique_id": command.file_unique_id,
             "file_size": command.file_size,
             "mime_type": command.mime_type,
             "file_name": command.file_name,
             "media_kind": command.media_kind.map(sooqa_library::MediaKind::as_str),
-            "local_work_path": command.local_work_path,
         });
         let submission = IngestSubmission::try_new_telegram(TelegramSubmissionInput {
             source_reference,

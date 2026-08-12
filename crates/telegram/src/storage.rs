@@ -85,8 +85,8 @@ pub enum StorageUploadError {
     MediaMissing(Uuid),
     #[error("media {0} has no recorded SHA-256")]
     MediaMissingSha256(Uuid),
-    #[error("media {0} has no local work path")]
-    MediaMissingWorkPath(Uuid),
+    #[error("media {0} workspace was reclaimed; reconstruction is required before storage upload")]
+    WorkspaceReclaimed(Uuid),
     #[error("media SHA-256 must contain 32 bytes, got {actual}")]
     InvalidSha256Length { actual: usize },
     #[error("media file is not available at {path}")]
@@ -207,7 +207,7 @@ where
             .local_work_path
             .clone()
             .map(PathBuf::from)
-            .ok_or(StorageUploadError::MediaMissingWorkPath(input.media_id))?;
+            .ok_or(StorageUploadError::WorkspaceReclaimed(input.media_id))?;
 
         let symlink_metadata =
             tokio::fs::symlink_metadata(&local_work_path).await.map_err(|_| {
@@ -464,6 +464,7 @@ impl TelegramStorageApi for TeloxideApi {
                 .upload_bot()
                 .send_video(chat_id, InputFile::file(request.local_work_path))
                 .caption(request.caption)
+                .supports_streaming(true)
                 .send()
                 .await
                 .map_err(StorageUploadApiError::Api)?,
@@ -904,6 +905,46 @@ mod tests {
         ));
         assert!(api.requests.lock().unwrap().is_empty());
         tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn reset_after_ready_attach_rejects_reclaimed_workspace_upload() {
+        let api = MockApi::default();
+        let store = MockStore::default();
+        let path = std::env::temp_dir().join(format!("sooqa-reclaimed-{}.mp4", Uuid::new_v4()));
+        let digest = vec![7_u8; 32];
+        let mut media = canonical_asset(&path, digest);
+        media.storage_state = MediaStorageState::Ready;
+        *store.canonical.lock().unwrap() = Some(media);
+        *store.active.lock().unwrap() = Some(StorageReceipt {
+            media_id: Uuid::from_u128(1),
+            storage_chat_id: -100123,
+            storage_message_id: 42,
+            telegram_file_id: Some("file-id".to_owned()),
+            telegram_file_unique_id: Some("unique-id".to_owned()),
+            media_kind: MediaKind::Video,
+            stored_at: OffsetDateTime::now_utc(),
+        });
+        let provider = StorageUploadProvider::new(api.clone(), store.clone(), -100123)
+            .expect("storage chat ID should be valid");
+
+        assert!(matches!(provider.upload(input()).await, Ok(StorageUploadOutcome::Reused(_))));
+
+        // A reset clears the Telegram attachment and the reclaimed local
+        // path before it can enqueue a new generation. The provider must
+        // surface reconstruction as a terminal state, not retry an upload
+        // that has no bytes to send.
+        *store.active.lock().unwrap() = None;
+        let mut reclaimed = canonical_asset(&path, vec![7_u8; 32]);
+        reclaimed.local_work_path = None;
+        reclaimed.storage_state = MediaStorageState::Pending;
+        *store.canonical.lock().unwrap() = Some(reclaimed);
+        assert!(matches!(
+            provider.upload(input()).await,
+            Err(StorageUploadError::WorkspaceReclaimed(media_id)) if media_id == Uuid::from_u128(1)
+        ));
+        assert!(!*store.reserved.lock().unwrap());
+        assert!(api.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

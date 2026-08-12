@@ -27,12 +27,15 @@ The repository currently provides:
       standalone x86_64 companion executable plus SHA-256 checksum.
 
 The composed worker registers `inspect_source` with the SSRF-hardened direct
-HTTP adapter, `download_source` into the shared media workspace, `probe_asset`,
+HTTP/allowlisted yt-dlp adapters, `download_source` into the shared media
+workspace, `probe_asset`,
 `normalize_asset`, `compute_fingerprint`, `finalize_ingest`, and, when
 configured, `upload_storage_asset`.
-The yt-dlp adapter remains available behind the media boundary but is not yet
-enabled in the production worker because its subprocess egress needs an
-equivalent SSRF boundary. Video normalization records a canonical artifact and
+The production worker is direct-only when `media.ytdlp_allowed_hosts` is empty;
+when hosts are configured, page-like URLs use the pinned yt-dlp/Deno runtime
+only for an exact host or dot-delimited subdomain match. Direct MP4/WebM
+responses remain on the direct adapter regardless of the page allowlist. Video
+normalization records a canonical artifact and
 queues sequence fingerprinting; the worker then performs exact-SHA reuse or
 the bounded `video_sequence_v1` identity decision before creating a
 `pending_storage` media row. Strong perceptual matches become durable
@@ -107,6 +110,22 @@ topology, including the pinned official local Telegram Bot API server, is
 documented in [operations.md](docs/operations.md) and configured under
 `deploy/home`.
 
+PostgreSQL integration tests use SQLx-managed isolated databases. The database
+named by `DATABASE_URL` is a test-control database: SQLx writes its
+`_sqlx_test` bookkeeping state there before creating per-test databases. A
+successful test is cleaned up automatically; a failed or panicking test may
+leave its database behind for diagnosis, after which a later run of the same
+test path can reclaim it or it must be dropped explicitly. The `sooqa` database
+used by the test command is intentionally disposable local/CI test-control
+state, not the runtime/home database. Use a separate test-control database if
+the runtime also uses `sooqa`.
+
+The `DATABASE_URL` role used for `just test-integration` must own or be allowed
+to write to that control database and have `CREATEDB` privilege so SQLx can
+create test databases. Use a dedicated development or CI account, never the
+runtime/production account. Tests remain parallel and do not require
+`--test-threads=1`.
+
 Apply forward-only migrations:
 
 ```bash
@@ -131,8 +150,11 @@ cargo run -p sooqa-worker -- --config config.toml --check-config
 
 The server and worker must share `media.work_root`. The current production
 worker preflights only binaries required by its registered handlers; the
-composed probe and normalization handlers require `ffprobe` and `ffmpeg`. The
-image in `Dockerfile` also contains `yt-dlp` for handlers added later.
+composed probe and normalization handlers require `ffprobe` and `ffmpeg`. When
+the yt-dlp allowlist is non-empty, startup also requires the pinned `yt-dlp`
+and Deno binaries, verifies the supported Deno version, and runs an offline
+yt-dlp/EJS fixture plus a Deno execution probe. The image in `Dockerfile`
+contains the pinned official distributions.
 
 The project is licensed under Apache-2.0. See [LICENSE](LICENSE) and
 [ADR 0006](docs/adr/0006-license.md).

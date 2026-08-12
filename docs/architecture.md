@@ -27,6 +27,7 @@ erDiagram
     }
     INGESTS {
         uuid id PK
+        uuid workspace_id
         text input_key UK
         text state
         jsonb input_json
@@ -73,14 +74,27 @@ this baseline.
 - `sooqa-publisher` defines channels, posts, and publication transitions.
 - `sooqa-jobs` defines typed job kinds and payloads. Persistence decodes the
   JSON envelope once; handlers receive a typed `JobCommand`.
-- `sooqa-media` owns direct HTTP, ffprobe, ffmpeg, image normalization,
-  hashing, fingerprints, workspaces, and subprocess safety.
+- `sooqa-media` owns direct HTTP, the exact-host 2ch mirror adapter, the
+  allowlisted yt-dlp adapter, ffprobe, ffmpeg, image normalization, hashing,
+  fingerprints, workspaces, and subprocess safety.
 - `sooqa-telegram` owns Telegram protocol mapping and storage upload effects.
-  Polling, downloads, and storage uploads use separate HTTP clients and
-  timeout policies.
+  Polling, worker-side source downloads, and storage uploads use separate HTTP
+  clients and timeout policies. Telegram file acceptance is metadata-only;
+  source bytes are reconstructed by the worker from the durable file ID.
 - `sooqa-persistence` owns migrations and short database transactions.
 - `sooqa-api` owns HTTP routing, one configured bearer secret, limits, and
   stable request-ID errors.
+
+Workspace lifecycle is shared across the ingest, jobs, persistence, media, and
+worker boundaries. Persistence owns the durable generation ID and cleanup-job
+enqueue/state fence. A valid cleanup attempt clears the current media
+local-work-path marker before committing its `Ready` decision, so storage reset
+remains reconstruction-required after cleanup success or lease recovery.
+Storage reset either commits first and makes cleanup defer, or observes the
+durable reclaimed marker; a stale attempt is rejected before it can touch the
+filesystem. `sooqa-media` validates and removes a whole workspace without
+following symlinks. Reconciliation protects every workspace ID still current
+on an ingest, so only old force-save generations are orphan candidates.
 
 ## Ingest and worker flow
 
@@ -117,6 +131,9 @@ sequenceDiagram
     Worker->>Media: upload only after media processing
     Media-->>Worker: ready, failed, or storage_unknown
     Worker->>Ingests: consume storage outcome by media_id
+    Ingests->>Queue: enqueue cleanup_workspace with workspace generation
+    Worker->>Ingests: check durable ownership and storage fence
+    Worker->>Media: remove whole UUID workspace
 ```
 
 When the video identity gate records `duplicate_pending`, the administrator
@@ -156,6 +173,24 @@ while an identity transaction is open. Stage metadata is
 bounded JSON input metadata; it is decoded into typed Rust structs at the
 handler boundary. Storage completion/failure is applied by `media_id`, and
 attach/reset/mark-unknown reconcile the linked ingest rows.
+
+Telegram file messages follow the same durable boundary: the polling server
+validates the administrator and advertised size, persists the Telegram file
+metadata, and acknowledges only after the ingest transaction commits. It does
+not create a workspace or call Telegram file download. The worker creates the
+workspace and downloads from the persisted file ID during the probe job, so a
+slow or replayed Telegram file cannot block later polling acceptance.
+
+When storage is durably ready, the storage transition, linked-ingest
+completion, `local_work_path = NULL`, and cleanup enqueue commit together. A
+duplicate or terminal failure uses the one-day cleanup retention window. A
+cleanup replay for an old generation is safe after force-save because the
+payload ID no longer matches the current ingest generation; a replay against a
+missing directory is also successful. Startup and periodic reconciliation scan
+only UUID-named workspace directories in bounded batches and protect every ID
+still current on an ingest. Completed rows remain protected after their
+cleanup job succeeds; the explicit cleanup path owns their deletion, while
+reconciliation handles only true old generations.
 
 Each successful ingest stage commits its ingest transition, successor enqueue,
 and current queue-job success atomically. Final-attempt recovery therefore

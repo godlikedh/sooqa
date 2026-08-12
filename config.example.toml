@@ -13,6 +13,9 @@ ffmpeg_path = "ffmpeg"
 ffprobe_path = "ffprobe"
 ytdlp_path = "yt-dlp"
 ytdlp_format = "bestvideo*+bestaudio/best"
+# Empty means direct-only. Page-like URLs are sent to yt-dlp only when their
+# initial hostname is explicitly listed here; subdomains are included.
+# ytdlp_allowed_hosts = ["youtube.com", "youtu.be"]
 # Total deadline for one ffmpeg normalization or video-frame extraction.
 processing_timeout_seconds = 3600
 # Maximum bytes staged from a URL before normalization. This may exceed 2 GB

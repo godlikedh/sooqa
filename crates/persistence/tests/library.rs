@@ -1,5 +1,3 @@
-use std::env;
-
 use serde_json::json;
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
 use sooqa_library::{
@@ -8,14 +6,7 @@ use sooqa_library::{
     StorageUploadReservationRequest, StorageUploadStore, VideoIdentityOutcome,
 };
 use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint, VideoSequenceSample};
-use sooqa_persistence::Database;
-
-async fn database() -> Database {
-    let url = env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL");
-    let database = Database::connect(&url, 10).await.expect("database should connect");
-    database.migrate().await.expect("migration should apply");
-    database
-}
+use sooqa_persistence::{Database, LibraryRepositoryError};
 
 fn ingest(sha256: Vec<u8>, source: &str) -> MediaIngest {
     MediaIngest {
@@ -63,10 +54,10 @@ fn exact_ingest(kind: MediaKind, sha256: Vec<u8>, source: &str) -> MediaIngest {
     ingest
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn media_aggregate_contains_source_and_tags_without_child_tables() {
-    let database = database().await;
+async fn media_aggregate_contains_source_and_tags_without_child_tables(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let resolution = database
         .library()
         .resolve_media(ingest(vec![7_u8; 32], "https://example.test/video"))
@@ -95,17 +86,12 @@ async fn media_aggregate_contains_source_and_tags_without_child_tables() {
         .await
         .unwrap();
     assert_eq!(page.items.iter().filter(|item| item.media.id == resolution.media.id).count(), 1);
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(resolution.media.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn concurrent_same_sha_resolves_to_one_media_row() {
-    let database = database().await;
+async fn concurrent_same_sha_resolves_to_one_media_row(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let digest = vec![8_u8; 32];
     let left = ingest(digest.clone(), "https://example.test/left");
     let right = ingest(digest, "https://example.test/right");
@@ -116,17 +102,12 @@ async fn concurrent_same_sha_resolves_to_one_media_row() {
     let right = right.unwrap();
     assert_eq!(left.media.id, right.media.id);
     assert!(left.media_created ^ right.media_created);
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(left.media.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn exact_sha_dedup_preserves_primary_source_metadata() {
-    let database = database().await;
+async fn exact_sha_dedup_preserves_primary_source_metadata(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let repository = database.library();
     let first = repository
         .resolve_media(ingest(vec![6_u8; 32], "https://example.test/primary"))
@@ -144,17 +125,12 @@ async fn exact_sha_dedup_preserves_primary_source_metadata() {
         details.source.unwrap().original_url.as_deref(),
         Some("https://example.test/primary")
     );
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(first.media.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn exact_duplicate_unions_tags_and_replaces_explicit_description() {
-    let database = database().await;
+async fn exact_duplicate_unions_tags_and_replaces_explicit_description(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let repository = database.library();
     let mut first_ingest = ingest(vec![70_u8; 32], "https://example.test/metadata-first");
     first_ingest.media.description = Some("first internal note".to_owned());
@@ -175,18 +151,12 @@ async fn exact_duplicate_unions_tags_and_replaces_explicit_description() {
     .unwrap();
     assert_eq!(description.as_deref(), Some("replacement internal note"));
     assert_eq!(tags, ["rust", "reaction"]);
-
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(first.media.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn non_video_media_uses_exact_sha_without_fingerprint_data() {
-    let database = database().await;
+async fn non_video_media_uses_exact_sha_without_fingerprint_data(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let repository = database.library();
     let mut media_ids = Vec::new();
     for (index, kind) in
@@ -218,17 +188,12 @@ async fn non_video_media_uses_exact_sha_without_fingerprint_data() {
         assert!(fingerprint.is_none());
         media_ids.push(first.media.id);
     }
-    sqlx::query("DELETE FROM media WHERE id = ANY($1::uuid[])")
-        .bind(media_ids)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn video_fingerprint_shortlist_uses_tokens_state_and_version_bounds() {
-    let database = database().await;
+async fn video_fingerprint_shortlist_uses_tokens_state_and_version_bounds(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let repository = database.library();
     let incoming = repository
         .resolve_media(ingest(vec![21_u8; 32], "https://example.test/incoming"))
@@ -289,18 +254,12 @@ async fn video_fingerprint_shortlist_uses_tokens_state_and_version_bounds() {
         .await
         .unwrap();
     assert!(unrelated.is_empty());
-
-    sqlx::query("DELETE FROM media WHERE id = ANY($1::uuid[])")
-        .bind(vec![incoming.media.id, pending.media.id, ready.media.id, unknown.media.id])
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn video_fingerprint_shortlist_is_capped_at_twenty() {
-    let database = database().await;
+async fn video_fingerprint_shortlist_is_capped_at_twenty(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let repository = database.library();
     let incoming = repository
         .resolve_media(ingest(vec![31_u8; 32], "https://example.test/cap-incoming"))
@@ -331,18 +290,12 @@ async fn video_fingerprint_shortlist_is_capped_at_twenty() {
         .unwrap();
     assert_eq!(candidates.len(), 20);
     assert!(candidates.iter().all(|candidate| candidate.shared_token_count >= 8));
-
-    sqlx::query("DELETE FROM media WHERE id = ANY($1::uuid[])")
-        .bind(media_ids)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn video_identity_reuses_exact_sha_and_stores_fingerprint_before_storage() {
-    let database = database().await;
+async fn video_identity_reuses_exact_sha_and_stores_fingerprint_before_storage(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let repository = database.library();
     let fingerprint = test_sequence(0x1111_2222_3333_4444);
     let first = repository
@@ -390,17 +343,14 @@ async fn video_identity_reuses_exact_sha_and_stores_fingerprint_before_storage()
             .unwrap(),
         1
     );
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(media_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn strong_video_match_stops_before_media_insertion_and_force_save_bypasses_it() {
-    let database = database().await;
+async fn strong_video_match_stops_before_media_insertion_and_force_save_bypasses_it(
+    pool: sqlx::PgPool,
+) {
+    let database = Database::from_pool(pool);
     let repository = database.library();
     let fingerprint = test_sequence(0x5555_6666_7777_8888);
     let first = repository
@@ -458,17 +408,12 @@ async fn strong_video_match_stops_before_media_insertion_and_force_save_bypasses
         other => panic!("expected force-save to create a new reservation, got {other:?}"),
     };
     assert_ne!(forced_id, first_id);
-    sqlx::query("DELETE FROM media WHERE id = ANY($1::uuid[])")
-        .bind(vec![first_id, forced_id])
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn concurrent_equivalent_videos_share_the_identity_barrier() {
-    let database = database().await;
+async fn concurrent_equivalent_videos_share_the_identity_barrier(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let repository = database.library();
     let fingerprint = test_sequence(0x9999_aaaa_bbbb_cccc);
     let left = ingest(vec![51_u8; 32], "https://example.test/concurrent-left");
@@ -515,11 +460,6 @@ async fn concurrent_equivalent_videos_share_the_identity_barrier() {
         .unwrap(),
         1
     );
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(new_ids[0])
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
 fn test_sequence(seed: u64) -> VideoSequenceFingerprint {
@@ -541,10 +481,10 @@ fn test_sequence(seed: u64) -> VideoSequenceFingerprint {
     .unwrap()
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn storage_reconciliation_reopens_and_completes_linked_ingest() {
-    let database = database().await;
+async fn storage_reconciliation_reopens_and_completes_linked_ingest(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let media = database
         .library()
         .resolve_media(ingest(vec![9_u8; 32], "https://example.test/reconcile"))
@@ -596,7 +536,13 @@ async fn storage_reconciliation_reopens_and_completes_linked_ingest() {
         )
         .await
         .unwrap();
-    assert_eq!(database.inbox().complete_storage_for_media(media.media.id).await.unwrap(), 1);
+    // Storage completion now completes linked ingests and enqueues cleanup in
+    // the same transaction as the durable ready transition. The compatibility
+    // helper is intentionally idempotent when called by the worker afterward.
+    assert_eq!(database.inbox().complete_storage_for_media(media.media.id).await.unwrap(), 0);
+    let media_details =
+        database.library().find_media_details(media.media.id).await.unwrap().unwrap();
+    assert!(media_details.media.local_work_path.is_none());
     let initially_ready =
         database.library().find_storage_receipt(media.media.id).await.unwrap().unwrap();
     assert_eq!(initially_ready.storage_message_id, 40);
@@ -636,57 +582,20 @@ async fn storage_reconciliation_reopens_and_completes_linked_ingest() {
     let attached = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
     assert_eq!(attached.status.as_str(), "completed");
 
-    database.library().reset_storage_upload(media.media.id).await.unwrap();
-    let reopened = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
-    assert_eq!(reopened.status.as_str(), "storing");
-    let reservation = database
-        .library()
-        .reserve_storage_upload(StorageUploadReservationRequest {
-            media_id: media.media.id,
-            generation: 1,
-        })
-        .await
-        .unwrap();
-    let owner_token = match reservation {
-        StorageUploadReservation::Reserved { owner_token, .. } => owner_token,
-        other => panic!("expected a fresh storage reservation, got {other:?}"),
-    };
-    database
-        .library()
-        .complete_storage_upload(
-            media.media.id,
-            owner_token,
-            StorageUploadAttachment {
-                storage_chat_id: -100123,
-                storage_message_id: 42,
-                telegram_file_id: Some("file-42".to_owned()),
-                telegram_file_unique_id: Some("unique-42".to_owned()),
-            },
+    assert!(matches!(
+        database.library().reset_storage_upload(media.media.id).await,
+        Err(LibraryRepositoryError::WorkspaceReclaimed(id)) if id == media.media.id
+    ));
+    let still_ready = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
+    assert_eq!(still_ready.status.as_str(), "completed");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' = $1",
         )
+        .bind(media.media.id.to_string())
+        .fetch_one(database.pool())
         .await
-        .unwrap();
-    database.inbox().complete_storage_for_media(media.media.id).await.unwrap();
-    let completed = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
-    assert_eq!(completed.status.as_str(), "completed");
-    let receipt = database.library().find_storage_receipt(media.media.id).await.unwrap().unwrap();
-    assert_eq!(receipt.storage_message_id, 42);
-
-    sqlx::query(
-        "DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1 OR payload->>'media_id' = $2",
-    )
-    .bind(ingest.ingest.id.to_string())
-    .bind(media.media.id.to_string())
-    .execute(database.pool())
-    .await
-    .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest.ingest.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(media.media.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
+        .unwrap(),
+        0
+    );
 }

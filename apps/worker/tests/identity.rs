@@ -14,7 +14,7 @@ use sooqa_inbox::{
     AssetNormalization, IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection,
     SourceMediaKind, SubmittedVia, TelegramSubmissionInput,
 };
-use sooqa_jobs::JobType;
+use sooqa_jobs::{JobType, NewJob};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
@@ -28,19 +28,13 @@ use sooqa_telegram::{
     StorageUploadProvider, StorageUploadRequest, StorageUploadResult, TelegramStorageApi,
 };
 use sooqa_worker::{
-    TelegramSourceDownloader, compute_fingerprint_handler, download_source_handler,
-    inspect_source_handler, probe_asset_handler_with_telegram_source, upload_storage_asset_handler,
+    TelegramSourceDownloader, cleanup_workspace_handler, compute_fingerprint_handler,
+    download_source_handler, inspect_source_handler, probe_asset_handler_with_telegram_source,
+    upload_storage_asset_handler,
 };
 use thiserror::Error;
 use tokio::fs;
 use uuid::Uuid;
-
-async fn database() -> Database {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL");
-    let database = Database::connect(&url, 10).await.expect("database should connect");
-    database.migrate().await.expect("migration should apply");
-    database
-}
 
 #[derive(Clone)]
 struct ReconstructingDirectSource {
@@ -124,10 +118,10 @@ impl ExternalCommandRunner for StaticProbeRunner {
     }
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn force_save_reconstructs_url_after_workspace_cleanup() {
-    let database = database().await;
+async fn force_save_reconstructs_url_after_workspace_cleanup(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let work_root = std::env::temp_dir().join(format!("sooqa-worker-url-{}", Uuid::new_v4()));
     let ingest = database
         .inbox()
@@ -187,16 +181,69 @@ async fn force_save_reconstructs_url_after_workspace_cleanup() {
     assert_eq!(source.download_calls.load(Ordering::Relaxed), 1);
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "probe_asset").await, 1);
 
-    cleanup_ingest(&database, ingest.ingest.id).await;
     let _ = fs::remove_dir_all(work_root).await;
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
-    let database = database().await;
+async fn cleanup_handler_removes_only_the_claimed_workspace(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let work_root = std::env::temp_dir().join(format!("sooqa-worker-cleanup-{}", Uuid::new_v4()));
+    let ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/cleanup-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let workspace = MediaWorkspace::create(&work_root, ingest.ingest.workspace_id).await.unwrap();
+    let source_path = workspace.path(WorkspaceArea::Source, "source.bin").unwrap();
+    fs::write(&source_path, b"cleanup-me").await.unwrap();
+    sqlx::query("UPDATE ingests SET state = 'completed', completed_at = now() WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'succeeded', completed_at = now() WHERE payload->>'ingest_id' = $1",
+    )
+    .bind(ingest.ingest.id.to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let cleanup_job = database
+        .jobs()
+        .enqueue(
+            NewJob::cleanup_workspace(ingest.ingest.id, ingest.ingest.workspace_id)
+                .dedupe_key(format!("test:cleanup-handler:{}", ingest.ingest.id)),
+        )
+        .await
+        .unwrap();
+    let claimed = database
+        .jobs()
+        .claim_next("cleanup-handler", Duration::from_secs(30), &[JobType::CleanupWorkspace])
+        .await
+        .unwrap()
+        .expect("cleanup job should be claimable");
+    assert_eq!(claimed.id, cleanup_job.id);
+    let handler = cleanup_workspace_handler(database.inbox(), work_root.clone());
+    handler(claimed.clone()).await.unwrap();
+    database.jobs().complete_lease(&claimed.lease().unwrap()).await.unwrap();
+    assert!(!workspace.root().exists());
+
+    let _ = fs::remove_dir_all(work_root).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn force_save_reconstructs_telegram_source_after_workspace_cleanup(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let work_root = std::env::temp_dir().join(format!("sooqa-worker-telegram-{}", Uuid::new_v4()));
-    let workspace_id = Uuid::new_v4();
     let ingest = database
         .inbox()
         .create_ingest(
@@ -206,7 +253,6 @@ async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
                 submitted_by_admin_id: None,
                 original_input: json!({
                     "source_type": "telegram",
-                    "telegram_workspace_id": workspace_id.to_string(),
                     "telegram_file_id": "durable-file-id",
                     "telegram_file_unique_id": "durable-unique-id",
                     "media_kind": "video"
@@ -218,13 +264,14 @@ async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
         )
         .await
         .unwrap();
-    let workspace = MediaWorkspace::create(&work_root, workspace_id).await.unwrap();
+    let workspace = MediaWorkspace::create(&work_root, ingest.ingest.workspace_id).await.unwrap();
     let source_path = workspace.path(WorkspaceArea::Source, "telegram-input.bin").unwrap();
     fs::write(&source_path, b"old-telegram-source").await.unwrap();
     workspace.cleanup().await.unwrap();
     mark_duplicate_pending(&database, ingest.ingest.id).await;
 
-    database.inbox().force_save(ingest.ingest.id).await.unwrap();
+    let resumed = database.inbox().force_save(ingest.ingest.id).await.unwrap();
+    assert_ne!(resumed.ingest.workspace_id, ingest.ingest.workspace_id);
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "probe_asset").await, 1);
     let source = ReconstructingTelegramSource { calls: Arc::new(AtomicUsize::new(0)) };
     let probe_handler = probe_asset_handler_with_telegram_source(
@@ -249,20 +296,19 @@ async fn force_save_reconstructs_telegram_source_after_workspace_cleanup() {
     let request = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
     assert_eq!(request.status, IngestStatus::Normalizing);
     assert_eq!(source.calls.load(Ordering::Relaxed), 1);
-    let workspace = MediaWorkspace::create(&work_root, workspace_id).await.unwrap();
+    let workspace = MediaWorkspace::create(&work_root, request.workspace_id).await.unwrap();
     let source_path = workspace.path(WorkspaceArea::Source, "telegram-input.bin").unwrap();
     assert_eq!(fs::read(&source_path).await.unwrap(), b"telegram-reconstructed");
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "probe_asset").await, 1);
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "normalize_asset").await, 1);
 
-    cleanup_ingest(&database, ingest.ingest.id).await;
     let _ = fs::remove_dir_all(work_root).await;
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn non_video_normalization_queues_finalization_without_fingerprint_job() {
-    let database = database().await;
+async fn non_video_normalization_queues_finalization_without_fingerprint_job(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let ingest = database
         .inbox()
         .create_ingest(
@@ -325,8 +371,6 @@ async fn non_video_normalization_queues_finalization_without_fingerprint_job() {
     assert_eq!(completed.status, IngestStatus::Storing);
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "compute_fingerprint").await, 0);
     assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "finalize_ingest").await, 1);
-
-    cleanup_ingest(&database, ingest.ingest.id).await;
 }
 
 #[derive(Clone)]
@@ -339,7 +383,15 @@ struct IdentityFrameRunner {
 impl ExternalCommandRunner for IdentityFrameRunner {
     async fn run(&self, command: ExternalCommand) -> Result<ExternalCommandOutput, CommandError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        let path = PathBuf::from(command.args().last().expect("frame output argument"));
+        let output_pattern = command.args().last().expect("frame output argument");
+        let output_pattern = output_pattern.to_string_lossy();
+        let frame_count = command
+            .args()
+            .windows(2)
+            .find_map(|args| (args[0] == "-frames:v").then(|| args[1].to_string_lossy()))
+            .expect("frame count argument")
+            .parse::<usize>()
+            .expect("frame count should be numeric");
         let variant = self.variant;
         let image = ImageBuffer::from_fn(64, 64, |x, y| {
             let (x, y) = if variant == 0 { (x, y) } else { (y, x) };
@@ -349,9 +401,12 @@ impl ExternalCommandRunner for IdentityFrameRunner {
                 ((x + y).saturating_mul(2) % 256) as u8,
             ])
         });
-        DynamicImage::ImageRgb8(image)
-            .save_with_format(&path, image::ImageFormat::Png)
-            .expect("fake extractor should write a frame");
+        for index in 0..frame_count {
+            let path = PathBuf::from(output_pattern.replace("%04d", &format!("{index:04}")));
+            DynamicImage::ImageRgb8(image.clone())
+                .save_with_format(&path, image::ImageFormat::Png)
+                .expect("fake extractor should write a frame");
+        }
         Ok(ExternalCommandOutput {
             success: true,
             exit_code: Some(0),
@@ -397,16 +452,15 @@ impl TelegramStorageApi for CountingStorageApi {
     }
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn composed_identity_worker_has_bounded_storage_effects() {
-    let database = database().await;
+async fn composed_identity_worker_has_bounded_storage_effects(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let work_root = std::env::temp_dir().join(format!("sooqa-worker-identity-{}", Uuid::new_v4()));
     let calls = Arc::new(AtomicUsize::new(0));
     let storage_api = CountingStorageApi { calls: Arc::clone(&calls) };
 
     let exact = prepare_fingerprint_request(&database, &work_root, "exact", b"exact-bytes").await;
-    let exact_id = exact.ingest_id;
     let exact_sha = hex_bytes(&exact.normalization.sha256);
     let exact_media = database
         .library()
@@ -441,11 +495,10 @@ async fn composed_identity_worker_has_bounded_storage_effects() {
         64 * 1024,
         Arc::new(strong_runner.clone()),
     )
-    .extract_video_sequence_from_area_with_cache_key(
+    .extract_video_sequence_from_area(
         &candidate_workspace,
         WorkspaceArea::Normalized,
         "canonical.mp4",
-        "candidate",
         4_000,
     )
     .await
@@ -527,25 +580,7 @@ async fn composed_identity_worker_has_bounded_storage_effects() {
         IngestStatus::Completed
     );
 
-    cleanup_ingest(&database, exact_id).await;
-    cleanup_ingest(&database, strong_request.id).await;
-    cleanup_ingest(&database, no_match_id).await;
     fs::remove_dir_all(&work_root).await.unwrap();
-    let _ = sqlx::query("DELETE FROM media WHERE id = $1 OR id = $2")
-        .bind(exact_media.media.id)
-        .bind(strong_candidate_id)
-        .execute(database.pool())
-        .await;
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'media_id' = $1")
-        .bind(media_id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(media_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
 async fn prepare_fingerprint_request(
@@ -703,19 +738,6 @@ async fn count_ingest_jobs(database: &Database, ingest_id: Uuid, kind: &str) -> 
     .fetch_one(database.pool())
     .await
     .unwrap()
-}
-
-async fn cleanup_ingest(database: &Database, ingest_id: Uuid) {
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(ingest_id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
 async fn mark_media_ready(database: &Database, media_id: Uuid) {

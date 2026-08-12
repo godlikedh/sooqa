@@ -1,3 +1,4 @@
+use crate::cleanup::{enqueue_workspace_cleanup_for_media, lock_workspace_fence};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -702,6 +703,7 @@ impl LibraryRepository {
 
     pub async fn reset_storage_upload(&self, id: Uuid) -> Result<(), LibraryRepositoryError> {
         let mut transaction = self.pool.begin().await?;
+        lock_workspace_fence(&mut transaction, id).await?;
         let row = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -709,6 +711,29 @@ impl LibraryRepository {
             .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
         if row.storage_token.is_some() {
             return Err(LibraryRepositoryError::StorageUploadActive(id));
+        }
+        if row.local_work_path.is_none() {
+            return Err(LibraryRepositoryError::WorkspaceReclaimed(id));
+        }
+        let cleanup_running = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM queue.jobs AS cleanup
+                JOIN ingests AS ingest
+                  ON cleanup.payload->>'ingest_id' = ingest.id::text
+                 AND cleanup.payload->>'workspace_id' = ingest.workspace_id::text
+                WHERE cleanup.kind = 'cleanup_workspace'
+                  AND cleanup.state = 'running'
+                  AND ingest.media_id = $1
+            )
+            "#,
+        )
+        .bind(id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if cleanup_running {
+            return Err(LibraryRepositoryError::WorkspaceReclaimed(id));
         }
         let generation = row
             .storage_generation
@@ -747,7 +772,7 @@ impl LibraryRepository {
         validate_attachment(&attachment)?;
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $3, telegram_storage_message_id = $4, telegram_file_id = $5, telegram_file_unique_id = $6, storage_token = NULL, storage_started_at = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_generation = $2 AND storage_state = 'storage_unknown' RETURNING *",
+            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $3, telegram_storage_message_id = $4, telegram_file_id = $5, telegram_file_unique_id = $6, storage_token = NULL, storage_started_at = NULL, local_work_path = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_generation = $2 AND storage_state = 'storage_unknown' RETURNING *",
         )
         .bind(id)
         .bind(generation)
@@ -759,6 +784,8 @@ impl LibraryRepository {
         .await?
         .ok_or(LibraryRepositoryError::StorageUploadNotUnknown(id))?;
         complete_linked_ingests_for_storage(&mut transaction, id).await?;
+        enqueue_workspace_cleanup_for_media(&mut transaction, id, OffsetDateTime::now_utc())
+            .await?;
         transaction.commit().await?;
         row.into_storage_receipt()
     }
@@ -996,8 +1023,9 @@ impl StorageUploadStore for LibraryRepository {
         attachment: StorageUploadAttachment,
     ) -> Result<StorageReceipt, Self::Error> {
         validate_attachment(&attachment)?;
+        let mut transaction = self.pool.begin().await?;
         let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $2, telegram_storage_message_id = $3, telegram_file_id = $4, telegram_file_unique_id = $5, storage_token = NULL, storage_started_at = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_token = $6 AND storage_state = 'pending_storage' RETURNING *",
+            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $2, telegram_storage_message_id = $3, telegram_file_id = $4, telegram_file_unique_id = $5, storage_token = NULL, storage_started_at = NULL, local_work_path = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_token = $6 AND storage_state = 'pending_storage' RETURNING *",
         )
         .bind(media_id)
         .bind(attachment.storage_chat_id)
@@ -1005,9 +1033,13 @@ impl StorageUploadStore for LibraryRepository {
         .bind(attachment.telegram_file_id)
         .bind(attachment.telegram_file_unique_id)
         .bind(owner_token)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await?
         .ok_or(LibraryRepositoryError::StorageUploadLeaseLost(media_id))?;
+        complete_linked_ingests_for_storage(&mut transaction, media_id).await?;
+        enqueue_workspace_cleanup_for_media(&mut transaction, media_id, OffsetDateTime::now_utc())
+            .await?;
+        transaction.commit().await?;
         row.into_storage_receipt()
     }
 
@@ -1368,6 +1400,8 @@ pub enum LibraryRepositoryError {
     InvalidNumber { field: &'static str },
     #[error("storage upload for media {0} is active")]
     StorageUploadActive(Uuid),
+    #[error("media {0} workspace was reclaimed; reconstruction is required before storage reset")]
+    WorkspaceReclaimed(Uuid),
     #[error("storage generation for media {0} overflowed")]
     StorageGenerationOverflow(Uuid),
     #[error("storage upload for media {0} is not unknown")]

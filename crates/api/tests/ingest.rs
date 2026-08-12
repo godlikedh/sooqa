@@ -1,5 +1,3 @@
-use std::env;
-
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -11,10 +9,8 @@ use sooqa_persistence::Database;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-async fn app() -> (Database, axum::Router) {
-    let url = env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL");
-    let database = Database::connect(&url, 10).await.unwrap();
-    database.migrate().await.unwrap();
+fn app(pool: sqlx::PgPool) -> (Database, axum::Router) {
+    let database = Database::from_pool(pool);
     let app = router(
         ApiSettings::default(),
         ApiState::new(database.inbox(), "test-api-token", database.library(), database.publisher()),
@@ -22,10 +18,10 @@ async fn app() -> (Database, axum::Router) {
     (database, app)
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn api_authenticates_with_the_single_configured_bearer_secret() {
-    let (database, app) = app().await;
+async fn api_authenticates_with_the_single_configured_bearer_secret(pool: sqlx::PgPool) {
+    let (_database, app) = app(pool);
     let response = app
         .clone()
         .oneshot(
@@ -53,28 +49,12 @@ async fn api_authenticates_with_the_single_configured_bearer_secret() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-    let ingest_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM ingests WHERE input_key = $1")
-        .bind("api-test-key")
-        .fetch_one(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(ingest_id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn force_save_is_authenticated_idempotent_and_durable() {
-    let (database, app) = app().await;
+async fn force_save_is_authenticated_idempotent_and_durable(pool: sqlx::PgPool) {
+    let (database, app) = app(pool);
     let ingest = database
         .inbox()
         .create_ingest(
@@ -161,23 +141,12 @@ async fn force_save_is_authenticated_idempotent_and_durable() {
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["id"], ingest.ingest.id.to_string());
     assert_eq!(body["status"], "queued");
-
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(ingest.ingest.id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest.ingest.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn accept_duplicate_reuses_ready_media_and_replays_without_uploading() {
-    let (database, app) = app().await;
+async fn accept_duplicate_reuses_ready_media_and_replays_without_uploading(pool: sqlx::PgPool) {
+    let (database, app) = app(pool);
     let media_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO media (id, kind, storage_state, tags, description, telegram_storage_chat_id, telegram_storage_message_id, telegram_file_id) VALUES ($1, 'video', 'ready', $2, $3, $4, $5, $6)",

@@ -9,6 +9,7 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 use uuid::Uuid;
 
 mod command;
@@ -22,13 +23,14 @@ mod image_normalize;
 mod normalize;
 mod publication;
 mod sequence_alignment;
+mod two_ch;
 mod video_sequence;
 mod workspace;
 mod ytdlp;
 
 pub use command::{
-    CommandError, DEFAULT_COMMAND_TIMEOUT, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommand,
-    ExternalCommandOutput, ExternalCommandRunner, ProcessCommandRunner,
+    CommandError, DEFAULT_COMMAND_PATH, DEFAULT_COMMAND_TIMEOUT, DEFAULT_MAX_OUTPUT_BYTES,
+    ExternalCommand, ExternalCommandOutput, ExternalCommandRunner, ProcessCommandRunner,
 };
 pub use diagnostics::{BinaryCheck, BinaryDiagnostic, diagnose_binaries};
 pub use direct_http::{DirectHttpDownloader, HostResolver, ResolvedAddress};
@@ -41,7 +43,8 @@ pub use ffprobe::{
     parse_probe_json,
 };
 pub use fingerprint::{
-    FingerprintVersion, FrameDecodeLimits, FrameExtractionError, FrameExtractor, VIDEO_SEQUENCE_V1,
+    DEFAULT_MAX_FRAME_SEQUENCE_BYTES, FingerprintVersion, FrameDecodeLimits, FrameExtractionError,
+    FrameExtractor, VIDEO_SEQUENCE_V1,
 };
 pub use hashing::{FileDigest, HashError, sha256_file};
 pub(crate) use hashing::{sha256_bytes, sha256_file_sync};
@@ -58,16 +61,19 @@ pub use sequence_alignment::{
     SequenceEvidence, align_video_sequences,
 };
 pub use sooqa_inbox::{SourceInspection, SourceMediaKind};
+pub use two_ch::{TWO_CH_MIRROR_HOSTS, TwoChMirrorDownloader};
 pub use video_sequence::{
     VIDEO_SEQUENCE_BASE_INTERVAL_MS, VIDEO_SEQUENCE_CODEC_V1, VIDEO_SEQUENCE_MAGIC,
     VIDEO_SEQUENCE_MAX_ANCHORS, VIDEO_SEQUENCE_MAX_SAMPLES, VIDEO_SEQUENCE_MAX_TOKENS,
-    VideoSequenceError, VideoSequenceFingerprint, VideoSequenceSample, derive_search_tokens,
-    select_video_sequence_timestamps, video_sequence_interval_ms,
+    VideoSequenceBuilder, VideoSequenceError, VideoSequenceFingerprint, VideoSequenceSample,
+    derive_search_tokens, select_video_sequence_timestamps, video_sequence_interval_ms,
 };
 pub use workspace::{
     ManifestEntry, MediaWorkspace, WorkspaceArea, WorkspaceError, WorkspaceManifest,
 };
-pub use ytdlp::{YtDlpConfig, YtDlpConfigError, YtDlpDownloader, YtDlpMetadata};
+pub use ytdlp::{
+    YtDlpConfig, YtDlpConfigError, YtDlpDownloader, YtDlpMetadata, is_supported_deno_version,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceInput {
@@ -148,17 +154,22 @@ pub async fn publish_artifact(
 pub struct SourceDownloaderRouter {
     direct_http: Arc<dyn SourceDownloader>,
     ytdlp: Option<Arc<dyn SourceDownloader>>,
+    ytdlp_allowed_hosts: Vec<String>,
 }
 
 impl SourceDownloaderRouter {
-    pub fn new(direct_http: Arc<dyn SourceDownloader>, ytdlp: Arc<dyn SourceDownloader>) -> Self {
-        Self { direct_http, ytdlp: Some(ytdlp) }
+    pub fn new(
+        direct_http: Arc<dyn SourceDownloader>,
+        ytdlp: Arc<dyn SourceDownloader>,
+        ytdlp_allowed_hosts: Vec<String>,
+    ) -> Self {
+        Self { direct_http, ytdlp: Some(ytdlp), ytdlp_allowed_hosts }
     }
 
     /// Builds a production-safe router until the yt-dlp process has an
     /// equivalent egress/SSRF boundary.
     pub fn direct_only(direct_http: Arc<dyn SourceDownloader>) -> Self {
-        Self { direct_http, ytdlp: None }
+        Self { direct_http, ytdlp: None, ytdlp_allowed_hosts: Vec::new() }
     }
 }
 
@@ -167,17 +178,8 @@ impl SourceDownloader for SourceDownloaderRouter {
     async fn inspect(&self, source: &SourceInput) -> Result<SourceInspection, DownloadError> {
         match self.direct_http.inspect(source).await {
             Ok(inspection) if inspection.media_kind != SourceMediaKind::Unknown => Ok(inspection),
-            Ok(_) => match &self.ytdlp {
-                Some(ytdlp) => ytdlp.inspect(source).await,
-                None => Err(DownloadError::terminal(
-                    "unsupported_source",
-                    "direct HTTP did not recognize a supported media response",
-                )),
-            },
-            Err(error) if should_try_ytdlp(&error) => match &self.ytdlp {
-                Some(ytdlp) => ytdlp.inspect(source).await,
-                None => Err(error),
-            },
+            Ok(_) => self.inspect_with_ytdlp_policy(source).await,
+            Err(error) if should_try_ytdlp(&error) => self.inspect_with_ytdlp_policy(source).await,
             Err(error) => Err(error),
         }
     }
@@ -191,7 +193,16 @@ impl SourceDownloader for SourceDownloaderRouter {
         match inspection.adapter.as_str() {
             "direct_http" => self.direct_http.download(inspection, destination, limits).await,
             "yt_dlp" => match &self.ytdlp {
-                Some(ytdlp) => ytdlp.download(inspection, destination, limits).await,
+                Some(ytdlp) => {
+                    if !is_allowed_ytdlp_source(&inspection.source_url, &self.ytdlp_allowed_hosts)?
+                    {
+                        return Err(DownloadError::terminal(
+                            "source_host_not_allowed",
+                            "page URL host is not enabled for yt-dlp",
+                        ));
+                    }
+                    ytdlp.download(inspection, destination, limits).await
+                }
                 None => Err(DownloadError::terminal(
                     "source_adapter_disabled",
                     "yt-dlp source adapter is not enabled in this worker",
@@ -203,6 +214,79 @@ impl SourceDownloader for SourceDownloaderRouter {
             )),
         }
     }
+}
+
+impl SourceDownloaderRouter {
+    async fn inspect_with_ytdlp_policy(
+        &self,
+        source: &SourceInput,
+    ) -> Result<SourceInspection, DownloadError> {
+        if !is_allowed_ytdlp_source(&source.source_url, &self.ytdlp_allowed_hosts)? {
+            return Err(DownloadError::terminal(
+                "source_host_not_allowed",
+                "page URL host is not enabled for yt-dlp",
+            ));
+        }
+        if self.ytdlp.is_none() {
+            return Err(DownloadError::terminal(
+                "unsupported_source",
+                "direct HTTP did not recognize a supported media response",
+            ));
+        }
+
+        self.ytdlp
+            .as_ref()
+            .expect("yt-dlp was checked before applying its host policy")
+            .inspect(source)
+            .await
+    }
+}
+
+fn is_allowed_ytdlp_source(
+    source_url: &str,
+    allowed_hosts: &[String],
+) -> Result<bool, DownloadError> {
+    let url = Url::parse(source_url).map_err(|_| {
+        DownloadError::terminal("invalid_source_url", "source URL could not be parsed")
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(DownloadError::terminal(
+            "unsupported_scheme",
+            "source URL must use http or https",
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(DownloadError::terminal(
+            "source_credentials_forbidden",
+            "source URL must not contain embedded credentials",
+        ));
+    }
+    let Some(host) = url.host_str() else {
+        return Err(DownloadError::terminal("missing_source_host", "source URL has no host"));
+    };
+    let default_port = match url.scheme() {
+        "http" => 80,
+        "https" => 443,
+        _ => unreachable!("scheme was checked above"),
+    };
+    if url.port().is_some_and(|port| port != default_port) {
+        return Err(DownloadError::terminal(
+            "source_port_not_allowed",
+            "yt-dlp page URLs must use the default HTTP or HTTPS port",
+        ));
+    }
+
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.ends_with('.') {
+        return Ok(false);
+    }
+    let host = host.to_ascii_lowercase();
+    if !matches!(url.host(), Some(url::Host::Domain(_))) {
+        return Ok(false);
+    }
+    Ok(allowed_hosts
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}"))))
 }
 
 fn should_try_ytdlp(error: &DownloadError) -> bool {
@@ -295,6 +379,45 @@ mod tests {
     }
 
     #[test]
+    fn ytdlp_host_policy_matches_exact_and_dot_delimited_subdomains_only() {
+        let allowed = vec!["youtube.com".to_owned(), "youtu.be".to_owned()];
+        for source_url in [
+            "https://youtube.com/watch?v=abc",
+            "https://WWW.YouTube.COM./shorts/abc",
+            "https://music.youtube.com/watch?v=abc",
+            "https://youtu.be/abc",
+        ] {
+            assert!(
+                is_allowed_ytdlp_source(source_url, &allowed).expect("URL should be valid"),
+                "host should be allowed: {source_url}"
+            );
+        }
+        for source_url in [
+            "https://notyoutube.com/watch?v=abc",
+            "https://youtube.com.attacker.example/watch?v=abc",
+            "https://127.0.0.1/watch?v=abc",
+            "https://[::1]/watch?v=abc",
+        ] {
+            assert!(
+                !is_allowed_ytdlp_source(source_url, &allowed).expect("URL should be valid"),
+                "host should be denied: {source_url}"
+            );
+        }
+        assert!(
+            !is_allowed_ytdlp_source("https://youtube.com../watch?v=abc", &allowed)
+                .unwrap_or(false)
+        );
+        assert!(matches!(
+            is_allowed_ytdlp_source("https://user:password@youtube.com/watch?v=abc", &allowed),
+            Err(DownloadError::Terminal { class, .. }) if class == "source_credentials_forbidden"
+        ));
+        assert!(matches!(
+            is_allowed_ytdlp_source("https://youtube.com:8443/watch?v=abc", &allowed),
+            Err(DownloadError::Terminal { class, .. }) if class == "source_port_not_allowed"
+        ));
+    }
+
+    #[test]
     fn source_inspection_round_trips_as_job_payload() {
         let inspection = SourceInspection {
             adapter: "fake".to_owned(),
@@ -326,6 +449,7 @@ mod tests {
                 inspection: Ok(inspection("yt_dlp", SourceMediaKind::Video)),
                 downloads: Arc::clone(&ytdlp_downloads),
             }),
+            vec!["example.test".to_owned()],
         );
 
         let inspection = router.inspect(&source()).await.expect("yt-dlp inspection should win");
@@ -341,6 +465,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_rejects_page_hosts_outside_the_allowlist_without_starting_ytdlp() {
+        let ytdlp_downloads = Arc::new(AtomicUsize::new(0));
+        let router = SourceDownloaderRouter::new(
+            Arc::new(StubDownloader {
+                inspection: Ok(inspection("direct_http", SourceMediaKind::Unknown)),
+                downloads: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(StubDownloader {
+                inspection: Ok(inspection("yt_dlp", SourceMediaKind::Video)),
+                downloads: Arc::clone(&ytdlp_downloads),
+            }),
+            vec!["youtube.com".to_owned()],
+        );
+        let source =
+            SourceInput { source_url: "https://notyoutube.com/watch?v=abc".to_owned(), ..source() };
+
+        assert!(matches!(
+            router.inspect(&source).await,
+            Err(DownloadError::Terminal { class, .. }) if class == "source_host_not_allowed"
+        ));
+        assert_eq!(ytdlp_downloads.load(Ordering::Relaxed), 0);
+
+        let mut selected = inspection("yt_dlp", SourceMediaKind::Video);
+        selected.source_url = source.source_url;
+        assert!(matches!(
+            router
+                .download(&selected, Path::new("source.bin"), &DownloadLimits::default())
+                .await,
+            Err(DownloadError::Terminal { class, .. }) if class == "source_host_not_allowed"
+        ));
+        assert_eq!(ytdlp_downloads.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn router_keeps_recognized_direct_media_on_http_adapter() {
         let direct_downloads = Arc::new(AtomicUsize::new(0));
         let ytdlp_downloads = Arc::new(AtomicUsize::new(0));
@@ -353,6 +511,7 @@ mod tests {
                 inspection: Ok(inspection("yt_dlp", SourceMediaKind::Video)),
                 downloads: Arc::clone(&ytdlp_downloads),
             }),
+            vec!["example.test".to_owned()],
         );
 
         let inspection = router.inspect(&source()).await.expect("direct inspection should win");
@@ -382,6 +541,7 @@ mod tests {
                 downloads: Arc::new(AtomicUsize::new(0)),
             }),
             Arc::clone(&ytdlp) as Arc<dyn SourceDownloader>,
+            vec!["example.test".to_owned()],
         );
         assert_eq!(
             fallback.inspect(&source()).await.expect("yt-dlp should be tried").adapter,
@@ -394,6 +554,7 @@ mod tests {
                 downloads: Arc::new(AtomicUsize::new(0)),
             }),
             ytdlp,
+            vec!["example.test".to_owned()],
         );
         assert!(matches!(
             blocked.inspect(&source()).await,
@@ -411,7 +572,7 @@ mod tests {
 
         assert!(matches!(
             router.inspect(&source()).await,
-            Err(DownloadError::Terminal { class, .. }) if class == "unsupported_source"
+            Err(DownloadError::Terminal { class, .. }) if class == "source_host_not_allowed"
         ));
     }
 }

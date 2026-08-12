@@ -1,3 +1,4 @@
+use crate::{WORKSPACE_CLEANUP_RETENTION, cleanup::enqueue_workspace_cleanup};
 use std::time::Duration;
 
 use sooqa_jobs::{Job, JobCommand, JobLease, JobPayloadError, JobStatus, JobType, NewJob};
@@ -292,6 +293,21 @@ impl JobRepository {
             .fetch_all(&self.pool)
             .await?)
     }
+
+    pub async fn protected_workspace_ids(&self) -> Result<Vec<Uuid>, JobRepositoryError> {
+        Ok(sqlx::query_scalar(
+            r#"
+            -- Reconciliation runs from a snapshot and deletes after this
+            -- query commits. Protect every workspace that is still current
+            -- for an ingest, not only active pipeline states, so a storage
+            -- reset cannot reopen bytes between the snapshot and deletion.
+            SELECT DISTINCT workspace_id
+            FROM ingests
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
 }
 
 fn lease_seconds(duration: Duration) -> Result<f64, JobRepositoryError> {
@@ -361,6 +377,20 @@ async fn reconcile_exhausted_job(
             .bind(ingest_id)
             .execute(&mut **transaction)
             .await?;
+            if let Some(workspace_id) =
+                sqlx::query_scalar::<_, Uuid>("SELECT workspace_id FROM ingests WHERE id = $1")
+                    .bind(ingest_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+            {
+                enqueue_workspace_cleanup(
+                    transaction,
+                    ingest_id,
+                    workspace_id,
+                    OffsetDateTime::now_utc() + WORKSPACE_CLEANUP_RETENTION,
+                )
+                .await?;
+            }
         }
         return Ok(());
     }

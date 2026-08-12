@@ -1,11 +1,9 @@
-use std::env;
-
 use serde_json::json;
 use sooqa_inbox::{
     IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection, SourceMediaKind,
     SubmittedVia,
 };
-use sooqa_jobs::{JobStatus, JobType};
+use sooqa_jobs::{JobCommand, JobStatus, JobType};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
@@ -13,17 +11,10 @@ use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint, VideoSequen
 use sooqa_persistence::{Database, InboxRepositoryError, SourceInspectionStart};
 use uuid::Uuid;
 
-async fn database() -> Database {
-    let url = env::var("DATABASE_URL").expect("DATABASE_URL must point to PostgreSQL");
-    let database = Database::connect(&url, 10).await.expect("database should connect");
-    database.migrate().await.expect("migration should apply");
-    database
-}
-
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn input_key_replays_identical_ingests_and_rejects_conflicts() {
-    let database = database().await;
+async fn input_key_replays_identical_ingests_and_rejects_conflicts(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let key = format!("test-ingest-{}", Uuid::new_v4());
     let mut input = IngestSubmissionInput::new("https://example.test/video", SubmittedVia::Api);
     input.idempotency_key = Some(key.clone());
@@ -56,6 +47,10 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts() {
         .await
         .unwrap()
         .expect("inspect job should be claimable");
+    assert!(matches!(
+        &claimed.command,
+        JobCommand::InspectSource(payload) if payload.ingest_id == first.ingest.id
+    ));
     let stale_attempt = claimed.lease().expect("claimed job should have a lease");
     database
         .jobs()
@@ -71,22 +66,12 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts() {
         database.inbox().begin_source_inspection(first.ingest.id, &stale_attempt).await.unwrap(),
         SourceInspectionStart::AlreadyAdvanced(_)
     ));
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(first.ingest.id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(first.ingest.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn source_inspection_completion_commits_job_success_with_transition() {
-    let database = database().await;
+async fn source_inspection_completion_commits_job_success_with_transition(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let ingest = database
         .inbox()
         .create_ingest(
@@ -116,6 +101,10 @@ async fn source_inspection_completion_commits_job_success_with_transition() {
         .await
         .unwrap()
         .expect("inspect job should be claimable");
+    assert!(matches!(
+        &claimed.command,
+        JobCommand::InspectSource(payload) if payload.ingest_id == ingest.ingest.id
+    ));
     let lease = claimed.lease().expect("claimed job should have a lease");
     let completed = database
         .inbox()
@@ -130,12 +119,26 @@ async fn source_inspection_completion_commits_job_success_with_transition() {
                 mime_type: Some("video/webm".to_owned()),
                 content_length_bytes: Some(1),
                 title: None,
-                metadata: json!({}),
+                metadata: json!({
+                    "two_ch_mirror": {
+                        "submitted_host": "2ch.life",
+                        "selected_host": "2ch.org",
+                        "selected_url": "https://2ch.org/b/src/inspected.webm"
+                    }
+                }),
             },
         )
         .await
         .unwrap();
     assert_eq!(completed.status, IngestStatus::Downloading);
+    let stored_inspection = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT input_json->'inspection' FROM ingests WHERE id = $1",
+    )
+    .bind(ingest.ingest.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored_inspection["metadata"]["two_ch_mirror"]["selected_host"], "2ch.org");
 
     let job_state = sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
         .bind(claimed.id)
@@ -166,23 +169,12 @@ async fn source_inspection_completion_commits_job_success_with_transition() {
     .await
     .unwrap();
     assert_eq!(successor_count, 1);
-
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(ingest.ingest.id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest.ingest.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
+#[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn duplicate_pending_force_save_is_durable_and_idempotent() {
-    let database = database().await;
+async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let mut submission_input = IngestSubmissionInput::new(
         format!("https://example.test/duplicate-{}", Uuid::new_v4()),
         SubmittedVia::Companion,
@@ -202,6 +194,20 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent() {
     .execute(database.pool())
     .await
     .unwrap();
+    sqlx::query("UPDATE ingests SET input_json = input_json || $2 WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .bind(json!({
+            "inspection": {
+                "metadata": {
+                    "two_ch_mirror": {
+                        "selected_host": "2ch.org"
+                    }
+                }
+            }
+        }))
+        .execute(database.pool())
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE queue.jobs SET state = 'succeeded', completed_at = now() WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",
     )
@@ -220,6 +226,7 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent() {
     assert_eq!(resumed.ingest.status, IngestStatus::Queued);
     assert!(resumed.ingest.force_save);
     assert!(resumed.ingest.duplicate_evidence.is_none());
+    assert!(resumed.ingest.original_input.get("inspection").is_none());
     assert_eq!(resumed.ingest.supplied_description.as_deref(), Some("keep this internal note"));
     assert_eq!(resumed.ingest.supplied_tags, ["cats", "reaction"]);
     assert_eq!(
@@ -247,23 +254,11 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent() {
     assert!(!replay.resumed);
     assert_eq!(replay.ingest.id, resumed.ingest.id);
     assert_eq!(replay.ingest.status, IngestStatus::Queued);
-
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(ingest.ingest.id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest.ingest.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
-#[tokio::test]
-#[ignore = "requires PostgreSQL"]
-async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata() {
-    let database = database().await;
+#[sqlx::test(migrations = "../../migrations")]
+async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let media_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO media (id, kind, storage_state, tags, description, telegram_storage_chat_id, telegram_storage_message_id, telegram_file_id) VALUES ($1, 'video', 'ready', $2, $3, $4, $5, $6)",
@@ -359,10 +354,11 @@ async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata() {
         .unwrap();
 }
 
-#[tokio::test]
-#[ignore = "requires PostgreSQL"]
-async fn duplicate_acceptance_joins_pending_storage_without_replacing_upload() {
-    let database = database().await;
+#[sqlx::test(migrations = "../../migrations")]
+async fn duplicate_acceptance_joins_pending_storage_without_replacing_upload(
+    pool: sqlx::PgPool,
+) {
+    let database = Database::from_pool(pool);
     let media_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO media (id, kind, storage_state) VALUES ($1, 'video', 'pending_storage')",
@@ -453,10 +449,9 @@ async fn duplicate_acceptance_joins_pending_storage_without_replacing_upload() {
         .unwrap();
 }
 
-#[tokio::test]
-#[ignore = "requires PostgreSQL"]
-async fn duplicate_accept_and_force_save_have_one_row_locked_winner() {
-    let database = database().await;
+#[sqlx::test(migrations = "../../migrations")]
+async fn duplicate_accept_and_force_save_have_one_row_locked_winner(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let media_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO media (id, kind, storage_state, telegram_storage_chat_id, telegram_storage_message_id, telegram_file_id) VALUES ($1, 'video', 'ready', $2, $3, $4)",
@@ -549,10 +544,9 @@ fn duplicate_evidence(media_id: Uuid) -> serde_json::Value {
     })
 }
 
-#[tokio::test]
-#[ignore = "requires PostgreSQL"]
-async fn stale_video_identity_finalizer_cannot_mutate_after_lease_recovery() {
-    let database = database().await;
+#[sqlx::test(migrations = "../../migrations")]
+async fn stale_video_identity_finalizer_cannot_mutate_after_lease_recovery(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
     let ingest = database
         .inbox()
         .create_ingest(
@@ -690,27 +684,6 @@ async fn stale_video_identity_finalizer_cannot_mutate_after_lease_recovery() {
             .unwrap(),
         JobStatus::Succeeded.as_str()
     );
-
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(ingest.ingest.id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ingests WHERE id = $1")
-        .bind(ingest.ingest.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'media_id' = $1")
-        .bind(media_id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM media WHERE id = $1")
-        .bind(media_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
 }
 
 fn test_video_ingest(ingest_id: Uuid, sha256: Vec<u8>) -> MediaIngest {

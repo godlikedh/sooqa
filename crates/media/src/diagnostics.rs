@@ -1,12 +1,14 @@
 use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 
-use crate::{ExternalCommand, ExternalCommandRunner};
+use crate::{DEFAULT_COMMAND_PATH, ExternalCommand, ExternalCommandRunner};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BinaryCheck {
     pub name: String,
     pub executable: PathBuf,
     pub version_args: Vec<OsString>,
+    pub clear_environment: bool,
+    pub required_output: Vec<String>,
 }
 
 impl BinaryCheck {
@@ -19,7 +21,23 @@ impl BinaryCheck {
             name: name.into(),
             executable: executable.into(),
             version_args: version_args.into_iter().map(Into::into).collect(),
+            clear_environment: false,
+            required_output: Vec::new(),
         }
+    }
+
+    pub fn with_cleared_environment(mut self) -> Self {
+        self.clear_environment = true;
+        self
+    }
+
+    pub fn requiring_output<I, S>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_output = values.into_iter().map(Into::into).collect();
+        self
     }
 }
 
@@ -60,13 +78,27 @@ async fn diagnose_binary(
         .cloned()
         .fold(ExternalCommand::new(check.executable.clone()), |command, arg| command.arg(arg))
         .timeout(timeout);
+    let command = if check.clear_environment {
+        command.clear_environment().env("PATH", DEFAULT_COMMAND_PATH)
+    } else {
+        command
+    };
     match runner.run(command).await {
         Ok(output) if output.success && !output.stdout_truncated && !output.stderr_truncated => {
-            BinaryDiagnostic {
-                name: check.name.clone(),
-                executable: check.executable.clone(),
-                version: first_line(&output.stdout),
-                error: None,
+            match check.required_output.iter().find(|required| !output_contains(&output, required))
+            {
+                Some(required) => BinaryDiagnostic {
+                    name: check.name.clone(),
+                    executable: check.executable.clone(),
+                    version: None,
+                    error: Some(format!("required capability output is missing: {required:?}")),
+                },
+                None => BinaryDiagnostic {
+                    name: check.name.clone(),
+                    executable: check.executable.clone(),
+                    version: first_line(&output.stdout),
+                    error: None,
+                },
             }
         }
         Ok(output) => BinaryDiagnostic {
@@ -82,6 +114,11 @@ async fn diagnose_binary(
             error: Some(error.to_string()),
         },
     }
+}
+
+fn output_contains(output: &crate::ExternalCommandOutput, expected: &str) -> bool {
+    String::from_utf8_lossy(&output.stdout).contains(expected)
+        || String::from_utf8_lossy(&output.stderr).contains(expected)
 }
 
 fn first_line(bytes: &[u8]) -> Option<String> {
@@ -141,5 +178,22 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].available());
         assert_eq!(diagnostics[0].version.as_deref(), Some("ffprobe version 7.0"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_reject_missing_required_capability_output() {
+        let runner = Arc::new(FakeRunner { calls: Mutex::new(Vec::new()) });
+        let checks = [BinaryCheck::new("yt-dlp", "yt-dlp", ["--help"])
+            .requiring_output(["--js-runtimes"])
+            .with_cleared_environment()];
+        let diagnostics = diagnose_binaries(runner, &checks, Duration::from_secs(1)).await;
+
+        assert!(!diagnostics[0].available());
+        assert!(
+            diagnostics[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.contains("required capability output is missing") })
+        );
     }
 }

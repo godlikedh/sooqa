@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     error::Error,
     io,
-    path::{Path, PathBuf},
+    path::Path,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -14,7 +14,6 @@ use std::{
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sooqa_library::MediaKind;
-use sooqa_media::{MediaWorkspace, WorkspaceArea};
 use teloxide::{
     Bot,
     payloads::{GetUpdatesSetters, SendMessageSetters},
@@ -50,7 +49,6 @@ const TELEGRAM_CLOUD_UPLOAD_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
 const TELEGRAM_MEDIA_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const TELEGRAM_MEDIA_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const TELEGRAM_MAX_UPLOAD_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
-const DEFAULT_MEDIA_WORK_ROOT_NAME: &str = "sooqa-telegram-work";
 const RESPONSE_RATE_LIMIT: Duration = Duration::from_secs(1);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_HANDLER_ATTEMPTS: usize = 5;
@@ -150,14 +148,12 @@ pub struct MediaIngestCommand {
     pub chat_id: i64,
     pub submitted_by_user_id: i64,
     pub media_kind: Option<MediaKind>,
-    pub workspace_id: Uuid,
     pub file_id: String,
     pub file_unique_id: String,
     pub file_size: Option<u32>,
     pub mime_type: Option<String>,
     pub file_name: Option<String>,
     pub caption: Option<String>,
-    pub local_work_path: PathBuf,
     pub idempotency_key: String,
 }
 
@@ -281,8 +277,6 @@ pub enum TelegramError {
     UpdateInProgress(i64),
     #[error("Telegram URL ingest failed: {0}")]
     Ingest(#[source] Box<dyn Error + Send + Sync>),
-    #[error("Telegram media download failed: {0}")]
-    MediaDownload(#[source] Box<dyn Error + Send + Sync>),
 }
 
 #[derive(Debug, ThisError)]
@@ -432,7 +426,6 @@ pub struct TelegramService<A, S, I = ()> {
     ingest_service: Option<I>,
     admin_user_ids: Arc<BTreeSet<i64>>,
     response_limiter: Arc<Mutex<HashMap<RateLimitKey, Instant>>>,
-    media_work_root: PathBuf,
     source_download_max_bytes: u64,
 }
 
@@ -454,7 +447,6 @@ where
             ingest_service: None,
             admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
             response_limiter: Arc::new(Mutex::new(HashMap::new())),
-            media_work_root: default_media_work_root(),
             source_download_max_bytes: DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
         }
     }
@@ -478,14 +470,8 @@ where
             ingest_service: Some(ingest_service),
             admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
             response_limiter: Arc::new(Mutex::new(HashMap::new())),
-            media_work_root: default_media_work_root(),
             source_download_max_bytes: DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
         }
-    }
-
-    pub fn with_media_work_root(mut self, media_work_root: impl Into<PathBuf>) -> Self {
-        self.media_work_root = media_work_root.into();
-        self
     }
 
     pub fn with_source_download_max_bytes(mut self, max_bytes: u64) -> Self {
@@ -662,43 +648,6 @@ where
                 self.release(claim).await?;
                 return Err(TelegramError::Ingest(Box::new(IngestUnavailable)));
             };
-            let workspace_id = telegram_workspace_id(message.update_id);
-            let workspace = match MediaWorkspace::create(&self.media_work_root, workspace_id).await
-            {
-                Ok(workspace) => workspace,
-                Err(error) => {
-                    self.clear_response(rate_limit_key);
-                    self.release(claim).await?;
-                    return Err(TelegramError::MediaDownload(Box::new(error)));
-                }
-            };
-            let local_work_path = match workspace.path(WorkspaceArea::Source, "telegram-input.bin")
-            {
-                Ok(path) => path,
-                Err(error) => {
-                    let _ = workspace.cleanup().await;
-                    self.clear_response(rate_limit_key);
-                    self.release(claim).await?;
-                    return Err(TelegramError::MediaDownload(Box::new(error)));
-                }
-            };
-            if let Err(error) = self.api.download_file(&file_id, &local_work_path).await {
-                self.clear_response(rate_limit_key);
-                if A::is_retryable_error(&error) {
-                    let _ = workspace.cleanup().await;
-                    self.release(claim).await?;
-                    return Err(TelegramError::MediaDownload(Box::new(error)));
-                }
-                let _ = workspace.cleanup().await;
-                let response = format!("⚠️ Telegram file cannot be downloaded: {error}");
-                if !self.allow_response(message.user_id, message.chat_id) {
-                    self.complete(claim).await?;
-                    return Ok(HandleOutcome::RateLimited);
-                }
-                self.send_and_complete(claim, message.chat_id, &response, rate_limit_key).await?;
-                return Ok(HandleOutcome::MediaRejected);
-            }
-
             let accepted = match ingest_service
                 .create_media(MediaIngestCommand {
                     update_id: message.update_id,
@@ -706,21 +655,18 @@ where
                     chat_id: message.chat_id,
                     submitted_by_user_id: user_id,
                     media_kind,
-                    workspace_id,
                     file_id,
                     file_unique_id,
                     file_size,
                     mime_type,
                     file_name,
                     caption: message.caption.clone(),
-                    local_work_path,
                     idempotency_key: format!("telegram:update:{}:v1", message.update_id),
                 })
                 .await
             {
                 Ok(accepted) => accepted,
                 Err(error) => {
-                    let _ = workspace.cleanup().await;
                     self.clear_response(rate_limit_key);
                     self.release(claim).await?;
                     return Err(TelegramError::Ingest(Box::new(error)));
@@ -956,15 +902,6 @@ where
     fn clear_response(&self, key: RateLimitKey) {
         self.response_limiter.lock().expect("Telegram rate limiter is not poisoned").remove(&key);
     }
-}
-
-fn default_media_work_root() -> PathBuf {
-    std::env::temp_dir().join(DEFAULT_MEDIA_WORK_ROOT_NAME)
-}
-
-fn telegram_workspace_id(update_id: i64) -> Uuid {
-    let update_id = u64::try_from(update_id).expect("Telegram update IDs must be non-negative");
-    Uuid::from_u128(0x534f4f514154454c0000000000000000_u128 | u128::from(update_id))
 }
 
 fn message_media(message: &Message) -> Option<TelegramMedia> {
@@ -1669,11 +1606,6 @@ where
         Ok(self)
     }
 
-    pub fn with_media_work_root(mut self, media_work_root: impl Into<PathBuf>) -> Self {
-        self.service = self.service.with_media_work_root(media_work_root);
-        self
-    }
-
     pub fn with_source_download_max_bytes(mut self, max_bytes: u64) -> Self {
         self.api = self.api.with_source_download_max_bytes(max_bytes);
         self.service.api = self.api.clone();
@@ -1873,17 +1805,11 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct RetryableDownloadApi {
-        failures_remaining: Arc<Mutex<u8>>,
-    }
-
-    #[derive(Debug, ThisError)]
-    #[error("retryable download failure")]
-    struct RetryableDownloadError;
+    struct BlockingDownloadApi;
 
     #[async_trait]
-    impl TelegramApi for RetryableDownloadApi {
-        type Error = RetryableDownloadError;
+    impl TelegramApi for BlockingDownloadApi {
+        type Error = MockError;
 
         async fn send_text(&self, _chat_id: i64, _text: &str) -> Result<(), Self::Error> {
             Ok(())
@@ -1905,25 +1831,9 @@ mod tests {
         async fn download_file(
             &self,
             _file_id: &str,
-            destination: &Path,
+            _destination: &Path,
         ) -> Result<(), Self::Error> {
-            let should_fail = {
-                let mut failures =
-                    self.failures_remaining.lock().expect("mock mutex should not be poisoned");
-                if *failures > 0 {
-                    *failures -= 1;
-                    true
-                } else {
-                    false
-                }
-            };
-            if should_fail {
-                return Err(RetryableDownloadError);
-            }
-            tokio::fs::write(destination, b"mock media")
-                .await
-                .expect("mock media should be written");
-            Ok(())
+            std::future::pending().await
         }
 
         fn is_retryable_error(_error: &Self::Error) -> bool {
@@ -2265,7 +2175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorized_media_is_downloaded_and_ingested_with_metadata() {
+    async fn authorized_media_is_queued_without_downloading_bytes() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
         let service =
@@ -2293,12 +2203,6 @@ mod tests {
             HandleOutcome::Responded(Command::Add)
         );
         let media_command = ingest.media_commands.lock().unwrap()[0].clone();
-        let expected_path =
-            MediaWorkspace::create(default_media_work_root(), telegram_workspace_id(11))
-                .await
-                .expect("test workspace should exist")
-                .path(WorkspaceArea::Source, "telegram-input.bin")
-                .expect("test source path should be valid");
         assert_eq!(
             media_command,
             MediaIngestCommand {
@@ -2307,27 +2211,54 @@ mod tests {
                 chat_id: 42,
                 submitted_by_user_id: 123,
                 media_kind: Some(MediaKind::Video),
-                workspace_id: telegram_workspace_id(11),
                 file_id: "file-id".to_owned(),
                 file_unique_id: "unique-id".to_owned(),
                 file_size: Some(1234),
                 mime_type: Some("video/webm".to_owned()),
                 file_name: Some("clip.webm".to_owned()),
                 caption: Some("a caption".to_owned()),
-                local_work_path: expected_path,
                 idempotency_key: "telegram:update:11:v1".to_owned(),
             }
         );
-        let media_path = ingest.media_commands.lock().unwrap()[0].local_work_path.clone();
-        assert_eq!(tokio::fs::read(media_path).await.unwrap(), b"mock media");
-        assert_eq!(api.downloads.lock().unwrap().as_slice(), &["file-id".to_owned()]);
-        MediaWorkspace::create(default_media_work_root(), telegram_workspace_id(11))
-            .await
-            .expect("test workspace should exist")
-            .cleanup()
-            .await
-            .expect("test workspace should be cleaned");
+        assert!(api.downloads.lock().unwrap().is_empty());
         assert_eq!(api.messages.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_media_download_cannot_delay_concurrent_metadata_acceptance() {
+        let api = BlockingDownloadApi;
+        let ingest = MockIngestService::default();
+        let service =
+            TelegramService::with_ingest(api, MockStore::default(), [123], ingest.clone());
+        let message = |update_id, chat_id| IncomingMessage {
+            update_id,
+            message_id: update_id,
+            user_id: Some(123),
+            chat_id,
+            is_private: true,
+            text: None,
+            caption: None,
+            media: Some(TelegramMedia::Supported {
+                media_kind: MediaKind::Video,
+                file_id: format!("file-{update_id}"),
+                file_unique_id: format!("unique-{update_id}"),
+                file_size: Some(2_000_000_000),
+                mime_type: Some("video/mp4".to_owned()),
+                file_name: Some("large.mp4".to_owned()),
+            }),
+        };
+
+        let results = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                service.handle_message(message(15, 42)),
+                service.handle_message(message(16, 43)),
+            )
+        })
+        .await
+        .expect("metadata acceptance must not wait for a media download");
+        assert!(matches!(results.0, Ok(HandleOutcome::Responded(Command::Add))));
+        assert!(matches!(results.1, Ok(HandleOutcome::Responded(Command::Add))));
+        assert_eq!(ingest.media_commands.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -2391,7 +2322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probeable_telegram_document_is_downloaded_without_declared_kind() {
+    async fn probeable_telegram_document_is_queued_without_declared_kind() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
         let service =
@@ -2421,18 +2352,12 @@ mod tests {
         assert_eq!(command.media_kind, None);
         assert_eq!(command.mime_type.as_deref(), Some("application/octet-stream"));
         assert_eq!(command.file_name, None);
-        assert_eq!(api.downloads.lock().unwrap().as_slice(), &["unknown-media".to_owned()]);
-        MediaWorkspace::create(default_media_work_root(), telegram_workspace_id(14))
-            .await
-            .expect("test workspace should exist")
-            .cleanup()
-            .await
-            .expect("test workspace should be cleaned");
+        assert!(api.downloads.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn retryable_media_download_releases_update_and_deduplicates_success() {
-        let api = RetryableDownloadApi { failures_remaining: Arc::new(Mutex::new(1)) };
+    async fn replayed_media_update_reuses_the_queued_ingest_without_downloading() {
+        let api = MockApi::default();
         let ingest = MockIngestService::default();
         let service =
             TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
@@ -2454,9 +2379,8 @@ mod tests {
             }),
         };
 
-        assert!(service.handle_message(message.clone()).await.is_err());
         assert_eq!(
-            service.handle_message(message).await.unwrap(),
+            service.handle_message(message.clone()).await.unwrap(),
             HandleOutcome::Responded(Command::Add)
         );
         assert_eq!(
@@ -2476,6 +2400,7 @@ mod tests {
             HandleOutcome::DuplicateIgnored
         );
         assert_eq!(ingest.media_commands.lock().unwrap().len(), 1);
+        assert!(api.downloads.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2972,7 +2897,11 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
         let address = listener.local_addr().expect("fake API address should be available");
-        let server = tokio::spawn(serve_upload(listener, UPLOAD_BODY_DELAY, PAYLOAD));
+        let server = tokio::spawn(serve_upload(
+            listener,
+            UPLOAD_BODY_DELAY,
+            b"name=\"supports_streaming\"\r\n\r\ntrue",
+        ));
         let directory = std::env::temp_dir().join(format!("sooqa-telegram-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&directory).await.expect("test directory should be created");
         let path = directory.join("canonical.mp4");
@@ -3004,7 +2933,10 @@ mod tests {
         assert!(request.target.contains("/bottest-token/SendVideo"));
         assert!(request.body_bytes > REDUCED_CLOUD_CEILING);
         assert!(request.body_bytes >= PAYLOAD.len() as u64);
-        assert!(request.body_contains_marker);
+        assert!(
+            request.body_contains_marker,
+            "SendVideo request must include supports_streaming=true"
+        );
         tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
     }
 
