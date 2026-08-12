@@ -225,6 +225,14 @@ private. See the [official local Bot API documentation](https://core.telegram.or
 and [upstream server README](https://github.com/tdlib/telegram-bot-api#usage)
 for Telegram-side requirements.
 
+Canonical videos are uploaded to the private storage channel with Telegram's
+`supports_streaming=true` `sendVideo` flag. The canonical video profile already
+produces MP4/H.264 video with optional AAC audio and fast-start metadata, so
+newly stored videos can begin playback before the full file is downloaded by a
+client. Images, animations, and audio use their existing upload methods and do
+not receive this video-only flag. This does not change existing storage
+messages; it applies to new uploads after deployment.
+
 ## Storage ambiguity
 
 Storage upload state is carried by the media row. `storage_unknown` means the

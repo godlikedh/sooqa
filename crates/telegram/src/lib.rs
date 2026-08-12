@@ -2350,7 +2350,11 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
         let address = listener.local_addr().expect("fake API address should be available");
-        let server = tokio::spawn(serve_upload(listener, UPLOAD_BODY_DELAY, PAYLOAD));
+        let server = tokio::spawn(serve_upload(
+            listener,
+            UPLOAD_BODY_DELAY,
+            b"name=\"supports_streaming\"\r\n\r\ntrue",
+        ));
         let directory = std::env::temp_dir().join(format!("sooqa-telegram-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&directory).await.expect("test directory should be created");
         let path = directory.join("canonical.mp4");
@@ -2382,7 +2386,10 @@ mod tests {
         assert!(request.target.contains("/bottest-token/SendVideo"));
         assert!(request.body_bytes > REDUCED_CLOUD_CEILING);
         assert!(request.body_bytes >= PAYLOAD.len() as u64);
-        assert!(request.body_contains_marker);
+        assert!(
+            request.body_contains_marker,
+            "SendVideo request must include supports_streaming=true"
+        );
         tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
     }
 
