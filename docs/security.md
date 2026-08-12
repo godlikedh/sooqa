@@ -19,7 +19,23 @@ or Telegram token.
 Telegram accepts private messages from configured positive administrator IDs.
 Media is staged below UUID-derived workspaces. Direct HTTP rejects credentials,
 private/special destinations, and unsafe redirects. ffmpeg, ffprobe, and
-yt-dlp receive argument arrays, bounded output, timeouts, and no shell.
+yt-dlp receive argument arrays, bounded output, timeouts, and no shell. yt-dlp
+is used for page-like URLs only when the submitted URL's normalized initial
+hostname is in `media.ytdlp_allowed_hosts`; exact hosts and dot-delimited
+subdomains are matched, while credentials, IP literals, and non-default ports
+are rejected. Its child environment is cleared and rebuilt with only a fixed
+`PATH`; yt-dlp ignores configuration and plugins, and remote components are
+disabled. The home image pins the official yt-dlp and Deno distributions by
+version and SHA-256 checksum. yt-dlp may follow provider redirects and fetch
+provider/CDN URLs after an allowlisted page is accepted, which is part of the
+single-admin deployment's explicit trust boundary. Each yt-dlp attempt gets a
+unique job-owned directory with a relative output and explicit home/temp paths;
+the worker monitors the aggregate directory while the child is running, not
+only the final file, and removes the complete directory on success, failure,
+timeout, or cancellation. The aggregate budget is three times the final source
+limit to leave room for split-stream merging. A successful attempt must leave
+exactly one regular final media file. The worker also refuses to enable the
+adapter if the offline EJS/Deno startup probes fail.
 
 The local Telegram Bot API service is a private Compose-network dependency. Its
 `api_id`, `api_hash`, and bot token are deployment secrets; the service has a

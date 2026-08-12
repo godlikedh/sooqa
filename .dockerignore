@@ -1,0 +1,3 @@
+target/
+.git/
+deploy/home/.env

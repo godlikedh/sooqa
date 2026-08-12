@@ -53,6 +53,49 @@ separate:
   object uploaded to Telegram storage. It must remain below the documented
   2000 MB local Bot API upload limit.
 
+### Allowlisted YouTube pages
+
+The worker is direct-only when `SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS` is empty. To
+enable public YouTube video and Shorts pages, set it to a comma-separated list
+such as:
+
+```bash
+SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS=youtube.com,youtu.be
+```
+
+Entries are normalized as DNS hostnames. `youtube.com` also allows its
+dot-delimited subdomains; `youtu.be` is an exact host entry. Credentials, IP
+literals, wildcards, paths, and non-default ports are rejected. Direct MP4 and
+WebM responses continue to use the direct HTTP adapter even when their host is
+not in this list. The worker logs whether yt-dlp is disabled or enabled and
+fails startup if an enabled yt-dlp or Deno capability is missing or too old.
+
+The home Compose deployment uses `youtube.com,youtu.be` when the variable is
+unset; set it to an empty value in `deploy/home/.env` for direct-only operation.
+The initial URL host is the allowlist decision point. yt-dlp is run without
+configuration files, browser cookies, netrc, plugins, or remote components, but
+an accepted provider page can still follow provider redirects and fetch its
+CDN media URLs. The supported home path is public regular videos and Shorts;
+private, members-only, age-restricted, geo-bypassed, and cookie-authenticated
+media are intentionally outside this setup.
+
+The home image downloads the official standalone `yt-dlp` distribution, which
+contains the bundled `yt-dlp-ejs` component, and a pinned Deno runtime. The
+current Dockerfile pins yt-dlp `2026.06.09` and Deno `2.8.1` with architecture-
+specific SHA-256 checksums. When the allowlist is enabled, worker startup runs
+an offline local-info fixture through yt-dlp with the configured EJS/Deno
+flags, checks that the bundled EJS component is discoverable, and executes a
+small Deno probe. Each yt-dlp download runs inside a unique attempt directory:
+its relative final output, temporary fragments, split streams, merge
+intermediates, and disabled-cache state are confined there. The worker monitors
+the aggregate attempt directory with a three-times-final-size budget to allow
+video/audio merging, while the final published file remains bounded by
+`SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES`; a successful attempt must contain
+exactly one regular media file. To update either dependency, change its version, asset names
+if needed, and every matching checksum together; build the home image and
+verify the startup diagnostics before doing an owner smoke test. CI uses fake
+executables and does not contact YouTube.
+
 The server and worker must share `media.work_root`; ffprobe and ffmpeg are
 needed for probing and normalization. Source downloads and Telegram uploads
 are streamed or path-based; no file-sized byte buffer is used.

@@ -20,11 +20,15 @@ use tokio::{
 
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+pub const DEFAULT_COMMAND_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExternalCommand {
     program: PathBuf,
     args: Vec<OsString>,
+    current_dir: Option<PathBuf>,
+    clear_environment: bool,
+    environment: Vec<(OsString, OsString)>,
     timeout: Duration,
     max_output_bytes: usize,
 }
@@ -34,6 +38,9 @@ impl ExternalCommand {
         Self {
             program: program.into(),
             args: Vec::new(),
+            current_dir: None,
+            clear_environment: false,
+            environment: Vec::new(),
             timeout: DEFAULT_COMMAND_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
@@ -41,6 +48,21 @@ impl ExternalCommand {
 
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());
+        self
+    }
+
+    pub fn current_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.current_dir = Some(path.into());
+        self
+    }
+
+    pub fn clear_environment(mut self) -> Self {
+        self.clear_environment = true;
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.environment.push((key.into(), value.into()));
         self
     }
 
@@ -60,6 +82,18 @@ impl ExternalCommand {
 
     pub fn args(&self) -> &[OsString] {
         &self.args
+    }
+
+    pub fn current_directory(&self) -> Option<&Path> {
+        self.current_dir.as_deref()
+    }
+
+    pub fn clears_environment(&self) -> bool {
+        self.clear_environment
+    }
+
+    pub fn environment(&self) -> &[(OsString, OsString)] {
+        &self.environment
     }
 
     pub fn timeout_duration(&self) -> Duration {
@@ -85,6 +119,20 @@ pub struct ExternalCommandOutput {
 pub trait ExternalCommandRunner: Send + Sync {
     async fn run(&self, command: ExternalCommand) -> Result<ExternalCommandOutput, CommandError>;
 
+    /// Run a command that produces one bounded output file.
+    ///
+    /// The default keeps test and adapter runners compatible. The production
+    /// process runner overrides this to monitor the file while the child is
+    /// still running.
+    async fn run_file(
+        &self,
+        command: ExternalCommand,
+        _output_file: &Path,
+        _max_bytes: u64,
+    ) -> Result<ExternalCommandOutput, CommandError> {
+        self.run(command).await
+    }
+
     /// Run a command that produces a bounded sequence of files.
     ///
     /// The default keeps test and adapter runners compatible. The production
@@ -109,23 +157,55 @@ impl ExternalCommandRunner for ProcessCommandRunner {
         run_process_command(command, None).await
     }
 
+    async fn run_file(
+        &self,
+        command: ExternalCommand,
+        output_file: &Path,
+        max_bytes: u64,
+    ) -> Result<ExternalCommandOutput, CommandError> {
+        run_process_command(
+            command,
+            Some(OutputLimitTarget::File { path: output_file.to_owned(), max_bytes }),
+        )
+        .await
+    }
+
     async fn run_sequence(
         &self,
         command: ExternalCommand,
         output_directory: &Path,
         max_bytes: u64,
     ) -> Result<ExternalCommandOutput, CommandError> {
-        run_process_command(command, Some((output_directory.to_owned(), max_bytes))).await
+        run_process_command(
+            command,
+            Some(OutputLimitTarget::Directory { path: output_directory.to_owned(), max_bytes }),
+        )
+        .await
     }
+}
+
+#[derive(Debug, Clone)]
+enum OutputLimitTarget {
+    File { path: PathBuf, max_bytes: u64 },
+    Directory { path: PathBuf, max_bytes: u64 },
 }
 
 async fn run_process_command(
     command: ExternalCommand,
-    sequence_output: Option<(PathBuf, u64)>,
+    output_limit: Option<OutputLimitTarget>,
 ) -> Result<ExternalCommandOutput, CommandError> {
     let program = command.program().to_owned();
     let mut process = Command::new(command.program());
     process.args(command.args()).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if command.clears_environment() {
+        process.env_clear();
+        for (key, value) in command.environment() {
+            process.env(key, value);
+        }
+    }
+    if let Some(current_dir) = command.current_directory() {
+        process.current_dir(current_dir);
+    }
     #[cfg(unix)]
     process.process_group(0);
     let mut child = process
@@ -163,10 +243,10 @@ async fn run_process_command(
             status.map_err(|source| CommandError::Wait { program: program.clone(), source })?;
         Ok::<_, CommandError>((stdout, stderr, status))
     };
-    let monitor_config = sequence_output.clone();
+    let monitor_config = output_limit.clone();
     let monitor = async move {
         match monitor_config {
-            Some((directory, max_bytes)) => monitor_sequence_output(directory, max_bytes).await,
+            Some(target) => monitor_output_limit(target).await,
             None => std::future::pending::<Result<(), std::io::Error>>().await,
         }
     };
@@ -185,19 +265,19 @@ async fn run_process_command(
         monitor_result = monitor => {
             match monitor_result {
                 Ok(()) => {
-                    let limit = sequence_output
+                    let limit = output_limit
                         .as_ref()
-                        .map(|(_, limit)| *limit)
-                        .expect("a sequence monitor has a configured limit");
+                        .map(output_limit_target_limit)
+                        .expect("an output monitor has a configured limit");
                     terminate_process_group(&mut child).await;
                     group_cleanup.disarm();
                     return Err(CommandError::OutputLimitExceeded { program, limit });
                 }
                 Err(source) => {
-                    let directory = sequence_output
+                    let directory = output_limit
                         .as_ref()
-                        .map(|(directory, _)| directory.clone())
-                        .expect("a sequence monitor has an output directory");
+                        .map(output_limit_target_path)
+                        .expect("an output monitor has a configured path");
                     terminate_process_group(&mut child).await;
                     group_cleanup.disarm();
                     return Err(CommandError::OutputMonitor { program, directory, source });
@@ -207,16 +287,19 @@ async fn run_process_command(
     };
     group_cleanup.disarm();
 
-    if let Some((directory, max_bytes)) = sequence_output.as_ref() {
-        let size = sequence_directory_size(directory).await.map_err(|source| {
+    if let Some(target) = output_limit.as_ref() {
+        let size = output_limit_target_size(target).await.map_err(|source| {
             CommandError::OutputMonitor {
                 program: program.clone(),
-                directory: directory.clone(),
+                directory: output_limit_target_path(target),
                 source,
             }
         })?;
-        if size > *max_bytes {
-            return Err(CommandError::OutputLimitExceeded { program, limit: *max_bytes });
+        if size > output_limit_target_limit(target) {
+            return Err(CommandError::OutputLimitExceeded {
+                program,
+                limit: output_limit_target_limit(target),
+            });
         }
     }
 
@@ -230,13 +313,50 @@ async fn run_process_command(
     })
 }
 
-async fn monitor_sequence_output(directory: PathBuf, max_bytes: u64) -> Result<(), std::io::Error> {
+async fn monitor_output_limit(target: OutputLimitTarget) -> Result<(), std::io::Error> {
     loop {
-        if sequence_directory_size(&directory).await? > max_bytes {
+        if output_limit_target_size(&target).await? > output_limit_target_limit(&target) {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+fn output_limit_target_path(target: &OutputLimitTarget) -> PathBuf {
+    match target {
+        OutputLimitTarget::File { path, .. } | OutputLimitTarget::Directory { path, .. } => {
+            path.clone()
+        }
+    }
+}
+
+fn output_limit_target_limit(target: &OutputLimitTarget) -> u64 {
+    match target {
+        OutputLimitTarget::File { max_bytes, .. }
+        | OutputLimitTarget::Directory { max_bytes, .. } => *max_bytes,
+    }
+}
+
+async fn output_limit_target_size(target: &OutputLimitTarget) -> Result<u64, std::io::Error> {
+    match target {
+        OutputLimitTarget::File { path, .. } => file_size(path).await,
+        OutputLimitTarget::Directory { path, .. } => sequence_directory_size(path).await,
+    }
+}
+
+async fn file_size(path: &Path) -> Result<u64, std::io::Error> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bounded output is not a regular file: {}", path.display()),
+        ));
+    }
+    Ok(metadata.len())
 }
 
 pub(crate) async fn sequence_directory_size(directory: &Path) -> Result<u64, std::io::Error> {
@@ -368,6 +488,10 @@ impl CommandError {
     pub fn is_timeout(&self) -> bool {
         matches!(self, Self::TimedOut { .. })
     }
+
+    pub fn is_output_limit_exceeded(&self) -> bool {
+        matches!(self, Self::OutputLimitExceeded { .. })
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -409,10 +533,14 @@ mod tests {
 
     #[test]
     fn command_keeps_program_and_arguments_separate() {
-        let command =
-            ExternalCommand::new("ffprobe").arg("-v").arg("error").arg("file with spaces.mp4");
+        let command = ExternalCommand::new("ffprobe")
+            .current_dir("/var/lib/sooqa/work")
+            .arg("-v")
+            .arg("error")
+            .arg("file with spaces.mp4");
 
         assert_eq!(command.program(), Path::new("ffprobe"));
+        assert_eq!(command.current_directory(), Some(Path::new("/var/lib/sooqa/work")));
         assert_eq!(
             command.args(),
             [OsString::from("-v"), OsString::from("error"), OsString::from("file with spaces.mp4")]
@@ -431,6 +559,31 @@ mod tests {
         let output = ProcessCommandRunner.run(command).await.expect("command should run");
         assert_eq!(output.stdout, b"1234");
         assert!(output.stdout_truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_runner_stops_when_one_output_file_exceeds_limit() {
+        let root = std::env::temp_dir().join(format!("sooqa-file-limit-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.expect("test root should be created");
+        let output = root.join("output.bin");
+        let command = ExternalCommand::new("/bin/sh")
+            // The shell is only a test fixture: production commands still use
+            // argument arrays and never invoke a shell.
+            .arg("-c")
+            .arg("while :; do printf 1234567890 >> \"$1\"; sleep 0.01; done")
+            .arg("sooqa-file-limit")
+            .arg(output.to_string_lossy().into_owned());
+
+        let error = ProcessCommandRunner
+            .run_file(command, &output, 32)
+            .await
+            .expect_err("bounded output should stop the producer");
+        assert!(error.is_output_limit_exceeded());
+        assert!(
+            tokio::fs::metadata(&output).await.expect("partial output should exist").len() > 32
+        );
+        tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
     }
 
     #[cfg(unix)]

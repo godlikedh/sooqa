@@ -8,7 +8,7 @@ use sooqa_media::{
     BinaryCheck, CanonicalImageProfile, CanonicalVideoProfile, DirectHttpDownloader,
     DownloadLimits, FfprobeAdapter, ImageNormalizer, MediaWorkspace, NormalizationPlanner,
     ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter, TwoChMirrorDownloader,
-    diagnose_binaries,
+    YtDlpConfig, YtDlpDownloader, diagnose_binaries, is_supported_deno_version,
 };
 use sooqa_persistence::{Database, JobRepository, WORKSPACE_CLEANUP_RETENTION};
 use uuid::Uuid;
@@ -47,10 +47,104 @@ async fn run() -> Result<(), Box<dyn Error>> {
         max_bytes: config.media.source_download_max_bytes,
         ..DownloadLimits::default()
     };
-    let source_downloader: Arc<dyn SourceDownloader> =
-        Arc::new(SourceDownloaderRouter::direct_only(Arc::new(TwoChMirrorDownloader::new(
-            DirectHttpDownloader::new(download_limits),
-        ))));
+    let mut binary_checks = vec![
+        BinaryCheck::new("ffprobe", config.media.ffprobe_path.clone(), ["-version"]),
+        BinaryCheck::new("ffmpeg", config.media.ffmpeg_path.clone(), ["-version"]),
+    ];
+    if !config.media.ytdlp_allowed_hosts.is_empty() {
+        binary_checks.push(
+            BinaryCheck::new("yt-dlp", config.media.ytdlp_path.clone(), ["--version"])
+                .with_cleared_environment(),
+        );
+        binary_checks.push(
+            BinaryCheck::new("yt-dlp capabilities", config.media.ytdlp_path.clone(), ["--help"])
+                .with_cleared_environment()
+                .requiring_output(["--js-runtimes", "--no-remote-components"]),
+        );
+        binary_checks
+            .push(BinaryCheck::new("deno", "deno", ["--version"]).with_cleared_environment());
+    }
+    let binary_diagnostics =
+        diagnose_binaries(Arc::new(ProcessCommandRunner), &binary_checks, Duration::from_secs(5))
+            .await;
+    for diagnostic in &binary_diagnostics {
+        match (&diagnostic.version, &diagnostic.error) {
+            (Some(version), None) => tracing::info!(
+                binary = %diagnostic.name,
+                executable = %diagnostic.executable.display(),
+                version = %version,
+                "external binary detected"
+            ),
+            (_, Some(error)) => tracing::error!(
+                binary = %diagnostic.name,
+                executable = %diagnostic.executable.display(),
+                error = %error,
+                "required external binary is unavailable"
+            ),
+            _ => tracing::error!(
+                binary = %diagnostic.name,
+                executable = %diagnostic.executable.display(),
+                "required external binary returned no version"
+            ),
+        }
+    }
+    let missing_binaries = binary_diagnostics
+        .iter()
+        .filter(|diagnostic| !diagnostic.available())
+        .map(|diagnostic| diagnostic.name.as_str())
+        .collect::<Vec<_>>();
+    if !missing_binaries.is_empty() {
+        return Err(format!(
+            "required worker binaries for enabled handlers are unavailable: {}",
+            missing_binaries.join(", ")
+        )
+        .into());
+    }
+    if !config.media.ytdlp_allowed_hosts.is_empty() {
+        let deno_version = binary_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.name == "deno")
+            .and_then(|diagnostic| diagnostic.version.as_deref())
+            .unwrap_or_default();
+        if !is_supported_deno_version(deno_version) {
+            return Err(format!(
+                "yt-dlp is enabled but Deno must be at least 2.3.0; detected {deno_version:?}"
+            )
+            .into());
+        }
+    }
+
+    let direct_http =
+        Arc::new(TwoChMirrorDownloader::new(DirectHttpDownloader::new(download_limits)));
+    let source_downloader: Arc<dyn SourceDownloader> = if config
+        .media
+        .ytdlp_allowed_hosts
+        .is_empty()
+    {
+        tracing::info!(
+            "source inspection handler enabled (direct HTTP with 2ch mirrors; yt-dlp disabled because the host allowlist is empty)"
+        );
+        Arc::new(SourceDownloaderRouter::direct_only(direct_http))
+    } else {
+        let ytdlp_config =
+            YtDlpConfig::new(config.media.ytdlp_path.clone(), config.media.ytdlp_format.clone())?;
+        let ytdlp = YtDlpDownloader::with_limits(ytdlp_config, download_limits);
+        if let Err(error) = ytdlp.verify_runtime(Duration::from_secs(5)).await {
+            return Err(std::io::Error::other(format!(
+                "yt-dlp is enabled but its bundled EJS/Deno runtime check failed: {error}"
+            ))
+            .into());
+        }
+        tracing::info!(
+            allowed_hosts = ?config.media.ytdlp_allowed_hosts,
+            "source inspection handler enabled (direct HTTP with allowlisted yt-dlp fallback)"
+        );
+        Arc::new(SourceDownloaderRouter::new(
+            direct_http,
+            Arc::new(ytdlp),
+            config.media.ytdlp_allowed_hosts.clone(),
+        ))
+    };
     let telegram_api =
         match config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured()) {
             Some(token) => Some(
@@ -68,7 +162,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
         telegram_api.clone().map(|api| Arc::new(api) as Arc<dyn TelegramSourceDownloader>);
     let inspect_handler = inspect_source_handler(database.inbox(), Arc::clone(&source_downloader));
     handlers.register(JobType::InspectSource, move |job| inspect_handler(job));
-    tracing::info!("source inspection handler enabled (direct HTTP with 2ch mirrors)");
     let download_handler = download_source_handler(
         database.inbox(),
         config.media.work_root.clone(),
@@ -148,57 +241,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
     .await?;
     if removed_workspaces > 0 {
         tracing::info!(removed_workspaces, "removed stale media workspaces");
-    }
-    let mut binary_checks = Vec::new();
-    if capabilities.contains(&JobType::ProbeAsset) {
-        binary_checks.push(BinaryCheck::new(
-            "ffprobe",
-            config.media.ffprobe_path.clone(),
-            ["-version"],
-        ));
-    }
-    if capabilities.contains(&JobType::NormalizeAsset) {
-        binary_checks.push(BinaryCheck::new(
-            "ffmpeg",
-            config.media.ffmpeg_path.clone(),
-            ["-version"],
-        ));
-    }
-    let binary_diagnostics =
-        diagnose_binaries(Arc::new(ProcessCommandRunner), &binary_checks, Duration::from_secs(5))
-            .await;
-    for diagnostic in &binary_diagnostics {
-        match (&diagnostic.version, &diagnostic.error) {
-            (Some(version), None) => tracing::info!(
-                binary = %diagnostic.name,
-                executable = %diagnostic.executable.display(),
-                version = %version,
-                "external binary detected"
-            ),
-            (_, Some(error)) => tracing::error!(
-                binary = %diagnostic.name,
-                executable = %diagnostic.executable.display(),
-                error = %error,
-                "required external binary is unavailable"
-            ),
-            _ => tracing::error!(
-                binary = %diagnostic.name,
-                executable = %diagnostic.executable.display(),
-                "required external binary returned no version"
-            ),
-        }
-    }
-    let missing_binaries = binary_diagnostics
-        .iter()
-        .filter(|diagnostic| !diagnostic.available())
-        .map(|diagnostic| diagnostic.name.as_str())
-        .collect::<Vec<_>>();
-    if !missing_binaries.is_empty() {
-        return Err(format!(
-            "required worker binaries for enabled handlers are unavailable: {}",
-            missing_binaries.join(", ")
-        )
-        .into());
     }
     tracing::info!(
         capabilities = ?capabilities.iter().map(|job_type| job_type.as_str()).collect::<Vec<_>>(),
