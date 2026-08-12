@@ -386,10 +386,18 @@ fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> 
         ),
         PublisherRepositoryError::PostNotEditable { .. }
         | PublisherRepositoryError::PostCannotBeScheduled { .. }
+        | PublisherRepositoryError::PostNotScheduled(_)
         | PublisherRepositoryError::PostNotClaimable { .. }
+        | PublisherRepositoryError::StalePublicationJob { .. }
+        | PublisherRepositoryError::PublishJobMissing(_)
+        | PublisherRepositoryError::PublishJobRunning(_)
+        | PublisherRepositoryError::PublishJobUnavailable { .. }
+        | PublisherRepositoryError::PublishJobUpdateLost(_)
         | PublisherRepositoryError::PublishLeaseLost(_)
         | PublisherRepositoryError::PublishConflict(_)
-        | PublisherRepositoryError::InvalidPublishFailureState(_) => ApiError::conflict(
+        | PublisherRepositoryError::InvalidPublishFailureState(_)
+        | PublisherRepositoryError::CadenceSlotInPast
+        | PublisherRepositoryError::InvalidCadenceSlot => ApiError::conflict(
             "invalid_publication_state",
             "The post cannot be changed in its current state",
             headers,

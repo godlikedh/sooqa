@@ -102,6 +102,13 @@ are streamed or path-based; no file-sized byte buffer is used.
 Polling, downloads, and storage uploads use separate HTTP timeout policies so a
 long upload cannot inherit the long-poll or download-stall deadline.
 
+Publisher scheduling is controlled only by PostgreSQL `posts.cadence_slot_at`
+and `queue.jobs.run_at`. The admin/API queue commands use `posts.revision` as
+an optimistic fence and keep one fixed-dedupe `publish_post` job per queued
+post. If a job is already claimed, its post cannot be edited, moved, or
+cancelled. A stale bot card or HTTP caller receives a conflict and must reload
+the post; Telegram is never contacted while these mutations are committed.
+
 In the administrator's private bot chat, `/duplicates` lists up to three
 pending duplicate ingests at a time. Ready candidates link to their Telegram
 storage message; `Use this` reuses the existing media item, while `Save anyway`

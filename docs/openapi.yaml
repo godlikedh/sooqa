@@ -432,9 +432,114 @@ paths:
       parameters:
         - $ref: '#/components/parameters/PostId'
         - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
       responses:
         '202':
           description: Post queued for immediate publication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/posts/{id}/earlier:
+    post:
+      tags: [posts]
+      operationId: movePostEarlier
+      summary: Swap a queued post with its adjacent earlier post
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
+      responses:
+        '200':
+          description: Current post after the swap or boundary no-op.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/posts/{id}/later:
+    post:
+      tags: [posts]
+      operationId: movePostLater
+      summary: Swap a queued post with its adjacent later post
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
+      responses:
+        '200':
+          description: Current post after the swap or boundary no-op.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/posts/{id}/slot:
+    post:
+      tags: [posts]
+      operationId: setPostSlot
+      summary: Move a queued post to a valid cadence slot
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetSlotRequest' }
+      responses:
+        '200':
+          description: Current post after moving or swapping the slot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/posts/{id}/cancel:
+    post:
+      tags: [posts]
+      operationId: cancelPost
+      summary: Cancel a mutable post and its publication job
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
+      responses:
+        '200':
+          description: Cancelled post.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Post' }
@@ -734,9 +839,10 @@ components:
         parse_mode: { type: string, enum: [HTML, MarkdownV2], nullable: true }
         disable_notification: { type: boolean }
         expected_updated_at: { type: string, format: date-time, nullable: true }
+        expected_revision: { type: integer, format: int64, nullable: true, minimum: 0 }
     Post:
       type: object
-      required: [id, media_id, channel_id, disable_notification, status, scheduled_at, created_at, updated_at]
+      required: [id, media_id, channel_id, disable_notification, status, scheduled_at, revision, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         media_id: { type: string, format: uuid }
@@ -749,8 +855,22 @@ components:
         cadence_slot_at: { type: string, format: date-time, nullable: true }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        revision: { type: integer, format: int64, minimum: 0 }
     ScheduleRequest:
       type: object
       additionalProperties: false
       properties:
         publish_at: { type: string, format: date-time, nullable: true }
+        expected_revision: { type: integer, format: int64, nullable: true, minimum: 0 }
+    QueueMutationRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        expected_revision: { type: integer, format: int64, nullable: true, minimum: 0 }
+    SetSlotRequest:
+      type: object
+      required: [slot]
+      additionalProperties: false
+      properties:
+        slot: { type: string, format: date-time }
+        expected_revision: { type: integer, format: int64, nullable: true, minimum: 0 }

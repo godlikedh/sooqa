@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 const MAX_CHANNEL_NAME_LENGTH: usize = 128;
 const MAX_REQUEST_KEY_LENGTH: usize = 255;
+pub const MAX_CAPTION_LENGTH: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Channel {
@@ -136,8 +137,8 @@ impl PostState {
         matches!(self, Self::Sending | Self::Published | Self::Unknown)
     }
 
-    pub const fn is_editable(self) -> bool {
-        matches!(self, Self::Draft)
+    pub const fn is_queue_mutable(self) -> bool {
+        matches!(self, Self::Draft | Self::Queued | Self::Failed)
     }
 }
 
@@ -178,6 +179,7 @@ pub struct Post {
     pub error_message: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+    pub revision: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +197,7 @@ pub struct PostUpdate {
     pub parse_mode: Option<Option<String>>,
     pub disable_notification: Option<bool>,
     pub expected_updated_at: Option<OffsetDateTime>,
+    pub expected_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +205,7 @@ pub struct PostSchedule {
     pub post_id: Uuid,
     pub requested_at: OffsetDateTime,
     pub request_key: String,
+    pub expected_revision: Option<i64>,
 }
 
 impl PostSchedule {
@@ -211,8 +215,19 @@ impl PostSchedule {
         request_key: impl Into<String>,
     ) -> Result<Self, PublisherValidationError> {
         let request_key = normalize_request_key(request_key.into())?;
-        Ok(Self { post_id, requested_at, request_key })
+        Ok(Self { post_id, requested_at, request_key, expected_revision: None })
     }
+
+    pub const fn with_expected_revision(mut self, expected_revision: i64) -> Self {
+        self.expected_revision = Some(expected_revision);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum QueueDirection {
+    Earlier,
+    Later,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +250,8 @@ pub enum PublisherValidationError {
     RequestKeyTooLong { max: usize },
     #[error("caption must be at most {max} characters")]
     CaptionTooLong { max: usize },
+    #[error("caption contains a disallowed control character")]
+    CaptionControlCharacter,
     #[error("invalid parse mode")]
     InvalidParseMode,
 }
@@ -250,6 +267,19 @@ pub fn normalize_request_key(value: String) -> Result<String, PublisherValidatio
     Ok(value)
 }
 
+pub fn validate_caption(caption: &str) -> Result<(), PublisherValidationError> {
+    if caption.chars().count() > MAX_CAPTION_LENGTH {
+        return Err(PublisherValidationError::CaptionTooLong { max: MAX_CAPTION_LENGTH });
+    }
+    if caption
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(PublisherValidationError::CaptionControlCharacter);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,11 +293,11 @@ mod tests {
     }
 
     #[test]
-    fn only_drafts_are_editable() {
-        assert!(PostState::Draft.is_editable());
-        assert!(!PostState::Queued.is_editable());
-        assert!(!PostState::Sending.is_editable());
-        assert!(!PostState::Unknown.is_editable());
+    fn queue_mutable_states_are_editable() {
+        assert!(PostState::Draft.is_queue_mutable());
+        assert!(PostState::Queued.is_queue_mutable());
+        assert!(!PostState::Sending.is_queue_mutable());
+        assert!(!PostState::Unknown.is_queue_mutable());
     }
 
     #[test]

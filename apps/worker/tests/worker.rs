@@ -13,7 +13,7 @@ fn registry_is_typed_by_job_kind() {
 
 #[test]
 fn job_envelopes_have_typed_payloads_and_fenced_leases() {
-    let new_job = NewJob::publish_post(Uuid::new_v4());
+    let new_job = NewJob::publish_post(Uuid::new_v4(), 0);
     let now = OffsetDateTime::now_utc();
     let job = Job {
         id: Uuid::new_v4(),

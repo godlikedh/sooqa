@@ -2,8 +2,8 @@ use serde_json::json;
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
-use sooqa_persistence::Database;
-use sooqa_publisher::{NewChannel, NewPost, PostSchedule, PostState, PostUpdate};
+use sooqa_persistence::{Database, PublisherRepositoryError};
+use sooqa_publisher::{NewChannel, NewPost, PostSchedule, PostState, PostUpdate, QueueDirection};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -102,6 +102,7 @@ async fn post_schedule_uses_one_row_and_channel_cadence(pool: sqlx::PgPool) {
                 parse_mode: None,
                 disable_notification: Some(true),
                 expected_updated_at: None,
+                expected_revision: None,
             },
         )
         .await
@@ -164,4 +165,238 @@ async fn post_schedule_uses_one_row_and_channel_cadence(pool: sqlx::PgPool) {
             .await
             .unwrap();
     assert_eq!(queued_run_at, rescheduled.scheduled_at);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fences(
+    pool: sqlx::PgPool,
+) {
+    let database = Database::from_pool(pool);
+    let mut new_channel =
+        NewChannel::try_new(format!("test-{}", Uuid::new_v4()), -1000000000001).unwrap();
+    new_channel.window_start = time::Time::from_hms(0, 0, 0).unwrap();
+    new_channel.window_end = time::Time::from_hms(23, 59, 0).unwrap();
+    new_channel.interval_minutes = 1;
+    let channel = database.publisher().create_channel(new_channel).await.unwrap();
+    let media = [
+        stored_media(&database).await,
+        stored_media(&database).await,
+        stored_media(&database).await,
+    ];
+    let posts = [
+        database
+            .publisher()
+            .create_post_idempotent(
+                NewPost {
+                    media_id: media[0],
+                    channel_id: channel.id,
+                    caption: Some("first".to_owned()),
+                    parse_mode: None,
+                    disable_notification: false,
+                },
+                format!("post-{}", Uuid::new_v4()),
+                b"first",
+            )
+            .await
+            .unwrap()
+            .post,
+        database
+            .publisher()
+            .create_post_idempotent(
+                NewPost {
+                    media_id: media[1],
+                    channel_id: channel.id,
+                    caption: Some("second".to_owned()),
+                    parse_mode: None,
+                    disable_notification: false,
+                },
+                format!("post-{}", Uuid::new_v4()),
+                b"second",
+            )
+            .await
+            .unwrap()
+            .post,
+        database
+            .publisher()
+            .create_post_idempotent(
+                NewPost {
+                    media_id: media[2],
+                    channel_id: channel.id,
+                    caption: Some("third".to_owned()),
+                    parse_mode: None,
+                    disable_notification: false,
+                },
+                format!("post-{}", Uuid::new_v4()),
+                b"third",
+            )
+            .await
+            .unwrap()
+            .post,
+    ];
+    let requested_at = OffsetDateTime::now_utc();
+    let mut queued = Vec::new();
+    for (index, post) in posts.iter().enumerate() {
+        queued.push(
+            database
+                .publisher()
+                .enqueue_post(
+                    PostSchedule::try_new(
+                        post.id,
+                        requested_at,
+                        format!("schedule-{index}-{}", Uuid::new_v4()),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    assert!(queued.iter().all(|post| post.revision == 1));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'publish_post' AND dedupe_key LIKE 'post:%:publish:v1' AND state = 'queued'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        3
+    );
+
+    let first_slot = queued[0].cadence_slot_at.unwrap();
+    let second_slot = queued[1].cadence_slot_at.unwrap();
+    let third_slot = queued[2].cadence_slot_at.unwrap();
+    assert!(first_slot < second_slot && second_slot < third_slot);
+    let moved = database
+        .publisher()
+        .move_adjacent(queued[1].id, QueueDirection::Earlier, Some(queued[1].revision))
+        .await
+        .unwrap();
+    assert_eq!(moved.cadence_slot_at, Some(first_slot));
+    assert_eq!(
+        database.publisher().find_post(queued[0].id).await.unwrap().unwrap().cadence_slot_at,
+        Some(second_slot)
+    );
+    assert_eq!(moved.revision, 2);
+
+    let swapped = database
+        .publisher()
+        .set_slot(queued[2].id, second_slot, Some(queued[2].revision))
+        .await
+        .unwrap();
+    assert_eq!(swapped.cadence_slot_at, Some(second_slot));
+    assert_eq!(
+        database.publisher().find_post(queued[0].id).await.unwrap().unwrap().cadence_slot_at,
+        Some(third_slot)
+    );
+
+    let edited = database
+        .publisher()
+        .update_post(
+            queued[2].id,
+            PostUpdate {
+                caption: Some(Some("edited".to_owned())),
+                parse_mode: None,
+                disable_notification: None,
+                expected_updated_at: None,
+                expected_revision: Some(swapped.revision),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(edited.caption.as_deref(), Some("edited"));
+    assert_eq!(edited.revision, swapped.revision + 1);
+    let job_payload: serde_json::Value =
+        sqlx::query_scalar("SELECT payload FROM queue.jobs WHERE dedupe_key = $1")
+            .bind(format!("post:{}:publish:v1", queued[2].id))
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(job_payload["expected_revision"], edited.revision);
+
+    let now = database
+        .publisher()
+        .publish_now(queued[2].id, "publish-now-test".to_owned(), Some(edited.revision))
+        .await
+        .unwrap();
+    assert_eq!(now.cadence_slot_at, edited.cadence_slot_at);
+    assert!(now.scheduled_at <= OffsetDateTime::now_utc());
+    let replay = database
+        .publisher()
+        .publish_now(queued[2].id, "publish-now-test".to_owned(), Some(now.revision))
+        .await
+        .unwrap();
+    assert_eq!(replay.revision, now.revision);
+    assert_eq!(replay.cadence_slot_at, now.cadence_slot_at);
+
+    let cancelled =
+        database.publisher().cancel_post(queued[1].id, Some(moved.revision)).await.unwrap();
+    assert_eq!(cancelled.state, PostState::Cancelled);
+    assert!(cancelled.cadence_slot_at.is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE dedupe_key = $1",)
+            .bind(format!("post:{}:publish:v1", queued[1].id))
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "cancelled"
+    );
+
+    let stale = database
+        .publisher()
+        .update_post(
+            queued[2].id,
+            PostUpdate {
+                caption: Some(None),
+                parse_mode: None,
+                disable_notification: None,
+                expected_updated_at: None,
+                expected_revision: Some(edited.revision),
+            },
+        )
+        .await;
+    assert!(matches!(stale, Err(PublisherRepositoryError::OptimisticConflict(_))));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn queued_post_cannot_be_rescheduled_after_publish_job_is_claimed(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let channel = database
+        .publisher()
+        .create_channel(
+            NewChannel::try_new(format!("test-{}", Uuid::new_v4()), -1000000000002).unwrap(),
+        )
+        .await
+        .unwrap();
+    let media_id = stored_media(&database).await;
+    let post = database
+        .publisher()
+        .create_post_idempotent(
+            NewPost {
+                media_id,
+                channel_id: channel.id,
+                caption: None,
+                parse_mode: None,
+                disable_notification: false,
+            },
+            format!("post-{}", Uuid::new_v4()),
+            b"claim",
+        )
+        .await
+        .unwrap()
+        .post;
+    let queued = database
+        .publisher()
+        .enqueue_post(
+            PostSchedule::try_new(post.id, OffsetDateTime::now_utc(), "claim-schedule").unwrap(),
+        )
+        .await
+        .unwrap();
+    let claimed = database.publisher().claim_publish(queued.id, queued.revision).await.unwrap();
+    assert_eq!(claimed.post.state, PostState::Sending);
+    assert!(matches!(
+        database.publisher().cancel_post(queued.id, Some(claimed.post.revision)).await,
+        Err(PublisherRepositoryError::PostCannotBeScheduled { state: PostState::Sending, .. })
+    ));
 }
