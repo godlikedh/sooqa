@@ -54,3 +54,7 @@ storage readiness, post send state, and queue lease invariants.
 No transaction remains open across a network call or subprocess. Retryable
 external effects use local keys/generations; an ambiguous Telegram upload or
 post send is retained as `storage_unknown` or `unknown` instead of guessed away.
+Publisher sends reuse only the persisted Telegram storage chat/message or its
+stored file ID; the publication worker has no local-media upload path. It sends
+the public caption explicitly, including an empty caption when absent, so
+private storage descriptions and tags are not copied into the target channel.

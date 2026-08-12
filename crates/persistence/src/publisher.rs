@@ -568,6 +568,59 @@ impl PublisherRepository {
         .ok_or(PublisherRepositoryError::PublishLeaseLost(id))?;
         row.into_post()
     }
+
+    pub async fn retry_publish(
+        &self,
+        id: Uuid,
+        generation: i32,
+        token: Uuid,
+        error_class: &str,
+        error_message: &str,
+    ) -> Result<Post, PublisherRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let channel_id = post_channel_id(&mut transaction, id).await?;
+        lock_channel(&mut transaction, channel_id).await?;
+        let current = lock_post(&mut transaction, id).await?;
+        if current.post_state()? != PostState::Sending
+            || current.send_generation != generation
+            || current.send_token != Some(token)
+        {
+            return Err(PublisherRepositoryError::PublishLeaseLost(id));
+        }
+        let revision = next_revision(current.revision)?;
+        let row = sqlx::query_as::<_, PostRow>(
+            "UPDATE posts SET state = 'queued', send_token = NULL, send_started_at = NULL, error_class = $2, error_message = $3, revision = $4, updated_at = now() WHERE id = $1 AND state = 'sending' AND send_generation = $5 AND send_token = $6 RETURNING *",
+        )
+        .bind(id)
+        .bind(error_class)
+        .bind(error_message)
+        .bind(revision)
+        .bind(generation)
+        .bind(token)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let job = lock_publish_job(&mut transaction, id)
+            .await?
+            .ok_or(PublisherRepositoryError::PublishJobMissing(id))?;
+        if job.state != "running" {
+            return Err(PublisherRepositoryError::PublishJobUnavailable {
+                post_id: id,
+                state: job.state,
+            });
+        }
+        let updated = sqlx::query(
+            "UPDATE queue.jobs SET payload = $2, updated_at = now() WHERE id = $1 AND state = 'running'",
+        )
+        .bind(job.id)
+        .bind(serde_json::json!({ "post_id": id, "expected_revision": row.revision }))
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(PublisherRepositoryError::PublishJobUpdateLost(id));
+        }
+        transaction.commit().await?;
+        row.into_post()
+    }
 }
 
 async fn post_channel_id(

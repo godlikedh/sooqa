@@ -29,8 +29,10 @@ use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
+mod publication;
 mod storage;
 
+pub use publication::{TelegramPublicationApi, TelegramPublicationRequest};
 pub use storage::{
     StorageUploadApiError, StorageUploadError, StorageUploadInput, StorageUploadOutcome,
     StorageUploadProvider, StorageUploadRequest, StorageUploadResult, TELEGRAM_STORAGE_PROVIDER,
@@ -289,6 +291,12 @@ pub enum TelegramApiError {
     Io(#[source] io::Error),
     #[error("Telegram Bot API download limit is {limit} bytes; file is {size} bytes")]
     DownloadLimit { size: u64, limit: u64 },
+    #[error("Telegram storage receipt has no file reference for {media_kind:?}")]
+    MissingFileReference { media_kind: MediaKind },
+    #[error("Telegram publication parse mode is invalid")]
+    InvalidParseMode,
+    #[error("Telegram message ID is outside the supported range: {0}")]
+    InvalidMessageId(i64),
 }
 
 #[async_trait]
@@ -1405,6 +1413,9 @@ impl TelegramApi for TeloxideApi {
             | TelegramApiError::Api(teloxide::RequestError::RetryAfter(_))
             | TelegramApiError::Download(teloxide::DownloadError::Network(_)) => true,
             TelegramApiError::DownloadLimit { .. }
+            | TelegramApiError::MissingFileReference { .. }
+            | TelegramApiError::InvalidParseMode
+            | TelegramApiError::InvalidMessageId(_)
             | TelegramApiError::Api(_)
             | TelegramApiError::Download(_)
             | TelegramApiError::Io(_) => false,

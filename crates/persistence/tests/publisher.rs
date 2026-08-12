@@ -1,4 +1,7 @@
+use std::time::Duration as StdDuration;
+
 use serde_json::json;
+use sooqa_jobs::JobType;
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
@@ -396,7 +399,88 @@ async fn queued_post_cannot_be_rescheduled_after_publish_job_is_claimed(pool: sq
     let claimed = database.publisher().claim_publish(queued.id, queued.revision).await.unwrap();
     assert_eq!(claimed.post.state, PostState::Sending);
     assert!(matches!(
+        database
+            .publisher()
+            .complete_publish(queued.id, claimed.post.send_generation, Uuid::new_v4(), 44,)
+            .await,
+        Err(PublisherRepositoryError::PublishLeaseLost(_))
+    ));
+    assert_eq!(
+        database.publisher().find_post(queued.id).await.unwrap().unwrap().state,
+        PostState::Sending
+    );
+    assert!(matches!(
         database.publisher().cancel_post(queued.id, Some(claimed.post.revision)).await,
         Err(PublisherRepositoryError::PostCannotBeScheduled { state: PostState::Sending, .. })
     ));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn safe_publication_retry_requeues_post_and_updates_job_revision(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let mut new_channel =
+        NewChannel::try_new(format!("test-{}", Uuid::new_v4()), -1000000000003).unwrap();
+    new_channel.window_start = time::Time::from_hms(0, 0, 0).unwrap();
+    new_channel.window_end = time::Time::from_hms(23, 59, 0).unwrap();
+    new_channel.interval_minutes = 1;
+    let channel = database.publisher().create_channel(new_channel).await.unwrap();
+    let media_id = stored_media(&database).await;
+    let post = database
+        .publisher()
+        .create_post_idempotent(
+            NewPost {
+                media_id,
+                channel_id: channel.id,
+                caption: Some("retry me".to_owned()),
+                parse_mode: None,
+                disable_notification: false,
+            },
+            format!("post-{}", Uuid::new_v4()),
+            b"safe-retry",
+        )
+        .await
+        .unwrap()
+        .post;
+    let queued = database
+        .publisher()
+        .enqueue_post(
+            PostSchedule::try_new(post.id, OffsetDateTime::now_utc(), "retry-schedule").unwrap(),
+        )
+        .await
+        .unwrap();
+    let due = database
+        .publisher()
+        .publish_now(queued.id, "retry-now".to_owned(), Some(queued.revision))
+        .await
+        .unwrap();
+    let _job = database
+        .jobs()
+        .claim_next("publisher-test", StdDuration::from_secs(60), &[JobType::PublishPost])
+        .await
+        .unwrap()
+        .expect("publish job should be claimed");
+    let claim = database.publisher().claim_publish(due.id, due.revision).await.unwrap();
+    let token = claim.post.send_token.unwrap();
+    let retried = database
+        .publisher()
+        .retry_publish(
+            queued.id,
+            claim.post.send_generation,
+            token,
+            "telegram_retryable",
+            "flood control",
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.state, PostState::Queued);
+    assert_eq!(retried.revision, claim.post.revision + 1);
+    assert!(retried.send_token.is_none());
+    let payload: serde_json::Value =
+        sqlx::query_scalar("SELECT payload FROM queue.jobs WHERE dedupe_key = $1")
+            .bind(format!("post:{}:publish:v1", queued.id))
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(payload["expected_revision"], retried.revision);
 }

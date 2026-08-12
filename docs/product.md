@@ -112,7 +112,13 @@ references the `posts` row, and one post row becomes the durable publication
 record after success. Telegram calls, HTTP downloads, ffmpeg, and ffprobe run
 outside database transactions. External effects use state plus generation or
 fencing tokens, and ambiguous effects are retained for explicit reconciliation
-instead of being blindly retried.
+instead of being blindly retried. Publication copies the ready Telegram storage
+message into the target channel and falls back to the stored media-kind-specific
+file ID only for an explicitly safe copy-unavailable response; it never reads
+the canonical local file. Missing public captions are sent as an explicit empty
+caption so storage metadata does not leak. Caption/entity rejection becomes a
+failed, editable post, while flood-control responses known to have had no
+effect requeue through the bounded job retry policy.
 
 ## Idempotency ownership
 
