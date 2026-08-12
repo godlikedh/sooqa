@@ -26,6 +26,7 @@ pub const DEFAULT_COMMAND_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 pub struct ExternalCommand {
     program: PathBuf,
     args: Vec<OsString>,
+    current_dir: Option<PathBuf>,
     clear_environment: bool,
     environment: Vec<(OsString, OsString)>,
     timeout: Duration,
@@ -37,6 +38,7 @@ impl ExternalCommand {
         Self {
             program: program.into(),
             args: Vec::new(),
+            current_dir: None,
             clear_environment: false,
             environment: Vec::new(),
             timeout: DEFAULT_COMMAND_TIMEOUT,
@@ -46,6 +48,11 @@ impl ExternalCommand {
 
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());
+        self
+    }
+
+    pub fn current_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.current_dir = Some(path.into());
         self
     }
 
@@ -75,6 +82,10 @@ impl ExternalCommand {
 
     pub fn args(&self) -> &[OsString] {
         &self.args
+    }
+
+    pub fn current_directory(&self) -> Option<&Path> {
+        self.current_dir.as_deref()
     }
 
     pub fn clears_environment(&self) -> bool {
@@ -191,6 +202,9 @@ async fn run_process_command(
         for (key, value) in command.environment() {
             process.env(key, value);
         }
+    }
+    if let Some(current_dir) = command.current_directory() {
+        process.current_dir(current_dir);
     }
     #[cfg(unix)]
     process.process_group(0);
@@ -519,10 +533,14 @@ mod tests {
 
     #[test]
     fn command_keeps_program_and_arguments_separate() {
-        let command =
-            ExternalCommand::new("ffprobe").arg("-v").arg("error").arg("file with spaces.mp4");
+        let command = ExternalCommand::new("ffprobe")
+            .current_dir("/var/lib/sooqa/work")
+            .arg("-v")
+            .arg("error")
+            .arg("file with spaces.mp4");
 
         assert_eq!(command.program(), Path::new("ffprobe"));
+        assert_eq!(command.current_directory(), Some(Path::new("/var/lib/sooqa/work")));
         assert_eq!(
             command.args(),
             [OsString::from("-v"), OsString::from("error"), OsString::from("file with spaces.mp4")]

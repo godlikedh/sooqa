@@ -85,7 +85,13 @@ current Dockerfile pins yt-dlp `2026.06.09` and Deno `2.8.1` with architecture-
 specific SHA-256 checksums. When the allowlist is enabled, worker startup runs
 an offline local-info fixture through yt-dlp with the configured EJS/Deno
 flags, checks that the bundled EJS component is discoverable, and executes a
-small Deno probe. To update either dependency, change its version, asset names
+small Deno probe. Each yt-dlp download runs inside a unique attempt directory:
+its relative final output, temporary fragments, split streams, merge
+intermediates, and disabled-cache state are confined there. The worker monitors
+the aggregate attempt directory with a three-times-final-size budget to allow
+video/audio merging, while the final published file remains bounded by
+`SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES`; a successful attempt must contain
+exactly one regular media file. To update either dependency, change its version, asset names
 if needed, and every matching checksum together; build the home image and
 verify the startup diagnostics before doing an owner smoke test. CI uses fake
 executables and does not contact YouTube.

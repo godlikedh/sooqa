@@ -10,7 +10,7 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
-use crate::publication::{PublishOutcome, TempArtifact, publish_or_reuse};
+use crate::publication::{PublishOutcome, TempDirectory, publish_or_reuse};
 use crate::{
     CommandError, DEFAULT_COMMAND_PATH, DEFAULT_MAX_OUTPUT_BYTES, DownloadError, DownloadLimits,
     DownloadedSource, ExternalCommand, ExternalCommandOutput, ExternalCommandRunner,
@@ -19,6 +19,7 @@ use crate::{
 
 const DEFAULT_DENO_PATH: &str = "deno";
 const MIN_SUPPORTED_DENO_VERSION: (u32, u32, u32) = (2, 3, 0);
+const YTDLP_ATTEMPT_MAX_BYTES_MULTIPLIER: u64 = 3;
 pub const DEFAULT_YTDLP_METADATA_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const RUNTIME_FIXTURE: &[u8] = br#"{
   "id": "sooqa-runtime-fixture",
@@ -161,12 +162,12 @@ impl YtDlpDownloader {
         Ok(output)
     }
 
-    async fn run_file(
+    async fn run_sequence(
         &self,
         args: Vec<String>,
         timeout: Duration,
         source_url: &str,
-        output_file: &Path,
+        output_directory: &Path,
         max_bytes: u64,
     ) -> Result<ExternalCommandOutput, DownloadError> {
         if timeout.is_zero() {
@@ -182,11 +183,12 @@ impl YtDlpDownloader {
             })
             .clear_environment()
             .env("PATH", DEFAULT_COMMAND_PATH)
+            .current_dir(output_directory)
             .timeout(timeout)
             .max_output_bytes(self.config.max_output_bytes);
         let output = self
             .runner
-            .run_file(command, output_file, max_bytes)
+            .run_sequence(command, output_directory, max_bytes)
             .await
             .map_err(|error| map_command_error(error, "source_too_large"))?;
         if output.stdout_truncated || output.stderr_truncated {
@@ -383,13 +385,20 @@ impl SourceDownloader for YtDlpDownloader {
     ) -> Result<DownloadedSource, DownloadError> {
         validate_limits(limits, limits.timeout)?;
         let source_url = validate_source_url(&inspection.source_url)?;
-        let temporary = destination.with_file_name(format!(".sooqa-ytdlp-{}.tmp", Uuid::new_v4()));
-        let mut temporary = TempArtifact::reserve(temporary).await.map_err(|source| {
+        let attempt_path = destination.with_file_name(format!(".sooqa-ytdlp-{}", Uuid::new_v4()));
+        let attempt = TempDirectory::reserve(attempt_path).await.map_err(|source| {
             DownloadError::terminal(
                 "destination_io",
-                format!("could not reserve yt-dlp temporary output: {source}"),
+                format!("could not reserve yt-dlp attempt directory: {source}"),
             )
         })?;
+        let attempt_max_bytes =
+            limits.max_bytes.checked_mul(YTDLP_ATTEMPT_MAX_BYTES_MULTIPLIER).ok_or_else(|| {
+                DownloadError::terminal(
+                    "invalid_download_limits",
+                    "yt-dlp aggregate attempt byte limit overflowed",
+                )
+            })?;
 
         let mut args = vec![
             "--no-playlist".to_owned(),
@@ -397,38 +406,40 @@ impl SourceDownloader for YtDlpDownloader {
             "--no-progress".to_owned(),
             "--no-part".to_owned(),
             "--force-overwrites".to_owned(),
+            "--no-cache-dir".to_owned(),
         ];
         args.extend(self.security_args());
         args.extend([
+            "--paths".to_owned(),
+            "home:.".to_owned(),
+            "--paths".to_owned(),
+            "temp:.".to_owned(),
             "--max-filesize".to_owned(),
             limits.max_bytes.to_string(),
             "--format".to_owned(),
             self.config.format_selection.clone(),
             "--output".to_owned(),
-            temporary.path().to_string_lossy().into_owned(),
+            "final.%(ext)s".to_owned(),
             "--".to_owned(),
             source_url.clone(),
         ]);
         let result = self
-            .run_file(args, limits.timeout, &source_url, temporary.path(), limits.max_bytes)
+            .run_sequence(args, limits.timeout, &source_url, attempt.path(), attempt_max_bytes)
             .await;
         result?;
 
-        let metadata = match tokio::fs::metadata(temporary.path()).await {
-            Ok(metadata) => metadata,
-            Err(source) => {
-                return Err(DownloadError::terminal(
-                    "destination_io",
-                    format!("yt-dlp did not produce the requested destination: {source}"),
-                ));
-            }
-        };
-        if !metadata.is_file() {
-            return Err(DownloadError::terminal(
+        let final_path = single_regular_file(attempt.path()).await.map_err(|source| {
+            DownloadError::terminal(
                 "destination_io",
-                "yt-dlp destination is not a regular file",
-            ));
-        }
+                format!("yt-dlp attempt did not produce exactly one final media file: {source}"),
+            )
+        })?;
+        let metadata = tokio::fs::metadata(&final_path).await.map_err(|source| {
+            DownloadError::terminal(
+                "destination_io",
+                format!("could not inspect yt-dlp final media file: {source}"),
+            )
+        })?;
         if metadata.len() > limits.max_bytes {
             return Err(DownloadError::terminal(
                 "source_too_large",
@@ -436,7 +447,7 @@ impl SourceDownloader for YtDlpDownloader {
             ));
         }
 
-        let published = publish_or_reuse(temporary.path(), destination).await.map_err(|error| {
+        let published = publish_or_reuse(&final_path, destination).await.map_err(|error| {
             DownloadError::terminal(
                 "destination_io",
                 format!("could not publish yt-dlp output: {error}"),
@@ -454,13 +465,39 @@ impl SourceDownloader for YtDlpDownloader {
                 })?
                 .len(),
         };
-        temporary.remove().await;
 
         Ok(DownloadedSource {
             path: destination.to_owned(),
             bytes,
             mime_type: inspection.mime_type.clone(),
         })
+    }
+}
+
+async fn single_regular_file(directory: &Path) -> Result<PathBuf, std::io::Error> {
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let metadata = tokio::fs::symlink_metadata(&path).await?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("yt-dlp attempt contains a non-regular entry: {}", path.display()),
+            ));
+        }
+        files.push(path);
+    }
+    match files.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "yt-dlp attempt directory is empty",
+        )),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "yt-dlp attempt contains multiple final media files",
+        )),
     }
 }
 
@@ -692,6 +729,7 @@ mod tests {
     use std::{
         os::unix::fs::PermissionsExt,
         path::PathBuf,
+        process::{Command, Stdio},
         sync::{Arc, Mutex},
     };
 
@@ -762,7 +800,7 @@ mod tests {
         let executable = root.join("fake-yt-dlp.sh");
         let args_log = root.join("args.log");
         let script = format!(
-            "#!/bin/sh\nset -eu\nif [ -n \"${{DATABASE_URL-}}\" ] || [ -n \"${{SOOQA_API_TOKEN-}}\" ] || [ -n \"${{SOOQA_TELEGRAM_BOT_TOKEN-}}\" ]; then exit 91; fi\nlog={args_log:?}\n: > \"$log\"\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$log\"; done\nif [ \"$1\" = \"--dump-single-json\" ]; then printf '%s\\n' '{{\"id\":\"abc\",\"title\":\"Example\",\"webpage_url\":\"https://example.test/watch?v=abc\",\"extractor\":\"generic\",\"duration\":3.5,\"filesize\":17,\"width\":1280,\"height\":720,\"ext\":\"mp4\",\"vcodec\":\"h264\",\"acodec\":\"aac\",\"format_id\":\"best\"}}'; else output=; previous=; for arg in \"$@\"; do if [ \"$previous\" = \"--output\" ]; then output=\"$arg\"; fi; previous=\"$arg\"; done; printf 'fake-media' > \"$output\"; fi\n",
+            "#!/bin/sh\nset -eu\nif [ -n \"${{DATABASE_URL-}}\" ] || [ -n \"${{SOOQA_API_TOKEN-}}\" ] || [ -n \"${{SOOQA_TELEGRAM_BOT_TOKEN-}}\" ]; then exit 91; fi\nlog={args_log:?}\n: > \"$log\"\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$log\"; done\nif [ \"$1\" = \"--dump-single-json\" ]; then printf '%s\\n' '{{\"id\":\"abc\",\"title\":\"Example\",\"webpage_url\":\"https://example.test/watch?v=abc\",\"extractor\":\"generic\",\"duration\":3.5,\"filesize\":17,\"width\":1280,\"height\":720,\"ext\":\"mp4\",\"vcodec\":\"h264\",\"acodec\":\"aac\",\"format_id\":\"best\"}}'; else printf 'fake-media' > final.mp4; fi\n",
             args_log = args_log.display()
         );
         tokio::fs::write(&executable, script).await.expect("fake executable should be written");
@@ -830,18 +868,15 @@ mod tests {
             .expect("download arguments should be logged");
         assert!(download_args.lines().any(|line| line == "--output"));
         assert!(download_args.lines().any(|line| line == "--max-filesize"));
+        assert!(download_args.lines().any(|line| line == "--paths"));
+        assert!(download_args.lines().any(|line| line == "home:."));
+        assert!(download_args.lines().any(|line| line == "temp:."));
         let output_argument = download_args
             .lines()
             .skip_while(|line| *line != "--output")
             .nth(1)
             .expect("download output argument should be logged");
-        assert_ne!(output_argument, destination.display().to_string());
-        assert!(
-            Path::new(output_argument)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".sooqa-ytdlp-") && name.ends_with(".tmp"))
-        );
+        assert_eq!(output_argument, "final.%(ext)s");
         assert!(
             download_args
                 .lines()
@@ -862,24 +897,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_enforces_the_output_limit_while_yt_dlp_is_running() {
+    async fn download_enforces_the_aggregate_attempt_limit_while_yt_dlp_is_running() {
         let root =
             std::env::temp_dir().join(format!("sooqa-ytdlp-size-limit-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&root).await.expect("test root should be created");
         let executable = root.join("fake-yt-dlp-size-limit.sh");
+        let pid_file = root.join("yt-dlp.pid");
         let script = r#"#!/bin/sh
 set -eu
-output=
-previous=
-for arg in "$@"; do
-    if [ "$previous" = "--output" ]; then output="$arg"; fi
-    previous="$arg"
-done
+printf '%s' "$$" > "PID_FILE"
+printf 'fake-media' > final.mp4
 while :; do
-    printf '0123456789' >> "$output"
+    printf '0123456789' >> intermediate.part
     sleep 0.01
 done
 "#;
+        let script = script.replace("PID_FILE", &pid_file.display().to_string());
         tokio::fs::write(&executable, script).await.expect("fake executable should be written");
         let mut permissions = tokio::fs::metadata(&executable)
             .await
@@ -909,9 +942,24 @@ done
         let error = downloader
             .download(&inspection, &destination, &limits)
             .await
-            .expect_err("yt-dlp output should be stopped at the byte limit");
+            .expect_err("yt-dlp attempt should be stopped at the aggregate byte limit");
         assert_eq!(error.class(), "source_too_large");
         assert!(!destination.exists());
+        let pid = tokio::fs::read_to_string(&pid_file)
+            .await
+            .expect("fake executable should have recorded its PID");
+        let status = Command::new("/bin/kill")
+            .arg("-0")
+            .arg(pid.trim())
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill probe should run");
+        assert!(!status.success(), "oversized yt-dlp process should be terminated");
+        let mut entries = tokio::fs::read_dir(&root).await.expect("test root should be readable");
+        while let Some(entry) = entries.next_entry().await.expect("directory should be readable") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.starts_with(".sooqa-ytdlp-"), "attempt directory was left behind");
+        }
         tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
     }
 
@@ -923,13 +971,8 @@ done
         let executable = root.join("fake-yt-dlp-failure.sh");
         let script = r#"#!/bin/sh
 set -eu
-output=
-previous=
-for arg in "$@"; do
-    if [ "$previous" = "--output" ]; then output="$arg"; fi
-    previous="$arg"
-done
-printf 'partial-media' > "$output"
+printf 'partial-media' > final.mp4
+printf 'leftover-sidecar' > intermediate.part
 exit 1
 "#;
         tokio::fs::write(&executable, script).await.expect("fake executable should be written");
@@ -965,7 +1008,7 @@ exit 1
         let mut entries = tokio::fs::read_dir(&root).await.expect("test root should be readable");
         while let Some(entry) = entries.next_entry().await.expect("directory should be readable") {
             let name = entry.file_name().to_string_lossy().into_owned();
-            assert!(!name.starts_with(".sooqa-ytdlp-"), "temporary output was left behind");
+            assert!(!name.starts_with(".sooqa-ytdlp-"), "attempt directory was left behind");
         }
         tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
     }
@@ -981,10 +1024,22 @@ exit 1
         ) -> Result<ExternalCommandOutput, CommandError> {
             std::future::pending().await
         }
+
+        async fn run_sequence(
+            &self,
+            _command: ExternalCommand,
+            output_directory: &Path,
+            _max_bytes: u64,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            tokio::fs::write(output_directory.join("leftover-sidecar.part"), b"sidecar")
+                .await
+                .expect("pending runner should write its sidecar");
+            std::future::pending().await
+        }
     }
 
     #[tokio::test]
-    async fn dropped_download_removes_the_yt_dlp_temporary_artifact() {
+    async fn dropped_download_removes_the_yt_dlp_attempt_directory_and_sidecars() {
         let root =
             std::env::temp_dir().join(format!("sooqa-ytdlp-cancel-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&root).await.expect("test root should be created");
@@ -1015,7 +1070,7 @@ exit 1
         let mut entries = tokio::fs::read_dir(&root).await.expect("test root should be readable");
         while let Some(entry) = entries.next_entry().await.expect("directory should be readable") {
             let name = entry.file_name().to_string_lossy().into_owned();
-            assert!(!name.starts_with(".sooqa-ytdlp-"), "yt-dlp temporary output was left behind");
+            assert!(!name.starts_with(".sooqa-ytdlp-"), "yt-dlp attempt directory was left behind");
         }
         tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
     }
