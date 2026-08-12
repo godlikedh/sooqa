@@ -303,6 +303,16 @@ sequenceDiagram
     end
 ```
 
+The configured administrator can inspect and mutate the same durable queue in
+the private Telegram DM with `/queue`. The Telegram adapter owns only bounded
+message-ID and ForceReply state; it does not create a UI table or issue SQL.
+Count callbacks load at most 125 posts, render one text card per post, and
+link directly to the existing storage message. Every mutating callback carries
+the post revision and delegates to `PublisherService`, so stale cards produce
+`Queue changed; run /queue again.` without changing PostgreSQL state. A
+partial render is deleted best-effort and reported, while a second `/queue`
+cleans the previous view before replacing it.
+
 ## Security and filesystem rules
 
 The API compares the configured bearer secret; no token administration data is

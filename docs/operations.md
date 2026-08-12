@@ -119,6 +119,15 @@ and are not automatically resent. Inspect `posts.error_class` and
 `posts.error_message` before manual reconciliation; a `sending` post with a
 lost worker lease must be investigated before any new send is authorized.
 
+The private administrator DM also provides `/queue`. It uses bounded count
+choices and up to 125 text-only cards ordered by cadence slot and stable post
+ID. Cards expose the storage link and call the durable Publisher mutations for
+moving, slot selection, public-text editing/clearing, immediate publication,
+and removal. Buttons include the current `posts.revision`; a stale button is
+rejected with `Queue changed; run /queue again.` The bot keeps only short-lived
+prompt state and message IDs in memory, deletes old views best-effort, and
+does not add a UI-session table or copy media while rendering.
+
 In the administrator's private bot chat, `/duplicates` lists up to three
 pending duplicate ingests at a time. Ready candidates link to their Telegram
 storage message; `Use this` reuses the existing media item, while `Save anyway`

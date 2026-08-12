@@ -8,8 +8,11 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
 sooqa-library = { path = "../library" }
 sooqa-media = { path = "../media" }
+sooqa-publisher = { path = "../publisher" }
 teloxide.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
