@@ -257,6 +257,7 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPo
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let media_id = Uuid::now_v7();
@@ -355,6 +356,7 @@ async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: s
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn duplicate_acceptance_joins_pending_storage_without_replacing_upload(
     pool: sqlx::PgPool,
 ) {
@@ -450,6 +452,7 @@ async fn duplicate_acceptance_joins_pending_storage_without_replacing_upload(
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn duplicate_accept_and_force_save_have_one_row_locked_winner(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let media_id = Uuid::now_v7();
@@ -545,6 +548,7 @@ fn duplicate_evidence(media_id: Uuid) -> serde_json::Value {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn stale_video_identity_finalizer_cannot_mutate_after_lease_recovery(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let ingest = database
