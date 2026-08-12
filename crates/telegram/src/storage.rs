@@ -464,6 +464,7 @@ impl TelegramStorageApi for TeloxideApi {
                 .upload_bot()
                 .send_video(chat_id, InputFile::file(request.local_work_path))
                 .caption(request.caption)
+                .supports_streaming(true)
                 .send()
                 .await
                 .map_err(StorageUploadApiError::Api)?,
