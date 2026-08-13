@@ -1313,6 +1313,17 @@ where
         };
         let post = match publisher.get_queue_post(prompt.post_id).await {
             Ok(post) => post,
+            Err(error) if P::is_conflict(&error) => {
+                self.clear_queue_view(chat_id).await;
+                self.send_and_complete(
+                    claim,
+                    chat_id,
+                    "Queue changed; run /queue again.",
+                    RateLimitKey { user_id: Some(chat_id), chat_id },
+                )
+                .await?;
+                return Ok(HandleOutcome::CallbackHandled);
+            }
             Err(error) => {
                 self.release(claim).await?;
                 return Err(TelegramError::Publisher(Box::new(error)));
@@ -3011,6 +3022,8 @@ mod tests {
     enum MockPublisherError {
         #[error("mock publisher failure")]
         Failure,
+        #[error("mock publisher post is missing")]
+        Missing,
         #[error("mock publisher conflict")]
         Conflict,
     }
@@ -3020,6 +3033,7 @@ mod tests {
         posts: Arc<Mutex<Vec<QueuePost>>>,
         conflict: Arc<Mutex<bool>>,
         captions: Arc<Mutex<Vec<CaptionMutation>>>,
+        slots: Arc<Mutex<Vec<(Uuid, OffsetDateTime, i64)>>>,
     }
 
     #[async_trait]
@@ -3048,7 +3062,7 @@ mod tests {
                 .iter()
                 .find(|post| post.id == post_id)
                 .cloned()
-                .ok_or(MockPublisherError::Failure)
+                .ok_or(MockPublisherError::Missing)
         }
 
         async fn move_queue_post(
@@ -3066,6 +3080,11 @@ mod tests {
             slot: OffsetDateTime,
             expected_revision: i64,
         ) -> Result<QueuePost, Self::Error> {
+            self.slots.lock().expect("mock mutex should not be poisoned").push((
+                post_id,
+                slot,
+                expected_revision,
+            ));
             self.mutate(post_id, expected_revision, |post| {
                 post.cadence_slot_at = Some(slot);
                 post.clone()
@@ -3106,7 +3125,7 @@ mod tests {
         }
 
         fn is_conflict(error: &Self::Error) -> bool {
-            matches!(error, MockPublisherError::Conflict)
+            matches!(error, MockPublisherError::Conflict | MockPublisherError::Missing)
         }
     }
 
@@ -3494,6 +3513,7 @@ mod tests {
             service.handle_message(queue_command).await.unwrap(),
             HandleOutcome::Responded(Command::Queue)
         );
+        assert!(api.deleted_messages.lock().unwrap().contains(&(123, 1)));
         assert!(publisher.captions.lock().unwrap().is_empty());
 
         service
@@ -3570,6 +3590,78 @@ mod tests {
                     CallbackData::QueueEditCaption {
                         post_id: post.id,
                         expected_revision: post.revision - 1,
+                    },
+                ))
+                .await
+                .unwrap(),
+            HandleOutcome::CallbackHandled
+        );
+        assert!(api.force_replies.lock().unwrap().is_empty());
+        assert!(
+            api.messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, text)| { text == "Queue changed; run /queue again." })
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_queue_slot_prompt_is_rejected_before_mutating_the_post() {
+        let api = MockApi::default();
+        let publisher = MockPublisherService::default();
+        let post = queue_post(35, 8);
+        publisher.posts.lock().unwrap().push(post.clone());
+        let service = TelegramService::with_ingest(
+            api.clone(),
+            MockStore::default(),
+            [123],
+            MockIngestService::default(),
+        )
+        .with_publisher(publisher.clone());
+
+        assert_eq!(
+            service
+                .handle_callback(callback(
+                    139,
+                    CallbackData::QueueSetSlot {
+                        post_id: post.id,
+                        expected_revision: post.revision - 1,
+                    },
+                ))
+                .await
+                .unwrap(),
+            HandleOutcome::CallbackHandled
+        );
+        assert!(api.force_replies.lock().unwrap().is_empty());
+        assert!(publisher.slots.lock().unwrap().is_empty());
+        assert!(
+            api.messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, text)| { text == "Queue changed; run /queue again." })
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_queue_prompt_post_returns_stable_conflict_response() {
+        let api = MockApi::default();
+        let service = TelegramService::with_ingest(
+            api.clone(),
+            MockStore::default(),
+            [123],
+            MockIngestService::default(),
+        )
+        .with_publisher(MockPublisherService::default());
+
+        assert_eq!(
+            service
+                .handle_callback(callback(
+                    140,
+                    CallbackData::QueueEditCaption {
+                        post_id: Uuid::from_u128(36),
+                        expected_revision: 0,
                     },
                 ))
                 .await

@@ -270,7 +270,8 @@ impl PublisherService for DatabasePublisherService {
     fn is_conflict(error: &Self::Error) -> bool {
         matches!(
             error,
-            sooqa_persistence::PublisherRepositoryError::OptimisticConflict(_)
+            sooqa_persistence::PublisherRepositoryError::PostMissing(_)
+                | sooqa_persistence::PublisherRepositoryError::OptimisticConflict(_)
                 | sooqa_persistence::PublisherRepositoryError::PostNotEditable { .. }
                 | sooqa_persistence::PublisherRepositoryError::PostCannotBeScheduled { .. }
                 | sooqa_persistence::PublisherRepositoryError::PostNotScheduled(_)
