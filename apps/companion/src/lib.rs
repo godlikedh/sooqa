@@ -26,7 +26,8 @@ const MAX_URL_CHARS: usize = 4_096;
 const MAX_PAGE_TITLE_CHARS: usize = 512;
 const MAX_DESCRIPTION_CHARS: usize = 2_048;
 const MAX_REQUESTED_PUBLISH_AT_CHARS: usize = 64;
-const MAX_POST_CAPTION_CHARS: usize = 4_096;
+// Keep this aligned with sooqa-publisher::MAX_CAPTION_LENGTH.
+const MAX_POST_CAPTION_CHARS: usize = 1_024;
 const MAX_TAGS: usize = 32;
 const MAX_TAG_CHARS: usize = 64;
 const RATE_LIMIT_REQUESTS: usize = 60;
@@ -300,10 +301,8 @@ fn validate_submission(
         .page_title
         .map(|value| bounded_text(value, MAX_PAGE_TITLE_CHARS, "page_title"))
         .transpose()?;
-    submission.description = submission
-        .description
-        .map(|value| bounded_text(value, MAX_DESCRIPTION_CHARS, "description"))
-        .transpose()?;
+    submission.description =
+        optional_multiline_text(submission.description, MAX_DESCRIPTION_CHARS, "description")?;
     submission.requested_publish_at = submission
         .requested_publish_at
         .map(|value| bounded_text(value, MAX_REQUESTED_PUBLISH_AT_CHARS, "requested_publish_at"))
@@ -312,10 +311,11 @@ fn validate_submission(
         time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
             .map_err(|_| "requested_publish_at")?;
     }
-    submission.requested_post_caption = submission
-        .requested_post_caption
-        .map(|value| bounded_text(value, MAX_POST_CAPTION_CHARS, "requested_post_caption"))
-        .transpose()?;
+    submission.requested_post_caption = optional_multiline_text(
+        submission.requested_post_caption,
+        MAX_POST_CAPTION_CHARS,
+        "requested_post_caption",
+    )?;
 
     let action = submission.requested_action.unwrap_or_default();
     match action {
@@ -358,6 +358,26 @@ fn bounded_text(
         return Err("bounded_text");
     }
     Ok(value)
+}
+
+fn optional_multiline_text(
+    value: Option<String>,
+    max_chars: usize,
+    _field: &'static str,
+) -> Result<Option<String>, &'static str> {
+    let Some(value) = value else { return Ok(None) };
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().count() > max_chars
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err("multiline_text");
+    }
+    Ok(Some(value))
 }
 
 fn validate_url(
@@ -646,16 +666,28 @@ mod tests {
         oversized_caption.requested_action = Some(RequestedAction::PostNow);
         oversized_caption.requested_post_caption = Some("x".repeat(MAX_POST_CAPTION_CHARS + 1));
         assert!(validate_submission(oversized_caption).is_err());
+
+        let mut exact_caption = submission();
+        exact_caption.requested_action = Some(RequestedAction::PostNow);
+        exact_caption.requested_post_caption = Some("x".repeat(MAX_POST_CAPTION_CHARS));
+        assert!(validate_submission(exact_caption).is_ok());
     }
 
     #[test]
-    fn submission_validation_rejects_credentials_and_control_text() {
+    fn submission_validation_allows_multiline_optional_text_but_rejects_other_controls() {
         let mut value = submission();
         value.url = "https://user:pass@example.com/clip.webm".to_owned();
         assert!(validate_submission(value).is_err());
 
         let mut value = submission();
-        value.description = Some("note\nwith control".to_owned());
+        value.description = Some("note\nwith tab\tand return\r".to_owned());
+        assert_eq!(
+            validate_submission(value).unwrap().description.as_deref(),
+            Some("note\nwith tab\tand return")
+        );
+
+        let mut value = submission();
+        value.description = Some("note\u{0000}with control".to_owned());
         assert!(validate_submission(value).is_err());
     }
 
@@ -700,6 +732,34 @@ mod tests {
         assert_eq!(encoded["description"], "internal note");
         assert_eq!(encoded["tags"], serde_json::json!(["Cats"]));
         assert!(encoded.get("requested_publish_at").is_none());
+    }
+
+    #[test]
+    fn backend_payload_omits_blank_optional_text_and_preserves_multiline_caption() {
+        let mut blank = submission();
+        blank.requested_action = Some(RequestedAction::PostNow);
+        blank.description = Some(" \n\t ".to_owned());
+        blank.requested_post_caption = Some(" \r\n\t ".to_owned());
+        let blank = validate_submission(blank).expect("blank optional text should be omitted");
+        let payload = BackendIngestRequest {
+            url: &blank.url,
+            page_url: blank.page_url.as_deref(),
+            page_title: blank.page_title.as_deref(),
+            description: blank.description.as_deref(),
+            tags: &blank.tags,
+            requested_action: blank.requested_action,
+            requested_publish_at: blank.requested_publish_at.as_deref(),
+            requested_post_caption: blank.requested_post_caption.as_deref(),
+        };
+        let encoded = serde_json::to_value(&payload).expect("payload should serialize");
+        assert!(encoded.get("description").is_none());
+        assert!(encoded.get("requested_post_caption").is_none());
+
+        let mut multiline = submission();
+        multiline.requested_action = Some(RequestedAction::PostNow);
+        multiline.requested_post_caption = Some("line one\nline two\tready".to_owned());
+        let multiline = validate_submission(multiline).expect("multiline caption should validate");
+        assert_eq!(multiline.requested_post_caption.as_deref(), Some("line one\nline two\tready"));
     }
 
     #[test]

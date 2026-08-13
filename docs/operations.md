@@ -253,6 +253,9 @@ description, tags, and a browser action ID. The backend ingest contract also
 accepts an optional `requested_action` (`save`, `queue`, or `post_now`), a
 future RFC3339 `requested_publish_at` for exact queueing, and separate public
 `requested_post_caption`; deployed save-only companions may omit these fields.
+Optional description and public caption values are trimmed and omitted when
+blank; nonblank multiline text permits newline, carriage return, and tab, while
+public captions remain limited to the Publisher's 1,024-character contract.
 A successful response means only that the backend accepted the ingest request;
 the userscript does not poll or claim that media is already stored. A failed
 request can be retried with the same action ID, preserving backend idempotency.
