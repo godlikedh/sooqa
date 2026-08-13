@@ -13,7 +13,7 @@ use sooqa_inbox::{
 use sooqa_jobs::{JobAttempt, NewJob};
 use sooqa_library::{
     MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, MediaIngest,
-    VideoIdentityOutcome,
+    VideoDuplicateClassification, VideoDuplicateEvidence, VideoIdentityOutcome,
 };
 use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint};
 use sqlx::{FromRow, PgPool};
@@ -21,9 +21,36 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+const DUPLICATE_DECISION_MARKER_KEY: &str = "_sooqa_duplicate_decision_v1";
+
 #[derive(Clone)]
 pub struct InboxRepository {
     pool: PgPool,
+}
+
+/// A candidate exposed to the private-admin decision surface. The
+/// classification and score come directly from the bounded evidence persisted
+/// on the ingest; this query never recomputes identity.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DuplicateCandidate {
+    pub media_id: Uuid,
+    pub classification: VideoDuplicateClassification,
+    pub score_bps: u16,
+    pub storage_state: String,
+    pub storage_chat_id: Option<i64>,
+    pub storage_message_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DuplicatePendingIngest {
+    pub ingest: Ingest,
+    pub candidates: Vec<DuplicateCandidate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcceptDuplicateResult {
+    pub ingest: Ingest,
+    pub replayed: bool,
 }
 
 impl InboxRepository {
@@ -127,6 +154,177 @@ impl InboxRepository {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Accept one already-evidenced media candidate without creating a media
+    /// row or starting another storage upload. The ingest row is the decision
+    /// fence: force-save and accept-duplicate serialize on its row lock, so
+    /// exactly one decision wins a race.
+    pub async fn accept_duplicate(
+        &self,
+        id: Uuid,
+        media_id: Uuid,
+    ) -> Result<AcceptDuplicateResult, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let mut request = load_request(&mut transaction, id).await?;
+
+        // Inspect the durable decision before looking at the current pipeline
+        // state. Storage may fail after a successful accept, and the original
+        // command must remain replay-safe while that downstream state changes.
+        if request.original_input.get(DUPLICATE_DECISION_MARKER_KEY).is_some() {
+            let accepted_media_id = accepted_duplicate_media_id(&request.original_input);
+            if !request.force_save
+                && accepted_media_id.is_some()
+                && request.media_id == accepted_media_id
+                && accepted_media_id == Some(media_id)
+            {
+                transaction.commit().await?;
+                return Ok(AcceptDuplicateResult { ingest: request, replayed: true });
+            }
+            return Err(InboxRepositoryError::DuplicateDecisionNotAllowed(request.status));
+        }
+
+        if !request.force_save
+            && matches!(request.status, IngestStatus::Storing | IngestStatus::Completed)
+        {
+            return Err(InboxRepositoryError::DuplicateDecisionNotAllowed(request.status));
+        }
+
+        if request.status != IngestStatus::DuplicatePending {
+            return Err(InboxRepositoryError::DuplicateDecisionNotAllowed(request.status));
+        }
+
+        let evidence = request
+            .duplicate_evidence
+            .clone()
+            .ok_or(InboxRepositoryError::DuplicateEvidenceMissing(id))
+            .and_then(|value| {
+                serde_json::from_value::<VideoDuplicateEvidence>(value).map_err(Into::into)
+            })?;
+        if !evidence.matches.iter().any(|candidate| candidate.media_id == media_id) {
+            return Err(InboxRepositoryError::DuplicateCandidateNotEvidenced(media_id));
+        }
+
+        let candidate = sqlx::query_as::<_, DuplicateMediaRow>(
+            r#"
+            SELECT storage_state, tags
+            FROM media
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(media_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(InboxRepositoryError::DuplicateCandidateMissing(media_id))?;
+
+        if !matches!(candidate.storage_state.as_str(), "ready" | "pending_storage") {
+            return Err(InboxRepositoryError::DuplicateCandidateUnavailable {
+                media_id,
+                state: candidate.storage_state,
+            });
+        }
+
+        let merged_tags = merge_duplicate_tags(&candidate.tags, &request.supplied_tags);
+        let supplied_description = request
+            .supplied_description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty());
+        sqlx::query(
+            r#"
+            UPDATE media
+            SET tags = $2,
+                description = CASE WHEN $3::text IS NOT NULL THEN $3 ELSE description END,
+                updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(media_id)
+        .bind(merged_tags)
+        .bind(supplied_description)
+        .execute(&mut *transaction)
+        .await?;
+
+        request.media_id = Some(media_id);
+        set_accepted_duplicate_marker(&mut request.original_input, media_id);
+        // Persist the decision marker together with the state transition before
+        // clearing the evidence. It is the durable idempotency fence for a
+        // successful duplicate-accept command.
+        request.duplicate_evidence = None;
+        request.error_code = None;
+        request.error_message = None;
+        request.completed_at = None;
+        request.transition_to(IngestStatus::Storing)?;
+        if candidate.storage_state == "ready" {
+            request.transition_to(IngestStatus::Completed)?;
+            request.completed_at = Some(OffsetDateTime::now_utc());
+        }
+        request.updated_at = OffsetDateTime::now_utc();
+        update_ingest_state(&mut transaction, &request).await?;
+        transaction.commit().await?;
+        Ok(AcceptDuplicateResult { ingest: request, replayed: false })
+    }
+
+    /// Return a bounded private-admin review page. Candidate state is read
+    /// from `media`; evidence ordering, classification, and score remain the
+    /// persisted identity decision and are not recalculated here.
+    pub async fn list_duplicate_pending(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<DuplicatePendingIngest>, InboxRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM ingests WHERE state = 'duplicate_pending' ORDER BY created_at, id LIMIT $1",
+        )
+        .bind(i64::from(limit.min(20)))
+        .fetch_all(&mut *transaction)
+        .await?;
+        let mut pending = Vec::with_capacity(ids.len());
+
+        for id in ids {
+            let request = load_request(&mut transaction, id).await?;
+            let evidence = request
+                .duplicate_evidence
+                .clone()
+                .ok_or(InboxRepositoryError::DuplicateEvidenceMissing(id))
+                .and_then(|value| {
+                    serde_json::from_value::<VideoDuplicateEvidence>(value).map_err(Into::into)
+                })?;
+            let mut candidates = Vec::with_capacity(evidence.matches.len());
+            for candidate in evidence.matches.into_iter().take(MAX_VIDEO_DUPLICATE_MATCHES) {
+                let storage = sqlx::query_as::<_, DuplicateMediaStorageRow>(
+                    r#"
+                    SELECT storage_state, telegram_storage_chat_id, telegram_storage_message_id
+                    FROM media
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(candidate.media_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                let (storage_state, storage_chat_id, storage_message_id) =
+                    storage.map_or(("missing".to_owned(), None, None), |row| {
+                        (
+                            row.storage_state,
+                            row.telegram_storage_chat_id,
+                            row.telegram_storage_message_id,
+                        )
+                    });
+                candidates.push(DuplicateCandidate {
+                    media_id: candidate.media_id,
+                    classification: candidate.classification,
+                    score_bps: candidate.score_bps,
+                    storage_state,
+                    storage_chat_id,
+                    storage_message_id,
+                });
+            }
+            pending.push(DuplicatePendingIngest { ingest: request, candidates });
+        }
+
+        transaction.commit().await?;
+        Ok(pending)
     }
 
     pub async fn begin_source_inspection(
@@ -1522,6 +1720,47 @@ fn probed_media_kind(probe: &serde_json::Value) -> Option<SourceMediaKind> {
     None
 }
 
+fn merge_duplicate_tags(existing: &[String], incoming: &[String]) -> Vec<String> {
+    let mut tags = existing.to_vec();
+    for tag in incoming {
+        if !tags.iter().any(|current| current == tag) {
+            tags.push(tag.clone());
+        }
+    }
+    tags
+}
+
+fn accepted_duplicate_media_id(input: &serde_json::Value) -> Option<Uuid> {
+    input
+        .get(DUPLICATE_DECISION_MARKER_KEY)?
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|version| *version == 1)?;
+    input
+        .get(DUPLICATE_DECISION_MARKER_KEY)?
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .filter(|kind| *kind == "accepted")
+        .and_then(|_| input.get(DUPLICATE_DECISION_MARKER_KEY)?.get("media_id"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn set_accepted_duplicate_marker(input: &mut serde_json::Value, media_id: Uuid) {
+    if let Some(object) = input.as_object_mut() {
+        object.insert(
+            DUPLICATE_DECISION_MARKER_KEY.to_owned(),
+            json!({"version": 1, "kind": "accepted", "media_id": media_id}),
+        );
+    } else {
+        let source = input.clone();
+        *input = json!({
+            "source": source,
+            DUPLICATE_DECISION_MARKER_KEY: {"version": 1, "kind": "accepted", "media_id": media_id},
+        });
+    }
+}
+
 async fn load_request(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: Uuid,
@@ -1627,6 +1866,19 @@ struct IngestRow {
     completed_at: Option<OffsetDateTime>,
 }
 
+#[derive(Debug, FromRow)]
+struct DuplicateMediaRow {
+    storage_state: String,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct DuplicateMediaStorageRow {
+    storage_state: String,
+    telegram_storage_chat_id: Option<i64>,
+    telegram_storage_message_id: Option<i64>,
+}
+
 impl IngestRow {
     fn into_ingest(self) -> Result<Ingest, InboxRepositoryError> {
         Ok(Ingest {
@@ -1687,6 +1939,16 @@ pub enum InboxRepositoryError {
     InvalidFailureStatus(IngestStatus),
     #[error("force-save is not allowed while ingest is in {0:?}")]
     ForceSaveNotAllowed(IngestStatus),
+    #[error("duplicate acceptance is not allowed while ingest is in {0:?}")]
+    DuplicateDecisionNotAllowed(IngestStatus),
+    #[error("ingest {0} has no persisted duplicate evidence")]
+    DuplicateEvidenceMissing(Uuid),
+    #[error("media candidate {0} is not present in persisted duplicate evidence")]
+    DuplicateCandidateNotEvidenced(Uuid),
+    #[error("media candidate {0} does not exist")]
+    DuplicateCandidateMissing(Uuid),
+    #[error("media candidate {media_id} is unavailable in storage state {state}")]
+    DuplicateCandidateUnavailable { media_id: Uuid, state: String },
     #[error("video ingests must complete the identity gate before storage finalization")]
     VideoFinalizationNotAllowed,
     #[error("duplicate evidence exceeds the {max}-byte limit")]

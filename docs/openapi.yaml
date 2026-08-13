@@ -107,6 +107,43 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/ingests/{id}/accept-duplicate:
+    post:
+      tags: [ingest]
+      operationId: acceptDuplicateIngest
+      summary: Accept an evidenced existing media candidate
+      description: >-
+        Reuses the selected persisted candidate without creating another media
+        row or storage upload. The command is replay-safe.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IngestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcceptDuplicateRequest'
+      responses:
+        '200':
+          description: The candidate was accepted, or the same decision was replayed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '202':
+          description: The candidate is pending storage and the ingest follows its lifecycle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/media:
     get:
       tags: [media]
@@ -510,6 +547,12 @@ components:
         tags:
           type: array
           items: { type: string }
+    AcceptDuplicateRequest:
+      type: object
+      required: [media_id]
+      additionalProperties: false
+      properties:
+        media_id: { type: string, format: uuid }
     IngestAcceptedResponse:
       type: object
       required: [id, status, links]

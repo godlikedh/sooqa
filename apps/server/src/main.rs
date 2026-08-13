@@ -9,10 +9,11 @@ use sooqa_inbox::{
     TelegramSubmissionInput,
 };
 use sooqa_library::StorageUploadAttachment;
-use sooqa_persistence::InboxRepository;
+use sooqa_persistence::{DuplicateCandidate, InboxRepository};
 use sooqa_telegram::{
-    IngestAccepted, IngestService, MediaIngestCommand, MemoryUpdateStore, TelegramRuntime,
-    UrlIngestCommand,
+    DuplicateCandidateCard, DuplicateCandidateStorage, DuplicateDecisionResult,
+    DuplicatePendingCard, IngestAccepted, IngestService, MediaIngestCommand, MemoryUpdateStore,
+    TelegramRuntime, UrlIngestCommand,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -254,4 +255,75 @@ impl IngestService for DatabaseIngestService {
             status: result.ingest.status.as_str().to_owned(),
         })
     }
+
+    async fn list_duplicate_pending(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<DuplicatePendingCard>, Self::Error> {
+        let pending = self.repository.list_duplicate_pending(limit as u32).await?;
+        Ok(pending
+            .into_iter()
+            .map(|pending| DuplicatePendingCard {
+                request_id: pending.ingest.id,
+                source_url: pending.ingest.source_url,
+                candidates: pending.candidates.into_iter().map(duplicate_candidate_card).collect(),
+            })
+            .collect())
+    }
+
+    async fn accept_duplicate(
+        &self,
+        request_id: Uuid,
+        media_id: Uuid,
+    ) -> Result<DuplicateDecisionResult, Self::Error> {
+        let result = self.repository.accept_duplicate(request_id, media_id).await?;
+        Ok(DuplicateDecisionResult {
+            request_id: result.ingest.id,
+            status: result.ingest.status.as_str().to_owned(),
+            media_id: result.ingest.media_id,
+        })
+    }
+
+    async fn force_save(&self, request_id: Uuid) -> Result<DuplicateDecisionResult, Self::Error> {
+        let result = self.repository.force_save(request_id).await?;
+        Ok(DuplicateDecisionResult {
+            request_id: result.ingest.id,
+            status: result.ingest.status.as_str().to_owned(),
+            media_id: result.ingest.media_id,
+        })
+    }
+}
+
+fn duplicate_candidate_card(candidate: DuplicateCandidate) -> DuplicateCandidateCard {
+    let storage = match candidate.storage_state.as_str() {
+        "ready" => DuplicateCandidateStorage::Ready {
+            open_url: candidate
+                .storage_chat_id
+                .zip(candidate.storage_message_id)
+                .and_then(|(chat_id, message_id)| storage_message_url(chat_id, message_id)),
+        },
+        "pending_storage" => DuplicateCandidateStorage::PendingStorage,
+        "missing" => DuplicateCandidateStorage::Missing,
+        state => DuplicateCandidateStorage::Unavailable { state: state.to_owned() },
+    };
+    DuplicateCandidateCard {
+        media_id: candidate.media_id,
+        classification: match candidate.classification {
+            sooqa_library::VideoDuplicateClassification::StrongDuplicate => {
+                "strong_duplicate".to_owned()
+            }
+            sooqa_library::VideoDuplicateClassification::PartialMatch => "partial_match".to_owned(),
+        },
+        score_bps: candidate.score_bps,
+        storage,
+    }
+}
+
+fn storage_message_url(chat_id: i64, message_id: i64) -> Option<String> {
+    if chat_id >= 0 || message_id <= 0 {
+        return None;
+    }
+    let raw_id = chat_id.to_string();
+    let internal_id = raw_id.strip_prefix("-100").unwrap_or_else(|| raw_id.trim_start_matches('-'));
+    (!internal_id.is_empty()).then(|| format!("https://t.me/c/{internal_id}/{message_id}"))
 }

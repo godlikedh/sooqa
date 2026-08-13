@@ -8,7 +8,8 @@ mod publisher;
 
 pub use cleanup::WORKSPACE_CLEANUP_RETENTION;
 pub use inbox::{
-    AssetNormalizationStart, AssetProbeStart, CreateIngestResult, ForceSaveResult, InboxRepository,
+    AcceptDuplicateResult, AssetNormalizationStart, AssetProbeStart, CreateIngestResult,
+    DuplicateCandidate, DuplicatePendingIngest, ForceSaveResult, InboxRepository,
     InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart, SourceDownloadStart,
     SourceInspectionStart, WorkspaceCleanupStart,
 };

@@ -136,6 +136,28 @@ sequenceDiagram
     Worker->>Media: remove whole UUID workspace
 ```
 
+When the video identity gate records `duplicate_pending`, the administrator
+can inspect it with `/duplicates` in the configured private bot chat. The bot
+renders at most three persisted candidates per ingest: ready candidates have
+an `Open media` link and `Use this` action, pending candidates have a `Use
+this` action with a storing label, and every card has `Save anyway`. Each
+callback is checked against the configured administrator and private chat
+before the durable command runs. Telegram callback queries are acknowledged
+before repository work so a slow database operation does not leave the client
+spinner active.
+
+The HTTP equivalent is
+`POST /api/v1/ingests/{id}/accept-duplicate` with `{ "media_id": "..." }`.
+The repository locks the ingest row, verifies that the media ID is in the
+persisted bounded evidence, locks the candidate media row, and accepts only
+`ready` or `pending_storage`. A ready candidate completes immediately. A
+pending candidate moves the ingest to `storing` and joins the candidate's
+existing storage lifecycle without inserting another media row or upload job.
+Incoming supplied tags are unioned into the existing media row and a nonempty
+supplied description replaces its description. The same row lock fences
+force-save, so a concurrent decision has one winner and the loser receives a
+stable conflict; repeating the winning decision is idempotent.
+
 The worker keeps source inspection, download, probe, normalization,
 fingerprinting, and exact finalization as separate typed jobs. Each stage
 updates `ingests` and enqueues its successor in a short transaction. Video
@@ -203,6 +225,14 @@ alignment produces at most three scalar evidence matches, capped at 16 KiB.
 Exact duplicates reuse the existing media row, strong perceptual matches stop
 at durable `duplicate_pending`, and no-match videos insert one
 `pending_storage` reservation before upload.
+
+Duplicate acceptance does not create a UI/session/history table. The bounded
+`duplicate_evidence` JSON on `ingests` is consumed into a versioned namespaced
+accepted-decision marker in `input_json`; once accepted, the evidence is cleared
+and the chosen `media_id` becomes the durable decision. Storage completion and
+failure continue to fan out by that media ID, and a retry of the winning accept
+command remains an idempotent replay even after a retryable or terminal storage
+failure.
 
 The home deployment adds the official `tdlib/telegram-bot-api` service in
 `--local` mode. It is built at a pinned upstream commit, has a dedicated

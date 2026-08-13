@@ -12,12 +12,16 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sooqa_library::MediaKind;
 use teloxide::{
     Bot,
-    payloads::GetUpdatesSetters,
+    payloads::{GetUpdatesSetters, SendMessageSetters},
     prelude::{Request, Requester},
-    types::{ChatId, FileId, Message, Update, UpdateKind},
+    types::{
+        CallbackQueryId, ChatId, FileId, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+        Update, UpdateKind,
+    },
 };
 use thiserror::Error as ThisError;
 use time::OffsetDateTime;
@@ -34,7 +38,7 @@ pub use storage::{
 };
 
 pub const START_RESPONSE: &str = "sooqa is ready. You are authorized.";
-pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorization\n/help — show this help\n/add <url> — queue a URL\n/status — show service status";
+pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorization\n/help — show this help\n/add <url> — queue a URL\n/status — show service status\n/duplicates — review pending duplicate candidates";
 pub const STATUS_RESPONSE: &str = "sooqa is online.";
 pub const UNAUTHORIZED_RESPONSE: &str = "This bot is restricted to its configured administrator.";
 pub const ADD_USAGE_RESPONSE: &str = "Send one http(s) URL after /add, or send a bare URL.";
@@ -60,6 +64,16 @@ pub struct IncomingMessage {
     pub text: Option<String>,
     pub caption: Option<String>,
     pub media: Option<TelegramMedia>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IncomingCallback {
+    pub update_id: i64,
+    pub callback_id: String,
+    pub user_id: i64,
+    pub chat_id: Option<i64>,
+    pub is_private: bool,
+    pub data: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -94,6 +108,7 @@ pub enum HandleOutcome {
     MediaRejected,
     Unauthorized,
     UnrecognizedIgnored,
+    CallbackHandled,
     Responded(Command),
 }
 
@@ -103,6 +118,7 @@ pub enum Command {
     Help,
     Add,
     Status,
+    Duplicates,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -147,6 +163,36 @@ pub struct IngestAccepted {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum DuplicateCandidateStorage {
+    Ready { open_url: Option<String> },
+    PendingStorage,
+    Unavailable { state: String },
+    Missing,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DuplicateCandidateCard {
+    pub media_id: Uuid,
+    pub classification: String,
+    pub score_bps: u16,
+    pub storage: DuplicateCandidateStorage,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DuplicatePendingCard {
+    pub request_id: Uuid,
+    pub source_url: String,
+    pub candidates: Vec<DuplicateCandidateCard>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DuplicateDecisionResult {
+    pub request_id: Uuid,
+    pub status: String,
+    pub media_id: Option<Uuid>,
+}
+
 #[async_trait]
 pub trait IngestService: Clone + Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
@@ -157,6 +203,19 @@ pub trait IngestService: Clone + Send + Sync + 'static {
         &self,
         command: MediaIngestCommand,
     ) -> Result<IngestAccepted, Self::Error>;
+
+    async fn list_duplicate_pending(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<DuplicatePendingCard>, Self::Error>;
+
+    async fn accept_duplicate(
+        &self,
+        request_id: Uuid,
+        media_id: Uuid,
+    ) -> Result<DuplicateDecisionResult, Self::Error>;
+
+    async fn force_save(&self, request_id: Uuid) -> Result<DuplicateDecisionResult, Self::Error>;
 }
 
 #[derive(Debug, ThisError)]
@@ -175,6 +234,25 @@ impl IngestService for () {
         &self,
         _command: MediaIngestCommand,
     ) -> Result<IngestAccepted, Self::Error> {
+        Err(IngestUnavailable)
+    }
+
+    async fn list_duplicate_pending(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<DuplicatePendingCard>, Self::Error> {
+        Err(IngestUnavailable)
+    }
+
+    async fn accept_duplicate(
+        &self,
+        _request_id: Uuid,
+        _media_id: Uuid,
+    ) -> Result<DuplicateDecisionResult, Self::Error> {
+        Err(IngestUnavailable)
+    }
+
+    async fn force_save(&self, _request_id: Uuid) -> Result<DuplicateDecisionResult, Self::Error> {
         Err(IngestUnavailable)
     }
 }
@@ -219,9 +297,24 @@ pub trait TelegramApi: Clone + Send + Sync + 'static {
 
     async fn send_text(&self, chat_id: i64, text: &str) -> Result<(), Self::Error>;
 
+    async fn send_inline_keyboard(
+        &self,
+        chat_id: i64,
+        text: &str,
+        keyboard: Vec<Vec<InlineButton>>,
+    ) -> Result<(), Self::Error>;
+
+    async fn answer_callback_query(&self, callback_id: &str) -> Result<(), Self::Error>;
+
     async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), Self::Error>;
 
     fn is_retryable_error(error: &Self::Error) -> bool;
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum InlineButton {
+    Callback { text: String, data: String },
+    Url { text: String, url: String },
 }
 
 #[async_trait]
@@ -470,6 +563,9 @@ where
                 Ok(HandleOutcome::Responded(Command::Add))
             }
             MessageAction::Command(command) => {
+                if command == Command::Duplicates {
+                    return self.handle_duplicate_command(message, claim).await;
+                }
                 if !self.allow_response(message.user_id, message.chat_id) {
                     self.complete(claim).await?;
                     return Ok(HandleOutcome::RateLimited);
@@ -479,6 +575,7 @@ where
                     Command::Help => HELP_RESPONSE,
                     Command::Status => STATUS_RESPONSE,
                     Command::Add => ADD_USAGE_RESPONSE,
+                    Command::Duplicates => unreachable!("duplicate command is handled above"),
                 };
                 self.send_and_complete(
                     claim,
@@ -585,30 +682,163 @@ where
         Ok(HandleOutcome::Responded(Command::Add))
     }
 
+    async fn handle_duplicate_command(
+        &self,
+        message: IncomingMessage,
+        claim: UpdateClaim,
+    ) -> Result<HandleOutcome, TelegramError> {
+        let rate_limit_key = RateLimitKey { user_id: message.user_id, chat_id: message.chat_id };
+        if !self.allow_response(message.user_id, message.chat_id) {
+            self.complete(claim).await?;
+            return Ok(HandleOutcome::RateLimited);
+        }
+        let Some(ingest_service) = self.ingest_service.as_ref() else {
+            self.clear_response(rate_limit_key);
+            self.release(claim).await?;
+            return Err(TelegramError::Ingest(Box::new(IngestUnavailable)));
+        };
+        let cards = match ingest_service.list_duplicate_pending(3).await {
+            Ok(cards) => cards,
+            Err(error) => {
+                self.clear_response(rate_limit_key);
+                self.release(claim).await?;
+                return Err(TelegramError::Ingest(Box::new(error)));
+            }
+        };
+        let (text, keyboard) = render_duplicate_cards(&cards);
+        if let Err(error) = self
+            .api
+            .send_inline_keyboard(message.chat_id, &text, keyboard)
+            .await
+            .map_err(|error| TelegramError::Api(Box::new(error)))
+        {
+            self.clear_response(rate_limit_key);
+            self.release(claim).await?;
+            return Err(error);
+        }
+        self.complete(claim).await?;
+        Ok(HandleOutcome::Responded(Command::Duplicates))
+    }
+
     pub async fn handle_update(&self, update: Update) -> Result<HandleOutcome, TelegramError> {
         let update_id = i64::from(update.id.0);
-        let UpdateKind::Message(message) = update.kind else {
-            let claim = match self.claim(update_id).await? {
-                UpdateClaimResult::Claimed(claim) => claim,
-                UpdateClaimResult::Completed => return Ok(HandleOutcome::DuplicateIgnored),
-                UpdateClaimResult::InProgress => {
-                    return Err(TelegramError::UpdateInProgress(update_id));
-                }
-            };
-            self.complete(claim).await?;
-            return Ok(HandleOutcome::NonMessageIgnored);
+        match update.kind {
+            UpdateKind::Message(message) => {
+                self.handle_message(IncomingMessage {
+                    update_id,
+                    message_id: i64::from(message.id.0),
+                    user_id: message.from.as_ref().and_then(|user| i64::try_from(user.id.0).ok()),
+                    chat_id: message.chat.id.0,
+                    is_private: message.chat.is_private(),
+                    text: message.text().map(str::to_owned),
+                    caption: message.caption().map(str::to_owned),
+                    media: message_media(&message),
+                })
+                .await
+            }
+            UpdateKind::CallbackQuery(callback) => {
+                let (chat_id, is_private) =
+                    callback.message.as_ref().map_or((None, false), |message| {
+                        (Some(message.chat().id.0), message.chat().is_private())
+                    });
+                self.handle_callback(IncomingCallback {
+                    update_id,
+                    callback_id: callback.id.0,
+                    user_id: i64::try_from(callback.from.id.0).unwrap_or_default(),
+                    chat_id,
+                    is_private,
+                    data: callback.data,
+                })
+                .await
+            }
+            _ => {
+                let claim = match self.claim(update_id).await? {
+                    UpdateClaimResult::Claimed(claim) => claim,
+                    UpdateClaimResult::Completed => return Ok(HandleOutcome::DuplicateIgnored),
+                    UpdateClaimResult::InProgress => {
+                        return Err(TelegramError::UpdateInProgress(update_id));
+                    }
+                };
+                self.complete(claim).await?;
+                Ok(HandleOutcome::NonMessageIgnored)
+            }
+        }
+    }
+
+    pub async fn handle_callback(
+        &self,
+        callback: IncomingCallback,
+    ) -> Result<HandleOutcome, TelegramError> {
+        let claim = match self.claim(callback.update_id).await? {
+            UpdateClaimResult::Claimed(claim) => claim,
+            UpdateClaimResult::Completed => return Ok(HandleOutcome::DuplicateIgnored),
+            UpdateClaimResult::InProgress => {
+                return Err(TelegramError::UpdateInProgress(callback.update_id));
+            }
         };
-        self.handle_message(IncomingMessage {
-            update_id,
-            message_id: i64::from(message.id.0),
-            user_id: message.from.as_ref().and_then(|user| i64::try_from(user.id.0).ok()),
-            chat_id: message.chat.id.0,
-            is_private: message.chat.is_private(),
-            text: message.text().map(str::to_owned),
-            caption: message.caption().map(str::to_owned),
-            media: message_media(&message),
-        })
-        .await
+
+        // Telegram clients keep showing a spinner until this is answered. Do
+        // this before any repository work, including for rejected callbacks.
+        if let Err(error) = self.api.answer_callback_query(&callback.callback_id).await {
+            self.release(claim).await?;
+            return Err(TelegramError::Api(Box::new(error)));
+        }
+
+        let authorized = callback.is_private
+            && callback.chat_id == Some(callback.user_id)
+            && self.admin_user_ids.contains(&callback.user_id);
+        if !authorized {
+            warn!(
+                target: "sooqa.telegram",
+                update_id = callback.update_id,
+                user_id = callback.user_id,
+                chat_id = ?callback.chat_id,
+                "unauthorized Telegram callback attempt"
+            );
+            self.complete(claim).await?;
+            return Ok(HandleOutcome::CallbackHandled);
+        }
+        let Some(data) = callback.data.as_deref().and_then(CallbackData::parse) else {
+            self.complete(claim).await?;
+            return Ok(HandleOutcome::CallbackHandled);
+        };
+
+        let Some(chat_id) = callback.chat_id else {
+            self.complete(claim).await?;
+            return Ok(HandleOutcome::CallbackHandled);
+        };
+        let Some(ingest_service) = self.ingest_service.as_ref() else {
+            self.release(claim).await?;
+            return Err(TelegramError::Ingest(Box::new(IngestUnavailable)));
+        };
+        let response = match data {
+            CallbackData::DuplicateUse { request_id, media_id } => {
+                match ingest_service.accept_duplicate(request_id, media_id).await {
+                    Ok(result) => {
+                        format_duplicate_decision_response("✅ Duplicate accepted", &result)
+                    }
+                    Err(error) => format!("⚠️ Duplicate decision was not applied: {error}"),
+                }
+            }
+            CallbackData::DuplicateForceSave { request_id } => {
+                match ingest_service.force_save(request_id).await {
+                    Ok(result) => {
+                        format_duplicate_decision_response("✅ Save anyway queued", &result)
+                    }
+                    Err(error) => format!("⚠️ Save anyway was not applied: {error}"),
+                }
+            }
+            CallbackData::IngestStatus { .. } => {
+                self.complete(claim).await?;
+                return Ok(HandleOutcome::CallbackHandled);
+            }
+        };
+        if let Err(error) = self.api.send_text(chat_id, &response).await {
+            self.release(claim).await?;
+            return Err(TelegramError::Api(Box::new(error)));
+        }
+        self.complete(claim).await?;
+        Ok(HandleOutcome::CallbackHandled)
     }
 
     async fn claim(&self, update_id: i64) -> Result<UpdateClaimResult, TelegramError> {
@@ -806,6 +1036,7 @@ fn parse_command(text: &str) -> Option<Command> {
         "help" => Some(Command::Help),
         "add" => Some(Command::Add),
         "status" => Some(Command::Status),
+        "duplicates" => Some(Command::Duplicates),
         _ => None,
     }
 }
@@ -868,26 +1099,132 @@ fn is_safe_http_url(value: &str) -> bool {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CallbackData {
     IngestStatus { request_id: Uuid },
+    DuplicateUse { request_id: Uuid, media_id: Uuid },
+    DuplicateForceSave { request_id: Uuid },
 }
 
 impl CallbackData {
     pub fn encode(self) -> String {
         match self {
             Self::IngestStatus { request_id } => format!("v1:ingest_status:{request_id}"),
+            Self::DuplicateUse { request_id, media_id } => {
+                format!("v1:duplicate_use:{}:{}", encode_uuid(request_id), encode_uuid(media_id))
+            }
+            Self::DuplicateForceSave { request_id } => {
+                format!("v1:duplicate_force_save:{}", encode_uuid(request_id))
+            }
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         let mut parts = value.split(':');
-        if parts.next()? != "v1" || parts.next()? != "ingest_status" {
+        if parts.next()? != "v1" {
             return None;
         }
-        let request_id = parts.next()?.parse().ok()?;
-        if parts.next().is_some() {
-            return None;
+        match parts.next()? {
+            "ingest_status" => {
+                let request_id = parts.next()?.parse().ok()?;
+                if parts.next().is_some() {
+                    return None;
+                }
+                Some(Self::IngestStatus { request_id })
+            }
+            "duplicate_use" => {
+                let request_id = decode_uuid(parts.next()?)?;
+                let media_id = decode_uuid(parts.next()?)?;
+                if parts.next().is_some() {
+                    return None;
+                }
+                Some(Self::DuplicateUse { request_id, media_id })
+            }
+            "duplicate_force_save" => {
+                let request_id = decode_uuid(parts.next()?)?;
+                if parts.next().is_some() {
+                    return None;
+                }
+                Some(Self::DuplicateForceSave { request_id })
+            }
+            _ => None,
         }
-        Some(Self::IngestStatus { request_id })
     }
+}
+
+fn encode_uuid(value: Uuid) -> String {
+    URL_SAFE_NO_PAD.encode(value.as_bytes())
+}
+
+fn decode_uuid(value: &str) -> Option<Uuid> {
+    let bytes = URL_SAFE_NO_PAD.decode(value).ok()?;
+    let bytes: [u8; 16] = bytes.try_into().ok()?;
+    Some(Uuid::from_bytes(bytes))
+}
+
+fn render_duplicate_cards(cards: &[DuplicatePendingCard]) -> (String, Vec<Vec<InlineButton>>) {
+    if cards.is_empty() {
+        return ("No pending duplicate decisions.".to_owned(), Vec::new());
+    }
+
+    let mut text = String::from("Pending duplicate decisions:\n");
+    let mut keyboard = Vec::new();
+    for card in cards {
+        text.push_str(&format!(
+            "\nIngest {}\nSource: {}\n",
+            card.request_id,
+            truncate_for_telegram(&card.source_url, 320)
+        ));
+        for (index, candidate) in card.candidates.iter().enumerate() {
+            let (state_label, can_use, open_url) = match &candidate.storage {
+                DuplicateCandidateStorage::Ready { open_url } => ("ready", true, open_url.clone()),
+                DuplicateCandidateStorage::PendingStorage => ("storing", true, None),
+                DuplicateCandidateStorage::Unavailable { state } => (state.as_str(), false, None),
+                DuplicateCandidateStorage::Missing => ("missing", false, None),
+            };
+            text.push_str(&format!(
+                "Candidate {}: {} (score {} bps) — {}\n",
+                index + 1,
+                candidate.classification,
+                candidate.score_bps,
+                state_label
+            ));
+            let mut row = Vec::new();
+            if let Some(open_url) = open_url {
+                row.push(InlineButton::Url { text: "Open media".to_owned(), url: open_url });
+            }
+            if can_use {
+                row.push(InlineButton::Callback {
+                    text: "Use this".to_owned(),
+                    data: CallbackData::DuplicateUse {
+                        request_id: card.request_id,
+                        media_id: candidate.media_id,
+                    }
+                    .encode(),
+                });
+            }
+            if !row.is_empty() {
+                keyboard.push(row);
+            }
+        }
+        keyboard.push(vec![InlineButton::Callback {
+            text: "Save anyway".to_owned(),
+            data: CallbackData::DuplicateForceSave { request_id: card.request_id }.encode(),
+        }]);
+    }
+    (text, keyboard)
+}
+
+fn truncate_for_telegram(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes.saturating_sub(3);
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}...", &value[..end])
+}
+
+fn format_duplicate_decision_response(prefix: &str, result: &DuplicateDecisionResult) -> String {
+    format!("{prefix}\nID: {}\nStatus: {}", result.request_id, result.status)
 }
 
 #[derive(Clone)]
@@ -1077,6 +1414,44 @@ impl TelegramApi for TeloxideApi {
     async fn send_text(&self, chat_id: i64, text: &str) -> Result<(), Self::Error> {
         self.bot()
             .send_message(ChatId(chat_id), text.to_owned())
+            .await
+            .map(|_| ())
+            .map_err(TelegramApiError::Api)
+    }
+
+    async fn send_inline_keyboard(
+        &self,
+        chat_id: i64,
+        text: &str,
+        keyboard: Vec<Vec<InlineButton>>,
+    ) -> Result<(), Self::Error> {
+        let keyboard = keyboard
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|button| match button {
+                        InlineButton::Callback { text, data } => {
+                            InlineKeyboardButton::callback(text, data)
+                        }
+                        InlineButton::Url { text, url } => {
+                            let url = Url::parse(&url).expect("rendered Telegram URL is valid");
+                            InlineKeyboardButton::url(text, url)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        self.bot()
+            .send_message(ChatId(chat_id), text.to_owned())
+            .reply_markup(InlineKeyboardMarkup::new(keyboard))
+            .await
+            .map(|_| ())
+            .map_err(TelegramApiError::Api)
+    }
+
+    async fn answer_callback_query(&self, callback_id: &str) -> Result<(), Self::Error> {
+        self.bot()
+            .answer_callback_query(CallbackQueryId(callback_id.to_owned()))
             .await
             .map(|_| ())
             .map_err(TelegramApiError::Api)
@@ -1352,9 +1727,13 @@ mod tests {
 
     use super::*;
 
+    type MockKeyboard = (i64, String, Vec<Vec<InlineButton>>);
+
     #[derive(Clone, Default)]
     struct MockApi {
         messages: Arc<Mutex<Vec<(i64, String)>>>,
+        keyboards: Arc<Mutex<Vec<MockKeyboard>>>,
+        callback_answers: Arc<Mutex<Vec<String>>>,
         downloads: Arc<Mutex<Vec<String>>>,
         fail: Arc<Mutex<bool>>,
         failures_remaining: Arc<Mutex<u8>>,
@@ -1380,6 +1759,28 @@ mod tests {
                 .lock()
                 .expect("mock mutex should not be poisoned")
                 .push((chat_id, text.to_owned()));
+            Ok(())
+        }
+
+        async fn send_inline_keyboard(
+            &self,
+            chat_id: i64,
+            text: &str,
+            keyboard: Vec<Vec<InlineButton>>,
+        ) -> Result<(), Self::Error> {
+            self.keyboards.lock().expect("mock mutex should not be poisoned").push((
+                chat_id,
+                text.to_owned(),
+                keyboard,
+            ));
+            Ok(())
+        }
+
+        async fn answer_callback_query(&self, callback_id: &str) -> Result<(), Self::Error> {
+            self.callback_answers
+                .lock()
+                .expect("mock mutex should not be poisoned")
+                .push(callback_id.to_owned());
             Ok(())
         }
 
@@ -1414,6 +1815,19 @@ mod tests {
             Ok(())
         }
 
+        async fn send_inline_keyboard(
+            &self,
+            _chat_id: i64,
+            _text: &str,
+            _keyboard: Vec<Vec<InlineButton>>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn answer_callback_query(&self, _callback_id: &str) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
         async fn download_file(
             &self,
             _file_id: &str,
@@ -1437,6 +1851,9 @@ mod tests {
     struct MockIngestService {
         commands: Arc<Mutex<Vec<UrlIngestCommand>>>,
         media_commands: Arc<Mutex<Vec<MediaIngestCommand>>>,
+        duplicate_cards: Arc<Mutex<Vec<DuplicatePendingCard>>>,
+        duplicate_accepts: Arc<Mutex<Vec<(Uuid, Uuid)>>>,
+        force_saves: Arc<Mutex<Vec<Uuid>>>,
         fail: Arc<Mutex<bool>>,
     }
 
@@ -1464,6 +1881,34 @@ mod tests {
             }
             self.media_commands.lock().expect("mock mutex should not be poisoned").push(command);
             Ok(IngestAccepted { request_id: Uuid::from_u128(1), status: "queued".to_owned() })
+        }
+
+        async fn list_duplicate_pending(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<DuplicatePendingCard>, Self::Error> {
+            Ok(self.duplicate_cards.lock().unwrap().clone())
+        }
+
+        async fn accept_duplicate(
+            &self,
+            request_id: Uuid,
+            media_id: Uuid,
+        ) -> Result<DuplicateDecisionResult, Self::Error> {
+            self.duplicate_accepts.lock().unwrap().push((request_id, media_id));
+            Ok(DuplicateDecisionResult {
+                request_id,
+                status: "completed".to_owned(),
+                media_id: Some(media_id),
+            })
+        }
+
+        async fn force_save(
+            &self,
+            request_id: Uuid,
+        ) -> Result<DuplicateDecisionResult, Self::Error> {
+            self.force_saves.lock().unwrap().push(request_id);
+            Ok(DuplicateDecisionResult { request_id, status: "queued".to_owned(), media_id: None })
         }
     }
 
@@ -1625,6 +2070,134 @@ mod tests {
                     .to_owned()
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_command_renders_bounded_candidates_and_actions() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        let request_id = Uuid::from_u128(10);
+        let ready_media_id = Uuid::from_u128(11);
+        let pending_media_id = Uuid::from_u128(12);
+        ingest.duplicate_cards.lock().unwrap().push(DuplicatePendingCard {
+            request_id,
+            source_url: "https://example.test/incoming".to_owned(),
+            candidates: vec![
+                DuplicateCandidateCard {
+                    media_id: ready_media_id,
+                    classification: "strong_duplicate".to_owned(),
+                    score_bps: 9_500,
+                    storage: DuplicateCandidateStorage::Ready {
+                        open_url: Some("https://t.me/c/123/456".to_owned()),
+                    },
+                },
+                DuplicateCandidateCard {
+                    media_id: pending_media_id,
+                    classification: "partial_match".to_owned(),
+                    score_bps: 7_100,
+                    storage: DuplicateCandidateStorage::PendingStorage,
+                },
+            ],
+        });
+        let service =
+            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest);
+
+        assert_eq!(
+            service.handle_message(message(20, Some(123), "/duplicates")).await.unwrap(),
+            HandleOutcome::Responded(Command::Duplicates)
+        );
+        let keyboards = api.keyboards.lock().unwrap();
+        assert_eq!(keyboards.len(), 1);
+        assert!(keyboards[0].1.contains("Candidate 1: strong_duplicate (score 9500 bps) — ready"));
+        assert!(keyboards[0].1.contains("Candidate 2: partial_match (score 7100 bps) — storing"));
+        assert!(keyboards[0].2.iter().flatten().any(|button| {
+            matches!(button, InlineButton::Url { text, url } if text == "Open media" && url == "https://t.me/c/123/456")
+        }));
+        assert_eq!(
+            keyboards[0]
+                .2
+                .iter()
+                .flatten()
+                .filter(|button| {
+                    matches!(button, InlineButton::Callback { text, .. } if text == "Use this")
+                })
+                .count(),
+            2
+        );
+        assert!(keyboards[0].2.iter().flatten().any(|button| {
+            matches!(button, InlineButton::Callback { text, .. } if text == "Save anyway")
+        }));
+    }
+
+    #[tokio::test]
+    async fn duplicate_callback_is_reauthorized_and_acknowledged_before_decision() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        let request_id = Uuid::from_u128(30);
+        let media_id = Uuid::from_u128(31);
+        let service =
+            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+
+        assert_eq!(
+            service
+                .handle_callback(IncomingCallback {
+                    update_id: 21,
+                    callback_id: "callback-1".to_owned(),
+                    user_id: 123,
+                    chat_id: Some(123),
+                    is_private: true,
+                    data: Some(CallbackData::DuplicateUse { request_id, media_id }.encode()),
+                })
+                .await
+                .unwrap(),
+            HandleOutcome::CallbackHandled
+        );
+        assert_eq!(api.callback_answers.lock().unwrap().as_slice(), &["callback-1"]);
+        assert_eq!(ingest.duplicate_accepts.lock().unwrap().as_slice(), &[(request_id, media_id)]);
+        assert!(api.messages.lock().unwrap()[0].1.contains("Duplicate accepted"));
+
+        assert_eq!(
+            service
+                .handle_callback(IncomingCallback {
+                    update_id: 22,
+                    callback_id: "callback-2".to_owned(),
+                    user_id: 456,
+                    chat_id: Some(456),
+                    is_private: true,
+                    data: Some(CallbackData::DuplicateForceSave { request_id }.encode()),
+                })
+                .await
+                .unwrap(),
+            HandleOutcome::CallbackHandled
+        );
+        assert_eq!(api.callback_answers.lock().unwrap().as_slice(), &["callback-1", "callback-2"]);
+        assert!(ingest.force_saves.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_malformed_callback_is_acknowledged_without_dispatch() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        let service =
+            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+
+        assert_eq!(
+            service
+                .handle_callback(IncomingCallback {
+                    update_id: 23,
+                    callback_id: "malformed-unauthorized".to_owned(),
+                    user_id: 456,
+                    chat_id: Some(456),
+                    is_private: true,
+                    data: Some("not-a-callback".to_owned()),
+                })
+                .await
+                .unwrap(),
+            HandleOutcome::CallbackHandled
+        );
+        assert_eq!(api.callback_answers.lock().unwrap().as_slice(), &["malformed-unauthorized"]);
+        assert!(ingest.duplicate_accepts.lock().unwrap().is_empty());
+        assert!(ingest.force_saves.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2438,6 +3011,7 @@ mod tests {
         assert_eq!(parse_command("/HELP extra"), Some(Command::Help));
         assert_eq!(parse_command("hello /status"), None);
         assert_eq!(parse_command("/add"), Some(Command::Add));
+        assert_eq!(parse_command("/duplicates"), Some(Command::Duplicates));
     }
 
     #[test]
@@ -2530,6 +3104,14 @@ mod tests {
             None
         );
         assert_eq!(CallbackData::parse(&format!("{encoded}:extra")), None);
+
+        let media_id = Uuid::from_u128(3);
+        let duplicate = CallbackData::DuplicateUse { request_id, media_id };
+        let encoded_duplicate = duplicate.encode();
+        assert!(encoded_duplicate.len() <= 64);
+        assert_eq!(CallbackData::parse(&encoded_duplicate), Some(duplicate));
+        let force_save = CallbackData::DuplicateForceSave { request_id };
+        assert_eq!(CallbackData::parse(&force_save.encode()), Some(force_save));
     }
 
     #[tokio::test]

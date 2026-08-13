@@ -127,8 +127,11 @@ naturally idempotent setters where possible.
 Issue #44 adds the versioned `video_sequence_v1` media foundation and its
 pre-storage identity gate. Video exact SHA reuse, bounded token shortlisting,
 aligned duplicate evidence, durable `duplicate_pending`, and the authorized
-force-save route are shipped together. Images, animations, and audio retain
-exact-SHA-only behavior.
+force-save route are shipped together. Issue #52 adds the first durable
+duplicate decision: `/api/v1/ingests/{id}/accept-duplicate` and the private
+admin bot's `/duplicates` cards for accepting an evidenced media item or
+choosing `Save anyway`. Images, animations, and audio retain exact-SHA-only
+behavior.
 
 ## Single-admin security
 
@@ -147,7 +150,6 @@ This reset does not add:
 - data-copy SQL, compatibility views, old-name aliases, or dual writes;
 - multiple administrators, users, tenants, storage providers, albums, media
   variants, derivative assets, or a generalized content taxonomy;
-- Telegram duplicate-interaction cards/buttons or status-message layout;
 - Grafana/Prometheus deployment;
 - Telegram publication functionality beyond behavior already present at the
   selected implementation base.
