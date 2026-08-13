@@ -219,6 +219,15 @@ $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvaria
 if ($actual -ne $expected) { throw "companion checksum mismatch" }
 ```
 
+The Windows workflow publishes these two files together only from a pushed
+semantic release tag such as `v0.2.0`; the tag is the companion protocol
+version boundary and the download is available from that release's Assets
+section. Do not use an unversioned or legacy prerelease named `release`, and do
+not replace an existing asset in place. A companion release that forwards
+queue or post-now intent requires a backend with the #76 ingest contract;
+save-only requests remain compatible because omitted intent fields are omitted
+from the forwarded JSON.
+
 Start the companion on the Windows workstation with a loopback listener and
 two different secrets:
 
@@ -240,10 +249,13 @@ cargo run -p sooqa-companion
 
 The companion exposes only `POST http://127.0.0.1:47831/v1/submit`. Its body is
 bounded and contains a direct MP4/WebM URL, page context, an optional internal
-description, tags, and a browser action ID. A successful response means only
-that the backend accepted the ingest request; the userscript does not poll or
-claim that media is already stored. A failed request can be retried with the
-same action ID, preserving backend idempotency.
+description, tags, and a browser action ID. The backend ingest contract also
+accepts an optional `requested_action` (`save`, `queue`, or `post_now`), a
+future RFC3339 `requested_publish_at` for exact queueing, and separate public
+`requested_post_caption`; deployed save-only companions may omit these fields.
+A successful response means only that the backend accepted the ingest request;
+the userscript does not poll or claim that media is already stored. A failed
+request can be retried with the same action ID, preserving backend idempotency.
 
 Install `userscripts/sooqa-2ch-save.user.js` in Tampermonkey. It is matched only
 to `https://2ch.su/*`, `https://2ch.org/*`, and `https://2ch.life/*`,

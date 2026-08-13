@@ -88,6 +88,9 @@ userscript stores only the local token in Tampermonkey storage. Windows users
 can download the standalone companion executable from the GitHub Releases page;
 the setup and checksum verification steps are in
 [operations.md](docs/operations.md).
+The companion forwards optional `requested_action`, exact RFC3339
+`requested_publish_at`, and public `requested_post_caption` fields without
+adding polling or workflow state; omitted intent remains save-only.
 
 `apps/` contains executable processes. `crates/` contains the modular-monolith
 boundaries: configuration/runtime, Inbox, Library, Publisher, Jobs, Media,

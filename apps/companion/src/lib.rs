@@ -25,13 +25,25 @@ const MAX_ACTION_ID_CHARS: usize = 128;
 const MAX_URL_CHARS: usize = 4_096;
 const MAX_PAGE_TITLE_CHARS: usize = 512;
 const MAX_DESCRIPTION_CHARS: usize = 2_048;
+const MAX_REQUESTED_PUBLISH_AT_CHARS: usize = 64;
+const MAX_POST_CAPTION_CHARS: usize = 4_096;
 const MAX_TAGS: usize = 32;
 const MAX_TAG_CHARS: usize = 64;
 const RATE_LIMIT_REQUESTS: usize = 60;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const RECEIVE_POLL: Duration = Duration::from_millis(200);
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedAction {
+    #[default]
+    Save,
+    Queue,
+    PostNow,
+}
+
 #[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CompanionSubmission {
     pub action_id: String,
     pub url: String,
@@ -43,6 +55,23 @@ pub struct CompanionSubmission {
     pub description: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_requested_action")]
+    pub requested_action: Option<RequestedAction>,
+    #[serde(default)]
+    pub requested_publish_at: Option<String>,
+    #[serde(default)]
+    pub requested_post_caption: Option<String>,
+}
+
+fn deserialize_requested_action<'de, D>(
+    deserializer: D,
+) -> Result<Option<RequestedAction>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<RequestedAction>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("requested_action must not be null"))
 }
 
 #[derive(Debug, Serialize)]
@@ -55,6 +84,12 @@ struct BackendIngestRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<&'a str>,
     tags: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_action: Option<RequestedAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_publish_at: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_post_caption: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,6 +195,9 @@ impl<'a> CompanionService<'a> {
             page_title: submission.page_title.as_deref(),
             description: submission.description.as_deref(),
             tags: &submission.tags,
+            requested_action: submission.requested_action,
+            requested_publish_at: submission.requested_publish_at.as_deref(),
+            requested_post_caption: submission.requested_post_caption.as_deref(),
         };
 
         match forward(
@@ -266,6 +304,35 @@ fn validate_submission(
         .description
         .map(|value| bounded_text(value, MAX_DESCRIPTION_CHARS, "description"))
         .transpose()?;
+    submission.requested_publish_at = submission
+        .requested_publish_at
+        .map(|value| bounded_text(value, MAX_REQUESTED_PUBLISH_AT_CHARS, "requested_publish_at"))
+        .transpose()?;
+    if let Some(value) = submission.requested_publish_at.as_deref() {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| "requested_publish_at")?;
+    }
+    submission.requested_post_caption = submission
+        .requested_post_caption
+        .map(|value| bounded_text(value, MAX_POST_CAPTION_CHARS, "requested_post_caption"))
+        .transpose()?;
+
+    let action = submission.requested_action.unwrap_or_default();
+    match action {
+        RequestedAction::Save => {
+            if submission.requested_publish_at.is_some()
+                || submission.requested_post_caption.is_some()
+            {
+                return Err("save_intent_fields");
+            }
+        }
+        RequestedAction::Queue => {}
+        RequestedAction::PostNow => {
+            if submission.requested_publish_at.is_some() {
+                return Err("post_now_publish_at");
+            }
+        }
+    }
     if submission.tags.len() > MAX_TAGS {
         return Err("tags");
     }
@@ -480,6 +547,9 @@ mod tests {
             page_title: Some("Thread".to_owned()),
             description: Some("  internal note  ".to_owned()),
             tags: vec!["Cats".to_owned(), "Cats".to_owned()],
+            requested_action: None,
+            requested_publish_at: None,
+            requested_post_caption: None,
         }
     }
 
@@ -506,6 +576,79 @@ mod tests {
     }
 
     #[test]
+    fn submission_validation_accepts_all_backend_actions_and_keeps_fields_separate() {
+        let mut save = submission();
+        save.requested_action = Some(RequestedAction::Save);
+        assert!(validate_submission(save).is_ok());
+
+        let mut queue = submission();
+        queue.requested_action = Some(RequestedAction::Queue);
+        queue.requested_post_caption = Some("public queue text".to_owned());
+        assert!(validate_submission(queue).is_ok());
+
+        let mut exact_queue = submission();
+        exact_queue.requested_action = Some(RequestedAction::Queue);
+        exact_queue.requested_publish_at = Some("2099-01-02T03:04:05Z".to_owned());
+        exact_queue.requested_post_caption = Some("public exact text".to_owned());
+        let exact_queue =
+            validate_submission(exact_queue).expect("exact queue submission should validate");
+        assert_eq!(exact_queue.description.as_deref(), Some("internal note"));
+        assert_eq!(exact_queue.requested_post_caption.as_deref(), Some("public exact text"));
+
+        let mut post_now = submission();
+        post_now.requested_action = Some(RequestedAction::PostNow);
+        post_now.requested_post_caption = Some("public now text".to_owned());
+        assert!(validate_submission(post_now).is_ok());
+    }
+
+    #[test]
+    fn submission_validation_rejects_intent_shape_errors_and_unknown_fields() {
+        let mut save_with_caption = submission();
+        save_with_caption.requested_post_caption = Some("public text".to_owned());
+        assert!(validate_submission(save_with_caption).is_err());
+
+        let mut save_with_time = submission();
+        save_with_time.requested_publish_at = Some("2099-01-02T03:04:05Z".to_owned());
+        assert!(validate_submission(save_with_time).is_err());
+
+        let mut post_now_with_time = submission();
+        post_now_with_time.requested_action = Some(RequestedAction::PostNow);
+        post_now_with_time.requested_publish_at = Some("2099-01-02T03:04:05Z".to_owned());
+        assert!(validate_submission(post_now_with_time).is_err());
+
+        let mut malformed_time = submission();
+        malformed_time.requested_action = Some(RequestedAction::Queue);
+        malformed_time.requested_publish_at = Some("not-an-instant".to_owned());
+        assert!(validate_submission(malformed_time).is_err());
+
+        let unknown_action = serde_json::from_value::<CompanionSubmission>(serde_json::json!({
+            "action_id": "unknown-action",
+            "url": "https://2ch.org/b/src/1/clip.webm",
+            "requested_action": "later"
+        }));
+        assert!(unknown_action.is_err());
+
+        let null_action = serde_json::from_value::<CompanionSubmission>(serde_json::json!({
+            "action_id": "null-action",
+            "url": "https://2ch.org/b/src/1/clip.webm",
+            "requested_action": null
+        }));
+        assert!(null_action.is_err());
+
+        let unknown_field = serde_json::from_value::<CompanionSubmission>(serde_json::json!({
+            "action_id": "unknown-field",
+            "url": "https://2ch.org/b/src/1/clip.webm",
+            "not_part_of_the_contract": true
+        }));
+        assert!(unknown_field.is_err());
+
+        let mut oversized_caption = submission();
+        oversized_caption.requested_action = Some(RequestedAction::PostNow);
+        oversized_caption.requested_post_caption = Some("x".repeat(MAX_POST_CAPTION_CHARS + 1));
+        assert!(validate_submission(oversized_caption).is_err());
+    }
+
+    #[test]
     fn submission_validation_rejects_credentials_and_control_text() {
         let mut value = submission();
         value.url = "https://user:pass@example.com/clip.webm".to_owned();
@@ -525,11 +668,38 @@ mod tests {
             page_title: value.page_title.as_deref(),
             description: value.description.as_deref(),
             tags: &value.tags,
+            requested_action: value.requested_action,
+            requested_publish_at: value.requested_publish_at.as_deref(),
+            requested_post_caption: value.requested_post_caption.as_deref(),
         };
         let encoded = serde_json::to_string(&payload).expect("payload should serialize");
         assert!(encoded.contains("internal note"));
         assert!(!encoded.contains("action-123"));
         assert!(!encoded.contains("local-secret"));
+    }
+
+    #[test]
+    fn backend_payload_forwards_the_typed_intent_without_conflating_metadata() {
+        let mut value = submission();
+        value.requested_action = Some(RequestedAction::PostNow);
+        value.requested_post_caption = Some("public text".to_owned());
+        let value = validate_submission(value).expect("submission should validate");
+        let payload = BackendIngestRequest {
+            url: &value.url,
+            page_url: value.page_url.as_deref(),
+            page_title: value.page_title.as_deref(),
+            description: value.description.as_deref(),
+            tags: &value.tags,
+            requested_action: value.requested_action,
+            requested_publish_at: value.requested_publish_at.as_deref(),
+            requested_post_caption: value.requested_post_caption.as_deref(),
+        };
+        let encoded = serde_json::to_value(&payload).expect("payload should serialize");
+        assert_eq!(encoded["requested_action"], "post_now");
+        assert_eq!(encoded["requested_post_caption"], "public text");
+        assert_eq!(encoded["description"], "internal note");
+        assert_eq!(encoded["tags"], serde_json::json!(["Cats"]));
+        assert!(encoded.get("requested_publish_at").is_none());
     }
 
     #[test]
@@ -601,6 +771,67 @@ mod tests {
                 .expect("backend body should be JSON");
             assert_eq!(body["url"], "https://2ch.org/b/src/1/clip.webm");
             assert!(body.get("action_id").is_none());
+        }
+    }
+
+    #[test]
+    fn http_submit_forwards_each_capture_action_and_exact_time() {
+        let (backend_url, captured, backend_thread) = start_backend(vec![202, 202, 202, 202]);
+        let config = test_config(free_loopback_address(), backend_url);
+        let (companion_url, stop, companion_thread) = start_companion(config);
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(2)).build();
+
+        let mut save = submission_value("action-save");
+        save["requested_action"] = serde_json::json!("save");
+        let mut queue = submission_value("action-queue");
+        queue["requested_action"] = serde_json::json!("queue");
+        queue["requested_post_caption"] = serde_json::json!("normal queue text");
+        let mut exact_queue = submission_value("action-exact-queue");
+        exact_queue["requested_action"] = serde_json::json!("queue");
+        exact_queue["requested_publish_at"] = serde_json::json!("2099-01-02T03:04:05Z");
+        exact_queue["requested_post_caption"] = serde_json::json!("exact queue text");
+        let mut post_now = submission_value("action-post-now");
+        post_now["requested_action"] = serde_json::json!("post_now");
+        post_now["requested_post_caption"] = serde_json::json!("post now text");
+
+        for body in [&save, &queue, &exact_queue, &post_now] {
+            let response =
+                send_json(&agent, &format!("{companion_url}{SUBMIT_PATH}"), "local-secret", body);
+            assert_eq!(response.0, 202);
+        }
+
+        stop.store(true, Ordering::Release);
+        companion_thread
+            .join()
+            .expect("companion thread should join")
+            .expect("companion should stop");
+        backend_thread.join().expect("backend thread should join").expect("backend should finish");
+
+        let captured = captured.lock().expect("capture lock should not be poisoned");
+        assert_eq!(captured.len(), 4);
+        let expected = [
+            ("action-save", "save", None, None),
+            ("action-queue", "queue", None, Some("normal queue text")),
+            ("action-exact-queue", "queue", Some("2099-01-02T03:04:05Z"), Some("exact queue text")),
+            ("action-post-now", "post_now", None, Some("post now text")),
+        ];
+        for (request, (action_id, action, publish_at, post_caption)) in
+            captured.iter().zip(expected)
+        {
+            assert_eq!(request.idempotency_key, format!("companion:{action_id}"));
+            let body = serde_json::from_str::<serde_json::Value>(&request.body)
+                .expect("backend body should be JSON");
+            assert_eq!(body["requested_action"], action);
+            match publish_at {
+                Some(value) => assert_eq!(body["requested_publish_at"], value),
+                None => assert!(body.get("requested_publish_at").is_none()),
+            }
+            match post_caption {
+                Some(value) => assert_eq!(body["requested_post_caption"], value),
+                None => assert!(body.get("requested_post_caption").is_none()),
+            }
+            assert_eq!(body["description"], "Internal note");
+            assert_eq!(body["tags"], serde_json::json!(["cats"]));
         }
     }
 
