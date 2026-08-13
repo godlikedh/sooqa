@@ -14,8 +14,9 @@ use sooqa_library::{
 use sooqa_persistence::Database;
 use sooqa_publisher::{NewChannel, NewPost, PostSchedule, PostState, PostUpdate};
 use sooqa_telegram::{TelegramPublicationApi, TelegramPublicationRequest};
-use sooqa_worker::publish_post_handler;
+use sooqa_worker::{HandlerFailure, HandlerRegistry, Worker, publish_post_handler};
 use time::OffsetDateTime;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -176,10 +177,7 @@ async fn stored_media(database: &Database) -> Uuid {
     media.media.id
 }
 
-async fn due_job(
-    database: &Database,
-    caption: Option<&str>,
-) -> (sooqa_jobs::Job, sooqa_publisher::Post) {
+async fn scheduled_post(database: &Database, caption: Option<&str>) -> sooqa_publisher::Post {
     let mut channel =
         NewChannel::try_new(format!("test-{}", Uuid::new_v4()), -1000000000100).unwrap();
     channel.window_start = time::Time::from_hms(0, 0, 0).unwrap();
@@ -221,6 +219,14 @@ async fn due_job(
         .publish_now(queued.id, format!("now-{}", Uuid::new_v4()), queued.revision)
         .await
         .unwrap();
+    created
+}
+
+async fn due_job(
+    database: &Database,
+    caption: Option<&str>,
+) -> (sooqa_jobs::Job, sooqa_publisher::Post) {
+    let created = scheduled_post(database, caption).await;
     let job = database
         .jobs()
         .claim_next("publication-test", Duration::from_secs(60), &[JobType::PublishPost])
@@ -421,6 +427,97 @@ async fn recovered_publication_reconciles_sending_before_any_second_send(pool: s
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
+async fn worker_shutdown_requeues_claimed_publication_for_reconciliation(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let created = scheduled_post(&database, Some("caption")).await;
+    let claimed_signal = Arc::new(Notify::new());
+    let publisher = database.publisher();
+    let signal = Arc::clone(&claimed_signal);
+    let mut registry = HandlerRegistry::new();
+    registry.register(JobType::PublishPost, move |job| {
+        let publisher = publisher.clone();
+        let signal = Arc::clone(&signal);
+        Box::pin(async move {
+            let attempt = job
+                .attempt()
+                .ok_or_else(|| HandlerFailure::permanent("test", "job has no lease"))?;
+            let (post_id, expected_revision) = match &job.command {
+                sooqa_jobs::JobCommand::PublishPost(payload) => {
+                    (payload.post_id, payload.expected_revision)
+                }
+                _ => return Err(HandlerFailure::permanent("test", "unexpected job type")),
+            };
+            publisher
+                .claim_publish(post_id, expected_revision, &attempt)
+                .await
+                .map_err(|error| HandlerFailure::permanent("test_claim", error.to_string()))?;
+            signal.notify_one();
+            std::future::pending::<Result<(), HandlerFailure>>().await
+        })
+    });
+    let worker = Worker::new(
+        database.jobs(),
+        registry,
+        "publication-shutdown-test",
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let worker_task = tokio::spawn(async move {
+        worker
+            .run(async move {
+                let _ = shutdown_receiver.await;
+            })
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), claimed_signal.notified())
+        .await
+        .expect("worker should claim the publication before shutdown");
+    shutdown_sender.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), worker_task)
+        .await
+        .expect("worker should stop after requeuing its active job")
+        .expect("worker task should join")
+        .expect("worker should stop without an error");
+
+    assert_eq!(
+        database.publisher().find_post(created.id).await.unwrap().unwrap().state,
+        PostState::Sending
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE dedupe_key = $1",)
+            .bind(format!("post:{}:publish:v1", created.id))
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "queued"
+    );
+
+    let recovered_job = database
+        .jobs()
+        .claim_next(
+            "publication-shutdown-recovery",
+            std::time::Duration::from_secs(60),
+            &[JobType::PublishPost],
+        )
+        .await
+        .unwrap()
+        .expect("shutdown should leave the publication job queued");
+    let telegram = FakeTelegram::new(FakeOutcome::Success(99), FakeOutcome::Success(100));
+    let handler = publish_post_handler(database.publisher(), database.library(), telegram.clone());
+    handler(recovered_job.clone()).await.unwrap();
+    database.jobs().complete_lease(&recovered_job.lease().unwrap()).await.unwrap();
+
+    let reconciled = database.publisher().find_post(created.id).await.unwrap().unwrap();
+    assert_eq!(reconciled.state, PostState::Unknown);
+    assert_eq!(reconciled.error_class.as_deref(), Some("publication_interrupted"));
+    assert!(telegram.calls().is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn final_retry_fails_post_before_job_is_failed(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let (job, created) = due_job(&database, Some("caption")).await;
@@ -444,6 +541,176 @@ async fn final_retry_fails_post_before_job_is_failed(pool: sqlx::PgPool) {
             .status,
         sooqa_jobs::JobStatus::Failed
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(job.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "failed"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn final_preclaim_disabled_channel_fails_post_with_no_telegram_call(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let (job, created) = due_job(&database, Some("caption")).await;
+    sqlx::query("UPDATE channels SET is_enabled = false WHERE id = $1")
+        .bind(created.channel_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE queue.jobs SET max_attempts = 1 WHERE id = $1")
+        .bind(job.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let telegram = FakeTelegram::new(FakeOutcome::Success(91), FakeOutcome::Success(92));
+    let handler = publish_post_handler(database.publisher(), database.library(), telegram.clone());
+
+    assert!(handler(job.clone()).await.is_err());
+    assert!(telegram.calls().is_empty());
+    let failed_job = database
+        .jobs()
+        .retry_lease(
+            &job.lease().unwrap(),
+            OffsetDateTime::now_utc(),
+            "publication_dependency",
+            "channel disabled",
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed_job.status, sooqa_jobs::JobStatus::Failed);
+    assert_eq!(
+        database.publisher().find_post(created.id).await.unwrap().unwrap().state,
+        PostState::Failed
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn final_preclaim_non_ready_media_fails_post_with_no_telegram_call(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let (job, created) = due_job(&database, Some("caption")).await;
+    let media_id: Uuid = sqlx::query_scalar("SELECT media_id FROM posts WHERE id = $1")
+        .bind(created.id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media SET storage_state = 'pending_storage' WHERE id = $1")
+        .bind(media_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE queue.jobs SET max_attempts = 1 WHERE id = $1")
+        .bind(job.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let telegram = FakeTelegram::new(FakeOutcome::Success(91), FakeOutcome::Success(92));
+    let handler = publish_post_handler(database.publisher(), database.library(), telegram.clone());
+
+    assert!(handler(job.clone()).await.is_err());
+    assert!(telegram.calls().is_empty());
+    let failed_job = database
+        .jobs()
+        .fail_lease(&job.lease().unwrap(), "publication_dependency", "media is not ready")
+        .await
+        .unwrap();
+    assert_eq!(failed_job.status, sooqa_jobs::JobStatus::Failed);
+    assert_eq!(
+        database.publisher().find_post(created.id).await.unwrap().unwrap().state,
+        PostState::Failed
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn nonterminal_preclaim_failure_requeues_job_and_leaves_post_queued(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let (job, created) = due_job(&database, Some("caption")).await;
+    sqlx::query("UPDATE channels SET is_enabled = false WHERE id = $1")
+        .bind(created.channel_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let telegram = FakeTelegram::new(FakeOutcome::Success(91), FakeOutcome::Success(92));
+    let handler = publish_post_handler(database.publisher(), database.library(), telegram.clone());
+
+    assert!(handler(job.clone()).await.is_err());
+    assert!(telegram.calls().is_empty());
+    let queued_job = database
+        .jobs()
+        .retry_lease(
+            &job.lease().unwrap(),
+            OffsetDateTime::now_utc(),
+            "publication_dependency",
+            "channel disabled",
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued_job.status, sooqa_jobs::JobStatus::Queued);
+    assert_eq!(
+        database.publisher().find_post(created.id).await.unwrap().unwrap().state,
+        PostState::Queued
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn expired_final_queued_publication_fails_post_with_job(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let (job, created) = due_job(&database, Some("caption")).await;
+    sqlx::query(
+        "UPDATE queue.jobs SET max_attempts = 1, lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(database.jobs().recover_stale_leases().await.unwrap(), 1);
+    assert_eq!(
+        database.publisher().find_post(created.id).await.unwrap().unwrap().state,
+        PostState::Failed
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(job.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "failed"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn expired_final_sending_publication_becomes_unknown_with_job(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let (job, created) = due_job(&database, Some("caption")).await;
+    let expected_revision = match &job.command {
+        sooqa_jobs::JobCommand::PublishPost(payload) => payload.expected_revision,
+        _ => unreachable!("due_job creates a publish job"),
+    };
+    database
+        .publisher()
+        .claim_publish(created.id, expected_revision, &job.lease().unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET max_attempts = 1, lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(database.jobs().recover_stale_leases().await.unwrap(), 1);
+    let post = database.publisher().find_post(created.id).await.unwrap().unwrap();
+    assert_eq!(post.state, PostState::Unknown);
+    assert_eq!(post.error_class.as_deref(), Some("publication_interrupted"));
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
             .bind(job.id)

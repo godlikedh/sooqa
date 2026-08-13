@@ -483,6 +483,88 @@ async fn queued_post_cannot_be_rescheduled_after_publish_job_is_claimed(pool: sq
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
+async fn concurrent_publish_claim_and_edit_finish_without_deadlock(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let channel = database
+        .publisher()
+        .create_channel(
+            NewChannel::try_new(format!("test-{}", Uuid::new_v4()), -1000000000006).unwrap(),
+        )
+        .await
+        .unwrap();
+    let media_id = stored_media(&database).await;
+    let created = database
+        .publisher()
+        .create_post_idempotent(
+            NewPost {
+                media_id,
+                channel_id: channel.id,
+                caption: Some("before race".to_owned()),
+                parse_mode: None,
+                disable_notification: false,
+            },
+            format!("post-{}", Uuid::new_v4()),
+            b"claim-edit-race",
+        )
+        .await
+        .unwrap()
+        .post;
+    let queued = database
+        .publisher()
+        .enqueue_post(
+            PostSchedule::try_new(
+                created.id,
+                OffsetDateTime::now_utc(),
+                "claim-edit-race-schedule",
+                created.revision,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let job = claim_publish_job(&database, queued.id).await;
+    let attempt = job.lease().unwrap();
+    let claim_repository = database.publisher();
+    let edit_repository = database.publisher();
+    let (claim, edit) = tokio::time::timeout(StdDuration::from_secs(5), async move {
+        tokio::join!(
+            claim_repository.claim_publish(queued.id, queued.revision, &attempt),
+            edit_repository.update_post(
+                queued.id,
+                PostUpdate {
+                    caption: Some(Some("edited during race".to_owned())),
+                    parse_mode: None,
+                    disable_notification: None,
+                    expected_updated_at: None,
+                    expected_revision: queued.revision,
+                },
+            ),
+        )
+    })
+    .await
+    .expect("claim and edit must not deadlock");
+
+    let claim = claim.expect("the exact running publication attempt should win the claim");
+    assert!(matches!(
+        edit,
+        Err(PublisherRepositoryError::PostNotEditable { .. })
+            | Err(PublisherRepositoryError::PublishJobRunning(_))
+    ));
+    assert_eq!(claim.post.state, PostState::Sending);
+    assert_eq!(claim.post.revision, queued.revision + 1);
+    let (job_state, payload): (String, serde_json::Value) =
+        sqlx::query_as("SELECT state, payload FROM queue.jobs WHERE id = $1")
+            .bind(job.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(job_state, "running");
+    assert_eq!(payload["post_id"], queued.id.to_string());
+    assert_eq!(payload["expected_revision"], queued.revision);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn safe_publication_retry_requeues_post_and_updates_job_revision(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let mut new_channel =

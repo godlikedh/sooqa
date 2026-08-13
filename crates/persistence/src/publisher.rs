@@ -494,10 +494,10 @@ impl PublisherRepository {
         attempt: &JobAttempt,
     ) -> Result<PublishClaim, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
-        lock_current_job_attempt(&mut transaction, id, attempt).await?;
         let channel_id = post_channel_id(&mut transaction, id).await?;
         let channel = lock_channel(&mut transaction, channel_id).await?;
         let current = lock_post(&mut transaction, id).await?;
+        lock_current_job_attempt(&mut transaction, id, attempt).await?;
         let state = current.post_state()?;
         if state != PostState::Queued {
             return Err(PublisherRepositoryError::PostNotClaimable { id, state });
@@ -532,18 +532,21 @@ impl PublisherRepository {
             return Err(PublisherRepositoryError::InvalidTelegramMessageId(telegram_message_id));
         }
         let mut transaction = self.pool.begin().await?;
-        lock_current_job_attempt(&mut transaction, id, &lease.attempt).await?;
+        let channel_id = post_channel_id(&mut transaction, id).await?;
+        let channel = lock_channel(&mut transaction, channel_id).await?;
         let current = lock_post(&mut transaction, id).await?;
+        lock_current_job_attempt(&mut transaction, id, &lease.attempt).await?;
         if current.post_state()? == PostState::Published {
             if current.send_generation != lease.generation
                 || current.telegram_message_id != Some(telegram_message_id)
             {
                 return Err(PublisherRepositoryError::PublishConflict(id));
             }
-            let channel_id = current.channel_id;
-            let chat_id = channel_chat_id_in_transaction(&mut transaction, channel_id).await?;
             transaction.commit().await?;
-            return Ok(PublishedMessage { post: current.into_post()?, channel_chat_id: chat_id });
+            return Ok(PublishedMessage {
+                post: current.into_post()?,
+                channel_chat_id: channel.telegram_chat_id,
+            });
         }
         if current.post_state()? != PostState::Sending
             || current.send_generation != lease.generation
@@ -560,10 +563,8 @@ impl PublisherRepository {
         .bind(lease.token)
         .fetch_one(&mut *transaction)
         .await?;
-        let channel_id = row.channel_id;
-        let chat_id = channel_chat_id_in_transaction(&mut transaction, channel_id).await?;
         transaction.commit().await?;
-        Ok(PublishedMessage { post: row.into_post()?, channel_chat_id: chat_id })
+        Ok(PublishedMessage { post: row.into_post()?, channel_chat_id: channel.telegram_chat_id })
     }
 
     pub async fn fail_publish(
@@ -578,6 +579,9 @@ impl PublisherRepository {
             return Err(PublisherRepositoryError::InvalidPublishFailureState(state));
         }
         let mut transaction = self.pool.begin().await?;
+        let channel_id = post_channel_id(&mut transaction, id).await?;
+        lock_channel(&mut transaction, channel_id).await?;
+        lock_post(&mut transaction, id).await?;
         lock_current_job_attempt(&mut transaction, id, &lease.attempt).await?;
         let row = sqlx::query_as::<_, PostRow>(
             "UPDATE posts SET state = $2, send_token = NULL, send_started_at = NULL, error_class = $3, error_message = $4, revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'sending' AND send_generation = $5 AND send_token = $6 RETURNING *",
@@ -603,10 +607,10 @@ impl PublisherRepository {
         error_message: &str,
     ) -> Result<PublishRetry, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
-        let job = lock_current_job_attempt(&mut transaction, id, &lease.attempt).await?;
         let channel_id = post_channel_id(&mut transaction, id).await?;
         lock_channel(&mut transaction, channel_id).await?;
         let current = lock_post(&mut transaction, id).await?;
+        let job = lock_current_job_attempt(&mut transaction, id, &lease.attempt).await?;
         if current.post_state()? != PostState::Sending
             || current.send_generation != lease.generation
             || current.send_token != Some(lease.token)
@@ -650,6 +654,9 @@ impl PublisherRepository {
         attempt: &JobAttempt,
     ) -> Result<bool, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
+        let channel_id = post_channel_id(&mut transaction, id).await?;
+        lock_channel(&mut transaction, channel_id).await?;
+        lock_post(&mut transaction, id).await?;
         lock_current_job_attempt(&mut transaction, id, attempt).await?;
         let updated = sqlx::query(
             "UPDATE posts SET state = 'unknown', send_token = NULL, send_started_at = NULL, error_class = 'publication_interrupted', error_message = 'a previous publication attempt lost its job lease', revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'sending'",
@@ -944,12 +951,13 @@ async fn lock_current_job_attempt(
     attempt: &JobAttempt,
 ) -> Result<PublishJobAttemptRow, PublisherRepositoryError> {
     sqlx::query_as::<_, PublishJobAttemptRow>(
-        "SELECT id, attempt_count, max_attempts FROM queue.jobs WHERE id = $1 AND state = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_expires_at > clock_timestamp() FOR UPDATE",
+        "SELECT id, attempt_count, max_attempts FROM queue.jobs WHERE id = $1 AND kind = 'publish_post' AND payload->>'post_id' = $5 AND state = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_expires_at > clock_timestamp() FOR UPDATE",
     )
     .bind(attempt.job_id)
     .bind(attempt.attempt_number)
     .bind(&attempt.lease_owner)
     .bind(attempt.lease_token)
+    .bind(post_id.to_string())
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(PublisherRepositoryError::PublishLeaseLost(post_id))
@@ -1040,17 +1048,6 @@ async fn next_free_slot(
         candidate = next_allowed_slot(candidate + time::Duration::seconds(1), channel)?;
     }
     Err(PublisherRepositoryError::CadenceSearchExhausted)
-}
-
-async fn channel_chat_id_in_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    id: Uuid,
-) -> Result<i64, PublisherRepositoryError> {
-    sqlx::query_scalar::<_, i64>("SELECT telegram_chat_id FROM channels WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or(PublisherRepositoryError::ChannelMissing(id))
 }
 
 fn next_allowed_slot(
