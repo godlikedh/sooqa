@@ -6,6 +6,9 @@ All notable changes to sooqa will be documented here.
 
 ### Added
 
+- Extended the loopback companion to validate and forward the typed capture
+  intent, public post text, and exact queue time, with version-tagged Windows
+  release assets and checksums.
 - Composed static JPEG/PNG image normalization into the durable ingest path,
   including typed canonical/thumbnail metadata, image content kinds, and
   idempotent thumbnail library persistence without a schema change.

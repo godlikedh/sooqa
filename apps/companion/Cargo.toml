@@ -13,6 +13,7 @@ sooqa-config = { path = "../../crates/config" }
 sooqa-runtime = { path = "../../crates/runtime" }
 subtle.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tiny_http = "0.12"
 tokio.workspace = true
 tracing.workspace = true
