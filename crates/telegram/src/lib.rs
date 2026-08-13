@@ -2826,7 +2826,15 @@ mod tests {
     use super::*;
 
     type MockKeyboard = (i64, String, Vec<Vec<InlineButton>>);
-    type CaptionMutation = (Uuid, Option<String>, i64);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum QueueMutationCall {
+        Move { post_id: Uuid, direction: QueueDirection, expected_revision: i64 },
+        Slot { post_id: Uuid, slot: OffsetDateTime, expected_revision: i64 },
+        Caption { post_id: Uuid, caption: Option<String>, expected_revision: i64 },
+        Publish { post_id: Uuid, expected_revision: i64 },
+        Cancel { post_id: Uuid, expected_revision: i64 },
+    }
 
     #[derive(Clone, Default)]
     struct MockApi {
@@ -3032,8 +3040,7 @@ mod tests {
     struct MockPublisherService {
         posts: Arc<Mutex<Vec<QueuePost>>>,
         conflict: Arc<Mutex<bool>>,
-        captions: Arc<Mutex<Vec<CaptionMutation>>>,
-        slots: Arc<Mutex<Vec<(Uuid, OffsetDateTime, i64)>>>,
+        operations: Arc<Mutex<Vec<QueueMutationCall>>>,
     }
 
     #[async_trait]
@@ -3068,9 +3075,13 @@ mod tests {
         async fn move_queue_post(
             &self,
             post_id: Uuid,
-            _direction: QueueDirection,
+            direction: QueueDirection,
             expected_revision: i64,
         ) -> Result<QueuePost, Self::Error> {
+            self.operations
+                .lock()
+                .expect("mock mutex should not be poisoned")
+                .push(QueueMutationCall::Move { post_id, direction, expected_revision });
             self.mutate(post_id, expected_revision, |post| post.clone())
         }
 
@@ -3080,11 +3091,10 @@ mod tests {
             slot: OffsetDateTime,
             expected_revision: i64,
         ) -> Result<QueuePost, Self::Error> {
-            self.slots.lock().expect("mock mutex should not be poisoned").push((
-                post_id,
-                slot,
-                expected_revision,
-            ));
+            self.operations
+                .lock()
+                .expect("mock mutex should not be poisoned")
+                .push(QueueMutationCall::Slot { post_id, slot, expected_revision });
             self.mutate(post_id, expected_revision, |post| {
                 post.cadence_slot_at = Some(slot);
                 post.clone()
@@ -3097,11 +3107,9 @@ mod tests {
             caption: Option<String>,
             expected_revision: i64,
         ) -> Result<QueuePost, Self::Error> {
-            self.captions.lock().expect("mock mutex should not be poisoned").push((
-                post_id,
-                caption.clone(),
-                expected_revision,
-            ));
+            self.operations.lock().expect("mock mutex should not be poisoned").push(
+                QueueMutationCall::Caption { post_id, caption: caption.clone(), expected_revision },
+            );
             self.mutate(post_id, expected_revision, |post| {
                 post.caption = caption;
                 post.clone()
@@ -3113,6 +3121,10 @@ mod tests {
             post_id: Uuid,
             expected_revision: i64,
         ) -> Result<QueuePost, Self::Error> {
+            self.operations
+                .lock()
+                .expect("mock mutex should not be poisoned")
+                .push(QueueMutationCall::Publish { post_id, expected_revision });
             self.mutate(post_id, expected_revision, |post| post.clone())
         }
 
@@ -3121,6 +3133,10 @@ mod tests {
             post_id: Uuid,
             expected_revision: i64,
         ) -> Result<QueuePost, Self::Error> {
+            self.operations
+                .lock()
+                .expect("mock mutex should not be poisoned")
+                .push(QueueMutationCall::Cancel { post_id, expected_revision });
             self.mutate(post_id, expected_revision, |post| post.clone())
         }
 
@@ -3388,6 +3404,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_callbacks_delegate_each_direct_mutation() {
+        let post_id = Uuid::from_u128(41);
+        let expected_revision = 9;
+        let cases = vec![
+            (
+                CallbackData::QueueEarlier { post_id, expected_revision },
+                QueueMutationCall::Move {
+                    post_id,
+                    direction: QueueDirection::Earlier,
+                    expected_revision,
+                },
+            ),
+            (
+                CallbackData::QueueLater { post_id, expected_revision },
+                QueueMutationCall::Move {
+                    post_id,
+                    direction: QueueDirection::Later,
+                    expected_revision,
+                },
+            ),
+            (
+                CallbackData::QueueClearCaption { post_id, expected_revision },
+                QueueMutationCall::Caption { post_id, caption: None, expected_revision },
+            ),
+            (
+                CallbackData::QueuePublishNow { post_id, expected_revision },
+                QueueMutationCall::Publish { post_id, expected_revision },
+            ),
+            (
+                CallbackData::QueueCancel { post_id, expected_revision },
+                QueueMutationCall::Cancel { post_id, expected_revision },
+            ),
+        ];
+
+        for (index, (data, expected_call)) in cases.into_iter().enumerate() {
+            let api = MockApi::default();
+            let publisher = MockPublisherService::default();
+            publisher.posts.lock().unwrap().push(queue_post(41, expected_revision));
+            let service = TelegramService::with_ingest(
+                api.clone(),
+                MockStore::default(),
+                [123],
+                MockIngestService::default(),
+            )
+            .with_publisher(publisher.clone());
+
+            assert_eq!(
+                service.handle_callback(callback(200 + index as i64, data)).await.unwrap(),
+                HandleOutcome::CallbackHandled
+            );
+            assert_eq!(publisher.operations.lock().unwrap().as_slice(), &[expected_call]);
+            assert_eq!(api.callback_answers.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_queue_slot_reply_delegates_the_exact_slot_and_revision() {
+        let api = MockApi::default();
+        *api.next_message_id.lock().unwrap() = 1;
+        let publisher = MockPublisherService::default();
+        let post = queue_post(42, 12);
+        publisher.posts.lock().unwrap().push(post.clone());
+        let service = TelegramService::with_ingest(
+            api.clone(),
+            MockStore::default(),
+            [123],
+            MockIngestService::default(),
+        )
+        .with_publisher(publisher.clone());
+
+        assert_eq!(
+            service
+                .handle_callback(callback(
+                    210,
+                    CallbackData::QueueSetSlot {
+                        post_id: post.id,
+                        expected_revision: post.revision,
+                    },
+                ))
+                .await
+                .unwrap(),
+            HandleOutcome::CallbackHandled
+        );
+        let slot_text = "2026-08-12T18:30:00Z";
+        let slot = OffsetDateTime::parse(slot_text, &time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let mut reply = admin_message(211, slot_text);
+        reply.reply_to_message_id = Some(1);
+        assert_eq!(
+            service.handle_message(reply).await.unwrap(),
+            HandleOutcome::Responded(Command::Queue)
+        );
+        assert_eq!(
+            publisher.operations.lock().unwrap().as_slice(),
+            &[QueueMutationCall::Slot { post_id: post.id, slot, expected_revision: post.revision }]
+        );
+        assert!(api.deleted_messages.lock().unwrap().contains(&(123, 1)));
+    }
+
+    #[tokio::test]
     async fn queue_command_renders_count_and_bounded_post_cards() {
         let api = MockApi::default();
         *api.next_message_id.lock().unwrap() = 1;
@@ -3460,8 +3576,12 @@ mod tests {
         reply.reply_to_message_id = Some(2);
         service.handle_message(reply).await.unwrap();
         assert_eq!(
-            publisher.captions.lock().unwrap().as_slice(),
-            &[(post.id, Some("updated text".to_owned()), post.revision)]
+            publisher.operations.lock().unwrap().as_slice(),
+            &[QueueMutationCall::Caption {
+                post_id: post.id,
+                caption: Some("updated text".to_owned()),
+                expected_revision: post.revision,
+            }]
         );
         assert!(api.deleted_messages.lock().unwrap().contains(&(123, 1)));
         assert!(
@@ -3505,7 +3625,7 @@ mod tests {
             service.handle_message(unrelated).await.unwrap(),
             HandleOutcome::UnrecognizedIgnored
         );
-        assert!(publisher.captions.lock().unwrap().is_empty());
+        assert!(publisher.operations.lock().unwrap().is_empty());
 
         let mut queue_command = admin_message(134, "/queue");
         queue_command.reply_to_message_id = Some(1);
@@ -3514,7 +3634,7 @@ mod tests {
             HandleOutcome::Responded(Command::Queue)
         );
         assert!(api.deleted_messages.lock().unwrap().contains(&(123, 1)));
-        assert!(publisher.captions.lock().unwrap().is_empty());
+        assert!(publisher.operations.lock().unwrap().is_empty());
 
         service
             .handle_callback(callback(
@@ -3565,7 +3685,7 @@ mod tests {
             service.handle_message(admin_message(136, "expired text")).await.unwrap(),
             HandleOutcome::UnrecognizedIgnored
         );
-        assert!(publisher.captions.lock().unwrap().is_empty());
+        assert!(publisher.operations.lock().unwrap().is_empty());
         assert!(api.deleted_messages.lock().unwrap().contains(&(123, 1)));
     }
 
@@ -3634,7 +3754,7 @@ mod tests {
             HandleOutcome::CallbackHandled
         );
         assert!(api.force_replies.lock().unwrap().is_empty());
-        assert!(publisher.slots.lock().unwrap().is_empty());
+        assert!(publisher.operations.lock().unwrap().is_empty());
         assert!(
             api.messages
                 .lock()
