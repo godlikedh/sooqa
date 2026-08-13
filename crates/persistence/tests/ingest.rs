@@ -9,7 +9,20 @@ use sooqa_library::{
 };
 use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint, VideoSequenceSample};
 use sooqa_persistence::{Database, InboxRepositoryError, SourceInspectionStart};
+use sooqa_publisher::NewChannel;
+use time::OffsetDateTime;
 use uuid::Uuid;
+
+async fn enabled_channel(database: &Database, chat_id: i64) -> Uuid {
+    database
+        .publisher()
+        .create_channel(
+            NewChannel::try_new(format!("ingest-test-{}", Uuid::new_v4()), chat_id).unwrap(),
+        )
+        .await
+        .unwrap()
+        .id
+}
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
@@ -84,7 +97,9 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts(pool: sqlx::P
 #[ignore = "requires PostgreSQL"]
 async fn exact_queue_replay_remains_idempotent_after_requested_time_passes(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
-    let requested_publish_at = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(500);
+    enabled_channel(&database, -1000000000301).await;
+    let clock = OffsetDateTime::now_utc();
+    let requested_publish_at = clock + time::Duration::seconds(1);
     let key = format!("exact-queue-replay-{}", Uuid::new_v4());
     let mut input =
         IngestSubmissionInput::new("https://example.test/exact-queue", SubmittedVia::Api);
@@ -93,19 +108,109 @@ async fn exact_queue_replay_remains_idempotent_after_requested_time_passes(pool:
     input.requested_publish_at = Some(requested_publish_at);
     let first = database
         .inbox()
-        .create_ingest(IngestSubmission::try_new(input.clone()).unwrap())
+        .create_ingest_at(IngestSubmission::try_new(input.clone()).unwrap(), clock)
         .await
         .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-
     let replay = database
         .inbox()
-        .create_ingest(IngestSubmission::try_new_for_idempotency_lookup(input).unwrap())
+        .create_ingest_at(
+            IngestSubmission::try_new_for_idempotency_lookup(input).unwrap(),
+            clock + time::Duration::seconds(2),
+        )
         .await
         .unwrap();
     assert_eq!(replay.ingest.id, first.ingest.id);
     assert!(!replay.created);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn publication_intent_requires_and_snapshots_one_enabled_channel(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let mut no_channel = IngestSubmissionInput::new(
+        format!("https://example.test/no-channel-{}", Uuid::new_v4()),
+        SubmittedVia::Api,
+    );
+    no_channel.requested_action = RequestedAction::Queue;
+    no_channel.idempotency_key = Some(format!("no-channel-{}", Uuid::new_v4()));
+    let no_channel_key = no_channel.idempotency_key.clone().unwrap();
+    let error = database
+        .inbox()
+        .create_ingest(IngestSubmission::try_new(no_channel).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, InboxRepositoryError::RequestedChannelNotConfigured));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ingests WHERE input_key = $1")
+            .bind(no_channel_key)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+
+    let channel_id = enabled_channel(&database, -1000000000303).await;
+    let mut queued = IngestSubmissionInput::new(
+        format!("https://example.test/one-channel-{}", Uuid::new_v4()),
+        SubmittedVia::Api,
+    );
+    queued.requested_action = RequestedAction::Queue;
+    queued.idempotency_key = Some(format!("one-channel-{}", Uuid::new_v4()));
+    let queued_submission = IngestSubmission::try_new(queued.clone()).unwrap();
+    let created = database.inbox().create_ingest(queued_submission).await.unwrap();
+    assert_eq!(created.ingest.requested_channel_id, Some(channel_id));
+
+    sqlx::query("UPDATE channels SET is_enabled = false WHERE id = $1")
+        .bind(channel_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let replay = database
+        .inbox()
+        .create_ingest(IngestSubmission::try_new_for_idempotency_lookup(queued).unwrap())
+        .await
+        .unwrap();
+    assert!(!replay.created);
+    assert_eq!(replay.ingest.id, created.ingest.id);
+    assert_eq!(replay.ingest.requested_channel_id, Some(channel_id));
+
+    let _first = enabled_channel(&database, -1000000000304).await;
+    let _second = enabled_channel(&database, -1000000000305).await;
+    let mut ambiguous = IngestSubmissionInput::new(
+        format!("https://example.test/multiple-channels-{}", Uuid::new_v4()),
+        SubmittedVia::Api,
+    );
+    ambiguous.requested_action = RequestedAction::PostNow;
+    ambiguous.idempotency_key = Some(format!("multiple-channels-{}", Uuid::new_v4()));
+    let ambiguous_key = ambiguous.idempotency_key.clone().unwrap();
+    let error = database
+        .inbox()
+        .create_ingest(IngestSubmission::try_new(ambiguous).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, InboxRepositoryError::RequestedChannelAmbiguous));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ingests WHERE input_key = $1")
+            .bind(ambiguous_key)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+
+    let save = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/save-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(save.ingest.requested_channel_id, None);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -215,6 +320,7 @@ async fn source_inspection_completion_commits_job_success_with_transition(pool: 
 #[ignore = "requires PostgreSQL"]
 async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
+    enabled_channel(&database, -1000000000302).await;
     let mut submission_input = IngestSubmissionInput::new(
         format!("https://example.test/duplicate-{}", Uuid::new_v4()),
         SubmittedVia::Companion,

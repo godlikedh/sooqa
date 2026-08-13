@@ -1,4 +1,5 @@
 use crate::library::LibraryRepositoryError;
+use crate::publisher::select_enabled_channel_candidates;
 use crate::{
     WORKSPACE_CLEANUP_RETENTION,
     cleanup::{
@@ -63,9 +64,39 @@ impl InboxRepository {
         &self,
         submission: IngestSubmission,
     ) -> Result<CreateIngestResult, InboxRepositoryError> {
+        self.create_ingest_at(submission, OffsetDateTime::now_utc()).await
+    }
+
+    /// Create an ingest using an explicit clock value. The production entry
+    /// point uses the current UTC time; the seam keeps replay tests
+    /// deterministic without waiting for a scheduled request to expire.
+    pub async fn create_ingest_at(
+        &self,
+        submission: IngestSubmission,
+        now: OffsetDateTime,
+    ) -> Result<CreateIngestResult, InboxRepositoryError> {
         let request_hash = submission.request_hash();
-        let request_id = Uuid::now_v7();
         let mut transaction = self.pool.begin().await?;
+
+        let input_key = submission.idempotency_key.clone().unwrap_or_else(|| {
+            format!("{}:{}", submission.kind.as_str(), submission.normalized_url)
+        });
+        if let Some(existing) = sqlx::query_as::<_, IngestIdentityRow>(
+            "SELECT id, request_hash FROM ingests WHERE input_key = $1 FOR UPDATE",
+        )
+        .bind(&input_key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            if existing.request_hash.as_slice() != request_hash.as_slice() {
+                return Err(InboxRepositoryError::IdempotencyConflict { key: input_key });
+            }
+            let request = load_request(&mut transaction, existing.id).await?;
+            transaction.commit().await?;
+            return Ok(CreateIngestResult { ingest: request, created: false });
+        }
+
+        let request_id = Uuid::now_v7();
         let mut request = Ingest::from_submission(request_id, &submission);
         request
             .transition_to(IngestStatus::Queued)
@@ -76,20 +107,35 @@ impl InboxRepository {
             .and_then(serde_json::Value::as_str)
             .and_then(|value| Uuid::parse_str(value).ok())
             .unwrap_or(request.id);
-        let input_key = submission.idempotency_key.clone().unwrap_or_else(|| {
-            format!("{}:{}", submission.kind.as_str(), submission.normalized_url)
-        });
+
+        if request.requested_action == RequestedAction::Queue
+            && request
+                .requested_publish_at
+                .is_some_and(|requested_publish_at| requested_publish_at <= now)
+        {
+            return Err(InboxRepositoryError::RequestedPublishAtNotFuture);
+        }
+
+        if request.requested_action != RequestedAction::Save {
+            let candidates = select_enabled_channel_candidates(&mut transaction).await?;
+            request.requested_channel_id = match candidates.as_slice() {
+                [] => return Err(InboxRepositoryError::RequestedChannelNotConfigured),
+                [channel_id] => Some(*channel_id),
+                _ => return Err(InboxRepositoryError::RequestedChannelAmbiguous),
+            };
+        }
+
         let inserted_id = sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO ingests (
                 id, input_key, request_hash, input_kind, state, submitted_via,
                 input_json, source_url, page_url, page_title, supplied_caption,
                 supplied_description, supplied_tags, requested_action, requested_publish_at,
-                requested_post_caption, workspace_id, media_id, error_code, error_message,
-                created_at, updated_at, completed_at
+                requested_post_caption, requested_channel_id, workspace_id, media_id,
+                error_code, error_message, created_at, updated_at, completed_at
             )
             VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11,
-                    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+                    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
             ON CONFLICT (input_key) DO NOTHING
             RETURNING id
             "#,
@@ -109,6 +155,7 @@ impl InboxRepository {
         .bind(request.requested_action.as_str())
         .bind(request.requested_publish_at)
         .bind(&request.requested_post_caption)
+        .bind(request.requested_channel_id)
         .bind(request.workspace_id)
         .bind(request.media_id)
         .bind(&request.error_code)
@@ -132,14 +179,6 @@ impl InboxRepository {
             let request = load_request(&mut transaction, existing.id).await?;
             transaction.commit().await?;
             return Ok(CreateIngestResult { ingest: request, created: false });
-        }
-
-        if request.requested_action == RequestedAction::Queue
-            && request.requested_publish_at.is_some_and(|requested_publish_at| {
-                requested_publish_at <= OffsetDateTime::now_utc()
-            })
-        {
-            return Err(InboxRepositoryError::RequestedPublishAtNotFuture);
         }
 
         match request.kind {
@@ -1782,7 +1821,8 @@ async fn load_request(
         r#"
         SELECT id, input_kind, state, submitted_via, input_json, source_url, page_url,
                page_title, supplied_caption, supplied_description, supplied_tags,
-               requested_action, requested_publish_at, requested_post_caption, input_key,
+               requested_action, requested_publish_at, requested_post_caption,
+               requested_channel_id, input_key,
                workspace_id, media_id, force_save, duplicate_evidence, error_code, error_message,
                created_at, updated_at, completed_at
         FROM ingests
@@ -1871,6 +1911,7 @@ struct IngestRow {
     requested_action: String,
     requested_publish_at: Option<OffsetDateTime>,
     requested_post_caption: Option<String>,
+    requested_channel_id: Option<Uuid>,
     input_key: String,
     workspace_id: Uuid,
     media_id: Option<Uuid>,
@@ -1919,6 +1960,7 @@ impl IngestRow {
                 .map_err(InboxRepositoryError::UnknownRequestedAction)?,
             requested_publish_at: self.requested_publish_at,
             requested_post_caption: self.requested_post_caption,
+            requested_channel_id: self.requested_channel_id,
             idempotency_key: Some(self.input_key),
             media_id: self.media_id,
             force_save: self.force_save,
@@ -1960,6 +2002,10 @@ pub enum InboxRepositoryError {
     UnknownRequestedAction(String),
     #[error("requested publish time must be in the future")]
     RequestedPublishAtNotFuture,
+    #[error("no enabled publication channel is configured")]
+    RequestedChannelNotConfigured,
+    #[error("multiple enabled publication channels are configured")]
+    RequestedChannelAmbiguous,
     #[error("invalid ingest failure status: {0:?}")]
     InvalidFailureStatus(IngestStatus),
     #[error("force-save is not allowed while ingest is in {0:?}")]

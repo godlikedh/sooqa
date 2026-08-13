@@ -168,6 +168,7 @@ async fn create_ingest(
             requested_action: result.ingest.requested_action,
             requested_publish_at: result.ingest.requested_publish_at,
             requested_post_caption: result.ingest.requested_post_caption.clone(),
+            requested_channel_id: result.ingest.requested_channel_id,
             links: IngestLinks::for_id(result.ingest.id),
         }),
     ))
@@ -336,6 +337,13 @@ fn map_validation_error(error: IngestValidationError, headers: &HeaderMap) -> Ap
             "requested_post_caption_not_allowed",
             "Save requests must not include public post text",
         ),
+        IngestValidationError::RequestedPostCaptionTooLong { .. } => {
+            ("requested_post_caption_too_long", "The requested public post text is too long")
+        }
+        IngestValidationError::RequestedPostCaptionControlCharacter => (
+            "requested_post_caption_invalid",
+            "The requested public post text contains a disallowed control character",
+        ),
     };
     ApiError::bad_request(code, message, headers)
 }
@@ -372,6 +380,16 @@ fn map_repository_error(error: InboxRepositoryError, headers: &HeaderMap) -> Api
         InboxRepositoryError::RequestedPublishAtNotFuture => ApiError::bad_request(
             "requested_publish_at_not_future",
             "An exact queue time must be in the future",
+            headers,
+        ),
+        InboxRepositoryError::RequestedChannelNotConfigured => ApiError::conflict(
+            "requested_channel_not_configured",
+            "A queue or post-now request requires exactly one enabled publication channel",
+            headers,
+        ),
+        InboxRepositoryError::RequestedChannelAmbiguous => ApiError::conflict(
+            "requested_channel_ambiguous",
+            "A queue or post-now request requires exactly one enabled publication channel",
             headers,
         ),
         InboxRepositoryError::ResourceMissing(_) => {
@@ -520,6 +538,7 @@ struct IngestAcceptedResponse {
     #[serde(with = "time::serde::rfc3339::option")]
     requested_publish_at: Option<OffsetDateTime>,
     requested_post_caption: Option<String>,
+    requested_channel_id: Option<Uuid>,
     links: IngestLinks,
 }
 
@@ -538,6 +557,7 @@ struct IngestResponse {
     #[serde(with = "time::serde::rfc3339::option")]
     requested_publish_at: Option<OffsetDateTime>,
     requested_post_caption: Option<String>,
+    requested_channel_id: Option<Uuid>,
     media_id: Option<Uuid>,
     force_save: bool,
     duplicate_evidence: Option<Value>,
@@ -567,6 +587,7 @@ impl IngestResponse {
             requested_action: request.requested_action,
             requested_publish_at: request.requested_publish_at,
             requested_post_caption: request.requested_post_caption.clone(),
+            requested_channel_id: request.requested_channel_id,
             media_id: request.media_id,
             force_save: request.force_save,
             duplicate_evidence: request.duplicate_evidence.clone(),

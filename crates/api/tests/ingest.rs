@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use sooqa_api::{ApiSettings, ApiState, router};
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
 use sooqa_persistence::Database;
+use sooqa_publisher::NewChannel;
 use time::OffsetDateTime;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -57,6 +58,13 @@ async fn api_authenticates_with_the_single_configured_bearer_secret(pool: sqlx::
 #[ignore = "requires PostgreSQL"]
 async fn api_round_trips_requested_intent_without_materializing_a_post(pool: sqlx::PgPool) {
     let (database, app) = app(pool);
+    let channel = database
+        .publisher()
+        .create_channel(
+            NewChannel::try_new(format!("api-intent-{}", Uuid::new_v4()), -1000000000201).unwrap(),
+        )
+        .await
+        .unwrap();
     let requested_publish_at =
         (OffsetDateTime::now_utc() + time::Duration::hours(1)).replace_nanosecond(0).unwrap();
     let requested_publish_at_text =
@@ -93,6 +101,7 @@ async fn api_round_trips_requested_intent_without_materializing_a_post(pool: sql
     assert_eq!(accepted["requested_action"], "queue");
     assert_eq!(accepted["requested_publish_at"], requested_publish_at_text);
     assert_eq!(accepted["requested_post_caption"], "public post text");
+    assert_eq!(accepted["requested_channel_id"], channel.id.to_string());
 
     let response = app
         .oneshot(
@@ -111,12 +120,12 @@ async fn api_round_trips_requested_intent_without_materializing_a_post(pool: sql
     assert_eq!(current["requested_action"], "queue");
     assert_eq!(current["requested_publish_at"], requested_publish_at_text);
     assert_eq!(current["requested_post_caption"], "public post text");
+    assert_eq!(current["requested_channel_id"], channel.id.to_string());
     assert_eq!(current["supplied_caption"], "selected text");
     assert_eq!(current["supplied_description"], "internal description");
     assert_eq!(current["supplied_tags"], json!(["cats"]));
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM posts WHERE id = $1")
-            .bind(ingest_id)
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM posts")
             .fetch_one(database.pool())
             .await
             .unwrap(),

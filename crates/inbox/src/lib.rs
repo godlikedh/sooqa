@@ -8,6 +8,8 @@ use url::Url;
 use uuid::Uuid;
 
 const MAX_IDEMPOTENCY_KEY_LENGTH: usize = 255;
+/// Must remain aligned with the Publisher's Telegram caption contract.
+pub const MAX_REQUESTED_POST_CAPTION_LENGTH: usize = 1_024;
 
 /// Durable source metadata produced by an inspection adapter.
 ///
@@ -474,6 +476,9 @@ pub struct Ingest {
     pub requested_action: RequestedAction,
     pub requested_publish_at: Option<time::OffsetDateTime>,
     pub requested_post_caption: Option<String>,
+    /// Server-selected publication target captured when the request is created.
+    /// This is deliberately absent from `IngestSubmission` and its request hash.
+    pub requested_channel_id: Option<Uuid>,
     pub idempotency_key: Option<String>,
     pub media_id: Option<Uuid>,
     pub force_save: bool,
@@ -505,6 +510,7 @@ impl Ingest {
             requested_action: submission.requested_action,
             requested_publish_at: submission.requested_publish_at,
             requested_post_caption: submission.requested_post_caption.clone(),
+            requested_channel_id: None,
             idempotency_key: submission.idempotency_key.clone(),
             media_id: None,
             force_save: false,
@@ -563,6 +569,10 @@ pub enum IngestValidationError {
     RequestedPublishAtNotFuture,
     #[error("save requests must not include public post text")]
     RequestedPostCaptionForbidden,
+    #[error("requested post caption must be at most {max} characters")]
+    RequestedPostCaptionTooLong { max: usize },
+    #[error("requested post caption contains a disallowed control character")]
+    RequestedPostCaptionControlCharacter,
 }
 
 fn normalize_url(input: &str, field: &'static str) -> Result<String, IngestValidationError> {
@@ -661,6 +671,20 @@ fn validate_requested_intent(
     requested_post_caption: Option<&str>,
     enforce_publish_time_freshness: bool,
 ) -> Result<(), IngestValidationError> {
+    if let Some(caption) = requested_post_caption {
+        if caption.chars().count() > MAX_REQUESTED_POST_CAPTION_LENGTH {
+            return Err(IngestValidationError::RequestedPostCaptionTooLong {
+                max: MAX_REQUESTED_POST_CAPTION_LENGTH,
+            });
+        }
+        if caption
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+        {
+            return Err(IngestValidationError::RequestedPostCaptionControlCharacter);
+        }
+    }
+
     match action {
         RequestedAction::Save => {
             if requested_publish_at.is_some() {
@@ -795,6 +819,41 @@ mod tests {
         let post_now = IngestSubmission::try_new(post_now).expect("post-now should be valid");
         assert_eq!(post_now.requested_action, RequestedAction::PostNow);
         assert_eq!(post_now.requested_post_caption.as_deref(), Some("publish this"));
+    }
+
+    #[test]
+    fn requested_post_caption_matches_the_publisher_text_contract() {
+        let mut multiline =
+            IngestSubmissionInput::new("https://example.com/multiline-caption", SubmittedVia::Api);
+        multiline.requested_action = RequestedAction::PostNow;
+        multiline.requested_post_caption = Some("line one\nline two\tready".to_owned());
+        let submission = IngestSubmission::try_new(multiline).expect("multiline caption is valid");
+        assert_eq!(submission.requested_post_caption.as_deref(), Some("line one\nline two\tready"));
+
+        let mut too_long =
+            IngestSubmissionInput::new("https://example.com/long-caption", SubmittedVia::Api);
+        too_long.requested_action = RequestedAction::PostNow;
+        too_long.requested_post_caption = Some("x".repeat(MAX_REQUESTED_POST_CAPTION_LENGTH + 1));
+        assert!(matches!(
+            IngestSubmission::try_new(too_long),
+            Err(IngestValidationError::RequestedPostCaptionTooLong { .. })
+        ));
+
+        let mut control =
+            IngestSubmissionInput::new("https://example.com/control-caption", SubmittedVia::Api);
+        control.requested_action = RequestedAction::PostNow;
+        control.requested_post_caption = Some("bad\u{0000}caption".to_owned());
+        assert!(matches!(
+            IngestSubmission::try_new(control),
+            Err(IngestValidationError::RequestedPostCaptionControlCharacter)
+        ));
+
+        let mut blank =
+            IngestSubmissionInput::new("https://example.com/blank-caption", SubmittedVia::Api);
+        blank.requested_action = RequestedAction::PostNow;
+        blank.requested_post_caption = Some(" \n\t ".to_owned());
+        let blank = IngestSubmission::try_new(blank).expect("blank optional caption is omitted");
+        assert!(blank.requested_post_caption.is_none());
     }
 
     #[test]

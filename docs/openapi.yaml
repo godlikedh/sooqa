@@ -676,13 +676,14 @@ components:
         media_id: { type: string, format: uuid }
     IngestAcceptedResponse:
       type: object
-      required: [id, status, requested_action, requested_publish_at, requested_post_caption, links]
+      required: [id, status, requested_action, requested_publish_at, requested_post_caption, requested_channel_id, links]
       properties:
         id: { type: string, format: uuid }
         status: { $ref: '#/components/schemas/IngestStatus' }
         requested_action: { type: string, enum: [save, queue, post_now] }
         requested_publish_at: { type: string, format: date-time, nullable: true }
         requested_post_caption: { type: string, nullable: true }
+        requested_channel_id: { type: string, format: uuid, nullable: true }
         links:
           type: object
           required: [self]
@@ -692,7 +693,7 @@ components:
       allOf:
         - $ref: '#/components/schemas/IngestAcceptedResponse'
         - type: object
-          required: [kind, source_url, created_at, updated_at, supplied_tags, force_save, requested_action, requested_publish_at, requested_post_caption]
+          required: [kind, source_url, created_at, updated_at, supplied_tags, force_save, requested_action, requested_publish_at, requested_post_caption, requested_channel_id]
           properties:
             kind: { type: string, enum: [url, telegram_message, upload] }
             source_url: { type: string }
@@ -704,6 +705,7 @@ components:
             requested_action: { type: string, enum: [save, queue, post_now] }
             requested_publish_at: { type: string, format: date-time, nullable: true }
             requested_post_caption: { type: string, nullable: true }
+            requested_channel_id: { type: string, format: uuid, nullable: true }
             media_id: { type: string, format: uuid, nullable: true }
             force_save: { type: boolean }
             duplicate_evidence:
