@@ -394,6 +394,23 @@ async fn reconcile_exhausted_job(
         }
         return Ok(());
     }
+    if job_type == JobType::PublishPost {
+        let Some(post_id) = job
+            .payload
+            .get("post_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+        else {
+            return Ok(());
+        };
+        sqlx::query(
+            "UPDATE posts SET state = 'unknown', send_token = NULL, send_started_at = NULL, error_class = 'publication_interrupted', error_message = 'publication job lease expired after the final attempt', revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'sending'",
+        )
+        .bind(post_id)
+        .execute(&mut **transaction)
+        .await?;
+        return Ok(());
+    }
     if job_type != JobType::UploadStorageAsset {
         return Ok(());
     }

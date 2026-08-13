@@ -239,6 +239,12 @@ pub struct PublishedMessage {
     pub channel_chat_id: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishRetry {
+    pub post: Post,
+    pub terminal: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PublisherValidationError {
     #[error("publication request key must not be empty")]

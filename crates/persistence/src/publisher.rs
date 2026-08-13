@@ -1,10 +1,11 @@
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use sha2::{Digest, Sha256};
+use sooqa_jobs::JobAttempt;
 use sooqa_publisher::{
     Channel, ChannelValidationError, NewChannel, NewPost, Post, PostSchedule, PostState,
-    PostUpdate, PublishClaim, PublishedMessage, PublisherValidationError, QueueDirection,
-    validate_caption,
+    PostUpdate, PublishClaim, PublishRetry, PublishedMessage, PublisherValidationError,
+    QueueDirection, validate_caption,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::collections::HashMap;
@@ -21,6 +22,13 @@ pub struct PublisherRepository {
 pub struct CreatePostResult {
     pub post: Post,
     pub created: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublishLease {
+    pub generation: i32,
+    pub token: Uuid,
+    pub attempt: JobAttempt,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -483,8 +491,10 @@ impl PublisherRepository {
         &self,
         id: Uuid,
         expected_revision: i64,
+        attempt: &JobAttempt,
     ) -> Result<PublishClaim, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
+        lock_current_job_attempt(&mut transaction, id, attempt).await?;
         let channel_id = post_channel_id(&mut transaction, id).await?;
         let channel = lock_channel(&mut transaction, channel_id).await?;
         let current = lock_post(&mut transaction, id).await?;
@@ -515,17 +525,17 @@ impl PublisherRepository {
     pub async fn complete_publish(
         &self,
         id: Uuid,
-        generation: i32,
-        token: Uuid,
+        lease: &PublishLease,
         telegram_message_id: i64,
     ) -> Result<PublishedMessage, PublisherRepositoryError> {
         if telegram_message_id <= 0 {
             return Err(PublisherRepositoryError::InvalidTelegramMessageId(telegram_message_id));
         }
         let mut transaction = self.pool.begin().await?;
+        lock_current_job_attempt(&mut transaction, id, &lease.attempt).await?;
         let current = lock_post(&mut transaction, id).await?;
         if current.post_state()? == PostState::Published {
-            if current.send_generation != generation
+            if current.send_generation != lease.generation
                 || current.telegram_message_id != Some(telegram_message_id)
             {
                 return Err(PublisherRepositoryError::PublishConflict(id));
@@ -536,8 +546,8 @@ impl PublisherRepository {
             return Ok(PublishedMessage { post: current.into_post()?, channel_chat_id: chat_id });
         }
         if current.post_state()? != PostState::Sending
-            || current.send_generation != generation
-            || current.send_token != Some(token)
+            || current.send_generation != lease.generation
+            || current.send_token != Some(lease.token)
         {
             return Err(PublisherRepositoryError::PublishLeaseLost(id));
         }
@@ -546,8 +556,8 @@ impl PublisherRepository {
         )
         .bind(id)
         .bind(telegram_message_id)
-        .bind(generation)
-        .bind(token)
+        .bind(lease.generation)
+        .bind(lease.token)
         .fetch_one(&mut *transaction)
         .await?;
         let channel_id = row.channel_id;
@@ -559,8 +569,7 @@ impl PublisherRepository {
     pub async fn fail_publish(
         &self,
         id: Uuid,
-        generation: i32,
-        token: Uuid,
+        lease: &PublishLease,
         state: PostState,
         error_class: &str,
         error_message: &str,
@@ -568,6 +577,8 @@ impl PublisherRepository {
         if !matches!(state, PostState::Failed | PostState::Unknown) {
             return Err(PublisherRepositoryError::InvalidPublishFailureState(state));
         }
+        let mut transaction = self.pool.begin().await?;
+        lock_current_job_attempt(&mut transaction, id, &lease.attempt).await?;
         let row = sqlx::query_as::<_, PostRow>(
             "UPDATE posts SET state = $2, send_token = NULL, send_started_at = NULL, error_class = $3, error_message = $4, revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'sending' AND send_generation = $5 AND send_token = $6 RETURNING *",
         )
@@ -575,65 +586,79 @@ impl PublisherRepository {
         .bind(state.as_str())
         .bind(error_class)
         .bind(error_message)
-        .bind(generation)
-        .bind(token)
-        .fetch_optional(&self.pool)
+        .bind(lease.generation)
+        .bind(lease.token)
+        .fetch_optional(&mut *transaction)
         .await?
         .ok_or(PublisherRepositoryError::PublishLeaseLost(id))?;
+        transaction.commit().await?;
         row.into_post()
     }
 
     pub async fn retry_publish(
         &self,
         id: Uuid,
-        generation: i32,
-        token: Uuid,
+        lease: &PublishLease,
         error_class: &str,
         error_message: &str,
-    ) -> Result<Post, PublisherRepositoryError> {
+    ) -> Result<PublishRetry, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
+        let job = lock_current_job_attempt(&mut transaction, id, &lease.attempt).await?;
         let channel_id = post_channel_id(&mut transaction, id).await?;
         lock_channel(&mut transaction, channel_id).await?;
         let current = lock_post(&mut transaction, id).await?;
         if current.post_state()? != PostState::Sending
-            || current.send_generation != generation
-            || current.send_token != Some(token)
+            || current.send_generation != lease.generation
+            || current.send_token != Some(lease.token)
         {
             return Err(PublisherRepositoryError::PublishLeaseLost(id));
         }
         let revision = next_revision(current.revision)?;
+        let terminal = job.attempt_count >= job.max_attempts;
+        let next_state = if terminal { PostState::Failed } else { PostState::Queued };
         let row = sqlx::query_as::<_, PostRow>(
-            "UPDATE posts SET state = 'queued', send_token = NULL, send_started_at = NULL, error_class = $2, error_message = $3, revision = $4, updated_at = now() WHERE id = $1 AND state = 'sending' AND send_generation = $5 AND send_token = $6 RETURNING *",
+            "UPDATE posts SET state = $2, send_token = NULL, send_started_at = NULL, error_class = $3, error_message = $4, revision = $5, updated_at = now() WHERE id = $1 AND state = 'sending' AND send_generation = $6 AND send_token = $7 RETURNING *",
         )
         .bind(id)
+        .bind(next_state.as_str())
         .bind(error_class)
         .bind(error_message)
         .bind(revision)
-        .bind(generation)
-        .bind(token)
+        .bind(lease.generation)
+        .bind(lease.token)
         .fetch_one(&mut *transaction)
         .await?;
-        let job = lock_publish_job(&mut transaction, id)
-            .await?
-            .ok_or(PublisherRepositoryError::PublishJobMissing(id))?;
-        if job.state != "running" {
-            return Err(PublisherRepositoryError::PublishJobUnavailable {
-                post_id: id,
-                state: job.state,
-            });
-        }
-        let updated = sqlx::query(
-            "UPDATE queue.jobs SET payload = $2, updated_at = now() WHERE id = $1 AND state = 'running'",
-        )
-        .bind(job.id)
-        .bind(serde_json::json!({ "post_id": id, "expected_revision": row.revision }))
-        .execute(&mut *transaction)
-        .await?;
-        if updated.rows_affected() != 1 {
-            return Err(PublisherRepositoryError::PublishJobUpdateLost(id));
+        if !terminal {
+            let updated = sqlx::query(
+                "UPDATE queue.jobs SET payload = $2, updated_at = now() WHERE id = $1 AND state = 'running'",
+            )
+            .bind(job.id)
+            .bind(serde_json::json!({ "post_id": id, "expected_revision": row.revision }))
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(PublisherRepositoryError::PublishJobUpdateLost(id));
+            }
         }
         transaction.commit().await?;
-        row.into_post()
+        Ok(PublishRetry { post: row.into_post()?, terminal })
+    }
+
+    pub async fn reconcile_interrupted_publish(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+    ) -> Result<bool, PublisherRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        lock_current_job_attempt(&mut transaction, id, attempt).await?;
+        let updated = sqlx::query(
+            "UPDATE posts SET state = 'unknown', send_token = NULL, send_started_at = NULL, error_class = 'publication_interrupted', error_message = 'a previous publication attempt lost its job lease', revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'sending'",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(updated.rows_affected() == 1)
     }
 }
 
@@ -889,6 +914,13 @@ struct PublishJobRow {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+struct PublishJobAttemptRow {
+    id: Uuid,
+    attempt_count: i32,
+    max_attempts: i32,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 struct OccupiedSlotRow {
     id: Uuid,
     state: String,
@@ -904,6 +936,23 @@ async fn lock_publish_job(
     .bind(format!("post:{post_id}:publish:v1"))
     .fetch_optional(&mut **transaction)
     .await?)
+}
+
+async fn lock_current_job_attempt(
+    transaction: &mut Transaction<'_, Postgres>,
+    post_id: Uuid,
+    attempt: &JobAttempt,
+) -> Result<PublishJobAttemptRow, PublisherRepositoryError> {
+    sqlx::query_as::<_, PublishJobAttemptRow>(
+        "SELECT id, attempt_count, max_attempts FROM queue.jobs WHERE id = $1 AND state = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_expires_at > clock_timestamp() FOR UPDATE",
+    )
+    .bind(attempt.job_id)
+    .bind(attempt.attempt_number)
+    .bind(&attempt.lease_owner)
+    .bind(attempt.lease_token)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(PublisherRepositoryError::PublishLeaseLost(post_id))
 }
 
 fn schedule_request_hash(schedule: &PostSchedule) -> Vec<u8> {

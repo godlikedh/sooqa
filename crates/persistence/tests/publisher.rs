@@ -5,7 +5,7 @@ use sooqa_jobs::JobType;
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
-use sooqa_persistence::{Database, PublisherRepositoryError};
+use sooqa_persistence::{Database, PublishLease, PublisherRepositoryError};
 use sooqa_publisher::{NewChannel, NewPost, PostSchedule, PostState, PostUpdate, QueueDirection};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -52,6 +52,20 @@ async fn stored_media(database: &Database) -> Uuid {
         .await
         .unwrap();
     media.media.id
+}
+
+async fn claim_publish_job(database: &Database, post_id: Uuid) -> sooqa_jobs::Job {
+    sqlx::query("UPDATE queue.jobs SET run_at = now() WHERE dedupe_key = $1")
+        .bind(format!("post:{post_id}:publish:v1"))
+        .execute(database.pool())
+        .await
+        .unwrap();
+    database
+        .jobs()
+        .claim_next("publisher-test", StdDuration::from_secs(60), &[JobType::PublishPost])
+        .await
+        .unwrap()
+        .expect("publish job should be claimable")
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -301,9 +315,11 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
     );
 
     let sending_before = database.publisher().find_post(queued[0].id).await.unwrap().unwrap();
+    let sending_job = claim_publish_job(&database, sending_before.id).await;
+    let sending_attempt = sending_job.lease().unwrap();
     let sending = database
         .publisher()
-        .claim_publish(sending_before.id, sending_before.revision)
+        .claim_publish(sending_before.id, sending_before.revision, &sending_attempt)
         .await
         .unwrap();
     let target_before = database.publisher().find_post(queued[2].id).await.unwrap().unwrap();
@@ -424,13 +440,18 @@ async fn queued_post_cannot_be_rescheduled_after_publish_job_is_claimed(pool: sq
         )
         .await
         .unwrap();
-    let claimed = database.publisher().claim_publish(queued.id, queued.revision).await.unwrap();
+    let job = claim_publish_job(&database, queued.id).await;
+    let attempt = job.lease().unwrap();
+    let claimed =
+        database.publisher().claim_publish(queued.id, queued.revision, &attempt).await.unwrap();
     assert_eq!(claimed.post.state, PostState::Sending);
+    let stale_lease = PublishLease {
+        generation: claimed.post.send_generation,
+        token: Uuid::new_v4(),
+        attempt: attempt.clone(),
+    };
     assert!(matches!(
-        database
-            .publisher()
-            .complete_publish(queued.id, claimed.post.send_generation, Uuid::new_v4(), 44,)
-            .await,
+        database.publisher().complete_publish(queued.id, &stale_lease, 44).await,
         Err(PublisherRepositoryError::PublishLeaseLost(_))
     ));
     assert_eq!(
@@ -482,35 +503,33 @@ async fn safe_publication_retry_requeues_post_and_updates_job_revision(pool: sql
         .publish_now(queued.id, "retry-now".to_owned(), queued.revision)
         .await
         .unwrap();
-    let _job = database
+    let job = database
         .jobs()
         .claim_next("publisher-test", StdDuration::from_secs(60), &[JobType::PublishPost])
         .await
         .unwrap()
         .expect("publish job should be claimed");
-    let claim = database.publisher().claim_publish(due.id, due.revision).await.unwrap();
+    let attempt = job.lease().unwrap();
+    let claim = database.publisher().claim_publish(due.id, due.revision, &attempt).await.unwrap();
     let token = claim.post.send_token.unwrap();
+    let lease =
+        PublishLease { generation: claim.post.send_generation, token, attempt: attempt.clone() };
     let retried = database
         .publisher()
-        .retry_publish(
-            queued.id,
-            claim.post.send_generation,
-            token,
-            "telegram_retryable",
-            "flood control",
-        )
+        .retry_publish(queued.id, &lease, "telegram_retryable", "flood control")
         .await
         .unwrap();
-    assert_eq!(retried.state, PostState::Queued);
-    assert_eq!(retried.revision, claim.post.revision + 1);
-    assert!(retried.send_token.is_none());
+    assert!(!retried.terminal);
+    assert_eq!(retried.post.state, PostState::Queued);
+    assert_eq!(retried.post.revision, claim.post.revision + 1);
+    assert!(retried.post.send_token.is_none());
     let payload: serde_json::Value =
         sqlx::query_scalar("SELECT payload FROM queue.jobs WHERE dedupe_key = $1")
             .bind(format!("post:{}:publish:v1", queued.id))
             .fetch_one(database.pool())
             .await
             .unwrap();
-    assert_eq!(payload["expected_revision"], retried.revision);
+    assert_eq!(payload["expected_revision"], retried.post.revision);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -606,6 +625,9 @@ async fn failed_post_edit_keeps_failed_job_until_explicit_requeue(pool: sqlx::Pg
             .unwrap();
     assert_eq!(job_state, "queued");
     assert_eq!(payload["expected_revision"], requeued.revision);
-    let claimed = database.publisher().claim_publish(requeued.id, requeued.revision).await.unwrap();
+    let job = claim_publish_job(&database, requeued.id).await;
+    let attempt = job.lease().unwrap();
+    let claimed =
+        database.publisher().claim_publish(requeued.id, requeued.revision, &attempt).await.unwrap();
     assert_eq!(claimed.post.state, PostState::Sending);
 }
