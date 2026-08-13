@@ -226,12 +226,13 @@ Exact duplicates reuse the existing media row, strong perceptual matches stop
 at durable `duplicate_pending`, and no-match videos insert one
 `pending_storage` reservation before upload.
 
-Duplicate acceptance does not create a UI/session/history table. The
-`duplicate_evidence` JSON on `ingests` is the only candidate decision record;
-once accepted it is cleared and the chosen `media_id` becomes the durable
-decision. Storage completion and failure continue to fan out by that media ID,
-so an accepted pending candidate completes or fails with the candidate's own
-upload result.
+Duplicate acceptance does not create a UI/session/history table. The bounded
+`duplicate_evidence` JSON on `ingests` is consumed into a versioned namespaced
+accepted-decision marker in `input_json`; once accepted, the evidence is cleared
+and the chosen `media_id` becomes the durable decision. Storage completion and
+failure continue to fan out by that media ID, and a retry of the winning accept
+command remains an idempotent replay even after a retryable or terminal storage
+failure.
 
 The home deployment adds the official `tdlib/telegram-bot-api` service in
 `--local` mode. It is built at a pinned upstream commit, has a dedicated

@@ -473,6 +473,104 @@ async fn duplicate_acceptance_joins_pending_storage_without_replacing_upload(poo
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
+async fn accepted_pending_storage_decision_replays_after_storage_failures(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let media_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO media (id, kind, storage_state) VALUES ($1, 'video', 'pending_storage')",
+    )
+    .bind(media_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/failure-replay-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ingests SET state = 'duplicate_pending', duplicate_evidence = $2 WHERE id = $1",
+    )
+    .bind(ingest.ingest.id)
+    .bind(duplicate_evidence(media_id))
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let accepted = database.inbox().accept_duplicate(ingest.ingest.id, media_id).await.unwrap();
+    assert_eq!(accepted.ingest.status, IngestStatus::Storing);
+    assert_eq!(
+        database
+            .inbox()
+            .fail_storage_for_media(
+                media_id,
+                IngestStatus::FailedRetryable,
+                "storage_upload",
+                "temporary storage failure",
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let retryable_replay =
+        database.inbox().accept_duplicate(ingest.ingest.id, media_id).await.unwrap();
+    assert!(retryable_replay.replayed);
+    assert_eq!(retryable_replay.ingest.status, IngestStatus::FailedRetryable);
+    assert!(matches!(
+        database.inbox().accept_duplicate(ingest.ingest.id, Uuid::now_v7()).await,
+        Err(InboxRepositoryError::DuplicateDecisionNotAllowed(IngestStatus::FailedRetryable))
+    ));
+
+    assert_eq!(
+        database
+            .inbox()
+            .fail_storage_for_media(
+                media_id,
+                IngestStatus::FailedTerminal,
+                "storage_upload",
+                "permanent storage failure",
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let terminal_replay =
+        database.inbox().accept_duplicate(ingest.ingest.id, media_id).await.unwrap();
+    assert!(terminal_replay.replayed);
+    assert_eq!(terminal_replay.ingest.status, IngestStatus::FailedTerminal);
+    assert!(matches!(
+        database.inbox().accept_duplicate(ingest.ingest.id, Uuid::now_v7()).await,
+        Err(InboxRepositoryError::DuplicateDecisionNotAllowed(IngestStatus::FailedTerminal))
+    ));
+
+    sqlx::query(
+        "DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1 OR payload->>'media_id' = $2",
+    )
+    .bind(ingest.ingest.id.to_string())
+    .bind(media_id.to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM media WHERE id = $1")
+        .bind(media_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn duplicate_accept_and_force_save_have_one_row_locked_winner(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let media_id = Uuid::now_v7();

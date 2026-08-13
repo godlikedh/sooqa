@@ -168,13 +168,25 @@ impl InboxRepository {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
 
-        if !request.force_save
-            && matches!(request.status, IngestStatus::Storing | IngestStatus::Completed)
-        {
-            if accepted_duplicate_media_id(&request.original_input) == Some(media_id) {
+        // Inspect the durable decision before looking at the current pipeline
+        // state. Storage may fail after a successful accept, and the original
+        // command must remain replay-safe while that downstream state changes.
+        if request.original_input.get(DUPLICATE_DECISION_MARKER_KEY).is_some() {
+            let accepted_media_id = accepted_duplicate_media_id(&request.original_input);
+            if !request.force_save
+                && accepted_media_id.is_some()
+                && request.media_id == accepted_media_id
+                && accepted_media_id == Some(media_id)
+            {
                 transaction.commit().await?;
                 return Ok(AcceptDuplicateResult { ingest: request, replayed: true });
             }
+            return Err(InboxRepositoryError::DuplicateDecisionNotAllowed(request.status));
+        }
+
+        if !request.force_save
+            && matches!(request.status, IngestStatus::Storing | IngestStatus::Completed)
+        {
             return Err(InboxRepositoryError::DuplicateDecisionNotAllowed(request.status));
         }
 
