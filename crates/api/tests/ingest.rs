@@ -354,18 +354,18 @@ async fn accept_duplicate_replays_after_pending_storage_failure(pool: sqlx::PgPo
     .await
     .unwrap();
 
-    let accept_request = || {
+    let accept_request = |requested_media_id| {
         app.clone().oneshot(
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/v1/ingests/{}/accept-duplicate", ingest.ingest.id))
                 .header("content-type", "application/json")
                 .header("authorization", "Bearer test-api-token")
-                .body(Body::from(json!({"media_id": media_id}).to_string()))
+                .body(Body::from(json!({"media_id": requested_media_id}).to_string()))
                 .unwrap(),
         )
     };
-    assert_eq!(accept_request().await.unwrap().status(), StatusCode::ACCEPTED);
+    assert_eq!(accept_request(media_id).await.unwrap().status(), StatusCode::ACCEPTED);
     assert_eq!(
         database
             .inbox()
@@ -379,11 +379,33 @@ async fn accept_duplicate_replays_after_pending_storage_failure(pool: sqlx::PgPo
             .unwrap(),
         1
     );
-    let response = accept_request().await.unwrap();
+    let response = accept_request(media_id).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["status"], "failed_retryable");
+
+    assert_eq!(
+        database
+            .inbox()
+            .fail_storage_for_media(
+                media_id,
+                sooqa_inbox::IngestStatus::FailedTerminal,
+                "storage_upload",
+                "permanent storage failure",
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let response = accept_request(media_id).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["status"], "failed_terminal");
+
+    let response = accept_request(Uuid::now_v7()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 
     sqlx::query(
         "DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1 OR payload->>'media_id' = $2",
