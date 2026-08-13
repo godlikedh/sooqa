@@ -144,9 +144,16 @@ class FakeElement {
     }
   }
 
-  focus() {}
+  focus() {
+    if (this.ownerDocument && this.ownerDocument.throwOnFocus) {
+      throw new Error("focus failed");
+    }
+  }
 
   showModal() {
+    if (this.ownerDocument && this.ownerDocument.throwOnShowModal) {
+      throw new Error("showModal failed");
+    }
     this.open = true;
   }
 
@@ -163,6 +170,8 @@ class FakeDocument extends FakeElement {
     this.title = "Fixture thread";
     this.body = new FakeElement("body", this);
     this.observers = [];
+    this.throwOnFocus = false;
+    this.throwOnShowModal = false;
   }
 
   createElement(tagName) {
@@ -312,6 +321,10 @@ function actionButtons(post) {
 
 function actionButton(post, key) {
   return actionButtons(post).find((button) => button.dataset.sooqaAction === key);
+}
+
+function assertActionButtonsState(post, disabled) {
+  for (const button of actionButtons(post)) assert.equal(button.disabled, disabled);
 }
 
 function requestPayload(request) {
@@ -639,6 +652,10 @@ test("Post now… asks for public text and Queue… adds an exact future time", 
 
   actionButton(post, "post_now_detailed").click();
   let dialog = browser.document.body.querySelector("dialog");
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 1);
+  assert.match(browser.document.body.querySelector("style").textContent, /sooqa-metadata-dialog/);
+  assert.match(browser.document.body.querySelector("style").textContent, /::backdrop/);
+  assertActionButtonsState(post, true);
   assert.equal(dialog.querySelectorAll("input").length, 1);
   assert.equal(dialog.querySelectorAll("textarea").length, 2);
   dialog.querySelector("input").value = "Cats";
@@ -646,12 +663,16 @@ test("Post now… asks for public text and Queue… adds an exact future time", 
   dialog.querySelectorAll("textarea")[1].value = "Public";
   dialog.querySelectorAll("button")[1].click();
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assertActionButtonsState(post, false);
   assert.equal(requestPayload(requests[0]).requested_action, "post_now");
   assert.equal(requestPayload(requests[0]).requested_post_caption, "Public");
   assert.equal("requested_publish_at" in requestPayload(requests[0]), false);
 
   actionButton(post, "queue_exact").click();
   dialog = browser.document.body.querySelector("dialog");
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 1);
+  assertActionButtonsState(post, true);
   assert.equal(dialog.querySelectorAll("input").length, 2);
   assert.equal(dialog.querySelectorAll("textarea").length, 2);
   dialog.querySelectorAll("input")[0].value = "Cats";
@@ -660,6 +681,8 @@ test("Post now… asks for public text and Queue… adds an exact future time", 
   dialog.querySelectorAll("input")[1].value = futureLocalDateTime();
   dialog.querySelectorAll("button")[1].click();
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assertActionButtonsState(post, false);
   const exact = requestPayload(requests[1]);
   assert.equal(exact.requested_action, "queue");
   assert.equal(exact.requested_post_caption, "Public");
@@ -674,17 +697,101 @@ test("Save… asks only for internal metadata", async () => {
   userscript.boot(browser.root);
   actionButton(post, "save_detailed").click();
   const dialog = browser.document.body.querySelector("dialog");
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 1);
+  assertActionButtonsState(post, true);
   assert.equal(dialog.querySelectorAll("input").length, 1);
   assert.equal(dialog.querySelectorAll("textarea").length, 1);
   dialog.querySelector("input").value = "cats";
   dialog.querySelector("textarea").value = "internal";
   dialog.querySelectorAll("button")[1].click();
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assertActionButtonsState(post, false);
   const payload = requestPayload(requests[0]);
   assert.equal(payload.requested_action, "save");
   assert.deepEqual(payload.tags, ["cats"]);
   assert.equal(payload.description, "internal");
   assert.equal("requested_post_caption" in payload, false);
+});
+
+test("detailed dialog cancel and Escape finish once and restore controls", async () => {
+  const requests = [];
+  const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+  const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+  browser.document.body.append(post);
+  userscript.boot(browser.root);
+  const saveDetailed = actionButton(post, "save_detailed");
+
+  saveDetailed.click();
+  let dialog = browser.document.body.querySelector("dialog");
+  let closeCalls = 0;
+  const close = dialog.close.bind(dialog);
+  const remove = dialog.remove.bind(dialog);
+  dialog.close = () => {
+    closeCalls += 1;
+    close();
+  };
+  dialog.remove = () => {
+    assert.equal(closeCalls, 1);
+    remove();
+  };
+  dialog.querySelector(".sooqa-cancel").click();
+  dialog.dispatchEvent({ type: "cancel" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeCalls, 1);
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assert.equal(requests.length, 0);
+  assertActionButtonsState(post, false);
+
+  saveDetailed.click();
+  dialog = browser.document.body.querySelector("dialog");
+  closeCalls = 0;
+  const escapeClose = dialog.close.bind(dialog);
+  const escapeRemove = dialog.remove.bind(dialog);
+  dialog.close = () => {
+    closeCalls += 1;
+    escapeClose();
+  };
+  dialog.remove = () => {
+    assert.equal(closeCalls, 1);
+    escapeRemove();
+  };
+  dialog.dispatchEvent({ type: "cancel" });
+  dialog.dispatchEvent({ type: "cancel" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeCalls, 1);
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assertActionButtonsState(post, false);
+
+  saveDetailed.click();
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 1);
+  browser.document.body.querySelector("dialog").querySelector(".sooqa-cancel").click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assertActionButtonsState(post, false);
+});
+
+test("detailed dialog open and focus failures fall back without dead buttons", async () => {
+  for (const failure of ["showModal", "focus"]) {
+    const requests = [];
+    const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+    browser.root.prompt = () => "cats|internal|Public fallback";
+    browser.document.throwOnShowModal = failure === "showModal";
+    browser.document.throwOnFocus = failure === "focus";
+    const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+    browser.document.body.append(post);
+    userscript.boot(browser.root);
+
+    actionButton(post, "post_now_detailed").click();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+    assertActionButtonsState(post, false);
+    assert.equal(requests.length, 1);
+    const payload = requestPayload(requests[0]);
+    assert.equal(payload.requested_action, "post_now");
+    assert.deepEqual(payload.tags, ["cats"]);
+    assert.equal(payload.description, "internal");
+    assert.equal(payload.requested_post_caption, "Public fallback");
+  }
 });
 
 test("buttons suppress in-flight duplicates, reuse timeout IDs, and reset after response", () => {

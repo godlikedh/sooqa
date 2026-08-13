@@ -25,7 +25,10 @@ the script prompts on first use.
 Plain actions send no metadata. `Save…` asks for tags and an internal
 description; `Post now…` adds public post text; and `Queue…` additionally asks
 for a required browser-local date/time, which is sent as an RFC3339 instant.
-Blank optional text is omitted, and textarea line breaks are preserved.
+Detailed actions use a userscript-owned modal layout with an existing prompt
+fallback if the browser cannot open or focus the native dialog. Cancel, Escape,
+and submission always restore the action buttons. Blank optional text is
+omitted, and textarea line breaks are preserved.
 `Queue` uses the normal cadence. The request is synchronous from the browser's
 perspective: `Accepted request` means the companion/backend accepted an ingest
 request, not that the media has finished downloading or appeared in Telegram

@@ -334,118 +334,172 @@
   }
 
   function dialogSupported(document) {
-    const dialog = document.createElement("dialog");
-    return typeof dialog.showModal === "function";
+    try {
+      const dialog = document.createElement("dialog");
+      return typeof dialog.showModal === "function" && typeof dialog.close === "function";
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function collectMetadataWithPrompt(env, action) {
+    const wantsPublicText = Boolean(action.publicText);
+    const wantsExactTime = Boolean(action.exactTime);
+    const promptParts = ["Tags (comma-separated)", "Internal description"];
+    if (wantsPublicText) promptParts.push("Public post text");
+    if (wantsExactTime) promptParts.push("Local date/time (YYYY-MM-DDTHH:MM)");
+    const value = env.prompt(promptParts.join(" | ") + ":", "");
+    if (value === null) return null;
+    const parts = String(value).split("|");
+    const metadata = {
+      tags: parseTags(parts.shift() || ""),
+      description: String(parts.shift() || "").trim(),
+    };
+    if (wantsPublicText) metadata.publicText = String(parts.shift() || "").trim();
+    if (wantsExactTime) {
+      metadata.requestedPublishAt = localDateTimeToRfc3339(
+        String(parts.shift() || "").trim(),
+        env.now ? env.now() : new Date()
+      );
+      if (!metadata.requestedPublishAt) {
+        if (env.setStatus) env.setStatus("Enter a future local date/time");
+        return null;
+      }
+    }
+    return metadata;
   }
 
   function collectMetadata(env, action) {
     const wantsPublicText = Boolean(action.publicText);
     const wantsExactTime = Boolean(action.exactTime);
     if (!dialogSupported(env.document)) {
-      const promptParts = ["Tags (comma-separated)", "Internal description"];
-      if (wantsPublicText) promptParts.push("Public post text");
-      if (wantsExactTime) promptParts.push("Local date/time (YYYY-MM-DDTHH:MM)");
-      const value = env.prompt(promptParts.join(" | ") + ":", "");
-      if (value === null) return Promise.resolve(null);
-      const parts = value.split("|");
-      const metadata = {
-        tags: parseTags(parts.shift() || ""),
-        description: String(parts.shift() || "").trim(),
-      };
-      if (wantsPublicText) metadata.publicText = String(parts.shift() || "").trim();
-      if (wantsExactTime) {
-        metadata.requestedPublishAt = localDateTimeToRfc3339(
-          String(parts.shift() || "").trim(),
-          env.now ? env.now() : new Date()
-        );
-        if (!metadata.requestedPublishAt) {
-          if (env.setStatus) env.setStatus("Enter a future local date/time");
-          return Promise.resolve(null);
-        }
+      try {
+        return Promise.resolve(collectMetadataWithPrompt(env, action));
+      } catch (_error) {
+        if (env.setStatus) env.setStatus("Detailed form unavailable");
+        return Promise.resolve(null);
       }
-      return Promise.resolve(metadata);
     }
 
     return new Promise((resolve) => {
-      const dialog = env.document.createElement("dialog");
-      dialog.className = "sooqa-metadata-dialog";
-      const form = env.document.createElement("form");
-      form.method = "dialog";
-      const fields = [];
-
-      const addField = (labelText, type, name, multiline = false) => {
-        const label = env.document.createElement("label");
-        label.textContent = labelText;
-        const field = env.document.createElement(multiline ? "textarea" : "input");
-        field.type = type;
-        field.name = name;
-        field.autocomplete = "off";
-        if (multiline) field.rows = 3;
-        label.append(field);
-        form.append(label);
-        fields.push(field);
-        return field;
+      let dialog = null;
+      let settled = false;
+      const closeAndRemove = () => {
+        try {
+          if (dialog && typeof dialog.close === "function") dialog.close();
+        } catch (_error) {
+          // A broken native dialog must not prevent cleanup or recovery.
+        }
+        try {
+          if (dialog && dialog.parentElement) dialog.remove();
+        } catch (_error) {
+          // Ignore DOM cleanup failures after the modal has been closed.
+        }
       };
-
-      const tags = addField("Tags (comma-separated)", "text", "tags");
-      const description = addField("Internal description", "text", "description", true);
-      const publicText = wantsPublicText
-        ? addField("Public post text", "text", "publicText", true)
-        : null;
-      const requestedPublishAt = wantsExactTime
-        ? addField("Local date/time", "datetime-local", "requestedPublishAt")
-        : null;
-      if (requestedPublishAt) requestedPublishAt.required = true;
-
-      const error = env.document.createElement("div");
-      error.className = "sooqa-dialog-error";
-      const actions = env.document.createElement("div");
-      const cancel = makeButton(env.document, "Cancel", "sooqa-cancel");
-      cancel.value = "cancel";
-      const confirm = makeButton(env.document, "Send", "sooqa-confirm", "submit");
-      confirm.value = "send";
-      actions.append(cancel, confirm);
-      form.append(error, actions);
-      dialog.append(form);
-
       const finish = (value) => {
-        dialog.remove();
+        if (settled) return;
+        settled = true;
+        closeAndRemove();
         resolve(value);
       };
-      form.addEventListener("submit", (event) => {
-        event.preventDefault();
-        const metadata = {
-          description: String(description.value || "").trim(),
-          tags: parseTags(tags.value),
-        };
-        if (publicText) metadata.publicText = String(publicText.value || "").trim();
-        if (requestedPublishAt) {
-          metadata.requestedPublishAt = localDateTimeToRfc3339(
-            requestedPublishAt.value,
-            env.now ? env.now() : new Date()
-          );
-          if (!metadata.requestedPublishAt) {
-            error.textContent = "Enter a future local date/time";
-            requestedPublishAt.focus();
-            return;
-          }
+      const recoverFromDialogFailure = () => {
+        if (settled) return;
+        settled = true;
+        closeAndRemove();
+        try {
+          resolve(collectMetadataWithPrompt(env, action));
+        } catch (_error) {
+          if (env.setStatus) env.setStatus("Detailed form unavailable");
+          resolve(null);
         }
-        finish(metadata);
-        dialog.close();
-      });
-      cancel.addEventListener("click", (event) => {
-        event.preventDefault();
-        finish(null);
-        dialog.close();
-      });
-      dialog.addEventListener("cancel", (event) => {
-        event.preventDefault();
-        finish(null);
-        dialog.close();
-      });
-      env.document.body.append(dialog);
-      dialog.showModal();
-      fields[0].focus();
+      };
+
+      try {
+        dialog = env.document.createElement("dialog");
+        dialog.className = "sooqa-metadata-dialog";
+        const form = env.document.createElement("form");
+        form.method = "dialog";
+        const fields = [];
+
+        const addField = (labelText, type, name, multiline = false) => {
+          const label = env.document.createElement("label");
+          label.textContent = labelText;
+          const field = env.document.createElement(multiline ? "textarea" : "input");
+          field.type = type;
+          field.name = name;
+          field.autocomplete = "off";
+          if (multiline) field.rows = 3;
+          label.append(field);
+          form.append(label);
+          fields.push(field);
+          return field;
+        };
+
+        const tags = addField("Tags (comma-separated)", "text", "tags");
+        const description = addField("Internal description", "text", "description", true);
+        const publicText = wantsPublicText
+          ? addField("Public post text", "text", "publicText", true)
+          : null;
+        const requestedPublishAt = wantsExactTime
+          ? addField("Local date/time", "datetime-local", "requestedPublishAt")
+          : null;
+        if (requestedPublishAt) requestedPublishAt.required = true;
+
+        const error = env.document.createElement("div");
+        error.className = "sooqa-dialog-error";
+        const actions = env.document.createElement("div");
+        actions.className = "sooqa-dialog-actions";
+        const cancel = makeButton(env.document, "Cancel", "sooqa-cancel");
+        cancel.value = "cancel";
+        const confirm = makeButton(env.document, "Send", "sooqa-confirm", "submit");
+        confirm.value = "send";
+        actions.append(cancel, confirm);
+        form.append(error, actions);
+        dialog.append(form);
+
+        form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          const metadata = {
+            description: String(description.value || "").trim(),
+            tags: parseTags(tags.value),
+          };
+          if (publicText) metadata.publicText = String(publicText.value || "").trim();
+          if (requestedPublishAt) {
+            metadata.requestedPublishAt = localDateTimeToRfc3339(
+              requestedPublishAt.value,
+              env.now ? env.now() : new Date()
+            );
+            if (!metadata.requestedPublishAt) {
+              error.textContent = "Enter a future local date/time";
+              try {
+                requestedPublishAt.focus();
+              } catch (_error) {
+                // Keep the validation message visible if focus is unavailable.
+              }
+              return;
+            }
+          }
+          finish(metadata);
+        });
+        cancel.addEventListener("click", (event) => {
+          event.preventDefault();
+          finish(null);
+        });
+        dialog.addEventListener("cancel", (event) => {
+          event.preventDefault();
+          finish(null);
+        });
+        dialog.addEventListener("close", () => finish(null));
+        env.document.body.append(dialog);
+        try {
+          dialog.showModal();
+          fields[0].focus();
+        } catch (_error) {
+          recoverFromDialogFailure();
+        }
+      } catch (_error) {
+        recoverFromDialogFailure();
+      }
     });
   }
 
@@ -576,7 +630,43 @@
       "}",
       ".sooqa-action-panel button { min-height: 2rem; padding: 0.25rem 0.5rem; }",
       ".sooqa-action-status, .sooqa-history { grid-column: 1 / -1; font-size: 0.85rem; }",
-      ".sooqa-dialog-error { min-height: 1.2em; color: #a00; }",
+      ".sooqa-metadata-dialog {",
+      "  box-sizing: border-box;",
+      "  position: fixed !important;",
+      "  z-index: 2147483647 !important;",
+      "  inset: 50% auto auto 50% !important;",
+      "  width: min(32rem, calc(100vw - 2rem)) !important;",
+      "  max-width: calc(100vw - 2rem) !important;",
+      "  max-height: calc(100vh - 2rem) !important;",
+      "  margin: 0 !important;",
+      "  transform: translate(-50%, -50%) !important;",
+      "  overflow: auto !important;",
+      "  padding: 1rem !important;",
+      "  border: 1px solid #64748b !important;",
+      "  border-radius: 0.5rem !important;",
+      "  background: #111827 !important;",
+      "  color: #f8fafc !important;",
+      "  font: 16px/1.4 system-ui, sans-serif !important;",
+      "}",
+      ".sooqa-metadata-dialog[open] { display: block !important; visibility: visible !important; }",
+      ".sooqa-metadata-dialog::backdrop { background: rgba(2, 6, 23, 0.72) !important; }",
+      ".sooqa-metadata-dialog form { display: grid !important; gap: 0.75rem !important; margin: 0 !important; }",
+      ".sooqa-metadata-dialog label { display: grid !important; gap: 0.35rem !important; font-weight: 600 !important; }",
+      ".sooqa-metadata-dialog input, .sooqa-metadata-dialog textarea {",
+      "  box-sizing: border-box;",
+      "  width: 100% !important;",
+      "  min-height: 2.25rem !important;",
+      "  padding: 0.4rem 0.5rem !important;",
+      "  border: 1px solid #94a3b8 !important;",
+      "  border-radius: 0.25rem !important;",
+      "  background: #f8fafc !important;",
+      "  color: #0f172a !important;",
+      "  font: inherit !important;",
+      "}",
+      ".sooqa-metadata-dialog textarea { min-height: 5rem !important; resize: vertical !important; }",
+      ".sooqa-dialog-actions { display: flex !important; justify-content: flex-end !important; gap: 0.5rem !important; }",
+      ".sooqa-dialog-actions button { min-height: 2.25rem !important; padding: 0.35rem 0.75rem !important; }",
+      ".sooqa-dialog-error { min-height: 1.2em; color: #fecaca; }",
       ".sooqa-history-control { margin: 0.5rem 0; }",
       "@media (max-width: 42rem) { .sooqa-attachment-row { flex-wrap: wrap; } }",
     ].join("\n");
