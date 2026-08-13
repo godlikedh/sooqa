@@ -243,6 +243,7 @@ pub struct PublishedMessage {
 pub struct QueuePost {
     pub id: Uuid,
     pub revision: i64,
+    pub state: PostState,
     pub scheduled_at: OffsetDateTime,
     pub cadence_slot_at: Option<OffsetDateTime>,
     pub time_zone: String,

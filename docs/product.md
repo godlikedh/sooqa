@@ -40,6 +40,12 @@ public post text, and links to the existing storage messages. Card actions
 call the Publisher commands for moves, slot changes, caption edits, immediate
 publication, and removal; callback payloads carry the post revision, and old
 views are harmlessly rejected or cleaned up from bounded process-local state.
+Caption and slot prompts are accepted only as replies to their own ForceReply
+message; ordinary messages and commands do not accidentally become captions.
+Draft and failed rows remain visible for editable actions, while cadence moves
+and slot assignment are rendered only for queued rows. Queue cards are paced
+per chat and retry bounded Telegram flood-control responses without replaying a
+completed update.
 
 Large-media capture uses Telegram's official local Bot API server when the home
 deployment is cut over manually. URL/link source downloads, Telegram-source

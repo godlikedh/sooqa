@@ -220,6 +220,10 @@ impl PublisherService for DatabasePublisherService {
         self.repository.list_queue_posts(u32::try_from(limit).unwrap_or(u32::MAX)).await
     }
 
+    async fn get_queue_post(&self, post_id: Uuid) -> Result<QueuePost, Self::Error> {
+        self.repository.find_queue_post(post_id).await
+    }
+
     async fn move_queue_post(
         &self,
         post_id: Uuid,

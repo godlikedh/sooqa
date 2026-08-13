@@ -82,7 +82,13 @@ this baseline.
   storage uploads, and publication use separate bounded calls. Telegram file
   acceptance is metadata-only; source bytes are reconstructed by the worker
   from the durable file ID. Publication receives only a ready storage receipt
-  and never receives a local media path.
+  and never receives a local media path. Queue prompts retain the ForceReply
+  message ID and post revision; callbacks validate the current queue projection
+  through the Publisher adapter before sending a prompt. Queue rendering
+  carries post state so draft/failed rows do not expose queued-only slot moves.
+  Queue cards use a per-chat pacing hook and bounded RetryAfter retries; a
+  partial view is cleaned up and its update claim is completed before reporting
+  the rendering failure.
 - `sooqa-persistence` owns migrations and short database transactions.
 - `sooqa-api` owns HTTP routing, one configured bearer secret, limits, and
   stable request-ID errors.

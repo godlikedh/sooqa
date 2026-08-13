@@ -77,6 +77,7 @@ struct PostRow {
 struct QueuePostRow {
     id: Uuid,
     revision: i64,
+    state: String,
     scheduled_at: OffsetDateTime,
     cadence_slot_at: Option<OffsetDateTime>,
     time_zone: String,
@@ -201,7 +202,7 @@ impl PublisherRepository {
         limit: u32,
     ) -> Result<Vec<QueuePost>, PublisherRepositoryError> {
         let rows = sqlx::query_as::<_, QueuePostRow>(
-            "SELECT posts.id, posts.revision, posts.scheduled_at, posts.cadence_slot_at, channels.time_zone, posts.caption, media.kind AS media_kind, media.title, media.description, media.tags, media.source_url, media.telegram_storage_chat_id AS storage_chat_id, media.telegram_storage_message_id AS storage_message_id FROM posts JOIN channels ON channels.id = posts.channel_id JOIN media ON media.id = posts.media_id WHERE posts.state IN ('draft', 'queued', 'failed') ORDER BY COALESCE(posts.cadence_slot_at, posts.scheduled_at), posts.id LIMIT $1",
+            "SELECT posts.id, posts.revision, posts.state, posts.scheduled_at, posts.cadence_slot_at, channels.time_zone, posts.caption, media.kind AS media_kind, media.title, media.description, media.tags, media.source_url, media.telegram_storage_chat_id AS storage_chat_id, media.telegram_storage_message_id AS storage_message_id FROM posts JOIN channels ON channels.id = posts.channel_id JOIN media ON media.id = posts.media_id WHERE posts.state IN ('draft', 'queued', 'failed') ORDER BY COALESCE(posts.cadence_slot_at, posts.scheduled_at), posts.id LIMIT $1",
         )
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
@@ -214,8 +215,12 @@ impl PublisherRepository {
         id: Uuid,
         _revision: i64,
     ) -> Result<QueuePost, PublisherRepositoryError> {
+        self.find_queue_post(id).await
+    }
+
+    pub async fn find_queue_post(&self, id: Uuid) -> Result<QueuePost, PublisherRepositoryError> {
         Ok(sqlx::query_as::<_, QueuePostRow>(
-            "SELECT posts.id, posts.revision, posts.scheduled_at, posts.cadence_slot_at, channels.time_zone, posts.caption, media.kind AS media_kind, media.title, media.description, media.tags, media.source_url, media.telegram_storage_chat_id AS storage_chat_id, media.telegram_storage_message_id AS storage_message_id FROM posts JOIN channels ON channels.id = posts.channel_id JOIN media ON media.id = posts.media_id WHERE posts.id = $1",
+            "SELECT posts.id, posts.revision, posts.state, posts.scheduled_at, posts.cadence_slot_at, channels.time_zone, posts.caption, media.kind AS media_kind, media.title, media.description, media.tags, media.source_url, media.telegram_storage_chat_id AS storage_chat_id, media.telegram_storage_message_id AS storage_message_id FROM posts JOIN channels ON channels.id = posts.channel_id JOIN media ON media.id = posts.media_id WHERE posts.id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -230,7 +235,7 @@ impl PublisherRepository {
         direction: QueueDirection,
         revision: i64,
     ) -> Result<QueuePost, PublisherRepositoryError> {
-        self.move_adjacent(id, direction, Some(revision)).await?;
+        self.move_adjacent(id, direction, revision).await?;
         self.queue_post(id, revision).await
     }
 
@@ -240,7 +245,7 @@ impl PublisherRepository {
         slot: OffsetDateTime,
         revision: i64,
     ) -> Result<QueuePost, PublisherRepositoryError> {
-        self.set_slot(id, slot, Some(revision)).await?;
+        self.set_slot(id, slot, revision).await?;
         self.queue_post(id, revision).await
     }
 
@@ -257,7 +262,7 @@ impl PublisherRepository {
                 parse_mode: None,
                 disable_notification: None,
                 expected_updated_at: None,
-                expected_revision: Some(revision),
+                expected_revision: revision,
             },
         )
         .await?;
@@ -270,7 +275,7 @@ impl PublisherRepository {
         revision: i64,
     ) -> Result<QueuePost, PublisherRepositoryError> {
         let request_key = format!("telegram:queue:now:{id}:{revision}");
-        self.publish_now(id, request_key, Some(revision)).await?;
+        self.publish_now(id, request_key, revision).await?;
         self.queue_post(id, revision).await
     }
 
@@ -279,7 +284,7 @@ impl PublisherRepository {
         id: Uuid,
         revision: i64,
     ) -> Result<QueuePost, PublisherRepositoryError> {
-        self.cancel_post(id, Some(revision)).await?;
+        self.cancel_post(id, revision).await?;
         self.queue_post(id, revision).await
     }
 
@@ -1281,6 +1286,8 @@ impl QueuePostRow {
         QueuePost {
             id: self.id,
             revision: self.revision,
+            state: PostState::try_from(self.state.as_str())
+                .expect("posts.state is constrained by the database schema"),
             scheduled_at: self.scheduled_at,
             cadence_slot_at: self.cadence_slot_at,
             time_zone: self.time_zone,
