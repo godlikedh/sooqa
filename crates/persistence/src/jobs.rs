@@ -2,7 +2,7 @@ use crate::{WORKSPACE_CLEANUP_RETENTION, cleanup::enqueue_workspace_cleanup};
 use std::time::Duration;
 
 use sooqa_jobs::{Job, JobCommand, JobLease, JobPayloadError, JobStatus, JobType, NewJob};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -165,6 +165,11 @@ impl JobRepository {
         error_class: &str,
         error_message: &str,
     ) -> Result<Job, JobRepositoryError> {
+        if self.is_publication_lease(lease).await? {
+            return self
+                .settle_publication_lease(lease, run_at, error_class, error_message, false)
+                .await;
+        }
         let row = sqlx::query_as::<_, JobRow>(
             r#"
             UPDATE queue.jobs
@@ -201,6 +206,11 @@ impl JobRepository {
         error_class: &str,
         error_message: &str,
     ) -> Result<Job, JobRepositoryError> {
+        if self.is_publication_lease(lease).await? {
+            return self
+                .settle_publication_lease(lease, run_at, error_class, error_message, false)
+                .await;
+        }
         let row = sqlx::query_as::<_, JobRow>(
             r#"
             UPDATE queue.jobs
@@ -236,6 +246,17 @@ impl JobRepository {
         error_class: &str,
         error_message: &str,
     ) -> Result<Job, JobRepositoryError> {
+        if self.is_publication_lease(lease).await? {
+            return self
+                .settle_publication_lease(
+                    lease,
+                    OffsetDateTime::now_utc(),
+                    error_class,
+                    error_message,
+                    true,
+                )
+                .await;
+        }
         let row = sqlx::query_as::<_, JobRow>(
             r#"
             UPDATE queue.jobs
@@ -262,6 +283,7 @@ impl JobRepository {
     }
 
     pub async fn recover_stale_leases(&self) -> Result<u64, JobRepositoryError> {
+        let publication_recovered = self.recover_stale_publication_leases().await?;
         let mut transaction = self.pool.begin().await?;
         let recovered = sqlx::query_as::<_, RecoveredJob>(
             r#"
@@ -273,7 +295,7 @@ impl JobRepository {
                 error_message = COALESCE(error_message, 'job lease expired'),
                 completed_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
                 updated_at = now()
-            WHERE state = 'running' AND lease_expires_at <= now()
+            WHERE state = 'running' AND kind <> 'publish_post' AND lease_expires_at <= now()
             RETURNING kind, payload, state, attempt_count, max_attempts
             "#,
         )
@@ -285,7 +307,144 @@ impl JobRepository {
             }
         }
         transaction.commit().await?;
-        Ok(recovered.len() as u64)
+        Ok(publication_recovered + recovered.len() as u64)
+    }
+
+    async fn is_publication_lease(&self, lease: &JobLease) -> Result<bool, JobRepositoryError> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT kind FROM queue.jobs WHERE id = $1 AND state = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_expires_at > clock_timestamp()",
+        )
+        .bind(lease.job_id)
+        .bind(lease.attempt_number)
+        .bind(&lease.lease_owner)
+        .bind(lease.lease_token)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some_and(|kind| kind == JobType::PublishPost.as_str()))
+    }
+
+    async fn settle_publication_lease(
+        &self,
+        lease: &JobLease,
+        run_at: OffsetDateTime,
+        error_class: &str,
+        error_message: &str,
+        force_terminal: bool,
+    ) -> Result<Job, JobRepositoryError> {
+        let payload = self.publication_payload(lease).await?;
+        let post_id = payload_uuid(&payload, "post_id");
+        let mut transaction = self.pool.begin().await?;
+        let post = match post_id {
+            Some(post_id) => lock_publication_post(&mut transaction, post_id).await?,
+            None => None,
+        };
+        let job = lock_running_job(&mut transaction, lease).await?;
+        let terminal = force_terminal || job.attempt_count >= job.max_attempts;
+        if terminal && let (Some(post), Some(post_id)) = (&post, post_id) {
+            settle_terminal_publication_post(
+                &mut transaction,
+                post,
+                post_id,
+                &job.payload,
+                error_class,
+                error_message,
+            )
+            .await?;
+        }
+        let state = if terminal { "failed" } else { "queued" };
+        let row = update_locked_job(
+            &mut transaction,
+            job.id,
+            state,
+            if terminal { job.run_at } else { run_at },
+            error_class,
+            error_message,
+            terminal,
+        )
+        .await?;
+        transaction.commit().await?;
+        row.into_job()
+    }
+
+    async fn publication_payload(
+        &self,
+        lease: &JobLease,
+    ) -> Result<serde_json::Value, JobRepositoryError> {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT payload FROM queue.jobs WHERE id = $1 AND kind = 'publish_post' AND state = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_expires_at > clock_timestamp()",
+        )
+        .bind(lease.job_id)
+        .bind(lease.attempt_number)
+        .bind(&lease.lease_owner)
+        .bind(lease.lease_token)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(JobRepositoryError::LeaseLost)
+    }
+
+    async fn recover_stale_publication_leases(&self) -> Result<u64, JobRepositoryError> {
+        let candidates = sqlx::query_as::<_, StalePublicationJob>(
+            "SELECT id, payload FROM queue.jobs WHERE kind = 'publish_post' AND state = 'running' AND lease_expires_at <= clock_timestamp()",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut recovered = 0;
+        for candidate in candidates {
+            if self.recover_stale_publication_lease(candidate).await? {
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
+    }
+
+    async fn recover_stale_publication_lease(
+        &self,
+        candidate: StalePublicationJob,
+    ) -> Result<bool, JobRepositoryError> {
+        let post_id = payload_uuid(&candidate.payload, "post_id");
+        let mut transaction = self.pool.begin().await?;
+        let post = match post_id {
+            Some(post_id) => lock_publication_post(&mut transaction, post_id).await?,
+            None => None,
+        };
+        let Some(job) = lock_expired_publication_job(&mut transaction, candidate.id).await? else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        let terminal = job.attempt_count >= job.max_attempts;
+        if terminal
+            && let (Some(post), Some(post_id)) = (&post, post_id)
+            && payload_uuid(&job.payload, "post_id") == Some(post_id)
+        {
+            let error_class = job.error_class.as_deref().unwrap_or("lease_expired");
+            let error_message = job.error_message.as_deref().unwrap_or("job lease expired");
+            let (post_error_class, post_error_message) = if post.state == "sending" {
+                ("publication_interrupted", "publication job lease expired after the final attempt")
+            } else {
+                (error_class, error_message)
+            };
+            settle_terminal_publication_post(
+                &mut transaction,
+                post,
+                post_id,
+                &job.payload,
+                post_error_class,
+                post_error_message,
+            )
+            .await?;
+        }
+        update_locked_job(
+            &mut transaction,
+            job.id,
+            if terminal { "failed" } else { "queued" },
+            OffsetDateTime::now_utc(),
+            job.error_class.as_deref().unwrap_or("lease_expired"),
+            job.error_message.as_deref().unwrap_or("job lease expired"),
+            terminal,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(true)
     }
 
     pub async fn live_job_ids(&self) -> Result<Vec<Uuid>, JobRepositoryError> {
@@ -348,6 +507,168 @@ struct RecoveredJob {
     max_attempts: i32,
 }
 
+#[derive(Debug, FromRow)]
+struct StalePublicationJob {
+    id: Uuid,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, FromRow)]
+struct PublicationPostRow {
+    state: String,
+    revision: i64,
+}
+
+async fn lock_publication_post(
+    transaction: &mut Transaction<'_, Postgres>,
+    post_id: Uuid,
+) -> Result<Option<PublicationPostRow>, sqlx::Error> {
+    let channel_id = sqlx::query_scalar::<_, Uuid>("SELECT channel_id FROM posts WHERE id = $1")
+        .bind(post_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    let Some(channel_id) = channel_id else {
+        return Ok(None);
+    };
+    sqlx::query("SELECT id FROM channels WHERE id = $1 FOR UPDATE")
+        .bind(channel_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    sqlx::query_as::<_, PublicationPostRow>(
+        "SELECT state, revision FROM posts WHERE id = $1 FOR UPDATE",
+    )
+    .bind(post_id)
+    .fetch_optional(&mut **transaction)
+    .await
+}
+
+async fn lock_running_job(
+    transaction: &mut Transaction<'_, Postgres>,
+    lease: &JobLease,
+) -> Result<JobRow, JobRepositoryError> {
+    sqlx::query_as::<_, JobRow>(
+        r#"
+        SELECT id, kind, payload, state, priority, run_at, attempt_count,
+               max_attempts, lease_token, lease_owner, lease_expires_at,
+               last_heartbeat_at, error_class, error_message, dedupe_key,
+               created_at, updated_at, completed_at
+        FROM queue.jobs
+        WHERE id = $1 AND kind = 'publish_post' AND state = 'running'
+          AND attempt_count = $2 AND lease_owner = $3 AND lease_token = $4
+          AND lease_expires_at > clock_timestamp()
+        FOR UPDATE
+        "#,
+    )
+    .bind(lease.job_id)
+    .bind(lease.attempt_number)
+    .bind(&lease.lease_owner)
+    .bind(lease.lease_token)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(JobRepositoryError::LeaseLost)
+}
+
+async fn lock_expired_publication_job(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_id: Uuid,
+) -> Result<Option<JobRow>, JobRepositoryError> {
+    Ok(sqlx::query_as::<_, JobRow>(
+        r#"
+        SELECT id, kind, payload, state, priority, run_at, attempt_count,
+               max_attempts, lease_token, lease_owner, lease_expires_at,
+               last_heartbeat_at, error_class, error_message, dedupe_key,
+               created_at, updated_at, completed_at
+        FROM queue.jobs
+        WHERE id = $1 AND kind = 'publish_post' AND state = 'running'
+          AND lease_expires_at <= clock_timestamp()
+        FOR UPDATE
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
+async fn update_locked_job(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_id: Uuid,
+    state: &str,
+    run_at: OffsetDateTime,
+    error_class: &str,
+    error_message: &str,
+    terminal: bool,
+) -> Result<JobRow, JobRepositoryError> {
+    Ok(sqlx::query_as::<_, JobRow>(
+        r#"
+        UPDATE queue.jobs
+        SET state = $2, run_at = $3, lease_token = NULL, lease_owner = NULL,
+            lease_expires_at = NULL, last_heartbeat_at = NULL,
+            error_class = $4, error_message = $5,
+            completed_at = CASE WHEN $6 THEN now() ELSE NULL END,
+            updated_at = now()
+        WHERE id = $1 AND state = 'running'
+        RETURNING id, kind, payload, state, priority, run_at, attempt_count,
+                  max_attempts, lease_token, lease_owner, lease_expires_at,
+                  last_heartbeat_at, error_class, error_message, dedupe_key,
+                  created_at, updated_at, completed_at
+        "#,
+    )
+    .bind(job_id)
+    .bind(state)
+    .bind(run_at)
+    .bind(error_class)
+    .bind(error_message)
+    .bind(terminal)
+    .fetch_one(&mut **transaction)
+    .await?)
+}
+
+async fn settle_terminal_publication_post(
+    transaction: &mut Transaction<'_, Postgres>,
+    post: &PublicationPostRow,
+    post_id: Uuid,
+    payload: &serde_json::Value,
+    error_class: &str,
+    error_message: &str,
+) -> Result<(), sqlx::Error> {
+    match post.state.as_str() {
+        "queued" if payload_i64(payload, "expected_revision") == Some(post.revision) => {
+            sqlx::query(
+                "UPDATE posts SET state = 'failed', send_token = NULL, send_started_at = NULL, error_class = $2, error_message = $3, revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'queued' AND revision = $4",
+            )
+            .bind(post_id)
+            .bind(error_class)
+            .bind(error_message)
+            .bind(post.revision)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        "sending" => {
+            sqlx::query(
+                "UPDATE posts SET state = 'unknown', send_token = NULL, send_started_at = NULL, error_class = $2, error_message = $3, revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'sending'",
+            )
+            .bind(post_id)
+            .bind(error_class)
+            .bind(error_message)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn payload_uuid(payload: &serde_json::Value, key: &str) -> Option<Uuid> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn payload_i64(payload: &serde_json::Value, key: &str) -> Option<i64> {
+    payload.get(key).and_then(serde_json::Value::as_i64)
+}
+
 async fn reconcile_exhausted_job(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     job: &RecoveredJob,
@@ -392,23 +713,6 @@ async fn reconcile_exhausted_job(
                 .await?;
             }
         }
-        return Ok(());
-    }
-    if job_type == JobType::PublishPost {
-        let Some(post_id) = job
-            .payload
-            .get("post_id")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| Uuid::parse_str(value).ok())
-        else {
-            return Ok(());
-        };
-        sqlx::query(
-            "UPDATE posts SET state = 'unknown', send_token = NULL, send_started_at = NULL, error_class = 'publication_interrupted', error_message = 'publication job lease expired after the final attempt', revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'sending'",
-        )
-        .bind(post_id)
-        .execute(&mut **transaction)
-        .await?;
         return Ok(());
     }
     if job_type != JobType::UploadStorageAsset {
