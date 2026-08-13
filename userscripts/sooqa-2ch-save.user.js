@@ -1,11 +1,13 @@
 // ==UserScript==
-// @name         sooqa: save 2ch media
+// @name         sooqa: 2ch media actions
 // @namespace    sooqa
-// @version      0.1.0
-// @description  Add one-click Save controls to direct MP4/WebM attachments.
+// @version      0.2.0
+// @description  Add save, queue, and post-now controls to direct 2ch media.
 // @match        https://2ch.su/*
 // @match        https://2ch.org/*
 // @match        https://2ch.life/*
+// @updateURL    https://raw.githubusercontent.com/godlikedh/sooqa/main/userscripts/sooqa-2ch-save.user.js
+// @downloadURL  https://raw.githubusercontent.com/godlikedh/sooqa/main/userscripts/sooqa-2ch-save.user.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
@@ -24,7 +26,21 @@
 
   const COMPANION_ENDPOINT = "http://127.0.0.1:47831/v1/submit";
   const TOKEN_STORAGE_KEY = "sooqa_companion_token";
+  const HISTORY_STORAGE_KEY = "sooqa_accepted_actions_v1";
+  const HISTORY_CONTROL_KEY = "sooqa_history_control";
+  const MAX_HISTORY_ENTRIES = 200;
+  const MAX_HISTORY_KEY_CHARS = 2_048;
   const SUPPORTED_MEDIA = /\.(?:mp4|webm)$/i;
+  const MIRROR_HOSTS = new Set(["2ch.su", "2ch.org", "2ch.life"]);
+
+  const ACTIONS = [
+    { key: "post_now", requestAction: "post_now", label: "Post now", detailed: false },
+    { key: "post_now_detailed", requestAction: "post_now", label: "Post now…", detailed: true, publicText: true },
+    { key: "queue", requestAction: "queue", label: "Queue", detailed: false },
+    { key: "queue_exact", requestAction: "queue", label: "Queue…", detailed: true, publicText: true, exactTime: true },
+    { key: "save", requestAction: "save", label: "Save", detailed: false },
+    { key: "save_detailed", requestAction: "save", label: "Save…", detailed: true },
+  ];
 
   function normalizeDirectMediaUrl(value, baseHref) {
     if (!value) return null;
@@ -35,6 +51,17 @@
       return url.href;
     } catch (_error) {
       return null;
+    }
+  }
+
+  function canonicalizeUrl(value) {
+    try {
+      const url = new URL(value);
+      if (MIRROR_HOSTS.has(url.hostname.toLowerCase())) url.hostname = "2ch.org";
+      url.hash = "";
+      return url.href;
+    } catch (_error) {
+      return String(value || "");
     }
   }
 
@@ -57,25 +84,73 @@
     return tags;
   }
 
-  function buildPayload({ actionId, mediaUrl, pageUrl, pageTitle, description, tags }) {
-    return {
+  function localDateTimeToRfc3339(value, now = new Date()) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(String(value || ""));
+    if (!match) return null;
+    const [, yearText, monthText, dayText, hourText, minuteText] = match;
+    const year = Number(yearText);
+    const month = Number(monthText);
+    const day = Number(dayText);
+    const hour = Number(hourText);
+    const minute = Number(minuteText);
+    const date = new Date(year, month - 1, day, hour, minute, 0, 0);
+    if (Number.isNaN(date.getTime()) || date <= now) return null;
+    if (
+      date.getFullYear() !== year ||
+      date.getMonth() !== month - 1 ||
+      date.getDate() !== day ||
+      date.getHours() !== hour ||
+      date.getMinutes() !== minute
+    ) {
+      return null;
+    }
+    return date.toISOString();
+  }
+
+  function buildPayload({
+    actionId,
+    mediaUrl,
+    pageUrl,
+    pageTitle,
+    action,
+    metadata = null,
+  }) {
+    const payload = {
       action_id: actionId,
       url: mediaUrl,
       page_url: pageUrl || null,
       page_title: pageTitle || null,
-      description: description || null,
-      tags: Array.isArray(tags) ? tags : parseTags(tags),
+      requested_action: action.requestAction,
     };
+    if (metadata) {
+      payload.description = metadata.description;
+      payload.tags = metadata.tags;
+      if (action.publicText) payload.requested_post_caption = metadata.publicText;
+      if (action.exactTime) payload.requested_publish_at = metadata.requestedPublishAt;
+    }
+    return payload;
   }
 
   function findPostContainer(node) {
-    const post = node.closest("article, .post, [data-num], [id^='p']");
+    const post = node.closest && node.closest("article, .post, [data-num], [id^='p']");
     if (post) return post;
     const parent = node.parentElement;
     if (parent && (parent.tagName === "VIDEO" || parent.tagName === "SOURCE")) {
       return parent.parentElement;
     }
     return parent;
+  }
+
+  function findAttachmentTarget(node) {
+    if (
+      node &&
+      node.tagName === "SOURCE" &&
+      node.parentElement &&
+      node.parentElement.tagName === "VIDEO"
+    ) {
+      return node.parentElement;
+    }
+    return node;
   }
 
   function makeButton(document, label, className, type = "button") {
@@ -86,15 +161,37 @@
     return button;
   }
 
-  function collectMetadata(env) {
-    if (!env.document.createElement("dialog").showModal) {
-      const value = env.prompt("Tags (comma-separated) | Internal description:", "");
+  function dialogSupported(document) {
+    const dialog = document.createElement("dialog");
+    return typeof dialog.showModal === "function";
+  }
+
+  function collectMetadata(env, action) {
+    const wantsPublicText = Boolean(action.publicText);
+    const wantsExactTime = Boolean(action.exactTime);
+    if (!dialogSupported(env.document)) {
+      const promptParts = ["Tags (comma-separated)", "Internal description"];
+      if (wantsPublicText) promptParts.push("Public post text");
+      if (wantsExactTime) promptParts.push("Local date/time (YYYY-MM-DDTHH:MM)");
+      const value = env.prompt(promptParts.join(" | ") + ":", "");
       if (value === null) return Promise.resolve(null);
-      const [tagText = "", ...descriptionParts] = value.split("|");
-      return Promise.resolve({
-        description: descriptionParts.join("|").trim(),
-        tags: parseTags(tagText),
-      });
+      const parts = value.split("|");
+      const metadata = {
+        tags: parseTags(parts.shift() || ""),
+        description: String(parts.shift() || "").trim(),
+      };
+      if (wantsPublicText) metadata.publicText = String(parts.shift() || "").trim();
+      if (wantsExactTime) {
+        metadata.requestedPublishAt = localDateTimeToRfc3339(
+          String(parts.shift() || "").trim(),
+          env.now ? env.now() : new Date()
+        );
+        if (!metadata.requestedPublishAt) {
+          if (env.setStatus) env.setStatus("Enter a future local date/time");
+          return Promise.resolve(null);
+        }
+      }
+      return Promise.resolve(metadata);
     }
 
     return new Promise((resolve) => {
@@ -102,26 +199,41 @@
       dialog.className = "sooqa-metadata-dialog";
       const form = env.document.createElement("form");
       form.method = "dialog";
-      const tagsLabel = env.document.createElement("label");
-      tagsLabel.textContent = "Tags (comma-separated)";
-      const tags = env.document.createElement("input");
-      tags.type = "text";
-      tags.name = "tags";
-      tags.autocomplete = "off";
-      tagsLabel.append(tags);
-      const descriptionLabel = env.document.createElement("label");
-      descriptionLabel.textContent = "Internal description";
-      const description = env.document.createElement("textarea");
-      description.name = "description";
-      description.rows = 3;
-      descriptionLabel.append(description);
+      const fields = [];
+
+      const addField = (labelText, type, name, multiline = false) => {
+        const label = env.document.createElement("label");
+        label.textContent = labelText;
+        const field = env.document.createElement(multiline ? "textarea" : "input");
+        field.type = type;
+        field.name = name;
+        field.autocomplete = "off";
+        if (multiline) field.rows = 3;
+        label.append(field);
+        form.append(label);
+        fields.push(field);
+        return field;
+      };
+
+      const tags = addField("Tags (comma-separated)", "text", "tags");
+      const description = addField("Internal description", "text", "description", true);
+      const publicText = wantsPublicText
+        ? addField("Public post text", "text", "publicText", true)
+        : null;
+      const requestedPublishAt = wantsExactTime
+        ? addField("Local date/time", "datetime-local", "requestedPublishAt")
+        : null;
+      if (requestedPublishAt) requestedPublishAt.required = true;
+
+      const error = env.document.createElement("div");
+      error.className = "sooqa-dialog-error";
       const actions = env.document.createElement("div");
       const cancel = makeButton(env.document, "Cancel", "sooqa-cancel");
       cancel.value = "cancel";
-      const save = makeButton(env.document, "Save", "sooqa-confirm", "submit");
-      save.value = "save";
-      actions.append(cancel, save);
-      form.append(tagsLabel, descriptionLabel, actions);
+      const confirm = makeButton(env.document, "Send", "sooqa-confirm", "submit");
+      confirm.value = "send";
+      actions.append(cancel, confirm);
+      form.append(error, actions);
       dialog.append(form);
 
       const finish = (value) => {
@@ -130,7 +242,23 @@
       };
       form.addEventListener("submit", (event) => {
         event.preventDefault();
-        finish({ description: description.value.trim(), tags: parseTags(tags.value) });
+        const metadata = {
+          description: String(description.value || "").trim(),
+          tags: parseTags(tags.value),
+        };
+        if (publicText) metadata.publicText = String(publicText.value || "").trim();
+        if (requestedPublishAt) {
+          metadata.requestedPublishAt = localDateTimeToRfc3339(
+            requestedPublishAt.value,
+            env.now ? env.now() : new Date()
+          );
+          if (!metadata.requestedPublishAt) {
+            error.textContent = "Enter a future local date/time";
+            requestedPublishAt.focus();
+            return;
+          }
+        }
+        finish(metadata);
         dialog.close();
       });
       cancel.addEventListener("click", (event) => {
@@ -145,127 +273,299 @@
       });
       env.document.body.append(dialog);
       dialog.showModal();
-      tags.focus();
+      fields[0].focus();
     });
   }
 
-  function decorate(root, env) {
-    const nodes = [];
-    if (root.matches && root.matches("a[href], video[src], source[src]")) nodes.push(root);
-    nodes.push(...Array.from(root.querySelectorAll("a[href], video[src], source[src]")));
-    for (const node of Array.from(nodes)) {
-      const mediaUrl = extractDirectAttachmentUrls([node], env.location.href)[0];
-      if (!mediaUrl) continue;
-      const container = findPostContainer(node);
-      if (!container) continue;
-      const alreadyDecorated = Array.from(
-        container.querySelectorAll("[data-sooqa-media-url]")
-      ).some((control) => control.dataset.sooqaMediaUrl === mediaUrl);
-      if (alreadyDecorated) continue;
+  function loadAcceptedHistory(env) {
+    if (env.history) return env.history;
+    let value = [];
+    if (typeof env.GM_getValue === "function") {
+      try {
+        const stored = env.GM_getValue(HISTORY_STORAGE_KEY, []);
+        if (Array.isArray(stored)) value = stored;
+        else if (typeof stored === "string") value = JSON.parse(stored);
+      } catch (_error) {
+        value = [];
+      }
+    }
+    env.history = value
+      .filter((entry) => (
+        entry &&
+        typeof entry.threadKey === "string" &&
+        typeof entry.mediaKey === "string" &&
+        typeof entry.actionId === "string" &&
+        entry.threadKey.length <= MAX_HISTORY_KEY_CHARS &&
+        entry.mediaKey.length <= MAX_HISTORY_KEY_CHARS
+      ))
+      .slice(-MAX_HISTORY_ENTRIES);
+    return env.history;
+  }
 
-      const controls = env.document.createElement("span");
-      controls.className = "sooqa-save-controls";
-      controls.dataset.sooqaMediaUrl = mediaUrl;
-      const save = makeButton(env.document, "Save", "sooqa-save");
-      const saveDetailed = makeButton(env.document, "Save...", "sooqa-save-detailed");
-      const status = env.document.createElement("span");
-      status.className = "sooqa-save-status";
-      const state = { actionId: null, payload: null, mode: null, sending: false, sent: false };
+  function saveAcceptedHistory(env) {
+    if (typeof env.GM_setValue !== "function") return;
+    try {
+      env.GM_setValue(HISTORY_STORAGE_KEY, loadAcceptedHistory(env));
+    } catch (_error) {
+      // History is advisory; storage failures must not block capture.
+    }
+  }
 
-      const setStatus = (value) => {
-        status.textContent = value;
+  function renderHistory(panel, env) {
+    const historyElement = panel.querySelector(".sooqa-history");
+    if (!historyElement) return;
+    const threadKey = panel.dataset.sooqaThreadKey;
+    const mediaKey = panel.dataset.sooqaMediaKey;
+    const entries = loadAcceptedHistory(env).filter(
+      (entry) => entry.threadKey === threadKey && entry.mediaKey === mediaKey
+    );
+    if (!entries.length) {
+      historyElement.textContent = "No accepted actions yet";
+      return;
+    }
+    const recent = entries.slice(-3).map((entry) => {
+      const label = entry.actionLabel || entry.requestedAction || "action";
+      return label + " (" + entry.acceptedAt + ")";
+    });
+    historyElement.textContent = "Accepted requests: " + recent.join(", ");
+  }
+
+  function renderAllHistory(env) {
+    for (const panel of Array.from(env.document.querySelectorAll(".sooqa-action-panel"))) {
+      renderHistory(panel, env);
+    }
+  }
+
+  function recordAcceptedAction(env, panel, action, actionId) {
+    const history = loadAcceptedHistory(env);
+    const marker = {
+      threadKey: panel.dataset.sooqaThreadKey,
+      mediaKey: panel.dataset.sooqaMediaKey,
+      actionId,
+      requestedAction: action.requestAction,
+      actionLabel: action.label,
+      acceptedAt: new Date().toISOString(),
+    };
+    const remaining = history.filter(
+      (entry) => !(
+        entry.threadKey === marker.threadKey &&
+        entry.mediaKey === marker.mediaKey &&
+        entry.actionId === marker.actionId
+      )
+    );
+    remaining.push(marker);
+    env.history = remaining.slice(-MAX_HISTORY_ENTRIES);
+    saveAcceptedHistory(env);
+    renderAllHistory(env);
+  }
+
+  function clearAcceptedHistory(env) {
+    env.history = [];
+    saveAcceptedHistory(env);
+    renderAllHistory(env);
+  }
+
+  function ensureHistoryControl(env) {
+    const existing = env.document.body.querySelector("." + HISTORY_CONTROL_KEY);
+    if (existing) return;
+    const button = makeButton(env.document, "Clear accepted history", HISTORY_CONTROL_KEY);
+    button.addEventListener("click", () => {
+      clearAcceptedHistory(env);
+      button.textContent = "Accepted history cleared";
+    });
+    env.document.body.append(button);
+  }
+
+  function ensureStyles(env) {
+    const existing = Array.from(env.document.querySelectorAll("style")).some(
+      (style) => style.dataset && style.dataset.sooqaStyles === "true"
+    );
+    if (existing) return;
+    const style = env.document.createElement("style");
+    style.dataset.sooqaStyles = "true";
+    style.textContent = [
+      ".sooqa-attachment-row {",
+      "  box-sizing: border-box;",
+      "  display: flex;",
+      "  flex: 0 0 100%;",
+      "  align-items: flex-start;",
+      "  gap: 0.75rem;",
+      "  width: 100%;",
+      "  margin: 0.5rem 0;",
+      "  grid-column: 1 / -1;",
+      "}",
+      ".sooqa-attachment-preview { flex: 0 1 auto; min-width: 0; }",
+      ".sooqa-action-panel {",
+      "  display: grid;",
+      "  grid-template-columns: repeat(2, minmax(7rem, max-content));",
+      "  flex: 0 0 auto;",
+      "  gap: 0.35rem;",
+      "  align-items: start;",
+      "}",
+      ".sooqa-action-panel button { min-height: 2rem; padding: 0.25rem 0.5rem; }",
+      ".sooqa-action-status, .sooqa-history { grid-column: 1 / -1; font-size: 0.85rem; }",
+      ".sooqa-dialog-error { min-height: 1.2em; color: #a00; }",
+      ".sooqa-history-control { margin: 0.5rem 0; }",
+      "@media (max-width: 42rem) { .sooqa-attachment-row { flex-wrap: wrap; } }",
+    ].join("\n");
+    (env.document.head || env.document.body).append(style);
+  }
+
+  function setButtonsDisabled(panel, disabled) {
+    for (const button of Array.from(panel.querySelectorAll("button[data-sooqa-action]"))) {
+      button.disabled = disabled;
+    }
+  }
+
+  function findExistingPanel(container, mediaKey) {
+    return Array.from(container.querySelectorAll(".sooqa-action-panel")).find(
+      (panel) => panel.dataset.sooqaMediaKey === mediaKey
+    );
+  }
+
+  function createActionPanel(env, mediaUrl, pageUrl) {
+    const mediaKey = canonicalizeUrl(mediaUrl);
+    const threadKey = canonicalizeUrl(pageUrl);
+    const panel = env.document.createElement("span");
+    panel.className = "sooqa-action-panel";
+    panel.dataset.sooqaMediaUrl = mediaUrl;
+    panel.dataset.sooqaMediaKey = mediaKey;
+    panel.dataset.sooqaThreadKey = threadKey;
+
+    const status = env.document.createElement("span");
+    status.className = "sooqa-action-status";
+    const historyElement = env.document.createElement("span");
+    historyElement.className = "sooqa-history";
+    const state = { retry: null, sending: false };
+
+    const setStatus = (value) => {
+      status.textContent = value;
+    };
+    const makeAttempt = (action, metadata) => {
+      const actionId = env.crypto.randomUUID();
+      const payload = buildPayload({
+        actionId,
+        mediaUrl,
+        pageUrl: env.location.href,
+        pageTitle: env.document.title,
+        action,
+        metadata,
+      });
+      return { actionKey: action.key, actionId, payload };
+    };
+
+    const submit = async (action) => {
+      if (state.sending) return;
+      if (state.retry && state.retry.actionKey !== action.key) state.retry = null;
+      if (!state.retry) {
+        let metadata = null;
+        if (action.detailed) {
+          metadata = await collectMetadata({ ...env, setStatus }, action);
+          if (!metadata) return;
+        }
+        state.retry = makeAttempt(action, metadata);
+      }
+
+      const attempt = state.retry;
+      state.sending = true;
+      setButtonsDisabled(panel, true);
+      const token = typeof env.GM_getValue === "function"
+        ? env.GM_getValue(TOKEN_STORAGE_KEY, "")
+        : "";
+      if (!token) {
+        state.sending = false;
+        setButtonsDisabled(panel, false);
+        setStatus("Configure companion token");
+        return;
+      }
+      if (typeof env.GM_xmlhttpRequest !== "function") {
+        state.sending = false;
+        setButtonsDisabled(panel, false);
+        setStatus("Tampermonkey request API unavailable");
+        return;
+      }
+
+      setStatus("Sending…");
+      const finishFailure = (message) => {
+        state.sending = false;
+        setButtonsDisabled(panel, false);
+        setStatus(message);
       };
-
-      const submit = async (mode) => {
-        if (state.sending || state.sent) return;
-        if (state.mode && state.mode !== mode) return;
-
-        state.sending = true;
-        save.disabled = true;
-        saveDetailed.disabled = true;
-        if (!state.payload) {
-          let description = "";
-          let tags = [];
-          if (mode === "detailed") {
-            const metadata = await collectMetadata(env);
-            if (!metadata) {
-              state.sending = false;
-              save.disabled = false;
-              saveDetailed.disabled = false;
-              return;
-            }
-            description = metadata.description;
-            tags = metadata.tags;
-          }
-          state.mode = mode;
-          state.actionId = env.crypto.randomUUID();
-          state.payload = buildPayload({
-            actionId: state.actionId,
-            mediaUrl,
-            pageUrl: env.location.href,
-            pageTitle: env.document.title,
-            description,
-            tags,
-          });
-        }
-
-        const token = typeof env.GM_getValue === "function"
-          ? env.GM_getValue(TOKEN_STORAGE_KEY, "")
-          : "";
-        if (!token) {
-          state.sending = false;
-          save.disabled = false;
-          saveDetailed.disabled = false;
-          setStatus("Configure companion token");
-          return;
-        }
-        if (typeof env.GM_xmlhttpRequest !== "function") {
-          state.sending = false;
-          save.disabled = false;
-          saveDetailed.disabled = false;
-          setStatus("Tampermonkey request API unavailable");
-          return;
-        }
-        setStatus("Saving…");
+      try {
         env.GM_xmlhttpRequest({
           method: "POST",
           url: COMPANION_ENDPOINT,
           headers: {
-            "Authorization": `Bearer ${token}`,
+            Authorization: "Bearer " + token,
             "Content-Type": "application/json",
           },
-          data: JSON.stringify(state.payload),
+          data: JSON.stringify(attempt.payload),
           timeout: 15_000,
           onload(response) {
             state.sending = false;
+            setButtonsDisabled(panel, false);
+            state.retry = null;
             if (response.status >= 200 && response.status < 300) {
-              state.sent = true;
-              setStatus("Accepted");
+              setStatus("Accepted request");
+              recordAcceptedAction(env, panel, action, attempt.actionId);
               return;
             }
-            save.disabled = false;
-            saveDetailed.disabled = false;
-            setStatus("Save failed; retry");
+            setStatus("Request failed; try again");
           },
           onerror() {
-            state.sending = false;
-            save.disabled = false;
-            saveDetailed.disabled = false;
-            setStatus("Save failed; retry");
+            finishFailure("Request failed; retry");
           },
           ontimeout() {
-            state.sending = false;
-            save.disabled = false;
-            saveDetailed.disabled = false;
-            setStatus("Save timed out; retry");
+            finishFailure("Request timed out; retry");
           },
         });
-      };
+      } catch (_error) {
+        finishFailure("Request failed; retry");
+      }
+    };
 
-      save.addEventListener("click", () => submit("simple"));
-      saveDetailed.addEventListener("click", () => submit("detailed"));
-      controls.append(save, " ", saveDetailed, " ", status);
-      container.append(" ", controls);
+    for (const action of ACTIONS) {
+      const button = makeButton(env.document, action.label, "sooqa-action-" + action.key);
+      button.dataset.sooqaAction = action.key;
+      button.addEventListener("click", () => submit(action));
+      panel.append(button);
+    }
+    panel.append(status, historyElement);
+    renderHistory(panel, env);
+    return panel;
+  }
+
+  function decorate(root, env) {
+    loadAcceptedHistory(env);
+    ensureStyles(env);
+    const nodes = [];
+    if (root.matches && root.matches("a[href], video[src], source[src]")) nodes.push(root);
+    nodes.push(...Array.from(root.querySelectorAll("a[href], video[src], source[src]")));
+    const decorated = new Set();
+    for (const node of nodes) {
+      const target = findAttachmentTarget(node);
+      const mediaUrl = extractDirectAttachmentUrls([node], env.location.href)[0];
+      if (!target || !mediaUrl || decorated.has(target)) continue;
+      const container = findPostContainer(target);
+      if (!container) continue;
+      const mediaKey = canonicalizeUrl(mediaUrl);
+      if (findExistingPanel(container, mediaKey)) {
+        decorated.add(target);
+        continue;
+      }
+
+      const row = env.document.createElement("div");
+      row.className = "sooqa-attachment-row";
+      row.dataset.sooqaMediaKey = mediaKey;
+      const preview = env.document.createElement("div");
+      preview.className = "sooqa-attachment-preview";
+      const panel = createActionPanel(env, mediaUrl, env.location.href);
+      const targetParent = target.parentElement;
+      if (targetParent) targetParent.insertBefore(row, target);
+      else container.append(row);
+      preview.append(target);
+      row.append(preview, panel);
+      decorated.add(target);
     }
   }
 
@@ -278,10 +578,14 @@
       document,
       location: root.location,
       crypto: root.crypto,
-      prompt: root.prompt.bind(root),
+      prompt: typeof root.prompt === "function" ? root.prompt.bind(root) : () => null,
       GM_getValue: root.GM_getValue,
+      GM_setValue: root.GM_setValue,
       GM_xmlhttpRequest: root.GM_xmlhttpRequest,
     };
+    loadAcceptedHistory(env);
+    ensureStyles(env);
+    ensureHistoryControl(env);
     decorate(document, env);
     const observer = new root.MutationObserver((mutations) => {
       for (const mutation of mutations) {
@@ -302,9 +606,14 @@
   }
 
   return {
+    ACTIONS,
     buildPayload,
+    canonicalizeUrl,
+    clearAcceptedHistory,
+    collectMetadata,
     decorate,
     extractDirectAttachmentUrls,
+    localDateTimeToRfc3339,
     normalizeDirectMediaUrl,
     parseTags,
     boot,

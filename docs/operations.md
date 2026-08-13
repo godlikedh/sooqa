@@ -257,13 +257,25 @@ A successful response means only that the backend accepted the ingest request;
 the userscript does not poll or claim that media is already stored. A failed
 request can be retried with the same action ID, preserving backend idempotency.
 
-Install `userscripts/sooqa-2ch-save.user.js` in Tampermonkey. It is matched only
-to `https://2ch.su/*`, `https://2ch.org/*`, and `https://2ch.life/*`,
-discovers direct `.mp4`/`.webm` links and media nodes, and observes
-dynamically added posts. The first run asks for the local token and stores it in
-Tampermonkey's private storage. It never receives or stores the backend token.
-`Save...` opens one metadata dialog for comma-separated tags and an internal
-description; those values become media metadata, not a public Telegram post.
+Install `userscripts/sooqa-2ch-save.user.js` in Tampermonkey. Its stable
+`@updateURL` and `@downloadURL` point to the script path on the repository's
+`main` branch, while the script's incremented `@version` lets Tampermonkey
+detect later releases.
+It is matched only to `https://2ch.su/*`, `https://2ch.org/*`, and
+`https://2ch.life/*`, discovers direct `.mp4`/`.webm` links and media nodes, and
+observes dynamically added posts. The first run asks for the local token and
+stores it in Tampermonkey's private storage. It never receives or stores the
+backend token. Each media preview gets `Post now`, `Post now…`, `Queue`,
+`Queue…`, `Save`, and `Save…` actions. Detailed actions collect only their
+documented metadata: internal tags/description, optional public post text, and
+the required browser-local exact time for `Queue…`; exact time is converted to
+an RFC3339 instant before submission.
+
+Accepted-action history is informational and local to the canonical thread and
+media identity across the three mirrors. It survives reloads, is bounded and
+clearable, never disables a button, and does not poll for ingest or publication
+state. A timeout/no-response retry keeps the same action ID for backend
+idempotency; a new deliberate action gets a new ID.
 
 For those three exact hosts, the worker's 2ch media adapter inspects official
 mirrors in the fixed order `2ch.org`, `2ch.su`, `2ch.life`, preserving the

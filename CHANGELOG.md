@@ -6,6 +6,9 @@ All notable changes to sooqa will be documented here.
 
 ### Added
 
+- Reworked the 2ch userscript into per-media six-action rows with typed
+  post-now/queue/save dialogs, exact browser-local queue times, retry-safe
+  action IDs, and bounded informational accepted history across mirrors.
 - Extended the loopback companion to validate and forward the typed capture
   intent, public post text, and exact queue time, with version-tagged Windows
   release assets and checksums.
