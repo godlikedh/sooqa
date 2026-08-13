@@ -18,7 +18,7 @@ use sooqa_worker::{
     HandlerRegistry, TelegramSourceDownloader, Worker, cleanup_workspace_handler,
     compute_fingerprint_handler, download_source_handler, finalize_ingest_handler,
     inspect_source_handler, media_processing_components, normalize_asset_handler,
-    probe_asset_handler_with_telegram_source, upload_storage_asset_handler,
+    probe_asset_handler_with_telegram_source, publish_post_handler, upload_storage_asset_handler,
 };
 
 #[tokio::main]
@@ -213,6 +213,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
         cleanup_workspace_handler(database.inbox(), config.media.work_root.clone());
     handlers.register(JobType::CleanupWorkspace, move |job| cleanup_handler(job));
     tracing::info!("workspace cleanup handler enabled");
+    if let Some(api) = telegram_api.clone() {
+        let publication_handler =
+            publish_post_handler(database.publisher(), database.library(), api);
+        handlers.register(JobType::PublishPost, move |job| publication_handler(job));
+        tracing::info!("fenced Telegram publication job handler enabled");
+    }
     match (telegram_api, config.telegram.storage_chat_id) {
         (Some(api), Some(storage_chat_id)) => {
             let provider = StorageUploadProvider::new(api, database.library(), storage_chat_id)?

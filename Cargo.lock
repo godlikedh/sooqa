@@ -2304,6 +2304,7 @@ dependencies = [
  "sooqa-library",
  "sooqa-media",
  "sooqa-persistence",
+ "sooqa-publisher",
  "sooqa-runtime",
  "sooqa-telegram",
  "sooqa-test-support",

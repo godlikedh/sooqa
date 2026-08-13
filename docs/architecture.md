@@ -77,10 +77,12 @@ this baseline.
 - `sooqa-media` owns direct HTTP, the exact-host 2ch mirror adapter, the
   allowlisted yt-dlp adapter, ffprobe, ffmpeg, image normalization, hashing,
   fingerprints, workspaces, and subprocess safety.
-- `sooqa-telegram` owns Telegram protocol mapping and storage upload effects.
-  Polling, worker-side source downloads, and storage uploads use separate HTTP
-  clients and timeout policies. Telegram file acceptance is metadata-only;
-  source bytes are reconstructed by the worker from the durable file ID.
+- `sooqa-telegram` owns Telegram protocol mapping, storage upload effects, and
+  publication copy/send effects. Polling, worker-side source downloads,
+  storage uploads, and publication use separate bounded calls. Telegram file
+  acceptance is metadata-only; source bytes are reconstructed by the worker
+  from the durable file ID. Publication receives only a ready storage receipt
+  and never receives a local media path.
 - `sooqa-persistence` owns migrations and short database transactions.
 - `sooqa-api` owns HTTP routing, one configured bearer secret, limits, and
   stable request-ID errors.
@@ -258,6 +260,56 @@ not compact unrelated posts. All post/job changes commit without Telegram I/O.
 Send generation and token fence retries, while `unknown` preserves an
 ambiguous Telegram outcome for explicit reconciliation. `publish now` changes
 only the job due time and leaves the cadence slot intact.
+
+Publication claims the queued post in a short transaction, increments its send
+generation, records a fresh token, and commits before calling Telegram. The
+adapter first calls `copyMessage` from the persisted private storage
+chat/message and supplies the public caption (an empty caption when absent),
+parse mode, and notification setting. Only an explicit copy-unavailable
+response permits the media-kind-specific stored `file_id` fallback. The
+canonical local file is never opened or uploaded by this path.
+
+Success and failure completion are conditional on the exact generation and
+token, so a stale worker cannot overwrite a newer attempt. Caption syntax
+errors become editable `failed` posts and their job is terminal; explicit
+no-effect errors such as Telegram flood-control responses requeue the post and
+update the running job payload before bounded retry. The final no-effect retry
+settles the post as `failed` before the worker settles the job, so a terminal
+job cannot leave a queued post behind. Database or malformed-receipt failures
+before the Telegram call are classified as known no-effect failures and follow
+the same bounded retry/final-failure path; missing or invalid receipts that
+cannot succeed are actionable `failed` outcomes. Network, invalid-response,
+and unknown Telegram outcomes become `unknown` and are never automatically
+sent again. If a worker lease expires while a post is `sending`, recovery
+fences that generation as `unknown` before the recovered job completes, and
+stale completion from the old attempt is rejected. The job is terminal after
+an ambiguous result; operator reconciliation is intentionally a later slice.
+
+```mermaid
+sequenceDiagram
+    participant Queue as queue.jobs
+    participant Worker
+    participant DB as posts + media
+    participant Telegram
+
+    Queue->>Worker: claim publish_post + expected revision
+    Worker->>DB: claim queued post -> sending + generation/token
+    DB-->>Worker: commit claim + storage receipt/channel
+    Worker->>Telegram: copyMessage(storage -> target)
+    alt copy unavailable and safe
+        Worker->>Telegram: send media by stored file_id
+    end
+    alt definite success
+        Worker->>DB: complete only matching generation/token -> published
+    else caption/entity rejection
+        Worker->>DB: matching failure -> failed
+    else ambiguous network/API outcome
+        Worker->>DB: matching failure -> unknown
+    else explicit no-effect retry
+        Worker->>DB: matching requeue + new job revision
+        Worker->>Queue: bounded retry policy
+    end
+```
 
 ## Security and filesystem rules
 

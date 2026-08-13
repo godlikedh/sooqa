@@ -109,6 +109,16 @@ post. If a job is already claimed, its post cannot be edited, moved, or
 cancelled. A stale bot card or HTTP caller receives a conflict and must reload
 the post; Telegram is never contacted while these mutations are committed.
 
+Publication claims the post before calling Telegram and records a fresh
+generation/token. It copies the ready storage message into the target channel;
+only a known copy-unavailable response may use the stored file ID fallback.
+Caption/entity rejection leaves an editable `failed` post. Explicit no-effect
+errors such as flood control requeue the post and follow bounded job retries.
+Network, invalid-response, and unknown API outcomes leave the post `unknown`
+and are not automatically resent. Inspect `posts.error_class` and
+`posts.error_message` before manual reconciliation; a `sending` post with a
+lost worker lease must be investigated before any new send is authorized.
+
 In the administrator's private bot chat, `/duplicates` lists up to three
 pending duplicate ingests at a time. Ready candidates link to their Telegram
 storage message; `Use this` reuses the existing media item, while `Save anyway`

@@ -13,6 +13,7 @@ sooqa-media = { path = "../../crates/media" }
 sooqa-jobs = { path = "../../crates/jobs" }
 sooqa-config = { path = "../../crates/config" }
 sooqa-persistence = { path = "../../crates/persistence" }
+sooqa-publisher = { path = "../../crates/publisher" }
 sooqa-runtime = { path = "../../crates/runtime" }
 sooqa-telegram = { path = "../../crates/telegram" }
 serde_json.workspace = true
