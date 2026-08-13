@@ -7,7 +7,9 @@ use axum::{
 use serde::{Deserialize, Serialize, de::Deserializer};
 use sha2::{Digest, Sha256};
 use sooqa_library::{MediaStatus, MediaStorageState};
-use sooqa_publisher::{Channel, NewChannel, NewPost, Post, PostSchedule, PostState, PostUpdate};
+use sooqa_publisher::{
+    Channel, NewChannel, NewPost, Post, PostSchedule, PostState, PostUpdate, QueueDirection,
+};
 use time::{OffsetDateTime, Time};
 use uuid::Uuid;
 
@@ -25,6 +27,10 @@ pub(crate) fn routes() -> Router<ApiState> {
         .route("/api/v1/posts/{id}", get(get_post).patch(update_post))
         .route("/api/v1/posts/{id}/schedule", post(schedule_post))
         .route("/api/v1/posts/{id}/publish", post(publish_now))
+        .route("/api/v1/posts/{id}/earlier", post(move_earlier))
+        .route("/api/v1/posts/{id}/later", post(move_later))
+        .route("/api/v1/posts/{id}/slot", post(set_slot))
+        .route("/api/v1/posts/{id}/cancel", post(cancel_post))
 }
 
 async fn list_channels(
@@ -195,16 +201,17 @@ async fn update_post(
             &headers,
         ));
     }
+    validate_expected_revision(payload.expected_revision, &headers)?;
     let current = state
         .publisher
         .find_post(id)
         .await
         .map_err(|error| map_publisher_error(error, &headers))?
         .ok_or_else(|| ApiError::not_found("post_not_found", "The post was not found", &headers))?;
-    if !current.state.is_editable() {
+    if !current.state.is_queue_mutable() {
         return Err(ApiError::conflict(
             "invalid_post_state",
-            "Only draft posts can be changed",
+            "The post cannot be changed in its current state",
             &headers,
         ));
     }
@@ -228,6 +235,7 @@ async fn update_post(
                 parse_mode,
                 disable_notification,
                 expected_updated_at: payload.expected_updated_at,
+                expected_revision: payload.expected_revision,
             },
         )
         .await
@@ -245,8 +253,14 @@ async fn schedule_post(
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     let requested_at = payload.publish_at.unwrap_or_else(OffsetDateTime::now_utc);
-    let schedule = PostSchedule::try_new(id, requested_at, idempotency_key(&headers)?)
-        .map_err(|error| map_publisher_error(error.into(), &headers))?;
+    validate_expected_revision(payload.expected_revision, &headers)?;
+    let schedule = PostSchedule::try_new(
+        id,
+        requested_at,
+        idempotency_key(&headers)?,
+        payload.expected_revision,
+    )
+    .map_err(|error| map_publisher_error(error.into(), &headers))?;
     let post = state
         .publisher
         .schedule_post(schedule)
@@ -259,16 +273,91 @@ async fn publish_now(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
+    body: Result<JsonExtractor<MutationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<PostResponse>), ApiError> {
     authorize(&state.api_token, &headers, "publisher:write").await?;
-    let schedule = PostSchedule::try_new(id, OffsetDateTime::now_utc(), idempotency_key(&headers)?)
-        .map_err(|error| map_publisher_error(error.into(), &headers))?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    validate_expected_revision(payload.expected_revision, &headers)?;
     let post = state
         .publisher
-        .schedule_post(schedule)
+        .publish_now(id, idempotency_key(&headers)?, payload.expected_revision)
         .await
         .map_err(|error| map_publisher_error(error, &headers))?;
     Ok((StatusCode::ACCEPTED, Json(PostResponse::from_post(&post))))
+}
+
+async fn move_earlier(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: Result<JsonExtractor<MutationRequest>, JsonRejection>,
+) -> Result<Json<PostResponse>, ApiError> {
+    move_adjacent(state, headers, id, body, QueueDirection::Earlier).await
+}
+
+async fn move_later(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: Result<JsonExtractor<MutationRequest>, JsonRejection>,
+) -> Result<Json<PostResponse>, ApiError> {
+    move_adjacent(state, headers, id, body, QueueDirection::Later).await
+}
+
+async fn move_adjacent(
+    state: ApiState,
+    headers: HeaderMap,
+    id: Uuid,
+    body: Result<JsonExtractor<MutationRequest>, JsonRejection>,
+    direction: QueueDirection,
+) -> Result<Json<PostResponse>, ApiError> {
+    authorize(&state.api_token, &headers, "publisher:write").await?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    validate_expected_revision(payload.expected_revision, &headers)?;
+    let post = state
+        .publisher
+        .move_adjacent(id, direction, payload.expected_revision)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
+    Ok(Json(PostResponse::from_post(&post)))
+}
+
+async fn set_slot(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: Result<JsonExtractor<SetSlotRequest>, JsonRejection>,
+) -> Result<Json<PostResponse>, ApiError> {
+    authorize(&state.api_token, &headers, "publisher:write").await?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    validate_expected_revision(payload.expected_revision, &headers)?;
+    let post = state
+        .publisher
+        .set_slot(id, payload.slot, payload.expected_revision)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
+    Ok(Json(PostResponse::from_post(&post)))
+}
+
+async fn cancel_post(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: Result<JsonExtractor<MutationRequest>, JsonRejection>,
+) -> Result<Json<PostResponse>, ApiError> {
+    authorize(&state.api_token, &headers, "publisher:write").await?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    validate_expected_revision(payload.expected_revision, &headers)?;
+    let post = state
+        .publisher
+        .cancel_post(id, payload.expected_revision)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
+    Ok(Json(PostResponse::from_post(&post)))
 }
 
 fn require_publishable(
@@ -280,6 +369,17 @@ fn require_publishable(
         return Err(ApiError::conflict(
             "media_not_publishable",
             "The media item is not ready for publication",
+            headers,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_expected_revision(expected_revision: i64, headers: &HeaderMap) -> Result<(), ApiError> {
+    if expected_revision < 0 {
+        return Err(ApiError::bad_request(
+            "invalid_expected_revision",
+            "expected_revision must be non-negative",
             headers,
         ));
     }
@@ -357,7 +457,11 @@ fn validate_caption(
     headers: &HeaderMap,
 ) -> Result<(), ApiError> {
     if let Some(caption) = caption
-        && (caption.chars().count() > MAX_CAPTION_LENGTH || caption.contains('\0'))
+        && (caption.chars().count() > MAX_CAPTION_LENGTH
+            || caption.contains('\0')
+            || caption.chars().any(|character| {
+                character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+            }))
     {
         return Err(ApiError::bad_request(
             "invalid_caption",
@@ -411,6 +515,7 @@ struct UpdatePostRequest {
     #[serde(default)]
     #[serde(with = "time::serde::rfc3339::option")]
     expected_updated_at: Option<OffsetDateTime>,
+    expected_revision: i64,
 }
 
 #[derive(Debug, Default)]
@@ -443,6 +548,21 @@ struct ScheduleRequest {
     #[serde(default)]
     #[serde(with = "time::serde::rfc3339::option")]
     publish_at: Option<OffsetDateTime>,
+    expected_revision: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MutationRequest {
+    expected_revision: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSlotRequest {
+    #[serde(with = "time::serde::rfc3339")]
+    slot: OffsetDateTime,
+    expected_revision: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -462,6 +582,7 @@ struct PostResponse {
     created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     updated_at: OffsetDateTime,
+    revision: i64,
 }
 
 impl PostResponse {
@@ -478,6 +599,7 @@ impl PostResponse {
             cadence_slot_at: post.cadence_slot_at,
             created_at: post.created_at,
             updated_at: post.updated_at,
+            revision: post.revision,
         }
     }
 }
@@ -565,7 +687,8 @@ mod tests {
     #[test]
     fn update_payload_can_explicitly_clear_caption() {
         let request: UpdatePostRequest =
-            serde_json::from_str(r#"{"caption":null}"#).expect("null caption is valid");
+            serde_json::from_str(r#"{"caption":null,"expected_revision":0}"#)
+                .expect("null caption is valid");
         assert!(matches!(request.caption, PatchField::Set(None)));
     }
 }

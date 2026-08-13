@@ -26,6 +26,13 @@ The first release is intentionally narrow:
 - searchable stored media with captions/descriptions and normalized tags;
 - immediate publication or a simple per-channel cadence queue.
 
+Publisher queue commands are durable PostgreSQL mutations: enqueue assigns the
+next valid channel-local cadence slot, adjacent and explicit slot moves swap
+only the affected posts, captions can be edited or explicitly cleared, and
+publish-now makes the existing post job due immediately without consuming its
+future cadence slot. Each queued post has one fixed-dedupe job and a revision
+fence; stale admin views and claimed jobs cannot overwrite newer queue state.
+
 Large-media capture uses Telegram's official local Bot API server when the home
 deployment is cut over manually. URL/link source downloads, Telegram-source
 downloads, and canonical normalized storage output have separate budgets. The

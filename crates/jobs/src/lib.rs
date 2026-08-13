@@ -140,6 +140,8 @@ pub struct MediaJobPayload {
 #[serde(deny_unknown_fields)]
 pub struct PublishPostPayload {
     pub post_id: Uuid,
+    #[serde(default)]
+    pub expected_revision: i64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -258,8 +260,8 @@ impl NewJob {
         Self::new(JobCommand::DownloadSource(DownloadSourcePayload { ingest_id, inspection }))
     }
 
-    pub fn publish_post(post_id: Uuid) -> Self {
-        Self::new(JobCommand::PublishPost(PublishPostPayload { post_id }))
+    pub fn publish_post(post_id: Uuid, expected_revision: i64) -> Self {
+        Self::new(JobCommand::PublishPost(PublishPostPayload { post_id, expected_revision }))
     }
 
     pub fn upload_storage_asset(asset_id: Uuid) -> Self {
@@ -415,9 +417,26 @@ mod tests {
     #[test]
     fn publish_payload_carries_post_id() {
         let post_id = Uuid::new_v4();
-        let job = NewJob::publish_post(post_id);
+        let job = NewJob::publish_post(post_id, 7);
         let command = JobCommand::from_payload(job.job_type(), job.payload_json()).unwrap();
-        assert_eq!(command, JobCommand::PublishPost(PublishPostPayload { post_id }));
+        assert_eq!(
+            command,
+            JobCommand::PublishPost(PublishPostPayload { post_id, expected_revision: 7 })
+        );
+    }
+
+    #[test]
+    fn legacy_publish_payload_defaults_to_initial_revision() {
+        let post_id = Uuid::new_v4();
+        let command = JobCommand::from_payload(
+            JobType::PublishPost,
+            serde_json::json!({ "post_id": post_id }),
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            JobCommand::PublishPost(PublishPostPayload { post_id, expected_revision: 0 })
+        );
     }
 
     #[test]

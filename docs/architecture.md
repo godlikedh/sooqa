@@ -249,9 +249,15 @@ state transition.
 Channels hold only target identity, enablement, timezone, window, and interval.
 Posts hold the intended message and the latest send result. A scheduled post
 is a query over `posts.state = 'queued'`; scheduling assigns `cadence_slot_at`
-and enqueues a `publish_post` job referencing the post ID. Send generation and
-token fence retries, while `unknown` preserves an ambiguous Telegram outcome
-for explicit reconciliation.
+and enqueues one fixed-dedupe `publish_post` job referencing the post ID. Queue
+mutations lock the channel first and then the affected post/job rows in a
+stable order. `posts.revision` is copied into the job payload, so a stale
+claim cannot send after an edit, swap, move, or publish-now operation. Adjacent
+move and occupied-slot operations swap exactly two slots; empty-slot moves do
+not compact unrelated posts. All post/job changes commit without Telegram I/O.
+Send generation and token fence retries, while `unknown` preserves an
+ambiguous Telegram outcome for explicit reconciliation. `publish now` changes
+only the job due time and leaves the cadence slot intact.
 
 ## Security and filesystem rules
 
