@@ -51,6 +51,19 @@ async fn stored_media(database: &Database) -> Uuid {
     media.media.id
 }
 
+async fn publish_job_snapshot(
+    database: &Database,
+    post_id: Uuid,
+) -> (String, OffsetDateTime, serde_json::Value) {
+    sqlx::query_as::<_, (String, OffsetDateTime, serde_json::Value)>(
+        "SELECT state, run_at, payload FROM queue.jobs WHERE dedupe_key = $1",
+    )
+    .bind(format!("post:{post_id}:publish:v1"))
+    .fetch_one(database.pool())
+    .await
+    .unwrap()
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
 async fn post_schedule_uses_one_row_and_channel_cadence(pool: sqlx::PgPool) {
@@ -304,6 +317,8 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
         .await
         .unwrap();
     let target_before = database.publisher().find_post(queued[2].id).await.unwrap().unwrap();
+    let sending_job_before = publish_job_snapshot(&database, sending.post.id).await;
+    let target_job_before = publish_job_snapshot(&database, target_before.id).await;
     let blocked = database
         .publisher()
         .set_slot(queued[2].id, sending.post.cadence_slot_at.unwrap(), target_before.revision)
@@ -318,6 +333,8 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
     let sending_after = database.publisher().find_post(sending.post.id).await.unwrap().unwrap();
     assert_eq!(sending_after.state, PostState::Sending);
     assert_eq!(sending_after.revision, sending.post.revision);
+    assert_eq!(publish_job_snapshot(&database, sending.post.id).await, sending_job_before);
+    assert_eq!(publish_job_snapshot(&database, target_before.id).await, target_job_before);
 
     let edited = database
         .publisher()
@@ -524,4 +541,70 @@ async fn failed_post_edit_keeps_failed_job_until_explicit_requeue(pool: sqlx::Pg
     assert_eq!(payload["expected_revision"], requeued.revision);
     let claimed = database.publisher().claim_publish(requeued.id, requeued.revision).await.unwrap();
     assert_eq!(claimed.post.state, PostState::Sending);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn failed_post_and_job_are_cancelled_together(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let channel = database
+        .publisher()
+        .create_channel(
+            NewChannel::try_new(format!("test-{}", Uuid::new_v4()), -1000000000005).unwrap(),
+        )
+        .await
+        .unwrap();
+    let media_id = stored_media(&database).await;
+    let post = database
+        .publisher()
+        .create_post_idempotent(
+            NewPost {
+                media_id,
+                channel_id: channel.id,
+                caption: Some("failed cancellation".to_owned()),
+                parse_mode: None,
+                disable_notification: false,
+            },
+            format!("post-{}", Uuid::new_v4()),
+            b"failed-cancellation",
+        )
+        .await
+        .unwrap()
+        .post;
+    let queued = database
+        .publisher()
+        .schedule_post(
+            PostSchedule::try_new(post.id, OffsetDateTime::now_utc(), "initial", 0).unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE posts SET state = 'failed', error_class = 'telegram', error_message = 'failed' WHERE id = $1",
+    )
+    .bind(queued.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'failed', error_class = 'telegram', error_message = 'failed' WHERE dedupe_key = $1",
+    )
+    .bind(format!("post:{}:publish:v1", queued.id))
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let failed = database.publisher().find_post(queued.id).await.unwrap().unwrap();
+    assert_eq!(failed.state, PostState::Failed);
+    let cancelled = database.publisher().cancel_post(failed.id, failed.revision).await.unwrap();
+    assert_eq!(cancelled.state, PostState::Cancelled);
+    assert!(cancelled.cadence_slot_at.is_none());
+    assert_eq!(cancelled.revision, failed.revision + 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE dedupe_key = $1")
+            .bind(format!("post:{}:publish:v1", failed.id))
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "cancelled"
+    );
 }
