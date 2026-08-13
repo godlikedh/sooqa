@@ -265,8 +265,10 @@ Install `userscripts/sooqa-2ch-save.user.js` in Tampermonkey. Its stable
 `main` branch, while the script's incremented `@version` lets Tampermonkey
 detect later releases.
 It is matched only to `https://2ch.su/*`, `https://2ch.org/*`, and
-`https://2ch.life/*`, discovers direct `.mp4`/`.webm` links and media nodes, and
-observes dynamically added posts. The first run asks for the local token and
+`https://2ch.life/*`, discovers direct `.mp4`/`.webm` links and media nodes
+inside real `.post` attachment areas, and observes dynamically added posts.
+Arbitrary page-level media and 2ch's generated fullscreen viewer are ignored.
+The first run asks for the local token and
 stores it in Tampermonkey's private storage. It never receives or stores the
 backend token. Each media preview gets `Post now`, `Post now…`, `Queue`,
 `Queue…`, `Save`, and `Save…` actions. Detailed actions collect only their

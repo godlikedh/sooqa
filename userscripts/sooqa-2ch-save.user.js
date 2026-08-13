@@ -162,6 +162,54 @@
     return node;
   }
 
+  function isExcludedElement(node) {
+    if (!node) return false;
+    const id = node.getAttribute && node.getAttribute("id");
+    if (id === "js-mv-main") return true;
+    if (!node.className || typeof node.className !== "string") {
+      return node.tagName === "DIALOG";
+    }
+    return node.tagName === "DIALOG" || node.className.split(/\s+/).some((className) => (
+      className === "mv" ||
+      className === "mv__main" ||
+      className === "mv__player" ||
+      className.startsWith("sooqa-") ||
+      className.startsWith("sooqa_")
+    ));
+  }
+
+  function isExcludedSubtree(node) {
+    let current = node;
+    while (current) {
+      if (isExcludedElement(current)) return true;
+      current = current.parentElement;
+    }
+    return false;
+  }
+
+  function postAttachmentArea(node) {
+    if (!node || !node.closest) return null;
+    const post = node.closest(".post");
+    if (!post) return null;
+    const area = node.closest(".post__images, .post__files, .post__attachments");
+    return area && area.closest(".post") === post ? area : null;
+  }
+
+  function isNativePostFigure(figure) {
+    if (isExcludedSubtree(figure) || !figure.closest) return false;
+    const post = figure.closest(".post");
+    const images = figure.closest(".post__images");
+    return Boolean(post && images && images.closest(".post") === post);
+  }
+
+  function isLegacyPostAttachment(node, target) {
+    if (isExcludedSubtree(node) || isExcludedSubtree(target)) return false;
+    const post = node.closest && node.closest(".post");
+    const targetPost = target && target.closest && target.closest(".post");
+    if (!post || post !== targetPost) return false;
+    return Boolean(postAttachmentArea(node) || postAttachmentArea(target));
+  }
+
   function findThreadContainer(node) {
     return node && node.closest
       ? node.closest(".thread[data-num], .thread, [data-thread-id], [data-thread-url]")
@@ -249,11 +297,13 @@
   }
 
   function attachmentCandidates(root, env) {
+    if (isExcludedSubtree(root)) return [];
     const candidates = [];
     const figures = [];
     if (root.matches && root.matches("figure.post__image")) figures.push(root);
     figures.push(...Array.from(root.querySelectorAll("figure.post__image")));
     for (const figure of figures) {
+      if (!isNativePostFigure(figure)) continue;
       const mediaUrl = figureMediaUrl(figure, env.location.href);
       if (mediaUrl) candidates.push({ node: figure, target: figure, mediaUrl });
     }
@@ -262,10 +312,15 @@
     if (root.matches && root.matches("a[href], video[src], source[src]")) nodes.push(root);
     nodes.push(...Array.from(root.querySelectorAll("a[href], video[src], source[src]")));
     for (const node of nodes) {
-      if (node.closest && node.closest("figure.post__image")) continue;
+      if (
+        isExcludedSubtree(node) ||
+        (node.closest && node.closest("figure.post__image"))
+      ) continue;
       const target = findAttachmentTarget(node);
       const mediaUrl = extractDirectAttachmentUrls([node], env.location.href)[0];
-      if (target && mediaUrl) candidates.push({ node, target, mediaUrl });
+      if (target && mediaUrl && isLegacyPostAttachment(node, target)) {
+        candidates.push({ node, target, mediaUrl });
+      }
     }
     return candidates;
   }
@@ -661,6 +716,7 @@
   }
 
   function decorate(root, env) {
+    if (isExcludedSubtree(root)) return;
     loadAcceptedHistory(env);
     ensureStyles(env);
     const decorated = new Set();
@@ -710,7 +766,7 @@
     const observer = new root.MutationObserver((mutations) => {
       for (const mutation of mutations) {
         for (const node of Array.from(mutation.addedNodes)) {
-          if (node.nodeType === 1) decorate(node, env);
+          if (node.nodeType === 1 && !isExcludedSubtree(node)) decorate(node, env);
         }
       }
     });

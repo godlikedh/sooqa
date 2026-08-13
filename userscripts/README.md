@@ -11,10 +11,11 @@ The script adds one vertically attached action row per direct `.mp4` or `.webm`
 attachment, including attachments added after the page initially loads. Each
 row has `Post now`, `Post now…`, `Queue`, `Queue…`, `Save`, and `Save…` in a
 3x2 action grid. Existing previews and native link/play/download behavior stay
-in place; on native `figure.post__image` markup the filename link and preview
-are treated as one attachment, including multi-item galleries. The script does
-not resize or replace media and does not scrape other domains or page-like
-links.
+in place; discovery is limited to actual `.post` attachment areas. On native
+`figure.post__image` markup the filename link and preview are treated as one
+attachment, including multi-item galleries. The script ignores arbitrary
+page-level media and 2ch's generated fullscreen viewer, does not resize or
+replace media, and does not scrape other domains or page-like links.
 
 The script sends only to `http://127.0.0.1:47831/v1/submit` with the local
 companion token read from Tampermonkey storage. It contains no backend API or
