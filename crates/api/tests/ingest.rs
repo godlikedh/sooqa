@@ -322,6 +322,89 @@ async fn accept_duplicate_reuses_ready_media_and_replays_without_uploading(pool:
         .unwrap();
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn accept_duplicate_replays_after_pending_storage_failure(pool: sqlx::PgPool) {
+    let (database, app) = app(pool);
+    let media_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO media (id, kind, storage_state) VALUES ($1, 'video', 'pending_storage')",
+    )
+    .bind(media_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/api-failure-replay-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ingests SET state = 'duplicate_pending', duplicate_evidence = $2 WHERE id = $1",
+    )
+    .bind(ingest.ingest.id)
+    .bind(duplicate_evidence(media_id))
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let accept_request = || {
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/ingests/{}/accept-duplicate", ingest.ingest.id))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-api-token")
+                .body(Body::from(json!({"media_id": media_id}).to_string()))
+                .unwrap(),
+        )
+    };
+    assert_eq!(accept_request().await.unwrap().status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        database
+            .inbox()
+            .fail_storage_for_media(
+                media_id,
+                sooqa_inbox::IngestStatus::FailedRetryable,
+                "storage_upload",
+                "temporary storage failure",
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let response = accept_request().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["status"], "failed_retryable");
+
+    sqlx::query(
+        "DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1 OR payload->>'media_id' = $2",
+    )
+    .bind(ingest.ingest.id.to_string())
+    .bind(media_id.to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM ingests WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM media WHERE id = $1")
+        .bind(media_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+}
+
 fn duplicate_evidence(media_id: Uuid) -> Value {
     json!({
         "algorithm_version": "video_sequence_v1",
