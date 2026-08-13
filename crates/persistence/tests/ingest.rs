@@ -1,7 +1,7 @@
 use serde_json::json;
 use sooqa_inbox::{
-    IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection, SourceMediaKind,
-    SubmittedVia,
+    IngestStatus, IngestSubmission, IngestSubmissionInput, RequestedAction, SourceInspection,
+    SourceMediaKind, SubmittedVia,
 };
 use sooqa_jobs::{JobCommand, JobStatus, JobType};
 use sooqa_library::{
@@ -30,13 +30,25 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts(pool: sqlx::P
 
     let mut conflicting =
         IngestSubmissionInput::new("https://example.test/other", SubmittedVia::Api);
-    conflicting.idempotency_key = Some(key);
+    conflicting.idempotency_key = Some(key.clone());
     let error = database
         .inbox()
         .create_ingest(IngestSubmission::try_new(conflicting).unwrap())
         .await
         .unwrap_err();
     assert!(matches!(error, InboxRepositoryError::IdempotencyConflict { .. }));
+
+    let mut changed_intent =
+        IngestSubmissionInput::new("https://example.test/video", SubmittedVia::Api);
+    changed_intent.idempotency_key = Some(key);
+    changed_intent.requested_action = RequestedAction::PostNow;
+    let error = database
+        .inbox()
+        .create_ingest(IngestSubmission::try_new(changed_intent).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, InboxRepositoryError::IdempotencyConflict { .. }));
+
     let claimed = database
         .jobs()
         .claim_next(
@@ -66,6 +78,34 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts(pool: sqlx::P
         database.inbox().begin_source_inspection(first.ingest.id, &stale_attempt).await.unwrap(),
         SourceInspectionStart::AlreadyAdvanced(_)
     ));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn exact_queue_replay_remains_idempotent_after_requested_time_passes(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let requested_publish_at = time::OffsetDateTime::now_utc() + time::Duration::milliseconds(500);
+    let key = format!("exact-queue-replay-{}", Uuid::new_v4());
+    let mut input =
+        IngestSubmissionInput::new("https://example.test/exact-queue", SubmittedVia::Api);
+    input.idempotency_key = Some(key);
+    input.requested_action = RequestedAction::Queue;
+    input.requested_publish_at = Some(requested_publish_at);
+    let first = database
+        .inbox()
+        .create_ingest(IngestSubmission::try_new(input.clone()).unwrap())
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+    let replay = database
+        .inbox()
+        .create_ingest(IngestSubmission::try_new_for_idempotency_lookup(input).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(replay.ingest.id, first.ingest.id);
+    assert!(!replay.created);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -181,6 +221,10 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPo
     );
     submission_input.supplied_description = Some("keep this internal note".to_owned());
     submission_input.supplied_tags = vec!["cats".to_owned(), "reaction".to_owned()];
+    submission_input.requested_action = RequestedAction::Queue;
+    submission_input.requested_publish_at =
+        Some(time::OffsetDateTime::now_utc() + time::Duration::minutes(5));
+    submission_input.requested_post_caption = Some("public queue text".to_owned());
     let ingest = database
         .inbox()
         .create_ingest(IngestSubmission::try_new(submission_input).unwrap())
@@ -229,6 +273,9 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPo
     assert!(resumed.ingest.original_input.get("inspection").is_none());
     assert_eq!(resumed.ingest.supplied_description.as_deref(), Some("keep this internal note"));
     assert_eq!(resumed.ingest.supplied_tags, ["cats", "reaction"]);
+    assert_eq!(resumed.ingest.requested_action, RequestedAction::Queue);
+    assert!(resumed.ingest.requested_publish_at.is_some());
+    assert_eq!(resumed.ingest.requested_post_caption.as_deref(), Some("public queue text"));
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM queue.jobs WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",

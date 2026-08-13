@@ -189,6 +189,17 @@ not create a workspace or call Telegram file download. The worker creates the
 workspace and downloads from the persisted file ID during the probe job, so a
 slow or replayed Telegram file cannot block later polling acceptance.
 
+URL ingest rows also persist a typed capture intent: `save`, `queue`, or
+`post_now`, with an optional future `requested_publish_at` and separate public
+`requested_post_caption`. An omitted action is `save`; a queue without a time
+uses the eventual channel cadence, while a future queue time is an exact
+instant that the later materializer will keep outside cadence/window rules.
+The Inbox validates action/time combinations before insertion and includes all
+source, metadata, and intent fields in the existing `input_key` request hash.
+The intent is carried through duplicate review, force-save, retries, and
+terminal ingest states. This slice only records the request: it does not
+insert a `posts` row or a publication job.
+
 When storage is durably ready, the storage transition, linked-ingest
 completion, `local_work_path = NULL`, and cleanup enqueue commit together. A
 duplicate or terminal failure uses the one-day cleanup retention window. A

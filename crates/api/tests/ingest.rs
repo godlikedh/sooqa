@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use sooqa_api::{ApiSettings, ApiState, router};
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
 use sooqa_persistence::Database;
+use time::OffsetDateTime;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -50,6 +51,138 @@ async fn api_authenticates_with_the_single_configured_bearer_secret(pool: sqlx::
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn api_round_trips_requested_intent_without_materializing_a_post(pool: sqlx::PgPool) {
+    let (database, app) = app(pool);
+    let requested_publish_at =
+        (OffsetDateTime::now_utc() + time::Duration::hours(1)).replace_nanosecond(0).unwrap();
+    let requested_publish_at_text =
+        requested_publish_at.format(&time::format_description::well_known::Rfc3339).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/ingests")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-api-token")
+                .header("idempotency-key", "api-requested-intent")
+                .body(Body::from(
+                    json!({
+                        "url": "https://example.test/requested-intent.webm",
+                        "selected_text": "selected text",
+                        "description": "internal description",
+                        "tags": ["Cats"],
+                        "requested_action": "queue",
+                        "requested_publish_at": requested_publish_at_text,
+                        "requested_post_caption": "public post text"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let accepted: Value = serde_json::from_slice(&body).unwrap();
+    let ingest_id = accepted["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    assert_eq!(accepted["requested_action"], "queue");
+    assert_eq!(accepted["requested_publish_at"], requested_publish_at_text);
+    assert_eq!(accepted["requested_post_caption"], "public post text");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/ingests/{ingest_id}"))
+                .header("authorization", "Bearer test-api-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let current: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(current["requested_action"], "queue");
+    assert_eq!(current["requested_publish_at"], requested_publish_at_text);
+    assert_eq!(current["requested_post_caption"], "public post text");
+    assert_eq!(current["supplied_caption"], "selected text");
+    assert_eq!(current["supplied_description"], "internal description");
+    assert_eq!(current["supplied_tags"], json!(["cats"]));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM posts WHERE id = $1")
+            .bind(ingest_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn api_rejects_invalid_requested_intent_before_persistence(pool: sqlx::PgPool) {
+    let (database, app) = app(pool);
+    for (key, payload, code) in [
+        (
+            "api-invalid-intent-caption",
+            json!({
+                "url": "https://example.test/save.webm",
+                "requested_post_caption": "public text"
+            }),
+            "requested_post_caption_not_allowed",
+        ),
+        (
+            "api-invalid-intent-time",
+            json!({
+                "url": "https://example.test/queue.webm",
+                "requested_action": "queue",
+                "requested_publish_at": "2000-01-01T00:00:00Z"
+            }),
+            "requested_publish_at_not_future",
+        ),
+        (
+            "api-invalid-intent-action",
+            json!({
+                "url": "https://example.test/unknown.webm",
+                "requested_action": "later"
+            }),
+            "invalid_requested_action",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/ingests")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-api-token")
+                    .header("idempotency-key", key)
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], code);
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM ingests WHERE input_key = 'api-invalid-intent-time'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        0
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

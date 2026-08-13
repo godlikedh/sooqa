@@ -650,6 +650,24 @@ components:
         tags:
           type: array
           items: { type: string }
+        requested_action:
+          type: string
+          enum: [save, queue, post_now]
+          default: save
+          description: >-
+            Durable follow-up intent. Omit this field for the save-only
+            behavior supported by older clients.
+        requested_publish_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            Future RFC3339 instant for an exact queue request. Omit it for
+            normal cadence queueing, save, and post_now.
+        requested_post_caption:
+          type: string
+          nullable: true
+          description: Public Telegram post text; distinct from media metadata.
     AcceptDuplicateRequest:
       type: object
       required: [media_id]
@@ -658,10 +676,13 @@ components:
         media_id: { type: string, format: uuid }
     IngestAcceptedResponse:
       type: object
-      required: [id, status, links]
+      required: [id, status, requested_action, requested_publish_at, requested_post_caption, links]
       properties:
         id: { type: string, format: uuid }
         status: { $ref: '#/components/schemas/IngestStatus' }
+        requested_action: { type: string, enum: [save, queue, post_now] }
+        requested_publish_at: { type: string, format: date-time, nullable: true }
+        requested_post_caption: { type: string, nullable: true }
         links:
           type: object
           required: [self]
@@ -671,7 +692,7 @@ components:
       allOf:
         - $ref: '#/components/schemas/IngestAcceptedResponse'
         - type: object
-          required: [kind, source_url, created_at, updated_at, supplied_tags, force_save]
+          required: [kind, source_url, created_at, updated_at, supplied_tags, force_save, requested_action, requested_publish_at, requested_post_caption]
           properties:
             kind: { type: string, enum: [url, telegram_message, upload] }
             source_url: { type: string }
@@ -680,6 +701,9 @@ components:
             supplied_caption: { type: string, nullable: true }
             supplied_description: { type: string, nullable: true }
             supplied_tags: { type: array, items: { type: string } }
+            requested_action: { type: string, enum: [save, queue, post_now] }
+            requested_publish_at: { type: string, format: date-time, nullable: true }
+            requested_post_caption: { type: string, nullable: true }
             media_id: { type: string, format: uuid, nullable: true }
             force_save: { type: boolean }
             duplicate_evidence:

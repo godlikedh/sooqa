@@ -115,6 +115,42 @@ pub enum SubmittedVia {
     TelegramBot,
 }
 
+/// The one follow-up operation requested alongside a media ingest.
+///
+/// This is intentionally only a durable request at the Inbox boundary. It
+/// does not create a post or decide how publication policy will be applied.
+#[derive(Debug, Clone, Copy, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedAction {
+    #[default]
+    Save,
+    Queue,
+    PostNow,
+}
+
+impl RequestedAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Save => "save",
+            Self::Queue => "queue",
+            Self::PostNow => "post_now",
+        }
+    }
+}
+
+impl TryFrom<&str> for RequestedAction {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "save" => Ok(Self::Save),
+            "queue" => Ok(Self::Queue),
+            "post_now" => Ok(Self::PostNow),
+            unknown => Err(unknown.to_owned()),
+        }
+    }
+}
+
 impl SubmittedVia {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -252,6 +288,9 @@ pub struct IngestSubmissionInput {
     pub supplied_caption: Option<String>,
     pub supplied_description: Option<String>,
     pub supplied_tags: Vec<String>,
+    pub requested_action: RequestedAction,
+    pub requested_publish_at: Option<time::OffsetDateTime>,
+    pub requested_post_caption: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
@@ -276,6 +315,9 @@ impl IngestSubmissionInput {
             supplied_caption: None,
             supplied_description: None,
             supplied_tags: Vec::new(),
+            requested_action: RequestedAction::Save,
+            requested_publish_at: None,
+            requested_post_caption: None,
             idempotency_key: None,
         }
     }
@@ -294,11 +336,31 @@ pub struct IngestSubmission {
     pub supplied_caption: Option<String>,
     pub supplied_description: Option<String>,
     pub supplied_tags: Vec<String>,
+    pub requested_action: RequestedAction,
+    pub requested_publish_at: Option<time::OffsetDateTime>,
+    pub requested_post_caption: Option<String>,
     pub idempotency_key: Option<String>,
 }
 
 impl IngestSubmission {
     pub fn try_new(input: IngestSubmissionInput) -> Result<Self, IngestValidationError> {
+        Self::try_new_inner(input, true)
+    }
+
+    /// Build a submission before the persistence layer can distinguish a new
+    /// request from an idempotent replay. Temporal freshness is checked by
+    /// persistence after that distinction; otherwise a replay of an exact
+    /// queue request could fail merely because its requested time elapsed.
+    pub fn try_new_for_idempotency_lookup(
+        input: IngestSubmissionInput,
+    ) -> Result<Self, IngestValidationError> {
+        Self::try_new_inner(input, false)
+    }
+
+    fn try_new_inner(
+        input: IngestSubmissionInput,
+        enforce_publish_time_freshness: bool,
+    ) -> Result<Self, IngestValidationError> {
         let original_url = input.source_url.trim().to_owned();
         let normalized_url = normalize_url(&original_url, "source URL")?;
         let page_url =
@@ -319,6 +381,13 @@ impl IngestSubmission {
         let page_title = normalize_optional_text(input.page_title);
         let supplied_caption = normalize_optional_text(input.supplied_caption);
         let supplied_description = normalize_optional_text(input.supplied_description);
+        let requested_post_caption = normalize_optional_text(input.requested_post_caption);
+        validate_requested_intent(
+            input.requested_action,
+            input.requested_publish_at,
+            requested_post_caption.as_deref(),
+            enforce_publish_time_freshness,
+        )?;
         let original_input = json!({
             "url": &original_url,
             "page_url": &page_url,
@@ -326,6 +395,9 @@ impl IngestSubmission {
             "selected_text": &supplied_caption,
             "description": &supplied_description,
             "tags": &supplied_tags,
+            "requested_action": input.requested_action.as_str(),
+            "requested_publish_at": format_requested_publish_at(input.requested_publish_at),
+            "requested_post_caption": &requested_post_caption,
         });
 
         Ok(Self {
@@ -340,6 +412,9 @@ impl IngestSubmission {
             supplied_caption,
             supplied_description,
             supplied_tags,
+            requested_action: input.requested_action,
+            requested_publish_at: input.requested_publish_at,
+            requested_post_caption,
             idempotency_key,
         })
     }
@@ -362,6 +437,9 @@ impl IngestSubmission {
             supplied_caption: normalize_optional_text(input.supplied_caption),
             supplied_description: None,
             supplied_tags: Vec::new(),
+            requested_action: RequestedAction::Save,
+            requested_publish_at: None,
+            requested_post_caption: None,
             idempotency_key,
         })
     }
@@ -393,6 +471,9 @@ pub struct Ingest {
     pub supplied_caption: Option<String>,
     pub supplied_description: Option<String>,
     pub supplied_tags: Vec<String>,
+    pub requested_action: RequestedAction,
+    pub requested_publish_at: Option<time::OffsetDateTime>,
+    pub requested_post_caption: Option<String>,
     pub idempotency_key: Option<String>,
     pub media_id: Option<Uuid>,
     pub force_save: bool,
@@ -421,6 +502,9 @@ impl Ingest {
             supplied_caption: submission.supplied_caption.clone(),
             supplied_description: submission.supplied_description.clone(),
             supplied_tags: submission.supplied_tags.clone(),
+            requested_action: submission.requested_action,
+            requested_publish_at: submission.requested_publish_at,
+            requested_post_caption: submission.requested_post_caption.clone(),
             idempotency_key: submission.idempotency_key.clone(),
             media_id: None,
             force_save: false,
@@ -467,6 +551,18 @@ pub enum IngestValidationError {
     IdempotencyKeyTooLong,
     #[error("supplied tags must not contain empty values")]
     EmptyTag,
+    #[error("requested action is invalid")]
+    InvalidRequestedAction,
+    #[error("requested publish time is invalid")]
+    InvalidRequestedPublishAt,
+    #[error("save requests must not include a requested publish time")]
+    RequestedPublishAtForbidden,
+    #[error("post-now requests must not include a requested publish time")]
+    RequestedPublishAtForbiddenForPostNow,
+    #[error("requested publish time must be in the future")]
+    RequestedPublishAtNotFuture,
+    #[error("save requests must not include public post text")]
+    RequestedPostCaptionForbidden,
 }
 
 fn normalize_url(input: &str, field: &'static str) -> Result<String, IngestValidationError> {
@@ -551,6 +647,46 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
+fn format_requested_publish_at(value: Option<time::OffsetDateTime>) -> Option<String> {
+    value.map(|value| {
+        value
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("RFC3339 formatting should be available")
+    })
+}
+
+fn validate_requested_intent(
+    action: RequestedAction,
+    requested_publish_at: Option<time::OffsetDateTime>,
+    requested_post_caption: Option<&str>,
+    enforce_publish_time_freshness: bool,
+) -> Result<(), IngestValidationError> {
+    match action {
+        RequestedAction::Save => {
+            if requested_publish_at.is_some() {
+                return Err(IngestValidationError::RequestedPublishAtForbidden);
+            }
+            if requested_post_caption.is_some() {
+                return Err(IngestValidationError::RequestedPostCaptionForbidden);
+            }
+        }
+        RequestedAction::Queue => {
+            if enforce_publish_time_freshness
+                && let Some(requested_publish_at) = requested_publish_at
+                && requested_publish_at <= time::OffsetDateTime::now_utc()
+            {
+                return Err(IngestValidationError::RequestedPublishAtNotFuture);
+            }
+        }
+        RequestedAction::PostNow => {
+            if requested_publish_at.is_some() {
+                return Err(IngestValidationError::RequestedPublishAtForbiddenForPostNow);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +745,96 @@ mod tests {
         assert_eq!(value.page_title.as_deref(), Some("Title"));
         assert_eq!(value.supplied_caption.as_deref(), Some("Caption"));
         assert_eq!(value.supplied_description.as_deref(), Some("Internal description"));
+    }
+
+    #[test]
+    fn requested_intent_is_typed_and_keeps_public_text_separate() {
+        let mut input = IngestSubmissionInput::new("https://example.com/video", SubmittedVia::Api);
+        input.supplied_caption = Some("selected text".to_owned());
+        input.supplied_description = Some("internal description".to_owned());
+        input.supplied_tags = vec!["cats".to_owned()];
+        input.requested_action = RequestedAction::Queue;
+        input.requested_publish_at =
+            Some(time::OffsetDateTime::now_utc() + time::Duration::minutes(5));
+        input.requested_post_caption = Some("public post text".to_owned());
+
+        let value = IngestSubmission::try_new(input).expect("requested intent should be valid");
+
+        assert_eq!(value.requested_action, RequestedAction::Queue);
+        assert!(value.requested_publish_at.is_some());
+        assert_eq!(value.requested_post_caption.as_deref(), Some("public post text"));
+        assert_eq!(value.supplied_caption.as_deref(), Some("selected text"));
+        assert_eq!(value.supplied_description.as_deref(), Some("internal description"));
+        assert_eq!(value.original_input["requested_action"], "queue");
+        assert_eq!(value.original_input["requested_post_caption"], "public post text");
+        assert_eq!(value.original_input["selected_text"], "selected text");
+        assert_eq!(value.original_input["description"], "internal description");
+    }
+
+    #[test]
+    fn requested_intent_defaults_to_save_for_legacy_submissions() {
+        let value = submission("https://example.com/video");
+
+        assert_eq!(value.requested_action, RequestedAction::Save);
+        assert!(value.requested_publish_at.is_none());
+        assert!(value.requested_post_caption.is_none());
+    }
+
+    #[test]
+    fn requested_intent_allows_cadence_queue_and_post_now() {
+        let mut queue = IngestSubmissionInput::new("https://example.com/queue", SubmittedVia::Api);
+        queue.requested_action = RequestedAction::Queue;
+        let queue = IngestSubmission::try_new(queue).expect("normal queue should be valid");
+        assert_eq!(queue.requested_action, RequestedAction::Queue);
+        assert!(queue.requested_publish_at.is_none());
+
+        let mut post_now =
+            IngestSubmissionInput::new("https://example.com/post-now", SubmittedVia::Api);
+        post_now.requested_action = RequestedAction::PostNow;
+        post_now.requested_post_caption = Some("publish this".to_owned());
+        let post_now = IngestSubmission::try_new(post_now).expect("post-now should be valid");
+        assert_eq!(post_now.requested_action, RequestedAction::PostNow);
+        assert_eq!(post_now.requested_post_caption.as_deref(), Some("publish this"));
+    }
+
+    #[test]
+    fn requested_intent_rejects_invalid_action_combinations_and_past_times() {
+        let mut save_with_caption =
+            IngestSubmissionInput::new("https://example.com", SubmittedVia::Api);
+        save_with_caption.requested_post_caption = Some("public".to_owned());
+        assert!(matches!(
+            IngestSubmission::try_new(save_with_caption),
+            Err(IngestValidationError::RequestedPostCaptionForbidden)
+        ));
+
+        let mut save_with_time =
+            IngestSubmissionInput::new("https://example.com", SubmittedVia::Api);
+        save_with_time.requested_publish_at =
+            Some(time::OffsetDateTime::now_utc() + time::Duration::minutes(5));
+        assert!(matches!(
+            IngestSubmission::try_new(save_with_time),
+            Err(IngestValidationError::RequestedPublishAtForbidden)
+        ));
+
+        let mut post_now_with_time =
+            IngestSubmissionInput::new("https://example.com", SubmittedVia::Api);
+        post_now_with_time.requested_action = RequestedAction::PostNow;
+        post_now_with_time.requested_publish_at =
+            Some(time::OffsetDateTime::now_utc() + time::Duration::minutes(5));
+        assert!(matches!(
+            IngestSubmission::try_new(post_now_with_time),
+            Err(IngestValidationError::RequestedPublishAtForbiddenForPostNow)
+        ));
+
+        let mut queue_in_the_past =
+            IngestSubmissionInput::new("https://example.com", SubmittedVia::Api);
+        queue_in_the_past.requested_action = RequestedAction::Queue;
+        queue_in_the_past.requested_publish_at =
+            Some(time::OffsetDateTime::now_utc() - time::Duration::minutes(1));
+        assert!(matches!(
+            IngestSubmission::try_new(queue_in_the_past),
+            Err(IngestValidationError::RequestedPublishAtNotFuture)
+        ));
     }
 
     #[test]

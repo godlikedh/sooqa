@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sooqa_inbox::{
-    Ingest, IngestSubmission, IngestSubmissionInput, IngestValidationError, SubmittedVia,
+    Ingest, IngestSubmission, IngestSubmissionInput, IngestValidationError, RequestedAction,
+    SubmittedVia,
 };
 use sooqa_persistence::{
     InboxRepository, InboxRepositoryError, LibraryRepository, LibraryRepositoryError,
@@ -123,6 +124,22 @@ async fn create_ingest(
         }
     })?;
 
+    let requested_action =
+        RequestedAction::try_from(payload.requested_action.as_str()).map_err(|_| {
+            map_validation_error(IngestValidationError::InvalidRequestedAction, &headers)
+        })?;
+    let requested_publish_at = payload
+        .requested_publish_at
+        .as_deref()
+        .map(|value| {
+            OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).map_err(
+                |_| {
+                    map_validation_error(IngestValidationError::InvalidRequestedPublishAt, &headers)
+                },
+            )
+        })
+        .transpose()?;
+
     let mut input = IngestSubmissionInput::new(payload.url, SubmittedVia::Api);
     input.submitted_by_admin_id = None;
     input.page_url = payload.page_url;
@@ -130,10 +147,13 @@ async fn create_ingest(
     input.supplied_caption = payload.selected_text;
     input.supplied_description = payload.description;
     input.supplied_tags = payload.tags;
+    input.requested_action = requested_action;
+    input.requested_publish_at = requested_publish_at;
+    input.requested_post_caption = payload.requested_post_caption;
     input.idempotency_key = Some(idempotency_key.to_owned());
 
-    let submission =
-        IngestSubmission::try_new(input).map_err(|error| map_validation_error(error, &headers))?;
+    let submission = IngestSubmission::try_new_for_idempotency_lookup(input)
+        .map_err(|error| map_validation_error(error, &headers))?;
     let result = state
         .inbox
         .create_ingest(submission)
@@ -145,6 +165,9 @@ async fn create_ingest(
         Json(IngestAcceptedResponse {
             id: result.ingest.id,
             status: result.ingest.status,
+            requested_action: result.ingest.requested_action,
+            requested_publish_at: result.ingest.requested_publish_at,
+            requested_post_caption: result.ingest.requested_post_caption.clone(),
             links: IngestLinks::for_id(result.ingest.id),
         }),
     ))
@@ -294,6 +317,25 @@ fn map_validation_error(error: IngestValidationError, headers: &HeaderMap) -> Ap
             ("invalid_idempotency_key", "The Idempotency-Key header is invalid")
         }
         IngestValidationError::EmptyTag => ("invalid_tag", "The submitted tags are invalid"),
+        IngestValidationError::InvalidRequestedAction => {
+            ("invalid_requested_action", "The requested action must be save, queue, or post_now")
+        }
+        IngestValidationError::InvalidRequestedPublishAt => (
+            "invalid_requested_publish_at",
+            "The requested publish time must be an RFC3339 instant",
+        ),
+        IngestValidationError::RequestedPublishAtForbidden
+        | IngestValidationError::RequestedPublishAtForbiddenForPostNow => (
+            "requested_publish_at_not_allowed",
+            "The requested publish time is not valid for this action",
+        ),
+        IngestValidationError::RequestedPublishAtNotFuture => {
+            ("requested_publish_at_not_future", "An exact queue time must be in the future")
+        }
+        IngestValidationError::RequestedPostCaptionForbidden => (
+            "requested_post_caption_not_allowed",
+            "Save requests must not include public post text",
+        ),
     };
     ApiError::bad_request(code, message, headers)
 }
@@ -325,6 +367,11 @@ fn map_repository_error(error: InboxRepositoryError, headers: &HeaderMap) -> Api
         | InboxRepositoryError::DuplicateCandidateUnavailable { .. } => ApiError::conflict(
             "duplicate_candidate_unavailable",
             "The selected duplicate candidate is no longer available",
+            headers,
+        ),
+        InboxRepositoryError::RequestedPublishAtNotFuture => ApiError::bad_request(
+            "requested_publish_at_not_future",
+            "An exact queue time must be in the future",
             headers,
         ),
         InboxRepositoryError::ResourceMissing(_) => {
@@ -448,6 +495,16 @@ struct IngestCreateRequest {
     description: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default = "default_requested_action")]
+    requested_action: String,
+    #[serde(default)]
+    requested_publish_at: Option<String>,
+    #[serde(default)]
+    requested_post_caption: Option<String>,
+}
+
+fn default_requested_action() -> String {
+    RequestedAction::Save.as_str().to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -459,6 +516,10 @@ struct AcceptDuplicateRequest {
 struct IngestAcceptedResponse {
     id: Uuid,
     status: sooqa_inbox::IngestStatus,
+    requested_action: RequestedAction,
+    #[serde(with = "time::serde::rfc3339::option")]
+    requested_publish_at: Option<OffsetDateTime>,
+    requested_post_caption: Option<String>,
     links: IngestLinks,
 }
 
@@ -473,6 +534,10 @@ struct IngestResponse {
     supplied_caption: Option<String>,
     supplied_description: Option<String>,
     supplied_tags: Vec<String>,
+    requested_action: RequestedAction,
+    #[serde(with = "time::serde::rfc3339::option")]
+    requested_publish_at: Option<OffsetDateTime>,
+    requested_post_caption: Option<String>,
     media_id: Option<Uuid>,
     force_save: bool,
     duplicate_evidence: Option<Value>,
@@ -499,6 +564,9 @@ impl IngestResponse {
             supplied_caption: request.supplied_caption.clone(),
             supplied_description: request.supplied_description.clone(),
             supplied_tags: request.supplied_tags.clone(),
+            requested_action: request.requested_action,
+            requested_publish_at: request.requested_publish_at,
+            requested_post_caption: request.requested_post_caption.clone(),
             media_id: request.media_id,
             force_save: request.force_save,
             duplicate_evidence: request.duplicate_evidence.clone(),

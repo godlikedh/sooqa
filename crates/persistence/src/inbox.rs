@@ -8,7 +8,8 @@ use crate::{
 use serde_json::json;
 use sooqa_inbox::{
     AssetNormalization, Ingest, IngestFinalization, IngestKind, IngestStateError, IngestStatus,
-    IngestSubmission, SourceDownload, SourceInspection, SourceMediaKind, SubmittedVia,
+    IngestSubmission, RequestedAction, SourceDownload, SourceInspection, SourceMediaKind,
+    SubmittedVia,
 };
 use sooqa_jobs::{JobAttempt, NewJob};
 use sooqa_library::{
@@ -83,11 +84,12 @@ impl InboxRepository {
             INSERT INTO ingests (
                 id, input_key, request_hash, input_kind, state, submitted_via,
                 input_json, source_url, page_url, page_title, supplied_caption,
-                supplied_description, supplied_tags, workspace_id, media_id, error_code,
-                error_message, created_at, updated_at, completed_at
+                supplied_description, supplied_tags, requested_action, requested_publish_at,
+                requested_post_caption, workspace_id, media_id, error_code, error_message,
+                created_at, updated_at, completed_at
             )
             VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11,
-                    $12, $13, $14, $15, $16, $17, $18, $19)
+                    $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
             ON CONFLICT (input_key) DO NOTHING
             RETURNING id
             "#,
@@ -104,6 +106,9 @@ impl InboxRepository {
         .bind(&request.supplied_caption)
         .bind(&request.supplied_description)
         .bind(&request.supplied_tags)
+        .bind(request.requested_action.as_str())
+        .bind(request.requested_publish_at)
+        .bind(&request.requested_post_caption)
         .bind(request.workspace_id)
         .bind(request.media_id)
         .bind(&request.error_code)
@@ -127,6 +132,14 @@ impl InboxRepository {
             let request = load_request(&mut transaction, existing.id).await?;
             transaction.commit().await?;
             return Ok(CreateIngestResult { ingest: request, created: false });
+        }
+
+        if request.requested_action == RequestedAction::Queue
+            && request.requested_publish_at.is_some_and(|requested_publish_at| {
+                requested_publish_at <= OffsetDateTime::now_utc()
+            })
+        {
+            return Err(InboxRepositoryError::RequestedPublishAtNotFuture);
         }
 
         match request.kind {
@@ -1768,7 +1781,8 @@ async fn load_request(
     let row = sqlx::query_as::<_, IngestRow>(
         r#"
         SELECT id, input_kind, state, submitted_via, input_json, source_url, page_url,
-               page_title, supplied_caption, supplied_description, supplied_tags, input_key,
+               page_title, supplied_caption, supplied_description, supplied_tags,
+               requested_action, requested_publish_at, requested_post_caption, input_key,
                workspace_id, media_id, force_save, duplicate_evidence, error_code, error_message,
                created_at, updated_at, completed_at
         FROM ingests
@@ -1854,6 +1868,9 @@ struct IngestRow {
     supplied_caption: Option<String>,
     supplied_description: Option<String>,
     supplied_tags: Vec<String>,
+    requested_action: String,
+    requested_publish_at: Option<OffsetDateTime>,
+    requested_post_caption: Option<String>,
     input_key: String,
     workspace_id: Uuid,
     media_id: Option<Uuid>,
@@ -1898,6 +1915,10 @@ impl IngestRow {
             supplied_caption: self.supplied_caption,
             supplied_description: self.supplied_description,
             supplied_tags: self.supplied_tags,
+            requested_action: RequestedAction::try_from(self.requested_action.as_str())
+                .map_err(InboxRepositoryError::UnknownRequestedAction)?,
+            requested_publish_at: self.requested_publish_at,
+            requested_post_caption: self.requested_post_caption,
             idempotency_key: Some(self.input_key),
             media_id: self.media_id,
             force_save: self.force_save,
@@ -1935,6 +1956,10 @@ pub enum InboxRepositoryError {
     UnknownIngestStatus(String),
     #[error("unknown submission source in database: {0}")]
     UnknownSubmittedVia(String),
+    #[error("unknown requested action in database: {0}")]
+    UnknownRequestedAction(String),
+    #[error("requested publish time must be in the future")]
+    RequestedPublishAtNotFuture,
     #[error("invalid ingest failure status: {0:?}")]
     InvalidFailureStatus(IngestStatus),
     #[error("force-save is not allowed while ingest is in {0:?}")]
