@@ -795,10 +795,6 @@ where
         let authorized = callback.is_private
             && callback.chat_id == Some(callback.user_id)
             && self.admin_user_ids.contains(&callback.user_id);
-        let Some(data) = callback.data.as_deref().and_then(CallbackData::parse) else {
-            self.complete(claim).await?;
-            return Ok(HandleOutcome::CallbackHandled);
-        };
         if !authorized {
             warn!(
                 target: "sooqa.telegram",
@@ -810,6 +806,10 @@ where
             self.complete(claim).await?;
             return Ok(HandleOutcome::CallbackHandled);
         }
+        let Some(data) = callback.data.as_deref().and_then(CallbackData::parse) else {
+            self.complete(claim).await?;
+            return Ok(HandleOutcome::CallbackHandled);
+        };
 
         let Some(chat_id) = callback.chat_id else {
             self.complete(claim).await?;
@@ -2182,6 +2182,32 @@ mod tests {
             HandleOutcome::CallbackHandled
         );
         assert_eq!(api.callback_answers.lock().unwrap().as_slice(), &["callback-1", "callback-2"]);
+        assert!(ingest.force_saves.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_malformed_callback_is_acknowledged_without_dispatch() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        let service =
+            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+
+        assert_eq!(
+            service
+                .handle_callback(IncomingCallback {
+                    update_id: 23,
+                    callback_id: "malformed-unauthorized".to_owned(),
+                    user_id: 456,
+                    chat_id: Some(456),
+                    is_private: true,
+                    data: Some("not-a-callback".to_owned()),
+                })
+                .await
+                .unwrap(),
+            HandleOutcome::CallbackHandled
+        );
+        assert_eq!(api.callback_answers.lock().unwrap().as_slice(), &["malformed-unauthorized"]);
+        assert!(ingest.duplicate_accepts.lock().unwrap().is_empty());
         assert!(ingest.force_saves.lock().unwrap().is_empty());
     }
 

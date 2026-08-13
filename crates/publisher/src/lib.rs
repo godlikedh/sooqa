@@ -197,7 +197,7 @@ pub struct PostUpdate {
     pub parse_mode: Option<Option<String>>,
     pub disable_notification: Option<bool>,
     pub expected_updated_at: Option<OffsetDateTime>,
-    pub expected_revision: Option<i64>,
+    pub expected_revision: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,7 +205,7 @@ pub struct PostSchedule {
     pub post_id: Uuid,
     pub requested_at: OffsetDateTime,
     pub request_key: String,
-    pub expected_revision: Option<i64>,
+    pub expected_revision: i64,
 }
 
 impl PostSchedule {
@@ -213,14 +213,11 @@ impl PostSchedule {
         post_id: Uuid,
         requested_at: OffsetDateTime,
         request_key: impl Into<String>,
+        expected_revision: i64,
     ) -> Result<Self, PublisherValidationError> {
         let request_key = normalize_request_key(request_key.into())?;
-        Ok(Self { post_id, requested_at, request_key, expected_revision: None })
-    }
-
-    pub const fn with_expected_revision(mut self, expected_revision: i64) -> Self {
-        self.expected_revision = Some(expected_revision);
-        self
+        validate_expected_revision(expected_revision)?;
+        Ok(Self { post_id, requested_at, request_key, expected_revision })
     }
 }
 
@@ -254,6 +251,15 @@ pub enum PublisherValidationError {
     CaptionControlCharacter,
     #[error("invalid parse mode")]
     InvalidParseMode,
+    #[error("expected revision must be non-negative")]
+    InvalidExpectedRevision,
+}
+
+pub fn validate_expected_revision(expected_revision: i64) -> Result<(), PublisherValidationError> {
+    if expected_revision < 0 {
+        return Err(PublisherValidationError::InvalidExpectedRevision);
+    }
+    Ok(())
 }
 
 pub fn normalize_request_key(value: String) -> Result<String, PublisherValidationError> {
@@ -302,11 +308,11 @@ mod tests {
 
     #[test]
     fn schedule_keys_are_normalized_and_bounded() {
-        let schedule = PostSchedule::try_new(Uuid::now_v7(), OffsetDateTime::now_utc(), " key ")
+        let schedule = PostSchedule::try_new(Uuid::now_v7(), OffsetDateTime::now_utc(), " key ", 0)
             .expect("key should be valid");
         assert_eq!(schedule.request_key, "key");
         assert!(matches!(
-            PostSchedule::try_new(Uuid::now_v7(), OffsetDateTime::now_utc(), " "),
+            PostSchedule::try_new(Uuid::now_v7(), OffsetDateTime::now_utc(), " ", 0),
             Err(PublisherValidationError::EmptyRequestKey)
         ));
     }

@@ -36,6 +36,7 @@ async fn api_authenticates_with_the_single_configured_bearer_secret(pool: sqlx::
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -126,6 +127,7 @@ async fn force_save_is_authenticated_idempotent_and_durable(pool: sqlx::PgPool) 
     );
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -246,6 +248,7 @@ async fn accept_duplicate_reuses_ready_media_and_replays_without_uploading(pool:
     );
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -258,6 +261,49 @@ async fn accept_duplicate_reuses_ready_media_and_replays_without_uploading(pool:
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/ingests/{}/accept-duplicate", ingest.ingest.id))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-api-token")
+                .body(Body::from(json!({"media_id": Uuid::now_v7()}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    sqlx::query("UPDATE ingests SET input_json = '{}'::jsonb WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    for state in ["completed", "storing"] {
+        sqlx::query("UPDATE ingests SET state = $2 WHERE id = $1")
+            .bind(ingest.ingest.id)
+            .bind(state)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/ingests/{}/accept-duplicate", ingest.ingest.id))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-api-token")
+                    .body(Body::from(json!({"media_id": media_id}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
 
     sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
         .bind(ingest.ingest.id.to_string())

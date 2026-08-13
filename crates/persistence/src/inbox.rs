@@ -21,6 +21,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+const DUPLICATE_DECISION_MARKER_KEY: &str = "_sooqa_duplicate_decision_v1";
+
 #[derive(Clone)]
 pub struct InboxRepository {
     pool: PgPool,
@@ -166,12 +168,14 @@ impl InboxRepository {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
 
-        if request.media_id == Some(media_id)
-            && !request.force_save
+        if !request.force_save
             && matches!(request.status, IngestStatus::Storing | IngestStatus::Completed)
         {
-            transaction.commit().await?;
-            return Ok(AcceptDuplicateResult { ingest: request, replayed: true });
+            if accepted_duplicate_media_id(&request.original_input) == Some(media_id) {
+                transaction.commit().await?;
+                return Ok(AcceptDuplicateResult { ingest: request, replayed: true });
+            }
+            return Err(InboxRepositoryError::DuplicateDecisionNotAllowed(request.status));
         }
 
         if request.status != IngestStatus::DuplicatePending {
@@ -231,6 +235,10 @@ impl InboxRepository {
         .await?;
 
         request.media_id = Some(media_id);
+        set_accepted_duplicate_marker(&mut request.original_input, media_id);
+        // Persist the decision marker together with the state transition before
+        // clearing the evidence. It is the durable idempotency fence for a
+        // successful duplicate-accept command.
         request.duplicate_evidence = None;
         request.error_code = None;
         request.error_message = None;
@@ -1708,6 +1716,37 @@ fn merge_duplicate_tags(existing: &[String], incoming: &[String]) -> Vec<String>
         }
     }
     tags
+}
+
+fn accepted_duplicate_media_id(input: &serde_json::Value) -> Option<Uuid> {
+    input
+        .get(DUPLICATE_DECISION_MARKER_KEY)?
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|version| *version == 1)?;
+    input
+        .get(DUPLICATE_DECISION_MARKER_KEY)?
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .filter(|kind| *kind == "accepted")
+        .and_then(|_| input.get(DUPLICATE_DECISION_MARKER_KEY)?.get("media_id"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn set_accepted_duplicate_marker(input: &mut serde_json::Value, media_id: Uuid) {
+    if let Some(object) = input.as_object_mut() {
+        object.insert(
+            DUPLICATE_DECISION_MARKER_KEY.to_owned(),
+            json!({"version": 1, "kind": "accepted", "media_id": media_id}),
+        );
+    } else {
+        let source = input.clone();
+        *input = json!({
+            "source": source,
+            DUPLICATE_DECISION_MARKER_KEY: {"version": 1, "kind": "accepted", "media_id": media_id},
+        });
+    }
 }
 
 async fn load_request(
