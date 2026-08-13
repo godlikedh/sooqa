@@ -320,7 +320,7 @@ async fn source_inspection_completion_commits_job_success_with_transition(pool: 
 #[ignore = "requires PostgreSQL"]
 async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
-    enabled_channel(&database, -1000000000302).await;
+    let channel_id = enabled_channel(&database, -1000000000302).await;
     let mut submission_input = IngestSubmissionInput::new(
         format!("https://example.test/duplicate-{}", Uuid::new_v4()),
         SubmittedVia::Companion,
@@ -382,6 +382,7 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPo
     assert_eq!(resumed.ingest.requested_action, RequestedAction::Queue);
     assert!(resumed.ingest.requested_publish_at.is_some());
     assert_eq!(resumed.ingest.requested_post_caption.as_deref(), Some("public queue text"));
+    assert_eq!(resumed.ingest.requested_channel_id, Some(channel_id));
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM queue.jobs WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",
@@ -407,12 +408,14 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPo
     assert!(!replay.resumed);
     assert_eq!(replay.ingest.id, resumed.ingest.id);
     assert_eq!(replay.ingest.status, IngestStatus::Queued);
+    assert_eq!(replay.ingest.requested_channel_id, Some(channel_id));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
 async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
+    let channel_id = enabled_channel(&database, -1000000000306).await;
     let media_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO media (id, kind, storage_state, tags, description, telegram_storage_chat_id, telegram_storage_message_id, telegram_file_id) VALUES ($1, 'video', 'ready', $2, $3, $4, $5, $6)",
@@ -433,6 +436,9 @@ async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: s
     );
     input.supplied_description = Some("new description".to_owned());
     input.supplied_tags = vec!["incoming".to_owned(), "existing".to_owned()];
+    input.requested_action = RequestedAction::Queue;
+    input.requested_publish_at = Some(time::OffsetDateTime::now_utc() + time::Duration::minutes(5));
+    input.requested_post_caption = Some("queued public text".to_owned());
     let ingest =
         database.inbox().create_ingest(IngestSubmission::try_new(input).unwrap()).await.unwrap();
     sqlx::query(
@@ -466,6 +472,10 @@ async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: s
     assert_eq!(accepted.ingest.status, IngestStatus::Completed);
     assert_eq!(accepted.ingest.media_id, Some(media_id));
     assert!(accepted.ingest.duplicate_evidence.is_none());
+    assert_eq!(accepted.ingest.requested_action, RequestedAction::Queue);
+    assert!(accepted.ingest.requested_publish_at.is_some());
+    assert_eq!(accepted.ingest.requested_post_caption.as_deref(), Some("queued public text"));
+    assert_eq!(accepted.ingest.requested_channel_id, Some(channel_id));
     let input_json =
         sqlx::query_scalar::<_, serde_json::Value>("SELECT input_json FROM ingests WHERE id = $1")
             .bind(ingest.ingest.id)
@@ -478,6 +488,10 @@ async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: s
     let replay = database.inbox().accept_duplicate(ingest.ingest.id, media_id).await.unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.ingest.media_id, Some(media_id));
+    assert_eq!(replay.ingest.requested_action, RequestedAction::Queue);
+    assert!(replay.ingest.requested_publish_at.is_some());
+    assert_eq!(replay.ingest.requested_post_caption.as_deref(), Some("queued public text"));
+    assert_eq!(replay.ingest.requested_channel_id, Some(channel_id));
     assert!(matches!(
         database.inbox().accept_duplicate(ingest.ingest.id, Uuid::now_v7()).await,
         Err(InboxRepositoryError::DuplicateDecisionNotAllowed(IngestStatus::Completed))
