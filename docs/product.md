@@ -111,16 +111,19 @@ fails the owning ingest only when that atomic success transaction did not
 commit.
 
 Lease heartbeats and terminal job mutations require an unexpired lease. When a
-final attempt expires, recovery fails the owning ingest explicitly (or marks
-storage unknown for an upload job) so a crashed worker cannot strand the
-workflow.
+final attempt expires, recovery fails the owning ingest explicitly (marks
+storage unknown for an upload job, or fences an interrupted publication as
+unknown) so a crashed worker cannot strand the workflow.
 
 Post cadence slots are assigned when a post is queued. A `publish_post` job
 references the `posts` row, and one post row becomes the durable publication
 record after success. Telegram calls, HTTP downloads, ffmpeg, and ffprobe run
 outside database transactions. External effects use state plus generation or
 fencing tokens, and ambiguous effects are retained for explicit reconciliation
-instead of being blindly retried. Publication copies the ready Telegram storage
+instead of being blindly retried. A retryable no-effect publication updates
+the running job payload and post revision atomically; on its final attempt the
+post becomes failed before the job becomes terminal. Publication copies the
+ready Telegram storage
 message into the target channel and falls back to the stored media-kind-specific
 file ID only for an explicitly safe copy-unavailable response; it never reads
 the canonical local file. Missing public captions are sent as an explicit empty

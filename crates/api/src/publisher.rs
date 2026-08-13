@@ -201,6 +201,7 @@ async fn update_post(
             &headers,
         ));
     }
+    validate_expected_revision(payload.expected_revision, &headers)?;
     let current = state
         .publisher
         .find_post(id)
@@ -252,11 +253,14 @@ async fn schedule_post(
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     let requested_at = payload.publish_at.unwrap_or_else(OffsetDateTime::now_utc);
-    let mut schedule = PostSchedule::try_new(id, requested_at, idempotency_key(&headers)?)
-        .map_err(|error| map_publisher_error(error.into(), &headers))?;
-    if let Some(expected_revision) = payload.expected_revision {
-        schedule = schedule.with_expected_revision(expected_revision);
-    }
+    validate_expected_revision(payload.expected_revision, &headers)?;
+    let schedule = PostSchedule::try_new(
+        id,
+        requested_at,
+        idempotency_key(&headers)?,
+        payload.expected_revision,
+    )
+    .map_err(|error| map_publisher_error(error.into(), &headers))?;
     let post = state
         .publisher
         .schedule_post(schedule)
@@ -269,13 +273,15 @@ async fn publish_now(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-    body: Option<JsonExtractor<MutationRequest>>,
+    body: Result<JsonExtractor<MutationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<PostResponse>), ApiError> {
     authorize(&state.api_token, &headers, "publisher:write").await?;
-    let expected_revision = body.and_then(|JsonExtractor(payload)| payload.expected_revision);
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    validate_expected_revision(payload.expected_revision, &headers)?;
     let post = state
         .publisher
-        .publish_now(id, idempotency_key(&headers)?, expected_revision)
+        .publish_now(id, idempotency_key(&headers)?, payload.expected_revision)
         .await
         .map_err(|error| map_publisher_error(error, &headers))?;
     Ok((StatusCode::ACCEPTED, Json(PostResponse::from_post(&post))))
@@ -309,6 +315,7 @@ async fn move_adjacent(
     authorize(&state.api_token, &headers, "publisher:write").await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    validate_expected_revision(payload.expected_revision, &headers)?;
     let post = state
         .publisher
         .move_adjacent(id, direction, payload.expected_revision)
@@ -326,6 +333,7 @@ async fn set_slot(
     authorize(&state.api_token, &headers, "publisher:write").await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    validate_expected_revision(payload.expected_revision, &headers)?;
     let post = state
         .publisher
         .set_slot(id, payload.slot, payload.expected_revision)
@@ -343,6 +351,7 @@ async fn cancel_post(
     authorize(&state.api_token, &headers, "publisher:write").await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    validate_expected_revision(payload.expected_revision, &headers)?;
     let post = state
         .publisher
         .cancel_post(id, payload.expected_revision)
@@ -360,6 +369,17 @@ fn require_publishable(
         return Err(ApiError::conflict(
             "media_not_publishable",
             "The media item is not ready for publication",
+            headers,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_expected_revision(expected_revision: i64, headers: &HeaderMap) -> Result<(), ApiError> {
+    if expected_revision < 0 {
+        return Err(ApiError::bad_request(
+            "invalid_expected_revision",
+            "expected_revision must be non-negative",
             headers,
         ));
     }
@@ -495,8 +515,7 @@ struct UpdatePostRequest {
     #[serde(default)]
     #[serde(with = "time::serde::rfc3339::option")]
     expected_updated_at: Option<OffsetDateTime>,
-    #[serde(default)]
-    expected_revision: Option<i64>,
+    expected_revision: i64,
 }
 
 #[derive(Debug, Default)]
@@ -529,15 +548,13 @@ struct ScheduleRequest {
     #[serde(default)]
     #[serde(with = "time::serde::rfc3339::option")]
     publish_at: Option<OffsetDateTime>,
-    #[serde(default)]
-    expected_revision: Option<i64>,
+    expected_revision: i64,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MutationRequest {
-    #[serde(default)]
-    expected_revision: Option<i64>,
+    expected_revision: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -545,8 +562,7 @@ struct MutationRequest {
 struct SetSlotRequest {
     #[serde(with = "time::serde::rfc3339")]
     slot: OffsetDateTime,
-    #[serde(default)]
-    expected_revision: Option<i64>,
+    expected_revision: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -671,7 +687,8 @@ mod tests {
     #[test]
     fn update_payload_can_explicitly_clear_caption() {
         let request: UpdatePostRequest =
-            serde_json::from_str(r#"{"caption":null}"#).expect("null caption is valid");
+            serde_json::from_str(r#"{"caption":null,"expected_revision":0}"#)
+                .expect("null caption is valid");
         assert!(matches!(request.caption, PatchField::Set(None)));
     }
 }

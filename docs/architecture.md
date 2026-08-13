@@ -272,10 +272,17 @@ Success and failure completion are conditional on the exact generation and
 token, so a stale worker cannot overwrite a newer attempt. Caption syntax
 errors become editable `failed` posts and their job is terminal; explicit
 no-effect errors such as Telegram flood-control responses requeue the post and
-update the running job payload before bounded retry. Network, invalid-response,
+update the running job payload before bounded retry. The final no-effect retry
+settles the post as `failed` before the worker settles the job, so a terminal
+job cannot leave a queued post behind. Database or malformed-receipt failures
+before the Telegram call are classified as known no-effect failures and follow
+the same bounded retry/final-failure path; missing or invalid receipts that
+cannot succeed are actionable `failed` outcomes. Network, invalid-response,
 and unknown Telegram outcomes become `unknown` and are never automatically
-sent again. The job is terminal after an ambiguous result; operator
-reconciliation is intentionally a later slice.
+sent again. If a worker lease expires while a post is `sending`, recovery
+fences that generation as `unknown` before the recovered job completes, and
+stale completion from the old attempt is rejected. The job is terminal after
+an ambiguous result; operator reconciliation is intentionally a later slice.
 
 ```mermaid
 sequenceDiagram

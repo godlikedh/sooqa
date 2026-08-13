@@ -1168,14 +1168,18 @@ impl MediaRow {
     }
 
     fn into_storage_receipt(self) -> Result<StorageReceipt, LibraryRepositoryError> {
+        let storage_chat_id = self
+            .telegram_storage_chat_id
+            .filter(|chat_id| *chat_id < 0)
+            .ok_or(LibraryRepositoryError::StorageReceiptMissing(self.id))?;
+        let storage_message_id = self
+            .telegram_storage_message_id
+            .filter(|message_id| *message_id > 0)
+            .ok_or(LibraryRepositoryError::StorageReceiptMissing(self.id))?;
         Ok(StorageReceipt {
             media_id: self.id,
-            storage_chat_id: self
-                .telegram_storage_chat_id
-                .ok_or(LibraryRepositoryError::StorageReceiptMissing(self.id))?,
-            storage_message_id: self
-                .telegram_storage_message_id
-                .ok_or(LibraryRepositoryError::StorageReceiptMissing(self.id))?,
+            storage_chat_id,
+            storage_message_id,
             telegram_file_id: self.telegram_file_id,
             telegram_file_unique_id: self.telegram_file_unique_id,
             media_kind: MediaKind::try_from(self.kind.as_str())

@@ -377,8 +377,6 @@ paths:
       summary: Edit a post before publication
       security:
         - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -433,7 +431,7 @@ paths:
         - $ref: '#/components/parameters/PostId'
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/QueueMutationRequest' }
@@ -833,13 +831,14 @@ components:
         parse_mode: { type: string, enum: [HTML, MarkdownV2], nullable: true }
     PostUpdateRequest:
       type: object
+      required: [expected_revision]
       additionalProperties: false
       properties:
         caption: { type: string, nullable: true, maxLength: 1024 }
         parse_mode: { type: string, enum: [HTML, MarkdownV2], nullable: true }
         disable_notification: { type: boolean }
         expected_updated_at: { type: string, format: date-time, nullable: true }
-        expected_revision: { type: integer, format: int64, nullable: true, minimum: 0 }
+        expected_revision: { type: integer, format: int64, minimum: 0 }
     Post:
       type: object
       required: [id, media_id, channel_id, disable_notification, status, scheduled_at, revision, created_at, updated_at]
@@ -858,19 +857,21 @@ components:
         revision: { type: integer, format: int64, minimum: 0 }
     ScheduleRequest:
       type: object
+      required: [expected_revision]
       additionalProperties: false
       properties:
         publish_at: { type: string, format: date-time, nullable: true }
-        expected_revision: { type: integer, format: int64, nullable: true, minimum: 0 }
+        expected_revision: { type: integer, format: int64, minimum: 0 }
     QueueMutationRequest:
       type: object
+      required: [expected_revision]
       additionalProperties: false
       properties:
-        expected_revision: { type: integer, format: int64, nullable: true, minimum: 0 }
+        expected_revision: { type: integer, format: int64, minimum: 0 }
     SetSlotRequest:
       type: object
-      required: [slot]
+      required: [slot, expected_revision]
       additionalProperties: false
       properties:
         slot: { type: string, format: date-time }
-        expected_revision: { type: integer, format: int64, nullable: true, minimum: 0 }
+        expected_revision: { type: integer, format: int64, minimum: 0 }

@@ -15,7 +15,9 @@ pub use inbox::{
 };
 pub use jobs::{JobRepository, JobRepositoryError};
 pub use library::{LibraryRepository, LibraryRepositoryError, VideoFingerprintCandidate};
-pub use publisher::{CreatePostResult, PublisherRepository, PublisherRepositoryError};
+pub use publisher::{
+    CreatePostResult, PublishLease, PublisherRepository, PublisherRepositoryError,
+};
 
 use sooqa_config::SecretString;
 use sqlx::{

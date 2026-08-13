@@ -1742,14 +1742,23 @@ where
             ));
         }
     };
-    job.attempt().ok_or_else(|| {
+    let attempt = job.attempt().ok_or_else(|| {
         HandlerFailure::permanent(
             "invalid_job_state",
             "publish_post handler requires a running job lease",
         )
     })?;
-    let claim = match publisher.claim_publish(post_id, expected_revision).await {
+    let claim = match publisher.claim_publish(post_id, expected_revision, &attempt).await {
         Ok(claim) => claim,
+        Err(sooqa_persistence::PublisherRepositoryError::PostNotClaimable {
+            state: sooqa_publisher::PostState::Sending,
+            ..
+        }) => match publisher.reconcile_interrupted_publish(post_id, &attempt).await {
+            Ok(_) | Err(sooqa_persistence::PublisherRepositoryError::PublishLeaseLost(_)) => {
+                return Ok(());
+            }
+            Err(error) => return Err(map_publisher_error(error)),
+        },
         Err(
             sooqa_persistence::PublisherRepositoryError::PostNotClaimable { .. }
             | sooqa_persistence::PublisherRepositoryError::StalePublicationJob { .. }
@@ -1763,16 +1772,31 @@ where
             "publication claim has no send token",
         )
     })?;
+    let lease = sooqa_persistence::PublishLease {
+        generation: claim.post.send_generation,
+        token,
+        attempt: attempt.clone(),
+    };
     let receipt = match library.find_storage_receipt(claim.post.media_id).await {
         Ok(Some(receipt)) => receipt,
         Ok(None) => {
             return record_publication_failure(
                 publisher,
                 &claim,
-                token,
+                &lease,
                 sooqa_publisher::PostState::Failed,
                 "storage_receipt_missing",
                 "media has no ready Telegram storage receipt",
+            )
+            .await;
+        }
+        Err(error) if matches!(error, LibraryRepositoryError::Database(_)) => {
+            return settle_pre_send_retryable_error(
+                publisher,
+                &claim,
+                &lease,
+                "storage_receipt_lookup",
+                &error.to_string(),
             )
             .await;
         }
@@ -1780,9 +1804,9 @@ where
             return record_publication_failure(
                 publisher,
                 &claim,
-                token,
-                sooqa_publisher::PostState::Unknown,
-                "storage_receipt_lookup",
+                &lease,
+                sooqa_publisher::PostState::Failed,
+                "storage_receipt_invalid",
                 &error.to_string(),
             )
             .await;
@@ -1805,7 +1829,7 @@ where
                 return record_publication_failure(
                     publisher,
                     &claim,
-                    token,
+                    &lease,
                     sooqa_publisher::PostState::Failed,
                     "storage_file_reference_missing",
                     "copyMessage was unavailable and the storage receipt has no file ID",
@@ -1816,18 +1840,18 @@ where
                 Ok(message_id) => message_id,
                 Err(error) => {
                     return settle_publication_transport_error::<A>(
-                        publisher, &claim, token, error,
+                        publisher, &claim, &lease, error,
                     )
                     .await;
                 }
             }
         }
         Err(error) => {
-            return settle_publication_transport_error::<A>(publisher, &claim, token, error).await;
+            return settle_publication_transport_error::<A>(publisher, &claim, &lease, error).await;
         }
     };
 
-    match publisher.complete_publish(post_id, claim.post.send_generation, token, message_id).await {
+    match publisher.complete_publish(post_id, &lease, message_id).await {
         Ok(_) | Err(sooqa_persistence::PublisherRepositoryError::PublishConflict(_)) => Ok(()),
         Err(sooqa_persistence::PublisherRepositoryError::PublishLeaseLost(_)) => Ok(()),
         Err(error) => {
@@ -1835,8 +1859,7 @@ where
             match publisher
                 .fail_publish(
                     post_id,
-                    claim.post.send_generation,
-                    token,
+                    &lease,
                     sooqa_publisher::PostState::Unknown,
                     "publication_commit",
                     &message,
@@ -1857,7 +1880,7 @@ where
 async fn settle_publication_transport_error<A>(
     publisher: &sooqa_persistence::PublisherRepository,
     claim: &sooqa_publisher::PublishClaim,
-    token: Uuid,
+    lease: &sooqa_persistence::PublishLease,
     error: A::Error,
 ) -> Result<(), HandlerFailure>
 where
@@ -1866,15 +1889,12 @@ where
     let message = error.to_string();
     if A::is_retryable_no_effect(&error) {
         return match publisher
-            .retry_publish(
-                claim.post.id,
-                claim.post.send_generation,
-                token,
-                "telegram_retryable",
-                &message,
-            )
+            .retry_publish(claim.post.id, lease, "telegram_retryable", &message)
             .await
         {
+            Ok(result) if result.terminal => {
+                Err(HandlerFailure::permanent("telegram_retryable", message))
+            }
             Ok(_) => Err(HandlerFailure::retryable("telegram_retryable", message)),
             Err(sooqa_persistence::PublisherRepositoryError::PublishLeaseLost(_)) => Ok(()),
             Err(error) => Err(HandlerFailure::permanent(
@@ -1890,28 +1910,36 @@ where
     } else {
         (sooqa_publisher::PostState::Failed, "publication_rejected")
     };
-    record_publication_failure(publisher, claim, token, state, class, &message).await
+    record_publication_failure(publisher, claim, lease, state, class, &message).await
+}
+
+async fn settle_pre_send_retryable_error(
+    publisher: &sooqa_persistence::PublisherRepository,
+    claim: &sooqa_publisher::PublishClaim,
+    lease: &sooqa_persistence::PublishLease,
+    error_class: &str,
+    error_message: &str,
+) -> Result<(), HandlerFailure> {
+    match publisher.retry_publish(claim.post.id, lease, error_class, error_message).await {
+        Ok(result) if result.terminal => Err(HandlerFailure::permanent(error_class, error_message)),
+        Ok(_) => Err(HandlerFailure::retryable(error_class, error_message)),
+        Err(sooqa_persistence::PublisherRepositoryError::PublishLeaseLost(_)) => Ok(()),
+        Err(error) => Err(HandlerFailure::permanent(
+            "publication_state",
+            format!("could not requeue a safe publication retry: {error}"),
+        )),
+    }
 }
 
 async fn record_publication_failure(
     publisher: &sooqa_persistence::PublisherRepository,
     claim: &sooqa_publisher::PublishClaim,
-    token: Uuid,
+    lease: &sooqa_persistence::PublishLease,
     state: sooqa_publisher::PostState,
     error_class: &str,
     error_message: &str,
 ) -> Result<(), HandlerFailure> {
-    match publisher
-        .fail_publish(
-            claim.post.id,
-            claim.post.send_generation,
-            token,
-            state,
-            error_class,
-            error_message,
-        )
-        .await
-    {
+    match publisher.fail_publish(claim.post.id, lease, state, error_class, error_message).await {
         Ok(_) => Err(HandlerFailure::permanent(error_class, error_message)),
         Err(sooqa_persistence::PublisherRepositoryError::PublishLeaseLost(_)) => Ok(()),
         Err(error) => Err(HandlerFailure::permanent(

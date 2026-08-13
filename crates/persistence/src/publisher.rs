@@ -1,10 +1,11 @@
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use sha2::{Digest, Sha256};
+use sooqa_jobs::JobAttempt;
 use sooqa_publisher::{
     Channel, ChannelValidationError, NewChannel, NewPost, Post, PostSchedule, PostState,
-    PostUpdate, PublishClaim, PublishedMessage, PublisherValidationError, QueueDirection,
-    QueuePost, validate_caption,
+    PostUpdate, PublishClaim, PublishRetry, PublishedMessage, PublisherValidationError,
+    QueueDirection, QueuePost, validate_caption,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::collections::HashMap;
@@ -21,6 +22,13 @@ pub struct PublisherRepository {
 pub struct CreatePostResult {
     pub post: Post,
     pub created: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublishLease {
+    pub generation: i32,
+    pub token: Uuid,
+    pub attempt: JobAttempt,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -312,8 +320,15 @@ impl PublisherRepository {
         .bind(disable_notification)
         .fetch_one(&mut *transaction)
         .await?;
-        if state != PostState::Draft {
-            update_publish_job(&mut transaction, id, row.scheduled_at, row.revision).await?;
+        match state {
+            PostState::Draft => {}
+            PostState::Queued => {
+                update_publish_job(&mut transaction, id, row.scheduled_at, row.revision).await?
+            }
+            PostState::Failed => {
+                update_failed_publish_job(&mut transaction, id, row.revision).await?
+            }
+            _ => unreachable!("queue mutable states are limited to draft, queued, and failed"),
         }
         transaction.commit().await?;
         row.into_post()
@@ -382,7 +397,7 @@ impl PublisherRepository {
         &self,
         id: Uuid,
         request_key: String,
-        expected_revision: Option<i64>,
+        expected_revision: i64,
     ) -> Result<Post, PublisherRepositoryError> {
         let request_key = sooqa_publisher::normalize_request_key(request_key)?;
         let operation_key = format!("publish_now:{request_key}");
@@ -431,7 +446,7 @@ impl PublisherRepository {
         &self,
         id: Uuid,
         direction: QueueDirection,
-        expected_revision: Option<i64>,
+        expected_revision: i64,
     ) -> Result<Post, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let channel_id = post_channel_id(&mut transaction, id).await?;
@@ -480,7 +495,7 @@ impl PublisherRepository {
         &self,
         id: Uuid,
         slot: OffsetDateTime,
-        expected_revision: Option<i64>,
+        expected_revision: i64,
     ) -> Result<Post, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let channel_id = post_channel_id(&mut transaction, id).await?;
@@ -492,8 +507,8 @@ impl PublisherRepository {
         }
         check_expected_revision(&current_snapshot, expected_revision)?;
         validate_slot(slot, &channel)?;
-        let occupied_id = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM posts WHERE channel_id = $1 AND state = 'queued' AND cadence_slot_at = $2 AND id <> $3 FOR UPDATE",
+        let occupied = sqlx::query_as::<_, OccupiedSlotRow>(
+            "SELECT id, state FROM posts WHERE channel_id = $1 AND state IN ('queued', 'sending') AND cadence_slot_at = $2 AND id <> $3 FOR UPDATE",
         )
         .bind(channel.id)
         .bind(slot)
@@ -504,7 +519,14 @@ impl PublisherRepository {
             transaction.commit().await?;
             return current_snapshot.into_post();
         }
-        if let Some(occupied_id) = occupied_id {
+        if let Some(occupied) = occupied {
+            let occupied_id = occupied.id;
+            if occupied.state == PostState::Sending.as_str() {
+                return Err(PublisherRepositoryError::PostNotEditable {
+                    id: occupied_id,
+                    state: PostState::Sending,
+                });
+            }
             let mut rows = lock_posts(&mut transaction, &[id, occupied_id]).await?;
             let current = rows.remove(&id).ok_or(PublisherRepositoryError::PostMissing(id))?;
             let occupied = rows
@@ -551,7 +573,7 @@ impl PublisherRepository {
     pub async fn cancel_post(
         &self,
         id: Uuid,
-        expected_revision: Option<i64>,
+        expected_revision: i64,
     ) -> Result<Post, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let channel_id = post_channel_id(&mut transaction, id).await?;
@@ -581,8 +603,10 @@ impl PublisherRepository {
         &self,
         id: Uuid,
         expected_revision: i64,
+        attempt: &JobAttempt,
     ) -> Result<PublishClaim, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
+        lock_current_job_attempt(&mut transaction, id, attempt).await?;
         let channel_id = post_channel_id(&mut transaction, id).await?;
         let channel = lock_channel(&mut transaction, channel_id).await?;
         let current = lock_post(&mut transaction, id).await?;
@@ -613,17 +637,17 @@ impl PublisherRepository {
     pub async fn complete_publish(
         &self,
         id: Uuid,
-        generation: i32,
-        token: Uuid,
+        lease: &PublishLease,
         telegram_message_id: i64,
     ) -> Result<PublishedMessage, PublisherRepositoryError> {
         if telegram_message_id <= 0 {
             return Err(PublisherRepositoryError::InvalidTelegramMessageId(telegram_message_id));
         }
         let mut transaction = self.pool.begin().await?;
+        lock_current_job_attempt(&mut transaction, id, &lease.attempt).await?;
         let current = lock_post(&mut transaction, id).await?;
         if current.post_state()? == PostState::Published {
-            if current.send_generation != generation
+            if current.send_generation != lease.generation
                 || current.telegram_message_id != Some(telegram_message_id)
             {
                 return Err(PublisherRepositoryError::PublishConflict(id));
@@ -634,8 +658,8 @@ impl PublisherRepository {
             return Ok(PublishedMessage { post: current.into_post()?, channel_chat_id: chat_id });
         }
         if current.post_state()? != PostState::Sending
-            || current.send_generation != generation
-            || current.send_token != Some(token)
+            || current.send_generation != lease.generation
+            || current.send_token != Some(lease.token)
         {
             return Err(PublisherRepositoryError::PublishLeaseLost(id));
         }
@@ -644,8 +668,8 @@ impl PublisherRepository {
         )
         .bind(id)
         .bind(telegram_message_id)
-        .bind(generation)
-        .bind(token)
+        .bind(lease.generation)
+        .bind(lease.token)
         .fetch_one(&mut *transaction)
         .await?;
         let channel_id = row.channel_id;
@@ -657,8 +681,7 @@ impl PublisherRepository {
     pub async fn fail_publish(
         &self,
         id: Uuid,
-        generation: i32,
-        token: Uuid,
+        lease: &PublishLease,
         state: PostState,
         error_class: &str,
         error_message: &str,
@@ -666,6 +689,8 @@ impl PublisherRepository {
         if !matches!(state, PostState::Failed | PostState::Unknown) {
             return Err(PublisherRepositoryError::InvalidPublishFailureState(state));
         }
+        let mut transaction = self.pool.begin().await?;
+        lock_current_job_attempt(&mut transaction, id, &lease.attempt).await?;
         let row = sqlx::query_as::<_, PostRow>(
             "UPDATE posts SET state = $2, send_token = NULL, send_started_at = NULL, error_class = $3, error_message = $4, revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'sending' AND send_generation = $5 AND send_token = $6 RETURNING *",
         )
@@ -673,65 +698,79 @@ impl PublisherRepository {
         .bind(state.as_str())
         .bind(error_class)
         .bind(error_message)
-        .bind(generation)
-        .bind(token)
-        .fetch_optional(&self.pool)
+        .bind(lease.generation)
+        .bind(lease.token)
+        .fetch_optional(&mut *transaction)
         .await?
         .ok_or(PublisherRepositoryError::PublishLeaseLost(id))?;
+        transaction.commit().await?;
         row.into_post()
     }
 
     pub async fn retry_publish(
         &self,
         id: Uuid,
-        generation: i32,
-        token: Uuid,
+        lease: &PublishLease,
         error_class: &str,
         error_message: &str,
-    ) -> Result<Post, PublisherRepositoryError> {
+    ) -> Result<PublishRetry, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
+        let job = lock_current_job_attempt(&mut transaction, id, &lease.attempt).await?;
         let channel_id = post_channel_id(&mut transaction, id).await?;
         lock_channel(&mut transaction, channel_id).await?;
         let current = lock_post(&mut transaction, id).await?;
         if current.post_state()? != PostState::Sending
-            || current.send_generation != generation
-            || current.send_token != Some(token)
+            || current.send_generation != lease.generation
+            || current.send_token != Some(lease.token)
         {
             return Err(PublisherRepositoryError::PublishLeaseLost(id));
         }
         let revision = next_revision(current.revision)?;
+        let terminal = job.attempt_count >= job.max_attempts;
+        let next_state = if terminal { PostState::Failed } else { PostState::Queued };
         let row = sqlx::query_as::<_, PostRow>(
-            "UPDATE posts SET state = 'queued', send_token = NULL, send_started_at = NULL, error_class = $2, error_message = $3, revision = $4, updated_at = now() WHERE id = $1 AND state = 'sending' AND send_generation = $5 AND send_token = $6 RETURNING *",
+            "UPDATE posts SET state = $2, send_token = NULL, send_started_at = NULL, error_class = $3, error_message = $4, revision = $5, updated_at = now() WHERE id = $1 AND state = 'sending' AND send_generation = $6 AND send_token = $7 RETURNING *",
         )
         .bind(id)
+        .bind(next_state.as_str())
         .bind(error_class)
         .bind(error_message)
         .bind(revision)
-        .bind(generation)
-        .bind(token)
+        .bind(lease.generation)
+        .bind(lease.token)
         .fetch_one(&mut *transaction)
         .await?;
-        let job = lock_publish_job(&mut transaction, id)
-            .await?
-            .ok_or(PublisherRepositoryError::PublishJobMissing(id))?;
-        if job.state != "running" {
-            return Err(PublisherRepositoryError::PublishJobUnavailable {
-                post_id: id,
-                state: job.state,
-            });
-        }
-        let updated = sqlx::query(
-            "UPDATE queue.jobs SET payload = $2, updated_at = now() WHERE id = $1 AND state = 'running'",
-        )
-        .bind(job.id)
-        .bind(serde_json::json!({ "post_id": id, "expected_revision": row.revision }))
-        .execute(&mut *transaction)
-        .await?;
-        if updated.rows_affected() != 1 {
-            return Err(PublisherRepositoryError::PublishJobUpdateLost(id));
+        if !terminal {
+            let updated = sqlx::query(
+                "UPDATE queue.jobs SET payload = $2, updated_at = now() WHERE id = $1 AND state = 'running'",
+            )
+            .bind(job.id)
+            .bind(serde_json::json!({ "post_id": id, "expected_revision": row.revision }))
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(PublisherRepositoryError::PublishJobUpdateLost(id));
+            }
         }
         transaction.commit().await?;
-        row.into_post()
+        Ok(PublishRetry { post: row.into_post()?, terminal })
+    }
+
+    pub async fn reconcile_interrupted_publish(
+        &self,
+        id: Uuid,
+        attempt: &JobAttempt,
+    ) -> Result<bool, PublisherRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        lock_current_job_attempt(&mut transaction, id, attempt).await?;
+        let updated = sqlx::query(
+            "UPDATE posts SET state = 'unknown', send_token = NULL, send_started_at = NULL, error_class = 'publication_interrupted', error_message = 'a previous publication attempt lost its job lease', revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'sending'",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(updated.rows_affected() == 1)
     }
 }
 
@@ -930,6 +969,31 @@ async fn update_publish_job(
     Ok(())
 }
 
+async fn update_failed_publish_job(
+    transaction: &mut Transaction<'_, Postgres>,
+    post_id: Uuid,
+    expected_revision: i64,
+) -> Result<(), PublisherRepositoryError> {
+    let row = lock_publish_job(transaction, post_id).await?;
+    let Some(row) = row else {
+        return Err(PublisherRepositoryError::PublishJobMissing(post_id));
+    };
+    if row.state != "failed" {
+        return Err(PublisherRepositoryError::PublishJobUnavailable { post_id, state: row.state });
+    }
+    let updated = sqlx::query(
+        "UPDATE queue.jobs SET payload = $2, updated_at = now() WHERE id = $1 AND state = 'failed'",
+    )
+    .bind(row.id)
+    .bind(serde_json::json!({ "post_id": post_id, "expected_revision": expected_revision }))
+    .execute(&mut **transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(PublisherRepositoryError::PublishJobUpdateLost(post_id));
+    }
+    Ok(())
+}
+
 async fn cancel_publish_job(
     transaction: &mut Transaction<'_, Postgres>,
     post_id: Uuid,
@@ -961,6 +1025,19 @@ struct PublishJobRow {
     state: String,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct PublishJobAttemptRow {
+    id: Uuid,
+    attempt_count: i32,
+    max_attempts: i32,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct OccupiedSlotRow {
+    id: Uuid,
+    state: String,
+}
+
 async fn lock_publish_job(
     transaction: &mut Transaction<'_, Postgres>,
     post_id: Uuid,
@@ -971,6 +1048,23 @@ async fn lock_publish_job(
     .bind(format!("post:{post_id}:publish:v1"))
     .fetch_optional(&mut **transaction)
     .await?)
+}
+
+async fn lock_current_job_attempt(
+    transaction: &mut Transaction<'_, Postgres>,
+    post_id: Uuid,
+    attempt: &JobAttempt,
+) -> Result<PublishJobAttemptRow, PublisherRepositoryError> {
+    sqlx::query_as::<_, PublishJobAttemptRow>(
+        "SELECT id, attempt_count, max_attempts FROM queue.jobs WHERE id = $1 AND state = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_expires_at > clock_timestamp() FOR UPDATE",
+    )
+    .bind(attempt.job_id)
+    .bind(attempt.attempt_number)
+    .bind(&attempt.lease_owner)
+    .bind(attempt.lease_token)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(PublisherRepositoryError::PublishLeaseLost(post_id))
 }
 
 fn schedule_request_hash(schedule: &PostSchedule) -> Vec<u8> {
@@ -988,9 +1082,14 @@ fn publish_now_request_hash(request_key: &str) -> Vec<u8> {
 
 fn check_expected_revision(
     current: &PostRow,
-    expected_revision: Option<i64>,
+    expected_revision: i64,
 ) -> Result<(), PublisherRepositoryError> {
-    if expected_revision.is_some_and(|expected| expected != current.revision) {
+    if expected_revision < 0 {
+        return Err(PublisherRepositoryError::Validation(
+            PublisherValidationError::InvalidExpectedRevision,
+        ));
+    }
+    if expected_revision != current.revision {
         return Err(PublisherRepositoryError::OptimisticConflict(current.id));
     }
     Ok(())
@@ -1017,8 +1116,15 @@ fn validate_slot(
     if local.time() < start || local.time() >= end {
         return Err(PublisherRepositoryError::InvalidCadenceSlot);
     }
-    let elapsed = local.time().signed_duration_since(start).num_seconds();
-    if elapsed < 0 || elapsed % (i64::from(channel.interval_minutes) * 60) != 0 {
+    let elapsed =
+        local.naive_local().signed_duration_since(NaiveDateTime::new(local.date_naive(), start));
+    let interval_nanos = i64::from(channel.interval_minutes)
+        .checked_mul(60)
+        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+        .ok_or(PublisherRepositoryError::InvalidCadenceSlot)?;
+    let elapsed_nanos =
+        elapsed.num_nanoseconds().ok_or(PublisherRepositoryError::InvalidCadenceSlot)?;
+    if elapsed_nanos < 0 || elapsed_nanos % interval_nanos != 0 {
         return Err(PublisherRepositoryError::InvalidCadenceSlot);
     }
     Ok(())
@@ -1067,38 +1173,32 @@ fn next_allowed_slot(
         .time_zone
         .parse()
         .map_err(|_| PublisherRepositoryError::InvalidTimeZone(channel.time_zone.clone()))?;
-    let mut candidate = to_chrono(requested)?;
+    let candidate = to_chrono(requested)?;
     let start = to_chrono_time(channel.window_start);
     let end = to_chrono_time(channel.window_end);
-    let interval = i64::from(channel.interval_minutes) * 60;
+    let interval = i64::from(channel.interval_minutes);
+    if interval <= 0 {
+        return Err(PublisherRepositoryError::CadenceSearchExhausted);
+    }
+    let mut date = candidate.with_timezone(&timezone).date_naive();
     for _ in 0..370 {
-        let local = candidate.with_timezone(&timezone);
-        let date = local.date_naive();
-        let time = local.time();
-        let target = if time < start {
-            NaiveDateTime::new(date, start)
-        } else if time >= end {
-            NaiveDateTime::new(date + ChronoDuration::days(1), start)
-        } else {
-            let elapsed = time.signed_duration_since(start).num_seconds();
-            let offset = ((elapsed + interval - 1) / interval) * interval;
-            let target_time = start + ChronoDuration::seconds(offset);
-            if target_time >= end {
-                NaiveDateTime::new(date + ChronoDuration::days(1), start)
-            } else {
-                NaiveDateTime::new(date, target_time)
+        let mut target = NaiveDateTime::new(date, start);
+        let end_target = NaiveDateTime::new(date, end);
+        while target < end_target {
+            let mut resolved = match timezone.from_local_datetime(&target) {
+                chrono::LocalResult::Single(value) => vec![value.with_timezone(&Utc)],
+                chrono::LocalResult::Ambiguous(earliest, latest) => {
+                    vec![earliest.with_timezone(&Utc), latest.with_timezone(&Utc)]
+                }
+                chrono::LocalResult::None => Vec::new(),
+            };
+            resolved.sort_unstable();
+            if let Some(result) = resolved.into_iter().find(|result| *result >= candidate) {
+                return from_chrono(result);
             }
-        };
-        let zoned = timezone
-            .from_local_datetime(&target)
-            .earliest()
-            .or_else(|| timezone.from_local_datetime(&target).latest())
-            .ok_or(PublisherRepositoryError::InvalidTimeZone(channel.time_zone.clone()))?;
-        let result = zoned.with_timezone(&Utc);
-        if result >= candidate {
-            return from_chrono(result);
+            target += ChronoDuration::minutes(interval);
         }
-        candidate += ChronoDuration::days(1);
+        date += ChronoDuration::days(1);
     }
     Err(PublisherRepositoryError::CadenceSearchExhausted)
 }
@@ -1211,6 +1311,8 @@ fn validate_post(post: &NewPost) -> Result<(), PublisherRepositoryError> {
 }
 
 fn validate_post_update(update: &PostUpdate) -> Result<(), PublisherRepositoryError> {
+    sooqa_publisher::validate_expected_revision(update.expected_revision)
+        .map_err(PublisherRepositoryError::Validation)?;
     if let Some(caption) = update.caption.as_ref().and_then(Option::as_ref) {
         validate_caption(caption).map_err(PublisherRepositoryError::Validation)?;
     }
@@ -1293,4 +1395,57 @@ pub enum PublisherRepositoryError {
     Database(#[from] sqlx::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel(time_zone: &str, window_start: u8, window_end: u8) -> ChannelRow {
+        let now = OffsetDateTime::now_utc();
+        ChannelRow {
+            id: Uuid::now_v7(),
+            telegram_chat_id: -100123,
+            name: "test".to_owned(),
+            is_enabled: true,
+            time_zone: time_zone.to_owned(),
+            window_start: Time::from_hms(window_start, 0, 0).expect("valid test start"),
+            window_end: Time::from_hms(window_end, 0, 0).expect("valid test end"),
+            interval_minutes: 30,
+            default_parse_mode: None,
+            default_disable_notification: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn timestamp(value: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+            .expect("valid test timestamp")
+    }
+
+    #[test]
+    fn validate_slot_rejects_fractional_cadence_offsets() {
+        let channel = channel("UTC", 8, 22);
+        assert!(matches!(
+            validate_slot(timestamp("2030-01-01T08:00:00.500Z"), &channel),
+            Err(PublisherRepositoryError::InvalidCadenceSlot)
+        ));
+    }
+
+    #[test]
+    fn next_allowed_slot_skips_nonexistent_spring_grid_points() {
+        let channel = channel("America/New_York", 1, 4);
+        let next = next_allowed_slot(timestamp("2026-03-08T06:40:00Z"), &channel)
+            .expect("a later grid point should exist");
+        assert_eq!(next, timestamp("2026-03-08T07:00:00Z"));
+    }
+
+    #[test]
+    fn next_allowed_slot_chooses_the_later_fall_fold_occurrence_when_needed() {
+        let channel = channel("America/New_York", 1, 4);
+        let next = next_allowed_slot(timestamp("2026-11-01T06:10:00Z"), &channel)
+            .expect("the second fold occurrence should be available");
+        assert_eq!(next, timestamp("2026-11-01T06:30:00Z"));
+    }
 }
