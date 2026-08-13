@@ -313,10 +313,32 @@ async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: s
     assert_eq!(accepted.ingest.status, IngestStatus::Completed);
     assert_eq!(accepted.ingest.media_id, Some(media_id));
     assert!(accepted.ingest.duplicate_evidence.is_none());
+    let input_json =
+        sqlx::query_scalar::<_, serde_json::Value>("SELECT input_json FROM ingests WHERE id = $1")
+            .bind(ingest.ingest.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(input_json["_sooqa_duplicate_decision_v1"]["kind"], "accepted");
+    assert_eq!(input_json["_sooqa_duplicate_decision_v1"]["media_id"], media_id.to_string());
 
     let replay = database.inbox().accept_duplicate(ingest.ingest.id, media_id).await.unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.ingest.media_id, Some(media_id));
+    assert!(matches!(
+        database.inbox().accept_duplicate(ingest.ingest.id, Uuid::now_v7()).await,
+        Err(InboxRepositoryError::DuplicateDecisionNotAllowed(IngestStatus::Completed))
+    ));
+
+    sqlx::query("UPDATE ingests SET state = 'storing', input_json = '{}'::jsonb WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        database.inbox().accept_duplicate(ingest.ingest.id, media_id).await,
+        Err(InboxRepositoryError::DuplicateDecisionNotAllowed(IngestStatus::Storing))
+    ));
 
     let (description, tags) = sqlx::query_as::<_, (Option<String>, Vec<String>)>(
         "SELECT description, tags FROM media WHERE id = $1",
