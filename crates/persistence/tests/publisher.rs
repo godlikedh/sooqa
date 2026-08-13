@@ -102,7 +102,7 @@ async fn post_schedule_uses_one_row_and_channel_cadence(pool: sqlx::PgPool) {
                 parse_mode: None,
                 disable_notification: Some(true),
                 expected_updated_at: None,
-                expected_revision: None,
+                expected_revision: 0,
             },
         )
         .await
@@ -113,10 +113,11 @@ async fn post_schedule_uses_one_row_and_channel_cadence(pool: sqlx::PgPool) {
     let requested_at = OffsetDateTime::now_utc();
     let (scheduled, second_scheduled) = tokio::join!(
         repository.schedule_post(
-            PostSchedule::try_new(created.post.id, requested_at, "schedule-key").unwrap()
+            PostSchedule::try_new(created.post.id, requested_at, "schedule-key", updated.revision)
+                .unwrap()
         ),
         repository.schedule_post(
-            PostSchedule::try_new(second.post.id, requested_at, "second-schedule-key").unwrap()
+            PostSchedule::try_new(second.post.id, requested_at, "second-schedule-key", 0).unwrap()
         )
     );
     let scheduled = scheduled.unwrap();
@@ -129,7 +130,13 @@ async fn post_schedule_uses_one_row_and_channel_cadence(pool: sqlx::PgPool) {
     assert!((second_slot - first_slot).whole_minutes().abs() >= 30);
     let replay = repository
         .schedule_post(
-            PostSchedule::try_new(created.post.id, requested_at, "schedule-key").unwrap(),
+            PostSchedule::try_new(
+                created.post.id,
+                requested_at,
+                "schedule-key",
+                scheduled.revision,
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -140,7 +147,8 @@ async fn post_schedule_uses_one_row_and_channel_cadence(pool: sqlx::PgPool) {
                 PostSchedule::try_new(
                     created.post.id,
                     requested_at + Duration::minutes(1),
-                    "schedule-key"
+                    "schedule-key",
+                    scheduled.revision,
                 )
                 .unwrap()
             )
@@ -153,6 +161,7 @@ async fn post_schedule_uses_one_row_and_channel_cadence(pool: sqlx::PgPool) {
                 created.post.id,
                 requested_at + Duration::hours(4),
                 "reschedule-key",
+                scheduled.revision,
             )
             .unwrap(),
         )
@@ -245,6 +254,7 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
                         post.id,
                         requested_at,
                         format!("schedule-{index}-{}", Uuid::new_v4()),
+                        0,
                     )
                     .unwrap(),
                 )
@@ -269,7 +279,7 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
     assert!(first_slot < second_slot && second_slot < third_slot);
     let moved = database
         .publisher()
-        .move_adjacent(queued[1].id, QueueDirection::Earlier, Some(queued[1].revision))
+        .move_adjacent(queued[1].id, QueueDirection::Earlier, queued[1].revision)
         .await
         .unwrap();
     assert_eq!(moved.cadence_slot_at, Some(first_slot));
@@ -279,16 +289,35 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
     );
     assert_eq!(moved.revision, 2);
 
-    let swapped = database
-        .publisher()
-        .set_slot(queued[2].id, second_slot, Some(queued[2].revision))
-        .await
-        .unwrap();
+    let swapped =
+        database.publisher().set_slot(queued[2].id, second_slot, queued[2].revision).await.unwrap();
     assert_eq!(swapped.cadence_slot_at, Some(second_slot));
     assert_eq!(
         database.publisher().find_post(queued[0].id).await.unwrap().unwrap().cadence_slot_at,
         Some(third_slot)
     );
+
+    let sending_before = database.publisher().find_post(queued[0].id).await.unwrap().unwrap();
+    let sending = database
+        .publisher()
+        .claim_publish(sending_before.id, sending_before.revision)
+        .await
+        .unwrap();
+    let target_before = database.publisher().find_post(queued[2].id).await.unwrap().unwrap();
+    let blocked = database
+        .publisher()
+        .set_slot(queued[2].id, sending.post.cadence_slot_at.unwrap(), target_before.revision)
+        .await;
+    assert!(matches!(
+        blocked,
+        Err(PublisherRepositoryError::PostNotEditable { state: PostState::Sending, .. })
+    ));
+    let target_after = database.publisher().find_post(queued[2].id).await.unwrap().unwrap();
+    assert_eq!(target_after.cadence_slot_at, target_before.cadence_slot_at);
+    assert_eq!(target_after.revision, target_before.revision);
+    let sending_after = database.publisher().find_post(sending.post.id).await.unwrap().unwrap();
+    assert_eq!(sending_after.state, PostState::Sending);
+    assert_eq!(sending_after.revision, sending.post.revision);
 
     let edited = database
         .publisher()
@@ -299,7 +328,7 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
                 parse_mode: None,
                 disable_notification: None,
                 expected_updated_at: None,
-                expected_revision: Some(swapped.revision),
+                expected_revision: swapped.revision,
             },
         )
         .await
@@ -316,21 +345,20 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
 
     let now = database
         .publisher()
-        .publish_now(queued[2].id, "publish-now-test".to_owned(), Some(edited.revision))
+        .publish_now(queued[2].id, "publish-now-test".to_owned(), edited.revision)
         .await
         .unwrap();
     assert_eq!(now.cadence_slot_at, edited.cadence_slot_at);
     assert!(now.scheduled_at <= OffsetDateTime::now_utc());
     let replay = database
         .publisher()
-        .publish_now(queued[2].id, "publish-now-test".to_owned(), Some(now.revision))
+        .publish_now(queued[2].id, "publish-now-test".to_owned(), now.revision)
         .await
         .unwrap();
     assert_eq!(replay.revision, now.revision);
     assert_eq!(replay.cadence_slot_at, now.cadence_slot_at);
 
-    let cancelled =
-        database.publisher().cancel_post(queued[1].id, Some(moved.revision)).await.unwrap();
+    let cancelled = database.publisher().cancel_post(queued[1].id, moved.revision).await.unwrap();
     assert_eq!(cancelled.state, PostState::Cancelled);
     assert!(cancelled.cadence_slot_at.is_none());
     assert_eq!(
@@ -351,7 +379,7 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
                 parse_mode: None,
                 disable_notification: None,
                 expected_updated_at: None,
-                expected_revision: Some(edited.revision),
+                expected_revision: edited.revision,
             },
         )
         .await;
@@ -389,14 +417,111 @@ async fn queued_post_cannot_be_rescheduled_after_publish_job_is_claimed(pool: sq
     let queued = database
         .publisher()
         .enqueue_post(
-            PostSchedule::try_new(post.id, OffsetDateTime::now_utc(), "claim-schedule").unwrap(),
+            PostSchedule::try_new(post.id, OffsetDateTime::now_utc(), "claim-schedule", 0).unwrap(),
         )
         .await
         .unwrap();
     let claimed = database.publisher().claim_publish(queued.id, queued.revision).await.unwrap();
     assert_eq!(claimed.post.state, PostState::Sending);
     assert!(matches!(
-        database.publisher().cancel_post(queued.id, Some(claimed.post.revision)).await,
+        database.publisher().cancel_post(queued.id, claimed.post.revision).await,
         Err(PublisherRepositoryError::PostCannotBeScheduled { state: PostState::Sending, .. })
     ));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn failed_post_edit_keeps_failed_job_until_explicit_requeue(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let channel = database
+        .publisher()
+        .create_channel(
+            NewChannel::try_new(format!("test-{}", Uuid::new_v4()), -1000000000003).unwrap(),
+        )
+        .await
+        .unwrap();
+    let media_id = stored_media(&database).await;
+    let post = database
+        .publisher()
+        .create_post_idempotent(
+            NewPost {
+                media_id,
+                channel_id: channel.id,
+                caption: Some("before failure".to_owned()),
+                parse_mode: None,
+                disable_notification: false,
+            },
+            format!("post-{}", Uuid::new_v4()),
+            b"failed-edit",
+        )
+        .await
+        .unwrap()
+        .post;
+    let queued = database
+        .publisher()
+        .schedule_post(
+            PostSchedule::try_new(post.id, OffsetDateTime::now_utc(), "initial", 0).unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE posts SET state = 'failed', error_class = 'telegram', error_message = 'failed' WHERE id = $1",
+    )
+    .bind(queued.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'failed', error_class = 'telegram', error_message = 'failed' WHERE dedupe_key = $1",
+    )
+    .bind(format!("post:{}:publish:v1", queued.id))
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let failed = database.publisher().find_post(queued.id).await.unwrap().unwrap();
+    let edited = database
+        .publisher()
+        .update_post(
+            failed.id,
+            PostUpdate {
+                caption: Some(Some("edited after failure".to_owned())),
+                parse_mode: None,
+                disable_notification: None,
+                expected_updated_at: None,
+                expected_revision: failed.revision,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(edited.state, PostState::Failed);
+    let (job_state, payload, error_class): (String, serde_json::Value, Option<String>) =
+        sqlx::query_as("SELECT state, payload, error_class FROM queue.jobs WHERE dedupe_key = $1")
+            .bind(format!("post:{}:publish:v1", edited.id))
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(job_state, "failed");
+    assert_eq!(payload["expected_revision"], edited.revision);
+    assert_eq!(error_class.as_deref(), Some("telegram"));
+
+    let requeued = database
+        .publisher()
+        .schedule_post(
+            PostSchedule::try_new(edited.id, OffsetDateTime::now_utc(), "retry", edited.revision)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(requeued.state, PostState::Queued);
+    let (job_state, payload): (String, serde_json::Value) =
+        sqlx::query_as("SELECT state, payload FROM queue.jobs WHERE dedupe_key = $1")
+            .bind(format!("post:{}:publish:v1", edited.id))
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(job_state, "queued");
+    assert_eq!(payload["expected_revision"], requeued.revision);
+    let claimed = database.publisher().claim_publish(requeued.id, requeued.revision).await.unwrap();
+    assert_eq!(claimed.post.state, PostState::Sending);
 }
