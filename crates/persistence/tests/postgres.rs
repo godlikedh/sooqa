@@ -59,7 +59,7 @@ async fn fresh_migration_contains_only_the_five_application_tables(pool: sqlx::P
         .fetch_one(database.pool())
         .await
         .expect("migration table should exist");
-    assert_eq!(migration_count, 4);
+    assert_eq!(migration_count, 5);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

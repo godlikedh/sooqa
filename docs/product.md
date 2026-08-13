@@ -47,6 +47,15 @@ and slot assignment are rendered only for queued rows. Queue cards are paced
 per chat and retry bounded Telegram flood-control responses without replaying a
 completed update.
 
+HTTP ingest requests may carry one versioned follow-up intent on the same
+`ingests` row: `save`, normal-cadence `queue`, exact-time `queue`, or
+`post_now`. The intent records an optional future publication instant and
+public post text separately from media description, tags, page context, and
+selected text. Omitting the action retains save-only behavior. This capture
+contract survives the asynchronous ingest pipeline and idempotent replays; it
+does not create a post until the later materialization and repetition-decision
+slice.
+
 Large-media capture uses Telegram's official local Bot API server when the home
 deployment is cut over manually. URL/link source downloads, Telegram-source
 downloads, and canonical normalized storage output have separate budgets. The

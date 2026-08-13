@@ -1300,6 +1300,19 @@ impl QueuePostRow {
     }
 }
 
+/// Return enough enabled channels to distinguish the valid single-target
+/// configuration from both missing and ambiguous configuration. The row locks
+/// keep a selected channel enabled until the caller commits its snapshot.
+pub(crate) async fn select_enabled_channel_candidates(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM channels WHERE is_enabled ORDER BY id LIMIT 2 FOR SHARE",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+}
+
 fn validate_post(post: &NewPost) -> Result<(), PublisherRepositoryError> {
     if let Some(caption) = &post.caption {
         validate_caption(caption).map_err(PublisherRepositoryError::Validation)?;

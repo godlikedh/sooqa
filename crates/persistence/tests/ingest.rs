@@ -1,7 +1,7 @@
 use serde_json::json;
 use sooqa_inbox::{
-    IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection, SourceMediaKind,
-    SubmittedVia,
+    IngestStatus, IngestSubmission, IngestSubmissionInput, RequestedAction, SourceInspection,
+    SourceMediaKind, SubmittedVia,
 };
 use sooqa_jobs::{JobCommand, JobStatus, JobType};
 use sooqa_library::{
@@ -9,7 +9,20 @@ use sooqa_library::{
 };
 use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint, VideoSequenceSample};
 use sooqa_persistence::{Database, InboxRepositoryError, SourceInspectionStart};
+use sooqa_publisher::NewChannel;
+use time::OffsetDateTime;
 use uuid::Uuid;
+
+async fn enabled_channel(database: &Database, chat_id: i64) -> Uuid {
+    database
+        .publisher()
+        .create_channel(
+            NewChannel::try_new(format!("ingest-test-{}", Uuid::new_v4()), chat_id).unwrap(),
+        )
+        .await
+        .unwrap()
+        .id
+}
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
@@ -30,13 +43,25 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts(pool: sqlx::P
 
     let mut conflicting =
         IngestSubmissionInput::new("https://example.test/other", SubmittedVia::Api);
-    conflicting.idempotency_key = Some(key);
+    conflicting.idempotency_key = Some(key.clone());
     let error = database
         .inbox()
         .create_ingest(IngestSubmission::try_new(conflicting).unwrap())
         .await
         .unwrap_err();
     assert!(matches!(error, InboxRepositoryError::IdempotencyConflict { .. }));
+
+    let mut changed_intent =
+        IngestSubmissionInput::new("https://example.test/video", SubmittedVia::Api);
+    changed_intent.idempotency_key = Some(key);
+    changed_intent.requested_action = RequestedAction::PostNow;
+    let error = database
+        .inbox()
+        .create_ingest(IngestSubmission::try_new(changed_intent).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, InboxRepositoryError::IdempotencyConflict { .. }));
+
     let claimed = database
         .jobs()
         .claim_next(
@@ -66,6 +91,126 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts(pool: sqlx::P
         database.inbox().begin_source_inspection(first.ingest.id, &stale_attempt).await.unwrap(),
         SourceInspectionStart::AlreadyAdvanced(_)
     ));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn exact_queue_replay_remains_idempotent_after_requested_time_passes(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    enabled_channel(&database, -1000000000301).await;
+    let clock = OffsetDateTime::now_utc();
+    let requested_publish_at = clock + time::Duration::seconds(1);
+    let key = format!("exact-queue-replay-{}", Uuid::new_v4());
+    let mut input =
+        IngestSubmissionInput::new("https://example.test/exact-queue", SubmittedVia::Api);
+    input.idempotency_key = Some(key);
+    input.requested_action = RequestedAction::Queue;
+    input.requested_publish_at = Some(requested_publish_at);
+    let first = database
+        .inbox()
+        .create_ingest_at(IngestSubmission::try_new(input.clone()).unwrap(), clock)
+        .await
+        .unwrap();
+
+    let replay = database
+        .inbox()
+        .create_ingest_at(
+            IngestSubmission::try_new_for_idempotency_lookup(input).unwrap(),
+            clock + time::Duration::seconds(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.ingest.id, first.ingest.id);
+    assert!(!replay.created);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn publication_intent_requires_and_snapshots_one_enabled_channel(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let mut no_channel = IngestSubmissionInput::new(
+        format!("https://example.test/no-channel-{}", Uuid::new_v4()),
+        SubmittedVia::Api,
+    );
+    no_channel.requested_action = RequestedAction::Queue;
+    no_channel.idempotency_key = Some(format!("no-channel-{}", Uuid::new_v4()));
+    let no_channel_key = no_channel.idempotency_key.clone().unwrap();
+    let error = database
+        .inbox()
+        .create_ingest(IngestSubmission::try_new(no_channel).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, InboxRepositoryError::RequestedChannelNotConfigured));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ingests WHERE input_key = $1")
+            .bind(no_channel_key)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+
+    let channel_id = enabled_channel(&database, -1000000000303).await;
+    let mut queued = IngestSubmissionInput::new(
+        format!("https://example.test/one-channel-{}", Uuid::new_v4()),
+        SubmittedVia::Api,
+    );
+    queued.requested_action = RequestedAction::Queue;
+    queued.idempotency_key = Some(format!("one-channel-{}", Uuid::new_v4()));
+    let queued_submission = IngestSubmission::try_new(queued.clone()).unwrap();
+    let created = database.inbox().create_ingest(queued_submission).await.unwrap();
+    assert_eq!(created.ingest.requested_channel_id, Some(channel_id));
+
+    sqlx::query("UPDATE channels SET is_enabled = false WHERE id = $1")
+        .bind(channel_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let replay = database
+        .inbox()
+        .create_ingest(IngestSubmission::try_new_for_idempotency_lookup(queued).unwrap())
+        .await
+        .unwrap();
+    assert!(!replay.created);
+    assert_eq!(replay.ingest.id, created.ingest.id);
+    assert_eq!(replay.ingest.requested_channel_id, Some(channel_id));
+
+    let _first = enabled_channel(&database, -1000000000304).await;
+    let _second = enabled_channel(&database, -1000000000305).await;
+    let mut ambiguous = IngestSubmissionInput::new(
+        format!("https://example.test/multiple-channels-{}", Uuid::new_v4()),
+        SubmittedVia::Api,
+    );
+    ambiguous.requested_action = RequestedAction::PostNow;
+    ambiguous.idempotency_key = Some(format!("multiple-channels-{}", Uuid::new_v4()));
+    let ambiguous_key = ambiguous.idempotency_key.clone().unwrap();
+    let error = database
+        .inbox()
+        .create_ingest(IngestSubmission::try_new(ambiguous).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, InboxRepositoryError::RequestedChannelAmbiguous));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ingests WHERE input_key = $1")
+            .bind(ambiguous_key)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+
+    let save = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/save-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(save.ingest.requested_channel_id, None);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -175,12 +320,17 @@ async fn source_inspection_completion_commits_job_success_with_transition(pool: 
 #[ignore = "requires PostgreSQL"]
 async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
+    let channel_id = enabled_channel(&database, -1000000000302).await;
     let mut submission_input = IngestSubmissionInput::new(
         format!("https://example.test/duplicate-{}", Uuid::new_v4()),
         SubmittedVia::Companion,
     );
     submission_input.supplied_description = Some("keep this internal note".to_owned());
     submission_input.supplied_tags = vec!["cats".to_owned(), "reaction".to_owned()];
+    submission_input.requested_action = RequestedAction::Queue;
+    submission_input.requested_publish_at =
+        Some(time::OffsetDateTime::now_utc() + time::Duration::minutes(5));
+    submission_input.requested_post_caption = Some("public queue text".to_owned());
     let ingest = database
         .inbox()
         .create_ingest(IngestSubmission::try_new(submission_input).unwrap())
@@ -229,6 +379,10 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPo
     assert!(resumed.ingest.original_input.get("inspection").is_none());
     assert_eq!(resumed.ingest.supplied_description.as_deref(), Some("keep this internal note"));
     assert_eq!(resumed.ingest.supplied_tags, ["cats", "reaction"]);
+    assert_eq!(resumed.ingest.requested_action, RequestedAction::Queue);
+    assert!(resumed.ingest.requested_publish_at.is_some());
+    assert_eq!(resumed.ingest.requested_post_caption.as_deref(), Some("public queue text"));
+    assert_eq!(resumed.ingest.requested_channel_id, Some(channel_id));
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM queue.jobs WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",
@@ -254,12 +408,14 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPo
     assert!(!replay.resumed);
     assert_eq!(replay.ingest.id, resumed.ingest.id);
     assert_eq!(replay.ingest.status, IngestStatus::Queued);
+    assert_eq!(replay.ingest.requested_channel_id, Some(channel_id));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
 async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
+    let channel_id = enabled_channel(&database, -1000000000306).await;
     let media_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO media (id, kind, storage_state, tags, description, telegram_storage_chat_id, telegram_storage_message_id, telegram_file_id) VALUES ($1, 'video', 'ready', $2, $3, $4, $5, $6)",
@@ -280,6 +436,9 @@ async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: s
     );
     input.supplied_description = Some("new description".to_owned());
     input.supplied_tags = vec!["incoming".to_owned(), "existing".to_owned()];
+    input.requested_action = RequestedAction::Queue;
+    input.requested_publish_at = Some(time::OffsetDateTime::now_utc() + time::Duration::minutes(5));
+    input.requested_post_caption = Some("queued public text".to_owned());
     let ingest =
         database.inbox().create_ingest(IngestSubmission::try_new(input).unwrap()).await.unwrap();
     sqlx::query(
@@ -313,6 +472,10 @@ async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: s
     assert_eq!(accepted.ingest.status, IngestStatus::Completed);
     assert_eq!(accepted.ingest.media_id, Some(media_id));
     assert!(accepted.ingest.duplicate_evidence.is_none());
+    assert_eq!(accepted.ingest.requested_action, RequestedAction::Queue);
+    assert!(accepted.ingest.requested_publish_at.is_some());
+    assert_eq!(accepted.ingest.requested_post_caption.as_deref(), Some("queued public text"));
+    assert_eq!(accepted.ingest.requested_channel_id, Some(channel_id));
     let input_json =
         sqlx::query_scalar::<_, serde_json::Value>("SELECT input_json FROM ingests WHERE id = $1")
             .bind(ingest.ingest.id)
@@ -325,6 +488,10 @@ async fn duplicate_acceptance_reuses_evidenced_media_and_merges_metadata(pool: s
     let replay = database.inbox().accept_duplicate(ingest.ingest.id, media_id).await.unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.ingest.media_id, Some(media_id));
+    assert_eq!(replay.ingest.requested_action, RequestedAction::Queue);
+    assert!(replay.ingest.requested_publish_at.is_some());
+    assert_eq!(replay.ingest.requested_post_caption.as_deref(), Some("queued public text"));
+    assert_eq!(replay.ingest.requested_channel_id, Some(channel_id));
     assert!(matches!(
         database.inbox().accept_duplicate(ingest.ingest.id, Uuid::now_v7()).await,
         Err(InboxRepositoryError::DuplicateDecisionNotAllowed(IngestStatus::Completed))
