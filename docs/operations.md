@@ -270,6 +270,9 @@ backend token. Each media preview gets `Post now`, `Post now…`, `Queue`,
 documented metadata: internal tags/description, optional public post text, and
 the required browser-local exact time for `Queue…`; exact time is converted to
 an RFC3339 instant before submission.
+Native `figure.post__image` filename/preview pairs are treated as one
+attachment, so galleries retain their existing preview structure while rows
+are added around each item.
 
 Accepted-action history is informational and local to the canonical thread and
 media identity across the three mirrors. It survives reloads, is bounded and

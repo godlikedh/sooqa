@@ -68,24 +68,33 @@ class FakeElement {
   }
 
   matchesSingle(selector) {
-    if (selector === "a[href]") return this.tagName === "A" && Boolean(this.href);
-    if (selector === "video[src]") return this.tagName === "VIDEO" && Boolean(this.src);
-    if (selector === "source[src]") return this.tagName === "SOURCE" && Boolean(this.src);
-    if (selector === "[data-num]") return this.attributes.has("data-num");
-    if (selector === "[id^='p']") return String(this.id || "").startsWith("p");
-    if (selector === "[data-sooqa-media-url]") return Boolean(this.dataset.sooqaMediaUrl);
-    if (selector.startsWith("button[")) {
-      return this.tagName === "BUTTON" && Boolean(this.dataset.sooqaAction);
+    const attributePattern = /\[([^\]=^]+)(?:\^?=['"]?([^'"]*)['"]?)?\]/;
+    const attributeMatch = attributePattern.exec(selector);
+    const selectorWithoutAttribute = attributeMatch
+      ? selector.replace(attributeMatch[0], "")
+      : selector;
+    const classMatch = /\.([\w-]+)/.exec(selectorWithoutAttribute);
+    const tagName = selectorWithoutAttribute.replace(/\.[\w-]+/, "").trim();
+    if (tagName && tagName !== "*" && this.tagName !== tagName.toUpperCase()) return false;
+    if (classMatch && !this.className.split(/\s+/).includes(classMatch[1])) return false;
+    if (!attributeMatch) return true;
+
+    const name = attributeMatch[1].trim();
+    const expected = attributeMatch[2];
+    let value = this.getAttribute(name);
+    if (name === "href" && !value) value = this.href || null;
+    if (name === "src" && !value) value = this.src || null;
+    if (name.startsWith("data-") && value === null) {
+      const datasetKey = name.slice(5).replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
+      value = this.dataset[datasetKey] || null;
     }
-    if (selector.startsWith(".")) return this.className.split(/\s+/).includes(selector.slice(1));
-    if (selector === "style" || selector === "dialog" || selector === "input" ||
-        selector === "textarea" || selector === "button" || selector === "form" ||
-        selector === "label" || selector === "div" || selector === "span" ||
-        selector === "article" || selector === "video" || selector === "source" ||
-        selector === "a") {
-      return this.tagName === selector.toUpperCase();
+    if (name === "id" && value === null) value = this.id || null;
+    if (expected !== undefined) {
+      return attributeMatch[0].includes("^=")
+        ? String(value || "").startsWith(expected)
+        : String(value || "") === expected;
     }
-    return false;
+    return Boolean(value);
   }
 
   querySelectorAll(selector) {
@@ -179,6 +188,43 @@ function createPost(document, mediaUrls) {
     post.append(link);
   }
   return post;
+}
+
+function createFigureAttachment(document, mediaUrl) {
+  const figure = document.createElement("figure");
+  figure.className = "post__image";
+
+  const caption = document.createElement("figcaption");
+  const filename = document.createElement("a");
+  filename.href = mediaUrl;
+  filename.setAttribute("href", mediaUrl);
+  filename.textContent = "clip.webm";
+  caption.append(filename);
+
+  const preview = document.createElement("a");
+  preview.className = "post__image-link";
+  preview.href = mediaUrl;
+  preview.setAttribute("href", mediaUrl);
+  const image = document.createElement("img");
+  image.src = mediaUrl.replace(/\.(?:mp4|webm)(?:\?.*)?$/i, ".jpg");
+  image.setAttribute("src", image.src);
+  image.className = "post__file-preview";
+  preview.append(image);
+
+  figure.append(caption, preview);
+  return figure;
+}
+
+function createRealThread(document, threadNumber, mediaUrls) {
+  const thread = document.createElement("div");
+  thread.className = "thread";
+  thread.setAttribute("data-num", threadNumber);
+  const post = document.createElement("article");
+  post.className = "post";
+  post.setAttribute("data-num", threadNumber + "-post");
+  for (const mediaUrl of mediaUrls) post.append(createFigureAttachment(document, mediaUrl));
+  thread.append(post);
+  return { thread, post };
 }
 
 function createDuplicateMediaPost(document, mediaUrl) {
@@ -317,6 +363,49 @@ test("builds typed plain and detailed payloads with separated public text", () =
   });
 });
 
+test("omits blank optional metadata while preserving tags and multiline public text", () => {
+  const save = userscript.ACTIONS.find((action) => action.key === "save_detailed");
+  const postNow = userscript.ACTIONS.find((action) => action.key === "post_now_detailed");
+  const tagsOnly = userscript.buildPayload({
+    actionId: "action-tags-only",
+    mediaUrl: "https://2ch.org/b/src/1/clip.webm",
+    pageUrl: "https://2ch.org/b/res/1.html",
+    pageTitle: "Thread",
+    action: save,
+    metadata: { description: " \n\t ", tags: ["cats"] },
+  });
+  assert.deepEqual(tagsOnly, {
+    action_id: "action-tags-only",
+    url: "https://2ch.org/b/src/1/clip.webm",
+    page_url: "https://2ch.org/b/res/1.html",
+    page_title: "Thread",
+    requested_action: "save",
+    tags: ["cats"],
+  });
+
+  const blankPublic = userscript.buildPayload({
+    actionId: "action-blank-public",
+    mediaUrl: "https://2ch.org/b/src/1/clip.webm",
+    pageUrl: "https://2ch.org/b/res/1.html",
+    pageTitle: "Thread",
+    action: postNow,
+    metadata: { description: "Internal", tags: [], publicText: " \n\t " },
+  });
+  assert.equal("requested_post_caption" in blankPublic, false);
+  assert.equal(blankPublic.description, "Internal");
+
+  const multiline = userscript.buildPayload({
+    actionId: "action-multiline-public",
+    mediaUrl: "https://2ch.org/b/src/1/clip.webm",
+    pageUrl: "https://2ch.org/b/res/1.html",
+    pageTitle: "Thread",
+    action: postNow,
+    metadata: { description: "line one\nline two", tags: [], publicText: "caption one\ncaption two\tready" },
+  });
+  assert.equal(multiline.description, "line one\nline two");
+  assert.equal(multiline.requested_post_caption, "caption one\ncaption two\tready");
+});
+
 test("normalizes tags and converts future browser-local time to RFC3339", () => {
   assert.deepEqual(userscript.parseTags(" Cats, reaction, cats "), ["cats", "reaction"]);
   const now = new Date(2026, 0, 1, 12, 0, 0);
@@ -331,11 +420,18 @@ test("fixture keeps the supported page surface narrow", () => {
     path.join(__dirname, "fixtures", "2ch-direct-attachments.html"),
     "utf8"
   );
+  const realFixture = fs.readFileSync(
+    path.join(__dirname, "fixtures", "2ch-real-attachments.html"),
+    "utf8"
+  );
   for (const host of ["2ch.su", "2ch.org", "2ch.life"]) {
     const escapedHost = host.replace(".", "\\.");
     assert.match(fixture, new RegExp("https://" + escapedHost + "/.*clip\\.webm"));
     assert.match(fixture, new RegExp("https://" + escapedHost + "/.*clip\\.mp4"));
   }
+  assert.match(realFixture, /figure class="post__image"/);
+  assert.match(realFixture, /class="post__image-link"/);
+  assert.match(realFixture, /figcaption>[\s\S]*clip\.webm/);
   assert.doesNotMatch(fixture, /youtube|yt-dlp/i);
 });
 
@@ -366,6 +462,36 @@ test("each supported host gets vertical six-action rows for initial and dynamic 
     browser.document.notifyAdded(dynamicPost);
     assert.equal(dynamicPost.querySelectorAll(".sooqa-attachment-row").length, 1);
     assert.equal(actionButtons(dynamicPost).length, 6);
+  }
+});
+
+test("real 2ch figures wrap the preview, not the filename link, across galleries and mirrors", () => {
+  for (const host of ["2ch.su", "2ch.org", "2ch.life"]) {
+    const requests = [];
+    const browser = createBrowser("https://" + host + "/b/", requests);
+    const initialUrls = Array.from({ length: 4 }, (_value, index) =>
+      "https://" + host + "/b/src/" + (index + 1) + "/initial.webm"
+    );
+    const initial = createRealThread(browser.document, "4100", initialUrls);
+    browser.document.body.append(initial.thread);
+    userscript.boot(browser.root);
+
+    assert.equal(initial.post.querySelectorAll(".sooqa-attachment-row").length, 4);
+    assert.equal(initial.post.querySelectorAll(".sooqa-action-panel").length, 4);
+    assert.equal(initial.post.querySelectorAll("figcaption .sooqa-attachment-row").length, 0);
+    for (const row of initial.post.querySelectorAll(".sooqa-attachment-row")) {
+      assert.equal(row.querySelectorAll("figure.post__image").length, 1);
+      assert.equal(row.querySelectorAll("a.post__image-link").length, 1);
+      assert.equal(row.querySelectorAll("button[data-sooqa-action]").length, 6);
+    }
+
+    const dynamicUrls = Array.from({ length: 8 }, (_value, index) =>
+      "https://" + host + "/b/src/" + (index + 20) + "/gallery.mp4"
+    );
+    const dynamic = createRealThread(browser.document, "4200", dynamicUrls);
+    browser.document.body.append(dynamic.thread);
+    assert.equal(dynamic.post.querySelectorAll(".sooqa-attachment-row").length, 8);
+    assert.equal(dynamic.post.querySelectorAll(".sooqa-action-panel").length, 8);
   }
 });
 
@@ -481,6 +607,57 @@ test("buttons suppress in-flight duplicates, reuse timeout IDs, and reset after 
   save.click();
   assert.equal(requests.length, 3);
   assert.notEqual(requestPayload(requests[2]).action_id, firstId);
+});
+
+test("detailed interaction is fenced while metadata collection is open", async () => {
+  const requests = [];
+  const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+  const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+  browser.document.body.append(post);
+  userscript.boot(browser.root);
+
+  actionButton(post, "save_detailed").click();
+  actionButton(post, "post_now_detailed").click();
+  actionButton(post, "queue").click();
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 1);
+  assert.equal(requests.length, 0);
+
+  const dialog = browser.document.body.querySelector("dialog");
+  dialog.querySelector("textarea").value = "internal";
+  dialog.querySelectorAll("button")[1].click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+  assert.equal(requestPayload(requests[0]).requested_action, "save");
+});
+
+test("derives a canonical thread URL from a board thread container", () => {
+  const storage = new Map();
+  const firstRequests = [];
+  const first = createBrowser("https://2ch.org/b/", firstRequests, storage);
+  const firstThread = createRealThread(
+    first.document,
+    "42",
+    ["https://2ch.org/b/src/1/clip.webm"]
+  );
+  first.document.body.append(firstThread.thread);
+  userscript.boot(first.root);
+  actionButton(firstThread.post, "save").click();
+  assert.equal(requestPayload(firstRequests[0]).page_url, "https://2ch.org/b/res/42.html");
+  assert.equal(
+    firstThread.post.querySelector(".sooqa-action-panel").dataset.sooqaThreadKey,
+    "https://2ch.org/b/res/42.html"
+  );
+
+  const reloadRequests = [];
+  const reload = createBrowser("https://2ch.su/b/", reloadRequests, storage);
+  const reloadThread = createRealThread(
+    reload.document,
+    "42",
+    ["https://2ch.su/b/src/1/clip.webm"]
+  );
+  reload.document.body.append(reloadThread.thread);
+  userscript.boot(reload.root);
+  assert.match(reloadThread.post.querySelector(".sooqa-history").textContent, /Accepted requests/);
 });
 
 test("accepted history is mirror-canonical, thread-local, bounded, and clearable", () => {

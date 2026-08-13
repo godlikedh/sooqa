@@ -123,16 +123,25 @@
       requested_action: action.requestAction,
     };
     if (metadata) {
-      payload.description = metadata.description;
-      payload.tags = metadata.tags;
-      if (action.publicText) payload.requested_post_caption = metadata.publicText;
-      if (action.exactTime) payload.requested_publish_at = metadata.requestedPublishAt;
+      const description = String(metadata.description || "").trim();
+      const tags = Array.isArray(metadata.tags) ? metadata.tags.filter(Boolean) : [];
+      if (description) payload.description = description;
+      if (tags.length) payload.tags = tags;
+      if (action.publicText) {
+        const publicText = String(metadata.publicText || "").trim();
+        if (publicText) payload.requested_post_caption = publicText;
+      }
+      if (action.exactTime && metadata.requestedPublishAt) {
+        payload.requested_publish_at = metadata.requestedPublishAt;
+      }
     }
     return payload;
   }
 
   function findPostContainer(node) {
-    const post = node.closest && node.closest("article, .post, [data-num], [id^='p']");
+    const post = node.closest && node.closest(
+      "article, .post, .thread[data-num], .thread, [data-num], [id^='p']"
+    );
     if (post) return post;
     const parent = node.parentElement;
     if (parent && (parent.tagName === "VIDEO" || parent.tagName === "SOURCE")) {
@@ -151,6 +160,114 @@
       return node.parentElement;
     }
     return node;
+  }
+
+  function findThreadContainer(node) {
+    return node && node.closest
+      ? node.closest(".thread[data-num], .thread, [data-thread-id], [data-thread-url]")
+      : null;
+  }
+
+  function threadNumber(thread) {
+    if (!thread || !thread.getAttribute) return null;
+    return (
+      thread.getAttribute("data-num") ||
+      thread.getAttribute("data-thread-id") ||
+      thread.getAttribute("data-thread-number") ||
+      null
+    );
+  }
+
+  function threadUrlFromElement(thread, baseHref) {
+    if (!thread) return null;
+    const explicit = [
+      thread.getAttribute && thread.getAttribute("data-thread-url"),
+      thread.getAttribute && thread.getAttribute("data-url"),
+    ].find(Boolean);
+    if (explicit) return new URL(explicit, baseHref).href;
+
+    const links = thread.querySelectorAll ? Array.from(thread.querySelectorAll("a[href]")) : [];
+    for (const link of links) {
+      const href = link.getAttribute && link.getAttribute("href");
+      if (!href || normalizeDirectMediaUrl(href, baseHref)) continue;
+      try {
+        const url = new URL(href, baseHref);
+        if (/\/(?:res|thread)\//i.test(url.pathname)) return url.href;
+      } catch (_error) {
+        // Ignore malformed links and continue to the data-number fallback.
+      }
+    }
+    return null;
+  }
+
+  function deriveThreadUrl(node, env) {
+    const thread = findThreadContainer(node);
+    if (!thread) return canonicalizeUrl(env.location.href);
+
+    const explicit = threadUrlFromElement(thread, env.location.href);
+    if (explicit) return canonicalizeUrl(explicit);
+
+    const number = threadNumber(thread);
+    if (!number) return canonicalizeUrl(env.location.href);
+
+    try {
+      const url = new URL(env.location.href);
+      const encodedNumber = encodeURIComponent(number);
+      const resourceMatch = /^(.*\/res\/)[^/]+(?:\.html)?\/?$/i.exec(url.pathname);
+      if (resourceMatch) {
+        url.pathname = resourceMatch[1] + encodedNumber + ".html";
+      } else {
+        const directory = url.pathname.endsWith("/")
+          ? url.pathname
+          : url.pathname.replace(/[^/]*$/, "");
+        url.pathname = directory + "res/" + encodedNumber + ".html";
+      }
+      url.search = "";
+      url.hash = "";
+      return canonicalizeUrl(url.href);
+    } catch (_error) {
+      return canonicalizeUrl(env.location.href);
+    }
+  }
+
+  function figureMediaUrl(figure, baseHref) {
+    const preferred = figure.querySelectorAll
+      ? Array.from(figure.querySelectorAll("a.post__image-link"))
+      : [];
+    const linkedPreview = figure.querySelectorAll
+      ? Array.from(figure.querySelectorAll("a[href]")).filter(
+        (link) => link.querySelector && link.querySelector("img, video, source")
+      )
+      : [];
+    const mediaNodes = figure.querySelectorAll
+      ? Array.from(figure.querySelectorAll("video[src], source[src]"))
+      : [];
+    return extractDirectAttachmentUrls(
+      [...preferred, ...linkedPreview, ...mediaNodes],
+      baseHref
+    )[0] || null;
+  }
+
+  function attachmentCandidates(root, env) {
+    const candidates = [];
+    const figures = [];
+    if (root.matches && root.matches("figure.post__image")) figures.push(root);
+    figures.push(...Array.from(root.querySelectorAll("figure.post__image")));
+    for (const figure of figures) {
+      const mediaUrl = figureMediaUrl(figure, env.location.href);
+      if (mediaUrl) candidates.push({ node: figure, target: figure, mediaUrl });
+    }
+
+    const nodes = [];
+    if (root.matches && root.matches("a[href], video[src], source[src]")) nodes.push(root);
+    nodes.push(...Array.from(root.querySelectorAll("a[href], video[src], source[src]")));
+    for (const node of nodes) {
+      if (node.closest && node.closest("figure.post__image")) continue;
+      const target = findAttachmentTarget(node);
+      const mediaUrl = extractDirectAttachmentUrls([node], env.location.href)[0];
+      if (target && mediaUrl) candidates.push({ node, target, mediaUrl });
+    }
+    return candidates;
   }
 
   function makeButton(document, label, className, type = "button") {
@@ -423,9 +540,9 @@
     );
   }
 
-  function createActionPanel(env, mediaUrl, pageUrl) {
+  function createActionPanel(env, mediaUrl, threadUrl) {
     const mediaKey = canonicalizeUrl(mediaUrl);
-    const threadKey = canonicalizeUrl(pageUrl);
+    const threadKey = canonicalizeUrl(threadUrl);
     const panel = env.document.createElement("span");
     panel.className = "sooqa-action-panel";
     panel.dataset.sooqaMediaUrl = mediaUrl;
@@ -436,7 +553,7 @@
     status.className = "sooqa-action-status";
     const historyElement = env.document.createElement("span");
     historyElement.className = "sooqa-history";
-    const state = { retry: null, sending: false };
+    const state = { retry: null, sending: false, collecting: false };
 
     const setStatus = (value) => {
       status.textContent = value;
@@ -446,7 +563,7 @@
       const payload = buildPayload({
         actionId,
         mediaUrl,
-        pageUrl: env.location.href,
+        pageUrl: threadUrl,
         pageTitle: env.document.title,
         action,
         metadata,
@@ -455,14 +572,22 @@
     };
 
     const submit = async (action) => {
-      if (state.sending) return;
+      if (state.sending || state.collecting) return;
       if (state.retry && state.retry.actionKey !== action.key) state.retry = null;
       if (!state.retry) {
         let metadata = null;
         if (action.detailed) {
-          metadata = await collectMetadata({ ...env, setStatus }, action);
-          if (!metadata) return;
+          state.collecting = true;
+          setButtonsDisabled(panel, true);
+          try {
+            metadata = await collectMetadata({ ...env, setStatus }, action);
+          } finally {
+            state.collecting = false;
+            if (!state.sending) setButtonsDisabled(panel, false);
+          }
+          if (!metadata || state.sending || state.retry) return;
         }
+        if (state.sending || state.collecting || state.retry) return;
         state.retry = makeAttempt(action, metadata);
       }
 
@@ -538,13 +663,8 @@
   function decorate(root, env) {
     loadAcceptedHistory(env);
     ensureStyles(env);
-    const nodes = [];
-    if (root.matches && root.matches("a[href], video[src], source[src]")) nodes.push(root);
-    nodes.push(...Array.from(root.querySelectorAll("a[href], video[src], source[src]")));
     const decorated = new Set();
-    for (const node of nodes) {
-      const target = findAttachmentTarget(node);
-      const mediaUrl = extractDirectAttachmentUrls([node], env.location.href)[0];
+    for (const { target, mediaUrl } of attachmentCandidates(root, env)) {
       if (!target || !mediaUrl || decorated.has(target)) continue;
       const container = findPostContainer(target);
       if (!container) continue;
@@ -559,7 +679,7 @@
       row.dataset.sooqaMediaKey = mediaKey;
       const preview = env.document.createElement("div");
       preview.className = "sooqa-attachment-preview";
-      const panel = createActionPanel(env, mediaUrl, env.location.href);
+      const panel = createActionPanel(env, mediaUrl, deriveThreadUrl(target, env));
       const targetParent = target.parentElement;
       if (targetParent) targetParent.insertBefore(row, target);
       else container.append(row);
