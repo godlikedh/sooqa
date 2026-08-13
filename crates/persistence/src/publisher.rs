@@ -5,7 +5,7 @@ use sooqa_jobs::JobAttempt;
 use sooqa_publisher::{
     Channel, ChannelValidationError, NewChannel, NewPost, Post, PostSchedule, PostState,
     PostUpdate, PublishClaim, PublishRetry, PublishedMessage, PublisherValidationError,
-    QueueDirection, validate_caption,
+    QueueDirection, QueuePost, validate_caption,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::collections::HashMap;
@@ -71,6 +71,24 @@ struct PostRow {
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     revision: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct QueuePostRow {
+    id: Uuid,
+    revision: i64,
+    state: String,
+    scheduled_at: OffsetDateTime,
+    cadence_slot_at: Option<OffsetDateTime>,
+    time_zone: String,
+    caption: Option<String>,
+    media_kind: String,
+    title: Option<String>,
+    description: Option<String>,
+    tags: Vec<String>,
+    source_url: Option<String>,
+    storage_chat_id: Option<i64>,
+    storage_message_id: Option<i64>,
 }
 
 impl PublisherRepository {
@@ -169,6 +187,105 @@ impl PublisherRepository {
             .await?
             .map(PostRow::into_post)
             .transpose()
+    }
+
+    pub async fn count_queue_posts(&self) -> Result<i64, PublisherRepositoryError> {
+        Ok(sqlx::query_scalar(
+            "SELECT count(*) FROM posts WHERE state IN ('draft', 'queued', 'failed')",
+        )
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    pub async fn list_queue_posts(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<QueuePost>, PublisherRepositoryError> {
+        let rows = sqlx::query_as::<_, QueuePostRow>(
+            "SELECT posts.id, posts.revision, posts.state, posts.scheduled_at, posts.cadence_slot_at, channels.time_zone, posts.caption, media.kind AS media_kind, media.title, media.description, media.tags, media.source_url, media.telegram_storage_chat_id AS storage_chat_id, media.telegram_storage_message_id AS storage_message_id FROM posts JOIN channels ON channels.id = posts.channel_id JOIN media ON media.id = posts.media_id WHERE posts.state IN ('draft', 'queued', 'failed') ORDER BY COALESCE(posts.cadence_slot_at, posts.scheduled_at), posts.id LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(QueuePostRow::into_queue_post).collect())
+    }
+
+    pub async fn queue_post(
+        &self,
+        id: Uuid,
+        _revision: i64,
+    ) -> Result<QueuePost, PublisherRepositoryError> {
+        self.find_queue_post(id).await
+    }
+
+    pub async fn find_queue_post(&self, id: Uuid) -> Result<QueuePost, PublisherRepositoryError> {
+        Ok(sqlx::query_as::<_, QueuePostRow>(
+            "SELECT posts.id, posts.revision, posts.state, posts.scheduled_at, posts.cadence_slot_at, channels.time_zone, posts.caption, media.kind AS media_kind, media.title, media.description, media.tags, media.source_url, media.telegram_storage_chat_id AS storage_chat_id, media.telegram_storage_message_id AS storage_message_id FROM posts JOIN channels ON channels.id = posts.channel_id JOIN media ON media.id = posts.media_id WHERE posts.id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(PublisherRepositoryError::PostMissing(id))?
+        .into_queue_post())
+    }
+
+    pub async fn move_queue_post(
+        &self,
+        id: Uuid,
+        direction: QueueDirection,
+        revision: i64,
+    ) -> Result<QueuePost, PublisherRepositoryError> {
+        self.move_adjacent(id, direction, revision).await?;
+        self.queue_post(id, revision).await
+    }
+
+    pub async fn set_queue_post_slot(
+        &self,
+        id: Uuid,
+        slot: OffsetDateTime,
+        revision: i64,
+    ) -> Result<QueuePost, PublisherRepositoryError> {
+        self.set_slot(id, slot, revision).await?;
+        self.queue_post(id, revision).await
+    }
+
+    pub async fn update_queue_caption(
+        &self,
+        id: Uuid,
+        revision: i64,
+        caption: Option<String>,
+    ) -> Result<QueuePost, PublisherRepositoryError> {
+        self.update_post(
+            id,
+            PostUpdate {
+                caption: Some(caption),
+                parse_mode: None,
+                disable_notification: None,
+                expected_updated_at: None,
+                expected_revision: revision,
+            },
+        )
+        .await?;
+        self.queue_post(id, revision).await
+    }
+
+    pub async fn publish_queue_post(
+        &self,
+        id: Uuid,
+        revision: i64,
+    ) -> Result<QueuePost, PublisherRepositoryError> {
+        let request_key = format!("telegram:queue:now:{id}:{revision}");
+        self.publish_now(id, request_key, revision).await?;
+        self.queue_post(id, revision).await
+    }
+
+    pub async fn cancel_queue_post(
+        &self,
+        id: Uuid,
+        revision: i64,
+    ) -> Result<QueuePost, PublisherRepositoryError> {
+        self.cancel_post(id, revision).await?;
+        self.queue_post(id, revision).await
     }
 
     pub async fn update_post(
@@ -1158,6 +1275,28 @@ impl PostRow {
             updated_at: self.updated_at,
             revision: self.revision,
         })
+    }
+}
+
+impl QueuePostRow {
+    fn into_queue_post(self) -> QueuePost {
+        QueuePost {
+            id: self.id,
+            revision: self.revision,
+            state: PostState::try_from(self.state.as_str())
+                .expect("posts.state is constrained by the database schema"),
+            scheduled_at: self.scheduled_at,
+            cadence_slot_at: self.cadence_slot_at,
+            time_zone: self.time_zone,
+            caption: self.caption,
+            media_kind: self.media_kind,
+            title: self.title,
+            description: self.description,
+            tags: self.tags,
+            source_url: self.source_url,
+            storage_chat_id: self.storage_chat_id,
+            storage_message_id: self.storage_message_id,
+        }
     }
 }
 

@@ -33,6 +33,20 @@ publish-now makes the existing post job due immediately without consuming its
 future cadence slot. Each queued post has one fixed-dedupe job and a revision
 fence; stale admin views and claimed jobs cannot overwrite newer queue state.
 
+The private administrator bot exposes `/queue` as a bounded control surface.
+It first offers count choices on the `1, 2, 5 x 10^n` scale, then renders
+text-only cards with localized cadence slots, catalogue metadata, separate
+public post text, and links to the existing storage messages. Card actions
+call the Publisher commands for moves, slot changes, caption edits, immediate
+publication, and removal; callback payloads carry the post revision, and old
+views are harmlessly rejected or cleaned up from bounded process-local state.
+Caption and slot prompts are accepted only as replies to their own ForceReply
+message; ordinary messages and commands do not accidentally become captions.
+Draft and failed rows remain visible for editable actions, while cadence moves
+and slot assignment are rendered only for queued rows. Queue cards are paced
+per chat and retry bounded Telegram flood-control responses without replaying a
+completed update.
+
 Large-media capture uses Telegram's official local Bot API server when the home
 deployment is cut over manually. URL/link source downloads, Telegram-source
 downloads, and canonical normalized storage output have separate budgets. The

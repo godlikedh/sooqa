@@ -83,6 +83,83 @@ async fn publish_job_snapshot(
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
+async fn queue_projection_preserves_every_mutable_post_state(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let channel = database
+        .publisher()
+        .create_channel(
+            NewChannel::try_new(format!("projection-{}", Uuid::new_v4()), -1000000000010).unwrap(),
+        )
+        .await
+        .unwrap();
+    let media_id = stored_media(&database).await;
+    let database_ref = &database;
+    let create = |suffix: &str| {
+        let suffix = suffix.to_owned();
+        async move {
+            database_ref
+                .publisher()
+                .create_post_idempotent(
+                    NewPost {
+                        media_id,
+                        channel_id: channel.id,
+                        caption: Some(suffix.to_owned()),
+                        parse_mode: None,
+                        disable_notification: false,
+                    },
+                    format!("projection-{suffix}-{}", Uuid::new_v4()),
+                    suffix.as_bytes(),
+                )
+                .await
+                .unwrap()
+                .post
+        }
+    };
+    let draft = create("draft").await;
+    let queued = create("queued").await;
+    let failed = create("failed").await;
+    let sending = create("sending").await;
+    let requested_at = OffsetDateTime::now_utc();
+    let queued = database
+        .publisher()
+        .schedule_post(PostSchedule::try_new(queued.id, requested_at, "queued-key", 0).unwrap())
+        .await
+        .unwrap();
+    let failed = database
+        .publisher()
+        .schedule_post(PostSchedule::try_new(failed.id, requested_at, "failed-key", 0).unwrap())
+        .await
+        .unwrap();
+    let sending = database
+        .publisher()
+        .schedule_post(PostSchedule::try_new(sending.id, requested_at, "sending-key", 0).unwrap())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE posts SET state = 'failed' WHERE id = $1")
+        .bind(failed.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE posts SET state = 'sending', send_token = gen_random_uuid(), send_started_at = now() WHERE id = $1",
+    )
+        .bind(sending.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let projected = database.publisher().list_queue_posts(10).await.unwrap();
+    let mut states = projected.iter().map(|post| post.state).collect::<Vec<_>>();
+    states.sort_by_key(|state| state.as_str());
+    assert_eq!(states, vec![PostState::Draft, PostState::Failed, PostState::Queued]);
+    assert!(projected.iter().any(|post| post.id == draft.id && post.state == PostState::Draft));
+    assert!(projected.iter().any(|post| post.id == queued.id && post.state == PostState::Queued));
+    assert!(projected.iter().any(|post| post.id == failed.id && post.state == PostState::Failed));
+    assert!(!projected.iter().any(|post| post.id == sending.id));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn post_schedule_uses_one_row_and_channel_cadence(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let channel = database

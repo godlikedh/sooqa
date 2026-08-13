@@ -240,6 +240,24 @@ pub struct PublishedMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuePost {
+    pub id: Uuid,
+    pub revision: i64,
+    pub state: PostState,
+    pub scheduled_at: OffsetDateTime,
+    pub cadence_slot_at: Option<OffsetDateTime>,
+    pub time_zone: String,
+    pub caption: Option<String>,
+    pub media_kind: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+    pub source_url: Option<String>,
+    pub storage_chat_id: Option<i64>,
+    pub storage_message_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRetry {
     pub post: Post,
     pub terminal: bool,
