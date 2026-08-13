@@ -46,7 +46,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "time",
     "uuid",
 ] }
-time = { version = "0.3", features = ["serde"] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 thiserror = "2"
 teloxide = { version = "0.17", default-features = false, features = ["rustls", "ctrlc_handler"] }

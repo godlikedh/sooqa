@@ -26,6 +26,27 @@ The first release is intentionally narrow:
 - searchable stored media with captions/descriptions and normalized tags;
 - immediate publication or a simple per-channel cadence queue.
 
+Publisher queue commands are durable PostgreSQL mutations: enqueue assigns the
+next valid channel-local cadence slot, adjacent and explicit slot moves swap
+only the affected posts, captions can be edited or explicitly cleared, and
+publish-now makes the existing post job due immediately without consuming its
+future cadence slot. Each queued post has one fixed-dedupe job and a revision
+fence; stale admin views and claimed jobs cannot overwrite newer queue state.
+
+The private administrator bot exposes `/queue` as a bounded control surface.
+It first offers count choices on the `1, 2, 5 x 10^n` scale, then renders
+text-only cards with localized cadence slots, catalogue metadata, separate
+public post text, and links to the existing storage messages. Card actions
+call the Publisher commands for moves, slot changes, caption edits, immediate
+publication, and removal; callback payloads carry the post revision, and old
+views are harmlessly rejected or cleaned up from bounded process-local state.
+Caption and slot prompts are accepted only as replies to their own ForceReply
+message; ordinary messages and commands do not accidentally become captions.
+Draft and failed rows remain visible for editable actions, while cadence moves
+and slot assignment are rendered only for queued rows. Queue cards are paced
+per chat and retry bounded Telegram flood-control responses without replaying a
+completed update.
+
 Large-media capture uses Telegram's official local Bot API server when the home
 deployment is cut over manually. URL/link source downloads, Telegram-source
 downloads, and canonical normalized storage output have separate budgets. The
@@ -96,16 +117,25 @@ fails the owning ingest only when that atomic success transaction did not
 commit.
 
 Lease heartbeats and terminal job mutations require an unexpired lease. When a
-final attempt expires, recovery fails the owning ingest explicitly (or marks
-storage unknown for an upload job) so a crashed worker cannot strand the
-workflow.
+final attempt expires, recovery fails the owning ingest explicitly (marks
+storage unknown for an upload job, or fences an interrupted publication as
+unknown) so a crashed worker cannot strand the workflow.
 
 Post cadence slots are assigned when a post is queued. A `publish_post` job
 references the `posts` row, and one post row becomes the durable publication
 record after success. Telegram calls, HTTP downloads, ffmpeg, and ffprobe run
 outside database transactions. External effects use state plus generation or
 fencing tokens, and ambiguous effects are retained for explicit reconciliation
-instead of being blindly retried.
+instead of being blindly retried. A retryable no-effect publication updates
+the running job payload and post revision atomically; on its final attempt the
+post becomes failed before the job becomes terminal. Publication copies the
+ready Telegram storage
+message into the target channel and falls back to the stored media-kind-specific
+file ID only for an explicitly safe copy-unavailable response; it never reads
+the canonical local file. Missing public captions are sent as an explicit empty
+caption so storage metadata does not leak. Caption/entity rejection becomes a
+failed, editable post, while flood-control responses known to have had no
+effect requeue through the bounded job retry policy.
 
 ## Idempotency ownership
 

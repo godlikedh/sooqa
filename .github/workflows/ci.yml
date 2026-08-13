@@ -90,10 +90,11 @@ jobs:
           DATABASE_URL: postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa
         run: |
           cargo test -p sooqa-persistence --tests -- --ignored
-          cargo test -p sooqa-api --test ingest -- --ignored
+          cargo test -p sooqa-api --tests -- --ignored
           cargo test -p sooqa-worker --test worker -- --ignored
           cargo test -p sooqa-worker --test inspection -- --ignored
           cargo test -p sooqa-worker --test identity -- --ignored
+          cargo test -p sooqa-worker --test publication -- --ignored
 
   media:
     name: Media integration

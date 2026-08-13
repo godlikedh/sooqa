@@ -77,10 +77,18 @@ this baseline.
 - `sooqa-media` owns direct HTTP, the exact-host 2ch mirror adapter, the
   allowlisted yt-dlp adapter, ffprobe, ffmpeg, image normalization, hashing,
   fingerprints, workspaces, and subprocess safety.
-- `sooqa-telegram` owns Telegram protocol mapping and storage upload effects.
-  Polling, worker-side source downloads, and storage uploads use separate HTTP
-  clients and timeout policies. Telegram file acceptance is metadata-only;
-  source bytes are reconstructed by the worker from the durable file ID.
+- `sooqa-telegram` owns Telegram protocol mapping, storage upload effects, and
+  publication copy/send effects. Polling, worker-side source downloads,
+  storage uploads, and publication use separate bounded calls. Telegram file
+  acceptance is metadata-only; source bytes are reconstructed by the worker
+  from the durable file ID. Publication receives only a ready storage receipt
+  and never receives a local media path. Queue prompts retain the ForceReply
+  message ID and post revision; callbacks validate the current queue projection
+  through the Publisher adapter before sending a prompt. Queue rendering
+  carries post state so draft/failed rows do not expose queued-only slot moves.
+  Queue cards use a per-chat pacing hook and bounded RetryAfter retries; a
+  partial view is cleaned up and its update claim is completed before reporting
+  the rendering failure.
 - `sooqa-persistence` owns migrations and short database transactions.
 - `sooqa-api` owns HTTP routing, one configured bearer secret, limits, and
   stable request-ID errors.
@@ -249,9 +257,75 @@ state transition.
 Channels hold only target identity, enablement, timezone, window, and interval.
 Posts hold the intended message and the latest send result. A scheduled post
 is a query over `posts.state = 'queued'`; scheduling assigns `cadence_slot_at`
-and enqueues a `publish_post` job referencing the post ID. Send generation and
-token fence retries, while `unknown` preserves an ambiguous Telegram outcome
-for explicit reconciliation.
+and enqueues one fixed-dedupe `publish_post` job referencing the post ID. Queue
+mutations lock the channel first and then the affected post/job rows in a
+stable order. `posts.revision` is copied into the job payload, so a stale
+claim cannot send after an edit, swap, move, or publish-now operation. Adjacent
+move and occupied-slot operations swap exactly two slots; empty-slot moves do
+not compact unrelated posts. All post/job changes commit without Telegram I/O.
+Send generation and token fence retries, while `unknown` preserves an
+ambiguous Telegram outcome for explicit reconciliation. `publish now` changes
+only the job due time and leaves the cadence slot intact.
+
+Publication claims the queued post in a short transaction, increments its send
+generation, records a fresh token, and commits before calling Telegram. The
+adapter first calls `copyMessage` from the persisted private storage
+chat/message and supplies the public caption (an empty caption when absent),
+parse mode, and notification setting. Only an explicit copy-unavailable
+response permits the media-kind-specific stored `file_id` fallback. The
+canonical local file is never opened or uploaded by this path.
+
+Success and failure completion are conditional on the exact generation and
+token, so a stale worker cannot overwrite a newer attempt. Caption syntax
+errors become editable `failed` posts and their job is terminal; explicit
+no-effect errors such as Telegram flood-control responses requeue the post and
+update the running job payload before bounded retry. The final no-effect retry
+settles the post as `failed` before the worker settles the job, so a terminal
+job cannot leave a queued post behind. Database or malformed-receipt failures
+before the Telegram call are classified as known no-effect failures and follow
+the same bounded retry/final-failure path; missing or invalid receipts that
+cannot succeed are actionable `failed` outcomes. Network, invalid-response,
+and unknown Telegram outcomes become `unknown` and are never automatically
+sent again. If a worker lease expires while a post is `sending`, recovery
+fences that generation as `unknown` before the recovered job completes, and
+stale completion from the old attempt is rejected. The job is terminal after
+an ambiguous result; operator reconciliation is intentionally a later slice.
+
+```mermaid
+sequenceDiagram
+    participant Queue as queue.jobs
+    participant Worker
+    participant DB as posts + media
+    participant Telegram
+
+    Queue->>Worker: claim publish_post + expected revision
+    Worker->>DB: claim queued post -> sending + generation/token
+    DB-->>Worker: commit claim + storage receipt/channel
+    Worker->>Telegram: copyMessage(storage -> target)
+    alt copy unavailable and safe
+        Worker->>Telegram: send media by stored file_id
+    end
+    alt definite success
+        Worker->>DB: complete only matching generation/token -> published
+    else caption/entity rejection
+        Worker->>DB: matching failure -> failed
+    else ambiguous network/API outcome
+        Worker->>DB: matching failure -> unknown
+    else explicit no-effect retry
+        Worker->>DB: matching requeue + new job revision
+        Worker->>Queue: bounded retry policy
+    end
+```
+
+The configured administrator can inspect and mutate the same durable queue in
+the private Telegram DM with `/queue`. The Telegram adapter owns only bounded
+message-ID and ForceReply state; it does not create a UI table or issue SQL.
+Count callbacks load at most 125 posts, render one text card per post, and
+link directly to the existing storage message. Every mutating callback carries
+the post revision and delegates to `PublisherService`, so stale cards produce
+`Queue changed; run /queue again.` without changing PostgreSQL state. A
+partial render is deleted best-effort and reported, while a second `/queue`
+cleans the previous view before replacing it.
 
 ## Security and filesystem rules
 
