@@ -54,6 +54,20 @@ Caption-sync failures appear from the media row's bounded sync marker and can
 be requeued with the authenticated
 `POST /api/v1/media/{id}/caption-sync/retry` command.
 
+Open `/admin` in the owner's Windows Chrome session for the embedded web
+client. Enter the configured API token when prompted; it is kept only in that
+browser session and can be removed with `Forget token`. The Dashboard loads
+only the bounded dashboard response and invokes the existing duplicate and
+publication-decision commands. Ingests loads 50 rows at a time and its refresh
+button returns to the first page; it has no retry or job controls. Settings
+loads disabled channels too, edits one selected target with its `updated_at`
+fence, and reloads after a stale or ambiguous configuration conflict.
+
+The server emits the admin HTML, CSS, and JavaScript from the binary, so no
+Node process, frontend service, CDN, or asset volume is required. Keep `/admin`
+behind the same trusted-LAN boundary as the bearer API; the page's CSP and
+session-only token handling are not an internet-exposure claim.
+
 ## Telegram and media
 
 Telegram polling is enabled only when its bot token and configured admin IDs

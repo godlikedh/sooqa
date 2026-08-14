@@ -14,11 +14,14 @@ lint:
 future-incompat:
     cargo check --workspace --all-targets --future-incompat-report
 
-test: test-userscript
+test: test-userscript test-admin-assets
     cargo test --workspace --all-targets
 
 test-userscript:
     node --test userscripts/test/*.test.cjs
+
+test-admin-assets:
+    node --test apps/server/assets/admin/test/*.test.cjs
 
 db-up:
     docker compose up -d postgres

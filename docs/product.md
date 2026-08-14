@@ -89,6 +89,26 @@ captions. The authenticated
 `POST /api/v1/media/{id}/caption-sync/retry` command creates a new generation
 for a failed sync.
 
+## Web admin shell
+
+The existing server serves the dark desktop-oriented `/admin` site from static
+HTML, CSS, and vanilla JavaScript embedded in the Rust binary. It has no
+frontend runtime, build service, CDN, external fonts, or separate container.
+The owner enters the configured bearer token once per browser session; the UI
+keeps it only in `sessionStorage`, sends same-origin `Authorization` headers,
+and provides a lock action that forgets it. The UI is an operational client,
+not a second workflow authority: PostgreSQL-backed API commands remain the
+source of truth, and stale revision conflicts refresh the affected view.
+
+The Dashboard renders bounded totals and attention cards for technical
+duplicate decisions, publication-repeat decisions, and storage-caption sync
+failures. Duplicate and repeat cards invoke their existing revision/idempotent
+commands; cancellation leaves media intact. Ingests is a read-only, newest-first
+50-row cursor list and refreshes only its first page. Settings edits or creates
+the one target channel through the optimistic `updated_at` API fence, including
+the IANA time zone and cadence window. Media and Schedule navigation is reserved
+for their subsequent implementation slices.
+
 Large-media capture uses Telegram's official local Bot API server when the home
 deployment is cut over manually. URL/link source downloads, Telegram-source
 downloads, and canonical normalized storage output have separate budgets. The
@@ -220,6 +240,11 @@ come from configuration/environment secrets and never from PostgreSQL or Git.
 Target publication channels remain database rows because they are editable
 product destinations. The API remains private and authenticated; the reset
 does not broaden exposure or add multi-user behavior.
+
+The web admin is intended for Windows Chrome on the owner's trusted home LAN.
+Its restrictive same-origin CSP, session-only token storage, and text-only
+rendering of backend values reduce accidental exposure, but the MVP does not
+claim to be safe for internet exposure.
 
 ## Explicit non-goals
 
