@@ -106,7 +106,7 @@ async fn create_media_publication_intent(
     Path(id): Path<Uuid>,
     body: Result<JsonExtractor<PublicationIntentRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<PostResponse>), ApiError> {
-    authorize(&state.api_token, &headers, "publisher:write").await?;
+    authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     let action = PublicationAction::try_from(payload.requested_action.as_str()).map_err(|_| {
@@ -149,7 +149,7 @@ async fn decide_post(
     Path(id): Path<Uuid>,
     body: Result<JsonExtractor<DecisionRequest>, JsonRejection>,
 ) -> Result<Json<PostResponse>, ApiError> {
-    authorize(&state.api_token, &headers, "publisher:write").await?;
+    authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     let decision = parse_decision(&payload.decision, &headers)?;
@@ -168,7 +168,7 @@ async fn schedule_post_exact(
     Path(id): Path<Uuid>,
     body: Result<JsonExtractor<ExactScheduleRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<PostResponse>), ApiError> {
-    authorize(&state.api_token, &headers, "publisher:write").await?;
+    authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     validate_expected_revision(payload.expected_revision, &headers)?;
