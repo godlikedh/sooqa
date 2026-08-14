@@ -7,7 +7,10 @@ use axum::{
 use serde::{Deserialize, Serialize, de::Deserializer};
 use sha2::{Digest, Sha256};
 use sooqa_library::{MediaStatus, MediaStorageState};
-use sooqa_publisher::{Channel, NewChannel, NewPost, Post, PostSchedule, PostState, PostUpdate};
+use sooqa_publisher::{
+    Channel, NewChannel, NewPost, Post, PostExactSchedule, PostSchedule, PostState, PostUpdate,
+    PublicationAction, PublicationDecision, PublicationIntent,
+};
 use time::{OffsetDateTime, Time};
 use uuid::Uuid;
 
@@ -21,9 +24,12 @@ pub(crate) fn routes() -> Router<ApiState> {
     Router::new()
         .route("/api/v1/channels", get(list_channels).post(create_channel))
         .route("/api/v1/channels/{id}", get(get_channel))
+        .route("/api/v1/media/{id}/publication-intent", post(create_media_publication_intent))
         .route("/api/v1/posts", post(create_post))
         .route("/api/v1/posts/{id}", get(get_post).patch(update_post))
         .route("/api/v1/posts/{id}/schedule", post(schedule_post))
+        .route("/api/v1/posts/{id}/schedule-exact", post(schedule_post_exact))
+        .route("/api/v1/posts/{id}/decision", post(decide_post))
         .route("/api/v1/posts/{id}/publish", post(publish_now))
         .route("/api/v1/posts/{id}/cancel", post(cancel_post))
 }
@@ -92,6 +98,93 @@ async fn get_channel(
             ApiError::not_found("channel_not_found", "The channel was not found", &headers)
         })?;
     Ok(Json(ChannelResponse::from_channel(&channel)))
+}
+
+async fn create_media_publication_intent(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: Result<JsonExtractor<PublicationIntentRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<PostResponse>), ApiError> {
+    authorize(&state.api_token, &headers, "publisher:write").await?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    let action = PublicationAction::try_from(payload.requested_action.as_str()).map_err(|_| {
+        ApiError::bad_request(
+            "invalid_publication_action",
+            "The requested action must be queue or post_now",
+            &headers,
+        )
+    })?;
+    let intent = PublicationIntent::try_new(
+        action,
+        payload.requested_publish_at,
+        payload.requested_post_caption,
+    )
+    .map_err(|error| map_publisher_error(error.into(), &headers))?;
+    let media = state
+        .library
+        .find_media(id)
+        .await
+        .map_err(|error| map_library_error(error, &headers))?
+        .ok_or_else(|| {
+            ApiError::not_found("media_not_found", "The media item was not found", &headers)
+        })?;
+    require_publishable(&media.status, media.storage_state, &headers)?;
+    let request_key = format!("media:{id}:intent:{}", idempotency_key(&headers)?);
+    let result = state
+        .publisher
+        .create_publication_intent(id, intent, request_key)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
+    Ok((
+        if result.created { StatusCode::CREATED } else { StatusCode::OK },
+        Json(PostResponse::from_post(&result.post)),
+    ))
+}
+
+async fn decide_post(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: Result<JsonExtractor<DecisionRequest>, JsonRejection>,
+) -> Result<Json<PostResponse>, ApiError> {
+    authorize(&state.api_token, &headers, "publisher:write").await?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    let decision = parse_decision(&payload.decision, &headers)?;
+    validate_expected_revision(payload.expected_revision, &headers)?;
+    let post = state
+        .publisher
+        .decide_post(id, decision, idempotency_key(&headers)?, payload.expected_revision)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
+    Ok(Json(PostResponse::from_post(&post)))
+}
+
+async fn schedule_post_exact(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: Result<JsonExtractor<ExactScheduleRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<PostResponse>), ApiError> {
+    authorize(&state.api_token, &headers, "publisher:write").await?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    validate_expected_revision(payload.expected_revision, &headers)?;
+    let schedule = PostExactSchedule::try_new(
+        id,
+        payload.publish_at,
+        idempotency_key(&headers)?,
+        payload.expected_revision,
+    )
+    .map_err(|error| map_publisher_error(error.into(), &headers))?;
+    let post = state
+        .publisher
+        .schedule_post_exact(schedule)
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
+    Ok((StatusCode::ACCEPTED, Json(PostResponse::from_post(&post))))
 }
 
 async fn create_post(
@@ -326,6 +419,20 @@ fn validate_expected_revision(expected_revision: i64, headers: &HeaderMap) -> Re
     Ok(())
 }
 
+fn parse_decision(value: &str, headers: &HeaderMap) -> Result<PublicationDecision, ApiError> {
+    match value {
+        "post_now_anyway" => Ok(PublicationDecision::PostNowAnyway),
+        "queue_anyway" => Ok(PublicationDecision::QueueAnyway),
+        "keep_exact_time" => Ok(PublicationDecision::KeepExactTime),
+        "cancel" => Ok(PublicationDecision::Cancel),
+        _ => Err(ApiError::bad_request(
+            "invalid_publication_decision",
+            "The publication decision is invalid",
+            headers,
+        )),
+    }
+}
+
 fn post_request_hash(payload: &CreatePostRequest) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(payload.media_id.as_bytes());
@@ -493,6 +600,32 @@ struct ScheduleRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PublicationIntentRequest {
+    requested_action: String,
+    #[serde(default)]
+    #[serde(with = "time::serde::rfc3339::option")]
+    requested_publish_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    requested_post_caption: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecisionRequest {
+    decision: String,
+    expected_revision: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactScheduleRequest {
+    #[serde(with = "time::serde::rfc3339")]
+    publish_at: OffsetDateTime,
+    expected_revision: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MutationRequest {
     expected_revision: i64,
 }
@@ -502,6 +635,11 @@ struct PostResponse {
     id: Uuid,
     media_id: Uuid,
     channel_id: Uuid,
+    origin_ingest_id: Option<Uuid>,
+    requested_action: PublicationAction,
+    #[serde(with = "time::serde::rfc3339::option")]
+    requested_publish_at: Option<OffsetDateTime>,
+    repeat_evidence: Option<sooqa_publisher::RepeatEvidence>,
     caption: Option<String>,
     parse_mode: Option<String>,
     disable_notification: bool,
@@ -523,6 +661,10 @@ impl PostResponse {
             id: post.id,
             media_id: post.media_id,
             channel_id: post.channel_id,
+            origin_ingest_id: post.origin_ingest_id,
+            requested_action: post.requested_action,
+            requested_publish_at: post.requested_publish_at,
+            repeat_evidence: post.repeat_evidence.clone(),
             caption: post.caption.clone(),
             parse_mode: post.parse_mode.clone(),
             disable_notification: post.disable_notification,

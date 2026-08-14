@@ -3,9 +3,10 @@ use chrono_tz::Tz;
 use sha2::{Digest, Sha256};
 use sooqa_jobs::JobAttempt;
 use sooqa_publisher::{
-    Channel, ChannelValidationError, NewChannel, NewPost, Post, PostSchedule, PostState,
-    PostUpdate, PublishClaim, PublishRetry, PublishedMessage, PublisherValidationError,
-    validate_caption,
+    Channel, ChannelValidationError, MAX_REPEAT_EVIDENCE_BYTES, MAX_REPEAT_EVIDENCE_CONFLICTS,
+    NewChannel, NewPost, Post, PostExactSchedule, PostSchedule, PostState, PostUpdate,
+    PublicationAction, PublicationDecision, PublicationIntent, PublishClaim, PublishRetry,
+    PublishedMessage, PublisherValidationError, RepeatConflict, RepeatEvidence, validate_caption,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
@@ -20,6 +21,12 @@ pub struct PublisherRepository {
 #[derive(Debug, Clone)]
 pub struct CreatePostResult {
     pub post: Post,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaterializationResult {
+    pub post: Option<Post>,
     pub created: bool,
 }
 
@@ -50,6 +57,12 @@ struct ChannelRow {
 struct PostRow {
     id: Uuid,
     request_hash: Option<Vec<u8>>,
+    origin_ingest_id: Option<Uuid>,
+    requested_action: String,
+    requested_publish_at: Option<OffsetDateTime>,
+    repeat_evidence: Option<serde_json::Value>,
+    decision_request_key: Option<String>,
+    decision_request_hash: Option<Vec<u8>>,
     schedule_request_key: Option<String>,
     schedule_request_hash: Option<Vec<u8>>,
     media_id: Uuid,
@@ -70,6 +83,38 @@ struct PostRow {
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     revision: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct MaterializationIngestRow {
+    id: Uuid,
+    state: String,
+    media_id: Option<Uuid>,
+    requested_action: String,
+    requested_publish_at: Option<OffsetDateTime>,
+    requested_post_caption: Option<String>,
+    requested_channel_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct RepeatConflictRow {
+    id: Uuid,
+    state: String,
+    scheduled_at: Option<OffsetDateTime>,
+    published_at: Option<OffsetDateTime>,
+    telegram_message_id: Option<i64>,
+    telegram_chat_id: i64,
+}
+
+struct IntendedPostInput<'a> {
+    request_key: &'a str,
+    request_hash: &'a [u8],
+    origin_ingest_id: Option<Uuid>,
+    media_id: Uuid,
+    channel: &'a ChannelRow,
+    intent: &'a PublicationIntent,
+    post_id: Uuid,
+    now: OffsetDateTime,
 }
 
 impl PublisherRepository {
@@ -159,6 +204,129 @@ impl PublisherRepository {
             return Err(PublisherRepositoryError::RequestKeyConflict(request_key));
         }
         Ok(CreatePostResult { post: existing.into_post()?, created: false })
+    }
+
+    /// Create the one intended post for a direct media action. The channel is
+    /// selected inside the same transaction as the post so a request cannot
+    /// observe one enabled channel and persist another target.
+    pub async fn create_publication_intent(
+        &self,
+        media_id: Uuid,
+        intent: PublicationIntent,
+        request_key: String,
+    ) -> Result<CreatePostResult, PublisherRepositoryError> {
+        let request_key = sooqa_publisher::normalize_request_key(request_key)?;
+        let request_hash = publication_intent_hash(media_id, &intent)?;
+        let mut transaction = self.pool.begin().await?;
+        if let Some(existing) =
+            sqlx::query_as::<_, PostRow>("SELECT * FROM posts WHERE request_key = $1 FOR UPDATE")
+                .bind(&request_key)
+                .fetch_optional(&mut *transaction)
+                .await?
+        {
+            if existing.request_hash.as_deref() != Some(request_hash.as_slice()) {
+                return Err(PublisherRepositoryError::RequestKeyConflict(request_key));
+            }
+            transaction.commit().await?;
+            return Ok(CreatePostResult { post: existing.into_post()?, created: false });
+        }
+
+        let media_state = lock_media_state(&mut transaction, media_id).await?;
+        if media_state != "ready" {
+            return Err(PublisherRepositoryError::MediaNotReady { media_id, state: media_state });
+        }
+        let channel_id = single_enabled_channel(&mut transaction).await?;
+        let channel = lock_channel(&mut transaction, channel_id).await?;
+        let post = insert_intended_post(
+            &mut transaction,
+            IntendedPostInput {
+                request_key: &request_key,
+                request_hash: &request_hash,
+                origin_ingest_id: None,
+                media_id,
+                channel: &channel,
+                intent: &intent,
+                post_id: Uuid::now_v7(),
+                now: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(CreatePostResult { post: post.into_post()?, created: true })
+    }
+
+    /// Materialize an ingest's captured publication intent. This operation is
+    /// deliberately database-only and is safe to replay: both the origin
+    /// ingest and the stable request key fence duplicate jobs.
+    pub async fn materialize_ingest(
+        &self,
+        ingest_id: Uuid,
+    ) -> Result<MaterializationResult, PublisherRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let ingest = sqlx::query_as::<_, MaterializationIngestRow>(
+            "SELECT id, state, media_id, requested_action, requested_publish_at, requested_post_caption, requested_channel_id FROM ingests WHERE id = $1 FOR UPDATE",
+        )
+        .bind(ingest_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(PublisherRepositoryError::IngestMissing(ingest_id))?;
+
+        if ingest.requested_action == "save" {
+            transaction.commit().await?;
+            return Ok(MaterializationResult { post: None, created: false });
+        }
+        if ingest.state != "completed" {
+            return Err(PublisherRepositoryError::MaterializationNotReady { ingest_id });
+        }
+        if let Some(existing) = sqlx::query_as::<_, PostRow>(
+            "SELECT * FROM posts WHERE origin_ingest_id = $1 FOR UPDATE",
+        )
+        .bind(ingest.id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            transaction.commit().await?;
+            return Ok(MaterializationResult { post: Some(existing.into_post()?), created: false });
+        }
+
+        let media_id =
+            ingest.media_id.ok_or(PublisherRepositoryError::IngestMediaMissing(ingest_id))?;
+        let media_state = lock_media_state(&mut transaction, media_id).await?;
+        if media_state != "ready" {
+            return Err(PublisherRepositoryError::MediaNotReady { media_id, state: media_state });
+        }
+        let channel_id = ingest
+            .requested_channel_id
+            .ok_or(PublisherRepositoryError::PublicationChannelNotConfigured)?;
+        let channel = lock_channel(&mut transaction, channel_id).await?;
+        ensure_channel_enabled(&channel)?;
+        let action =
+            PublicationAction::try_from(ingest.requested_action.as_str()).map_err(|_| {
+                PublisherRepositoryError::InvalidPublicationAction(ingest.requested_action.clone())
+            })?;
+        let intent = PublicationIntent::try_new(
+            action,
+            ingest.requested_publish_at,
+            ingest.requested_post_caption.clone(),
+        )?;
+        let request_key = format!("ingest:{}:publication:v1", ingest.id);
+        let request_hash = publication_intent_hash(media_id, &intent)?;
+        let post = insert_intended_post(
+            &mut transaction,
+            IntendedPostInput {
+                request_key: &request_key,
+                request_hash: &request_hash,
+                origin_ingest_id: Some(ingest.id),
+                media_id,
+                channel: &channel,
+                intent: &intent,
+                post_id: Uuid::now_v7(),
+                now: OffsetDateTime::now_utc(),
+            },
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(MaterializationResult { post: Some(post.into_post()?), created: true })
     }
 
     pub async fn find_post(&self, id: Uuid) -> Result<Option<Post>, PublisherRepositoryError> {
@@ -278,6 +446,171 @@ impl PublisherRepository {
         schedule: PostSchedule,
     ) -> Result<Post, PublisherRepositoryError> {
         self.schedule_post(schedule).await
+    }
+
+    /// Schedule one post at an explicit future instant. This path intentionally
+    /// does not inspect unrelated cadence posts or the channel window, and it
+    /// allows multiple posts to share the same instant.
+    pub async fn schedule_post_exact(
+        &self,
+        schedule: PostExactSchedule,
+    ) -> Result<Post, PublisherRepositoryError> {
+        let operation_key = format!("exact:{}", schedule.request_key);
+        let request_hash = exact_schedule_request_hash(schedule.requested_at);
+        let mut transaction = self.pool.begin().await?;
+        let channel_id = post_channel_id(&mut transaction, schedule.post_id).await?;
+        let channel = lock_channel(&mut transaction, channel_id).await?;
+        let current = lock_post(&mut transaction, schedule.post_id).await?;
+        if current.schedule_request_key.as_deref() == Some(operation_key.as_str()) {
+            if current.schedule_request_hash.as_deref() != Some(request_hash.as_slice()) {
+                return Err(PublisherRepositoryError::RequestKeyConflict(operation_key));
+            }
+            transaction.commit().await?;
+            return current.into_post();
+        }
+        if schedule.requested_at <= OffsetDateTime::now_utc() {
+            return Err(PublisherRepositoryError::ExactScheduleInPast);
+        }
+        let state = current.post_state()?;
+        if !state.is_queue_mutable() {
+            return Err(PublisherRepositoryError::PostCannotBeScheduled { id: current.id, state });
+        }
+        check_expected_revision(&current, schedule.expected_revision)?;
+        ensure_channel_enabled(&channel)?;
+        ensure_media_ready(&mut transaction, current.media_id).await?;
+        let row = apply_exact_schedule(
+            &mut transaction,
+            &current,
+            schedule.requested_at,
+            &operation_key,
+            &request_hash,
+            next_revision(current.revision)?,
+        )
+        .await?;
+        if state == PostState::Draft {
+            insert_publish_job(&mut transaction, row.id, schedule.requested_at, row.revision)
+                .await?;
+        } else {
+            update_publish_job(&mut transaction, row.id, schedule.requested_at, row.revision)
+                .await?;
+        }
+        transaction.commit().await?;
+        row.into_post()
+    }
+
+    /// Consume one persisted repeat-review decision. The decision request key
+    /// is stored on the post so a replay can return the same row even after its
+    /// revision has advanced, while a different stale command is rejected.
+    pub async fn decide_post(
+        &self,
+        id: Uuid,
+        decision: PublicationDecision,
+        request_key: String,
+        expected_revision: i64,
+    ) -> Result<Post, PublisherRepositoryError> {
+        let request_key = sooqa_publisher::normalize_request_key(request_key)?;
+        let request_hash = decision_request_hash(decision, expected_revision);
+        let mut transaction = self.pool.begin().await?;
+        let channel_id = post_channel_id(&mut transaction, id).await?;
+        let channel = lock_channel(&mut transaction, channel_id).await?;
+        let current = lock_post(&mut transaction, id).await?;
+        if current.decision_request_key.as_deref() == Some(request_key.as_str()) {
+            if current.decision_request_hash.as_deref() != Some(request_hash.as_slice()) {
+                return Err(PublisherRepositoryError::RequestKeyConflict(request_key));
+            }
+            transaction.commit().await?;
+            return current.into_post();
+        }
+        let state = current.post_state()?;
+        if state != PostState::Draft {
+            return Err(PublisherRepositoryError::PostDecisionNotAllowed { id, state });
+        }
+        check_expected_revision(&current, expected_revision)?;
+        let action =
+            PublicationAction::try_from(current.requested_action.as_str()).map_err(|_| {
+                PublisherRepositoryError::InvalidPublicationAction(current.requested_action.clone())
+            })?;
+        if !decision_allowed(action, current.requested_publish_at, decision) {
+            return Err(PublisherRepositoryError::InvalidPublicationDecision { id, decision });
+        }
+
+        let revision = next_revision(current.revision)?;
+        let row = match decision {
+            PublicationDecision::Cancel => {
+                sqlx::query_as::<_, PostRow>(
+                    "UPDATE posts SET state = 'cancelled', repeat_evidence = NULL, decision_request_key = $2, decision_request_hash = $3, cadence_slot_at = NULL, revision = $4, updated_at = now() WHERE id = $1 AND state = 'draft' AND revision = $5 RETURNING *",
+                )
+                .bind(id)
+                .bind(&request_key)
+                .bind(request_hash.as_slice())
+                .bind(revision)
+                .bind(expected_revision)
+                .fetch_one(&mut *transaction)
+                .await?
+            }
+            PublicationDecision::PostNowAnyway => {
+                ensure_channel_enabled(&channel)?;
+                ensure_media_ready(&mut transaction, current.media_id).await?;
+                let now = OffsetDateTime::now_utc();
+                let row = sqlx::query_as::<_, PostRow>(
+                    "UPDATE posts SET state = 'queued', scheduled_at = $2, cadence_slot_at = NULL, repeat_evidence = NULL, decision_request_key = $3, decision_request_hash = $4, revision = $5, error_class = NULL, error_message = NULL, updated_at = now() WHERE id = $1 AND state = 'draft' AND revision = $6 RETURNING *",
+                )
+                .bind(id)
+                .bind(now)
+                .bind(&request_key)
+                .bind(request_hash.as_slice())
+                .bind(revision)
+                .bind(expected_revision)
+                .fetch_one(&mut *transaction)
+                .await?;
+                insert_publish_job(&mut transaction, id, now, row.revision).await?;
+                row
+            }
+            PublicationDecision::QueueAnyway => {
+                ensure_channel_enabled(&channel)?;
+                ensure_media_ready(&mut transaction, current.media_id).await?;
+                let slot = next_free_slot(&mut transaction, &channel, id, OffsetDateTime::now_utc())
+                    .await?;
+                let row = sqlx::query_as::<_, PostRow>(
+                    "UPDATE posts SET state = 'queued', scheduled_at = $2, cadence_slot_at = $2, repeat_evidence = NULL, decision_request_key = $3, decision_request_hash = $4, revision = $5, error_class = NULL, error_message = NULL, updated_at = now() WHERE id = $1 AND state = 'draft' AND revision = $6 RETURNING *",
+                )
+                .bind(id)
+                .bind(slot)
+                .bind(&request_key)
+                .bind(request_hash.as_slice())
+                .bind(revision)
+                .bind(expected_revision)
+                .fetch_one(&mut *transaction)
+                .await?;
+                insert_publish_job(&mut transaction, id, slot, row.revision).await?;
+                row
+            }
+            PublicationDecision::KeepExactTime => {
+                ensure_channel_enabled(&channel)?;
+                ensure_media_ready(&mut transaction, current.media_id).await?;
+                let requested_at = current
+                    .requested_publish_at
+                    .ok_or(PublisherRepositoryError::ExactTimeMissing(id))?;
+                if requested_at <= OffsetDateTime::now_utc() {
+                    return Err(PublisherRepositoryError::ExactScheduleInPast);
+                }
+                let row = sqlx::query_as::<_, PostRow>(
+                    "UPDATE posts SET state = 'queued', scheduled_at = $2, cadence_slot_at = NULL, repeat_evidence = NULL, decision_request_key = $3, decision_request_hash = $4, revision = $5, error_class = NULL, error_message = NULL, updated_at = now() WHERE id = $1 AND state = 'draft' AND revision = $6 RETURNING *",
+                )
+                .bind(id)
+                .bind(requested_at)
+                .bind(&request_key)
+                .bind(request_hash.as_slice())
+                .bind(revision)
+                .bind(expected_revision)
+                .fetch_one(&mut *transaction)
+                .await?;
+                insert_publish_job(&mut transaction, id, requested_at, row.revision).await?;
+                row
+            }
+        };
+        transaction.commit().await?;
+        row.into_post()
     }
 
     pub async fn publish_now(
@@ -618,6 +951,218 @@ async fn ensure_media_ready(
     Ok(())
 }
 
+async fn lock_media_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    media_id: Uuid,
+) -> Result<String, PublisherRepositoryError> {
+    sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1 FOR UPDATE")
+        .bind(media_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(PublisherRepositoryError::MediaMissing(media_id))
+}
+
+async fn single_enabled_channel(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<Uuid, PublisherRepositoryError> {
+    match select_enabled_channel_candidates(transaction).await?.as_slice() {
+        [] => Err(PublisherRepositoryError::PublicationChannelNotConfigured),
+        [channel_id] => Ok(*channel_id),
+        _ => Err(PublisherRepositoryError::PublicationChannelAmbiguous),
+    }
+}
+
+async fn insert_intended_post(
+    transaction: &mut Transaction<'_, Postgres>,
+    input: IntendedPostInput<'_>,
+) -> Result<PostRow, PublisherRepositoryError> {
+    let IntendedPostInput {
+        request_key,
+        request_hash,
+        origin_ingest_id,
+        media_id,
+        channel,
+        intent,
+        post_id,
+        now,
+    } = input;
+    let evaluation_at = match (intent.action, intent.requested_publish_at) {
+        (PublicationAction::PostNow, None) => now,
+        (PublicationAction::PostNow, Some(_)) => {
+            return Err(PublisherRepositoryError::Validation(
+                PublisherValidationError::PostNowTimeNotAllowed,
+            ));
+        }
+        (PublicationAction::Queue, Some(requested_at)) => {
+            if requested_at <= now {
+                return Err(PublisherRepositoryError::ExactScheduleInPast);
+            }
+            requested_at
+        }
+        (PublicationAction::Queue, None) => {
+            next_free_slot(transaction, channel, post_id, now).await?
+        }
+    };
+    let conflicts = find_repeat_conflicts(transaction, media_id, evaluation_at, post_id).await?;
+    let repeat_evidence = if conflicts.is_empty() {
+        None
+    } else {
+        let evidence = RepeatEvidence { conflicts };
+        let value = serde_json::to_value(&evidence)?;
+        let encoded = serde_json::to_vec(&value)?;
+        if encoded.len() > MAX_REPEAT_EVIDENCE_BYTES {
+            return Err(PublisherRepositoryError::RepeatEvidenceTooLarge {
+                max: MAX_REPEAT_EVIDENCE_BYTES,
+            });
+        }
+        Some(value)
+    };
+    let needs_decision = repeat_evidence.is_some();
+    let state = if needs_decision { "draft" } else { "queued" };
+    let cadence_slot_at = (!needs_decision && intent.action == PublicationAction::Queue)
+        .then_some(intent.requested_publish_at.is_none().then_some(evaluation_at))
+        .flatten();
+    let row = sqlx::query_as::<_, PostRow>(
+        r#"
+        INSERT INTO posts (
+            id, request_key, request_hash, origin_ingest_id, requested_action,
+            requested_publish_at, repeat_evidence, media_id, channel_id, state,
+            caption, parse_mode, disable_notification, scheduled_at, cadence_slot_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        RETURNING *
+        "#,
+    )
+    .bind(post_id)
+    .bind(request_key)
+    .bind(request_hash)
+    .bind(origin_ingest_id)
+    .bind(intent.action.as_str())
+    .bind(intent.requested_publish_at)
+    .bind(&repeat_evidence)
+    .bind(media_id)
+    .bind(channel.id)
+    .bind(state)
+    .bind(&intent.caption)
+    .bind(&channel.default_parse_mode)
+    .bind(channel.default_disable_notification)
+    .bind(evaluation_at)
+    .bind(cadence_slot_at)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !needs_decision {
+        insert_publish_job(transaction, row.id, evaluation_at, row.revision).await?;
+    }
+    Ok(row)
+}
+
+async fn find_repeat_conflicts(
+    transaction: &mut Transaction<'_, Postgres>,
+    media_id: Uuid,
+    intended_at: OffsetDateTime,
+    post_id: Uuid,
+) -> Result<Vec<RepeatConflict>, PublisherRepositoryError> {
+    let rows = sqlx::query_as::<_, RepeatConflictRow>(
+        r#"
+        SELECT posts.id, posts.state, posts.scheduled_at, posts.published_at,
+               posts.telegram_message_id, channels.telegram_chat_id
+        FROM posts
+        JOIN channels ON channels.id = posts.channel_id
+        WHERE posts.media_id = $1
+          AND posts.id <> $2
+          AND (
+              posts.state IN ('queued', 'sending')
+              OR (
+                  posts.state = 'published'
+                  AND posts.published_at IS NOT NULL
+                  AND posts.published_at >= $3 - interval '14 days'
+                  AND posts.published_at < $3
+              )
+          )
+        ORDER BY COALESCE(posts.published_at, posts.scheduled_at), posts.id
+        LIMIT $4
+        "#,
+    )
+    .bind(media_id)
+    .bind(post_id)
+    .bind(intended_at)
+    .bind(i64::try_from(MAX_REPEAT_EVIDENCE_CONFLICTS).expect("evidence limit fits i64"))
+    .fetch_all(&mut **transaction)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let state = PostState::try_from(row.state.as_str())
+                .map_err(PublisherRepositoryError::InvalidState)?;
+            let at = row
+                .published_at
+                .or(row.scheduled_at)
+                .ok_or(PublisherRepositoryError::InvalidRepeatEvidenceTimestamp(row.id))?;
+            let target_message_link = row
+                .telegram_message_id
+                .filter(|_| state == PostState::Published)
+                .map(|message_id| telegram_message_link(row.telegram_chat_id, message_id));
+            Ok(RepeatConflict { post_id: row.id, state, at, target_message_link })
+        })
+        .collect()
+}
+
+fn telegram_message_link(chat_id: i64, message_id: i64) -> String {
+    let chat = chat_id.to_string();
+    let chat = chat.strip_prefix("-100").unwrap_or(chat.as_str());
+    format!("https://t.me/c/{chat}/{message_id}")
+}
+
+async fn apply_exact_schedule(
+    transaction: &mut Transaction<'_, Postgres>,
+    current: &PostRow,
+    requested_at: OffsetDateTime,
+    request_key: &str,
+    request_hash: &[u8],
+    revision: i64,
+) -> Result<PostRow, PublisherRepositoryError> {
+    sqlx::query_as::<_, PostRow>(
+        "UPDATE posts SET schedule_request_key = $2, schedule_request_hash = $3, requested_action = 'queue', requested_publish_at = $4, repeat_evidence = NULL, state = 'queued', scheduled_at = $4, cadence_slot_at = NULL, revision = $5, error_class = NULL, error_message = NULL, updated_at = now() WHERE id = $1 AND state IN ('draft', 'queued', 'failed') AND revision = $6 RETURNING *",
+    )
+    .bind(current.id)
+    .bind(request_key)
+    .bind(request_hash)
+    .bind(requested_at)
+    .bind(revision)
+    .bind(current.revision)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(PublisherRepositoryError::PostCannotBeScheduled {
+        id: current.id,
+        state: current.post_state()?,
+    })
+}
+
+fn decision_allowed(
+    action: PublicationAction,
+    requested_publish_at: Option<OffsetDateTime>,
+    decision: PublicationDecision,
+) -> bool {
+    match action {
+        PublicationAction::PostNow => {
+            matches!(
+                decision,
+                PublicationDecision::PostNowAnyway
+                    | PublicationDecision::QueueAnyway
+                    | PublicationDecision::Cancel
+            )
+        }
+        PublicationAction::Queue => {
+            matches!(
+                decision,
+                PublicationDecision::QueueAnyway
+                    | PublicationDecision::KeepExactTime
+                    | PublicationDecision::Cancel
+            ) && (requested_publish_at.is_some()
+                || !matches!(decision, PublicationDecision::KeepExactTime))
+        }
+    }
+}
+
 async fn insert_publish_job(
     transaction: &mut Transaction<'_, Postgres>,
     post_id: Uuid,
@@ -780,6 +1325,32 @@ fn publish_now_request_hash(request_key: &str) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+fn exact_schedule_request_hash(requested_at: OffsetDateTime) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"exact_schedule:v1:");
+    hasher.update(requested_at.unix_timestamp_nanos().to_be_bytes());
+    hasher.finalize().to_vec()
+}
+
+fn decision_request_hash(decision: PublicationDecision, expected_revision: i64) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"publication_decision:v1:");
+    hasher.update(decision.as_str().as_bytes());
+    hasher.update(expected_revision.to_be_bytes());
+    hasher.finalize().to_vec()
+}
+
+fn publication_intent_hash(
+    media_id: Uuid,
+    intent: &PublicationIntent,
+) -> Result<Vec<u8>, PublisherRepositoryError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"publication_intent:v1:");
+    hasher.update(media_id.as_bytes());
+    hasher.update(serde_json::to_vec(intent)?);
+    Ok(hasher.finalize().to_vec())
+}
+
 fn check_expected_revision(
     current: &PostRow,
     expected_revision: i64,
@@ -910,10 +1481,19 @@ impl PostRow {
 
     fn into_post(self) -> Result<Post, PublisherRepositoryError> {
         let state = self.post_state()?;
+        let requested_action = PublicationAction::try_from(self.requested_action.as_str())
+            .map_err(|_| {
+                PublisherRepositoryError::InvalidPublicationAction(self.requested_action.clone())
+            })?;
+        let repeat_evidence = self.repeat_evidence.map(serde_json::from_value).transpose()?;
         Ok(Post {
             id: self.id,
             media_id: self.media_id,
             channel_id: self.channel_id,
+            origin_ingest_id: self.origin_ingest_id,
+            requested_action,
+            requested_publish_at: self.requested_publish_at,
+            repeat_evidence,
             caption: self.caption,
             parse_mode: self.parse_mode,
             disable_notification: self.disable_notification,
@@ -992,6 +1572,10 @@ pub enum PublisherRepositoryError {
     ChannelMissing(Uuid),
     #[error("channel {0} is disabled")]
     ChannelDisabled(Uuid),
+    #[error("publication requires exactly one enabled target channel")]
+    PublicationChannelNotConfigured,
+    #[error("publication target channel configuration is ambiguous")]
+    PublicationChannelAmbiguous,
     #[error("media {0} was not found")]
     MediaMissing(Uuid),
     #[error("media {media_id} is not ready for publication: {state}")]
@@ -1002,6 +1586,20 @@ pub enum PublisherRepositoryError {
     PostNotEditable { id: Uuid, state: PostState },
     #[error("post {id} cannot be scheduled in state {state:?}")]
     PostCannotBeScheduled { id: Uuid, state: PostState },
+    #[error("ingest {0} was not found for publication materialization")]
+    IngestMissing(Uuid),
+    #[error("ingest {0} has no resolved media for publication materialization")]
+    IngestMediaMissing(Uuid),
+    #[error("ingest {ingest_id} is not ready for publication materialization")]
+    MaterializationNotReady { ingest_id: Uuid },
+    #[error("invalid publication action in database: {0}")]
+    InvalidPublicationAction(String),
+    #[error("publication decision {decision:?} is not allowed for post {id}")]
+    InvalidPublicationDecision { id: Uuid, decision: PublicationDecision },
+    #[error("post {id} cannot consume a publication decision in state {state:?}")]
+    PostDecisionNotAllowed { id: Uuid, state: PostState },
+    #[error("post {0} has no exact requested publication time")]
+    ExactTimeMissing(Uuid),
     #[error("post {id} is not claimable in state {state:?}")]
     PostNotClaimable { id: Uuid, state: PostState },
     #[error("post request key conflicts with another post: {0}")]
@@ -1036,10 +1634,16 @@ pub enum PublisherRepositoryError {
     CadenceSearchExhausted,
     #[error("cadence slot is in the past")]
     CadenceSlotInPast,
+    #[error("explicit publication time is in the past")]
+    ExactScheduleInPast,
     #[error("cadence slot is outside the channel window or interval")]
     InvalidCadenceSlot,
     #[error("invalid publication timestamp")]
     InvalidTimestamp,
+    #[error("repeat evidence for post {0} has no timestamp")]
+    InvalidRepeatEvidenceTimestamp(Uuid),
+    #[error("repeat evidence exceeds the {max}-byte limit")]
+    RepeatEvidenceTooLarge { max: usize },
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("serialization error: {0}")]

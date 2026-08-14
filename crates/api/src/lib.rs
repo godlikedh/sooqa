@@ -438,6 +438,16 @@ fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> 
         PublisherRepositoryError::ChannelDisabled(_) => {
             ApiError::conflict("channel_disabled", "The channel is disabled", headers)
         }
+        PublisherRepositoryError::PublicationChannelNotConfigured => ApiError::conflict(
+            "requested_channel_not_configured",
+            "A publication request requires exactly one enabled publication channel",
+            headers,
+        ),
+        PublisherRepositoryError::PublicationChannelAmbiguous => ApiError::conflict(
+            "requested_channel_ambiguous",
+            "A publication request requires exactly one enabled publication channel",
+            headers,
+        ),
         PublisherRepositoryError::PostMissing(_) => {
             ApiError::not_found("post_not_found", "The post was not found", headers)
         }
@@ -449,6 +459,37 @@ fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> 
             "The media item is not ready for publication",
             headers,
         ),
+        PublisherRepositoryError::IngestMissing(_) => {
+            ApiError::not_found("ingest_not_found", "The ingest request was not found", headers)
+        }
+        PublisherRepositoryError::IngestMediaMissing(_)
+        | PublisherRepositoryError::MaterializationNotReady { .. } => ApiError::conflict(
+            "publication_materialization_pending",
+            "The publication intent is not ready to materialize",
+            headers,
+        ),
+        PublisherRepositoryError::InvalidPublicationAction(_)
+        | PublisherRepositoryError::InvalidPublicationDecision { .. }
+        | PublisherRepositoryError::ExactTimeMissing(_)
+        | PublisherRepositoryError::RepeatEvidenceTooLarge { .. } => ApiError::bad_request(
+            "invalid_publication_request",
+            "The publication request is invalid",
+            headers,
+        ),
+        PublisherRepositoryError::PostDecisionNotAllowed { .. } => ApiError::conflict(
+            "publication_decision_not_allowed",
+            "The post is no longer waiting for a publication decision",
+            headers,
+        ),
+        PublisherRepositoryError::ExactScheduleInPast => ApiError::bad_request(
+            "exact_schedule_in_past",
+            "The exact publication time must be in the future",
+            headers,
+        ),
+        PublisherRepositoryError::InvalidRepeatEvidenceTimestamp(_) => {
+            error!("publisher API returned invalid repeat evidence");
+            ApiError::internal(headers)
+        }
         PublisherRepositoryError::PostNotEditable { .. }
         | PublisherRepositoryError::PostCannotBeScheduled { .. }
         | PublisherRepositoryError::PostNotClaimable { .. }

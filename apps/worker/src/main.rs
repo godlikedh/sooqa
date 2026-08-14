@@ -17,8 +17,9 @@ use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
 use sooqa_worker::{
     HandlerRegistry, TelegramSourceDownloader, Worker, cleanup_workspace_handler,
     compute_fingerprint_handler, download_source_handler, finalize_ingest_handler,
-    inspect_source_handler, media_processing_components, normalize_asset_handler,
-    probe_asset_handler_with_telegram_source, publish_post_handler, upload_storage_asset_handler,
+    inspect_source_handler, materialize_publication_handler, media_processing_components,
+    normalize_asset_handler, probe_asset_handler_with_telegram_source, publish_post_handler,
+    upload_storage_asset_handler,
 };
 
 #[tokio::main]
@@ -209,6 +210,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let finalize_handler = finalize_ingest_handler(database.inbox(), database.library());
     handlers.register(JobType::FinalizeIngest, move |job| finalize_handler(job));
     tracing::info!("ingest finalization handler enabled");
+    let materialize_handler = materialize_publication_handler(database.publisher());
+    handlers.register(JobType::MaterializePublication, move |job| materialize_handler(job));
+    tracing::info!("publication materialization handler enabled");
     let cleanup_handler =
         cleanup_workspace_handler(database.inbox(), config.media.work_root.clone());
     handlers.register(JobType::CleanupWorkspace, move |job| cleanup_handler(job));
