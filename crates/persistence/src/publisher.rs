@@ -3,10 +3,11 @@ use chrono_tz::Tz;
 use sha2::{Digest, Sha256};
 use sooqa_jobs::JobAttempt;
 use sooqa_publisher::{
-    Channel, ChannelValidationError, MAX_REPEAT_EVIDENCE_BYTES, MAX_REPEAT_EVIDENCE_CONFLICTS,
-    NewChannel, NewPost, Post, PostExactSchedule, PostSchedule, PostState, PostUpdate,
-    PublicationAction, PublicationDecision, PublicationIntent, PublishClaim, PublishRetry,
-    PublishedMessage, PublisherValidationError, RepeatConflict, RepeatEvidence, validate_caption,
+    Channel, ChannelUpdate, ChannelValidationError, MAX_REPEAT_EVIDENCE_BYTES,
+    MAX_REPEAT_EVIDENCE_CONFLICTS, NewChannel, NewPost, Post, PostCursor, PostExactSchedule,
+    PostListItem, PostPage, PostSchedule, PostState, PostUpdate, PublicationAction,
+    PublicationDecision, PublicationIntent, PublishClaim, PublishRetry, PublishedMessage,
+    PublisherValidationError, RepeatConflict, RepeatEvidence, validate_caption,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
@@ -17,6 +18,8 @@ use uuid::Uuid;
 pub struct PublisherRepository {
     pool: PgPool,
 }
+
+const CHANNEL_CONFIGURATION_ADVISORY_LOCK: i64 = 0x736f_6f71_615f_6368;
 
 #[derive(Debug, Clone)]
 pub struct CreatePostResult {
@@ -51,6 +54,21 @@ struct ChannelRow {
     default_disable_notification: bool,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct PostCursorRow {
+    id: Uuid,
+    scheduled_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct PostListMetadataRow {
+    channel_name: String,
+    media_kind: String,
+    source_url: Option<String>,
+    telegram_storage_chat_id: Option<i64>,
+    telegram_storage_message_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -145,6 +163,42 @@ impl PublisherRepository {
         row.into_channel()
     }
 
+    /// Create a settings-managed channel only when it leaves one enabled
+    /// publication target. The lower-level create path remains available for
+    /// diagnostics and fixtures that intentionally model ambiguity.
+    pub async fn create_channel_unambiguous(
+        &self,
+        channel: NewChannel,
+    ) -> Result<Channel, PublisherRepositoryError> {
+        channel.validate()?;
+        let mut transaction = self.pool.begin().await?;
+        lock_channel_configuration(&mut transaction).await?;
+        let other_enabled =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM channels WHERE is_enabled)")
+                .fetch_one(&mut *transaction)
+                .await?;
+        if other_enabled {
+            return Err(PublisherRepositoryError::ChannelEnablementAmbiguous);
+        }
+        let id = Uuid::now_v7();
+        let row = sqlx::query_as::<_, ChannelRow>(
+            "INSERT INTO channels (id, name, telegram_chat_id, time_zone, window_start, window_end, interval_minutes, default_parse_mode, default_disable_notification) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *",
+        )
+        .bind(id)
+        .bind(channel.name)
+        .bind(channel.telegram_chat_id)
+        .bind(channel.time_zone)
+        .bind(channel.window_start)
+        .bind(channel.window_end)
+        .bind(channel.interval_minutes)
+        .bind(channel.default_parse_mode)
+        .bind(channel.default_disable_notification)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        row.into_channel()
+    }
+
     pub async fn find_channel(
         &self,
         id: Uuid,
@@ -168,6 +222,115 @@ impl PublisherRepository {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(ChannelRow::into_channel).collect()
+    }
+
+    pub async fn update_channel(
+        &self,
+        id: Uuid,
+        update: ChannelUpdate,
+    ) -> Result<Channel, PublisherRepositoryError> {
+        if update.name.is_none()
+            && update.telegram_chat_id.is_none()
+            && update.is_enabled.is_none()
+            && update.time_zone.is_none()
+            && update.window_start.is_none()
+            && update.window_end.is_none()
+            && update.interval_minutes.is_none()
+            && update.default_parse_mode.is_none()
+            && update.default_disable_notification.is_none()
+        {
+            return Err(PublisherRepositoryError::EmptyChannelUpdate);
+        }
+        let mut transaction = self.pool.begin().await?;
+        lock_channel_configuration(&mut transaction).await?;
+        let current =
+            sqlx::query_as::<_, ChannelRow>("SELECT * FROM channels WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(PublisherRepositoryError::ChannelMissing(id))?;
+        if update.expected_updated_at.is_some_and(|expected| expected != current.updated_at) {
+            return Err(PublisherRepositoryError::ChannelOptimisticConflict(id));
+        }
+        let candidate = NewChannel {
+            name: update.name.map(|name| name.trim().to_owned()).unwrap_or(current.name),
+            telegram_chat_id: update.telegram_chat_id.unwrap_or(current.telegram_chat_id),
+            time_zone: update
+                .time_zone
+                .map(|time_zone| time_zone.trim().to_owned())
+                .unwrap_or(current.time_zone),
+            window_start: update.window_start.unwrap_or(current.window_start),
+            window_end: update.window_end.unwrap_or(current.window_end),
+            interval_minutes: update.interval_minutes.unwrap_or(current.interval_minutes),
+            default_parse_mode: update.default_parse_mode.unwrap_or(current.default_parse_mode),
+            default_disable_notification: update
+                .default_disable_notification
+                .unwrap_or(current.default_disable_notification),
+        };
+        candidate.validate()?;
+        let is_enabled = update.is_enabled.unwrap_or(current.is_enabled);
+        if is_enabled {
+            let other_enabled = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM channels WHERE is_enabled AND id <> $1)",
+            )
+            .bind(id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if other_enabled {
+                return Err(PublisherRepositoryError::ChannelEnablementAmbiguous);
+            }
+        }
+        let row = sqlx::query_as::<_, ChannelRow>(
+            "UPDATE channels SET name = $2, telegram_chat_id = $3, is_enabled = $4, time_zone = $5, window_start = $6, window_end = $7, interval_minutes = $8, default_parse_mode = $9, default_disable_notification = $10, updated_at = now() WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(candidate.name)
+        .bind(candidate.telegram_chat_id)
+        .bind(is_enabled)
+        .bind(candidate.time_zone)
+        .bind(candidate.window_start)
+        .bind(candidate.window_end)
+        .bind(candidate.interval_minutes)
+        .bind(candidate.default_parse_mode)
+        .bind(candidate.default_disable_notification)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        row.into_channel()
+    }
+
+    pub async fn count_future_queued_posts(&self) -> Result<u64, PublisherRepositoryError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM posts WHERE state = 'queued' AND scheduled_at > now()",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        u64::try_from(count).map_err(|_| PublisherRepositoryError::InvalidCount)
+    }
+
+    pub async fn count_repeat_decisions(&self) -> Result<u64, PublisherRepositoryError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM posts WHERE state = 'draft' AND repeat_evidence IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        u64::try_from(count).map_err(|_| PublisherRepositoryError::InvalidCount)
+    }
+
+    pub async fn list_repeat_decisions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<Post>, PublisherRepositoryError> {
+        if !(1..=50).contains(&limit) {
+            return Err(PublisherRepositoryError::InvalidLimit { value: limit });
+        }
+        let rows = sqlx::query_as::<_, PostRow>(
+            "SELECT * FROM posts WHERE state = 'draft' AND repeat_evidence IS NOT NULL ORDER BY updated_at DESC, id DESC LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(PostRow::into_post).collect()
     }
 
     pub async fn create_post_idempotent(
@@ -337,6 +500,80 @@ impl PublisherRepository {
             .await?
             .map(PostRow::into_post)
             .transpose()
+    }
+
+    /// List bounded schedule cards. The default hides published/cancelled
+    /// history; the cursor follows the same ordered `(scheduled_at, id)` pair
+    /// used by the UI and never loads the posts table wholesale.
+    pub async fn list_posts(
+        &self,
+        limit: u32,
+        cursor: Option<PostCursor>,
+        include_history: bool,
+    ) -> Result<PostPage, PublisherRepositoryError> {
+        if !(1..=50).contains(&limit) {
+            return Err(PublisherRepositoryError::InvalidLimit { value: limit });
+        }
+        let rows = sqlx::query_as::<_, PostCursorRow>(
+            r#"
+            SELECT id, scheduled_at
+            FROM posts
+            WHERE ($1 OR state NOT IN ('published', 'cancelled'))
+              AND ($2::timestamptz IS NULL OR (scheduled_at, id) > ($2, $3))
+            ORDER BY scheduled_at ASC, id ASC
+            LIMIT $4
+            "#,
+        )
+        .bind(include_history)
+        .bind(cursor.as_ref().map(|value| value.scheduled_at))
+        .bind(cursor.as_ref().map(|value| value.id))
+        .bind(i64::from(limit) + 1)
+        .fetch_all(&self.pool)
+        .await?;
+        let has_more = rows.len() > limit as usize;
+        let rows = rows.into_iter().take(limit as usize).collect::<Vec<_>>();
+        let next_cursor = has_more
+            .then(|| rows.last())
+            .flatten()
+            .map(|row| PostCursor { scheduled_at: row.scheduled_at, id: row.id });
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(item) = self.load_post_list_item(row.id).await? {
+                items.push(item);
+            }
+        }
+        Ok(PostPage { items, next_cursor })
+    }
+
+    async fn load_post_list_item(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<PostListItem>, PublisherRepositoryError> {
+        let Some(post) = self.find_post(id).await? else { return Ok(None) };
+        let row = sqlx::query_as::<_, PostListMetadataRow>(
+            r#"
+            SELECT c.name AS channel_name, m.kind AS media_kind, m.source_url,
+                   m.telegram_storage_chat_id, m.telegram_storage_message_id
+            FROM posts AS p
+            JOIN channels AS c ON c.id = p.channel_id
+            JOIN media AS m ON m.id = p.media_id
+            WHERE p.id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        Ok(Some(PostListItem {
+            post,
+            channel_name: row.channel_name,
+            media_kind: row.media_kind,
+            source_url: row.source_url,
+            storage_url: telegram_message_link_optional(
+                row.telegram_storage_chat_id,
+                row.telegram_storage_message_id,
+            ),
+        }))
     }
 
     pub async fn update_post(
@@ -981,6 +1218,16 @@ async fn lock_publication_request(
     Ok(())
 }
 
+async fn lock_channel_configuration(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(CHANNEL_CONFIGURATION_ADVISORY_LOCK)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
 fn ensure_repeat_decision_resolved(current: &PostRow) -> Result<(), PublisherRepositoryError> {
     if current.repeat_evidence.is_some() {
         return Err(PublisherRepositoryError::RepeatDecisionRequired { id: current.id });
@@ -1136,6 +1383,11 @@ fn telegram_message_link(chat_id: i64, message_id: i64) -> String {
     let chat = chat_id.to_string();
     let chat = chat.strip_prefix("-100").unwrap_or(chat.as_str());
     format!("https://t.me/c/{chat}/{message_id}")
+}
+
+fn telegram_message_link_optional(chat_id: Option<i64>, message_id: Option<i64>) -> Option<String> {
+    let (chat_id, message_id) = chat_id.zip(message_id)?;
+    (chat_id < 0 && message_id > 0).then(|| telegram_message_link(chat_id, message_id))
 }
 
 async fn apply_exact_schedule(
@@ -1598,6 +1850,12 @@ pub enum PublisherRepositoryError {
     ChannelMissing(Uuid),
     #[error("channel {0} is disabled")]
     ChannelDisabled(Uuid),
+    #[error("channel {0} was modified by another request")]
+    ChannelOptimisticConflict(Uuid),
+    #[error("channel update must change at least one field")]
+    EmptyChannelUpdate,
+    #[error("enabling channel would create an ambiguous publication target")]
+    ChannelEnablementAmbiguous,
     #[error("publication requires exactly one enabled target channel")]
     PublicationChannelNotConfigured,
     #[error("publication target channel configuration is ambiguous")]
@@ -1608,6 +1866,10 @@ pub enum PublisherRepositoryError {
     MediaNotReady { media_id: Uuid, state: String },
     #[error("post {0} was not found")]
     PostMissing(Uuid),
+    #[error("post list limit must be between 1 and 50, got {value}")]
+    InvalidLimit { value: u32 },
+    #[error("database count was negative")]
+    InvalidCount,
     #[error("post {id} is not editable in state {state:?}")]
     PostNotEditable { id: Uuid, state: PostState },
     #[error("post {id} cannot be scheduled in state {state:?}")]

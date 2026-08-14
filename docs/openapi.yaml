@@ -11,6 +11,8 @@ servers:
 tags:
   - name: health
     description: Process liveness.
+  - name: admin
+    description: Bounded single-admin operational views.
   - name: ingest
     description: Durable media ingestion requests.
   - name: media
@@ -20,6 +22,24 @@ tags:
   - name: posts
     description: Intended posts and publication scheduling.
 paths:
+  /api/v1/dashboard:
+    get:
+      tags: [admin]
+      operationId: getDashboard
+      summary: Read bounded dashboard counts and attention cards
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+      responses:
+        '200':
+          description: Current bounded operational dashboard state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DashboardResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
   /health/live:
     get:
       tags: [health]
@@ -36,6 +56,24 @@ paths:
         '400':
           description: The health request was malformed.
   /api/v1/ingests:
+    get:
+      tags: [admin]
+      operationId: listIngests
+      summary: List bounded newest-first ingest cards
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: A cursor-paginated operational ingest page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
     post:
       tags: [ingest]
       operationId: createIngest
@@ -148,11 +186,16 @@ paths:
     get:
       tags: [media]
       operationId: searchMedia
-      summary: Search normalized media
+      summary: List or exactly look up normalized media
+      description: >-
+        With no q parameter this returns newest-first bounded catalogue pages.
+        q accepts only a media UUID, ingest UUID, normalized HTTP(S) source URL, or
+        private HTTPS Telegram storage link. The three official 2ch mirror hosts
+        resolve to one source identity while stored provenance is retained.
       security:
         - bearerAuth: []
       parameters:
-        - { name: q, in: query, schema: { type: string } }
+        - { name: q, in: query, description: "Exact media UUID, ingest UUID, source URL, or Telegram storage link.", schema: { type: string } }
         - { name: tags, in: query, description: Comma-separated normalized tags., schema: { type: string } }
         - { name: kind, in: query, schema: { $ref: '#/components/schemas/MediaKind' } }
         - name: status
@@ -161,7 +204,7 @@ paths:
             allOf:
               - $ref: '#/components/schemas/MediaStatus'
             default: active
-        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 50 } }
         - { name: cursor, in: query, schema: { type: string } }
       responses:
         '200':
@@ -329,6 +372,35 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      tags: [channels]
+      operationId: updateChannel
+      summary: Update the single target channel settings
+      description: >-
+        Updates only the selected channel with an updated_at optimistic fence.
+        Enabling a second channel is rejected as an ambiguous publication
+        target.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChannelUpdateRequest' }
+      responses:
+        '200':
+          description: Updated channel settings.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Channel' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/media/{id}/publication-intent:
     post:
       tags: [media]
@@ -366,6 +438,29 @@ paths:
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/posts:
+    get:
+      tags: [posts]
+      operationId: listPosts
+      summary: List bounded unpublished schedule work
+      description: >-
+        Orders draft, queued, sending, failed, and unknown posts by
+        scheduled_at then stable ID. Published and cancelled history is hidden
+        unless include_history is true.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: include_history, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: A bounded schedule page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PostPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
     post:
       tags: [posts]
       operationId: createPost
@@ -706,6 +801,28 @@ components:
           required: [self]
           properties:
             self: { type: string }
+    IngestPage:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/IngestListItem' } }
+        next_cursor: { type: string, nullable: true }
+    IngestListItem:
+      type: object
+      required: [id, requested_action, status, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        source_url: { type: string, nullable: true }
+        page_url: { type: string, nullable: true }
+        requested_action: { type: string, enum: [save, queue, post_now] }
+        status: { $ref: '#/components/schemas/IngestStatus' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time, nullable: true }
+        media_id: { type: string, format: uuid, nullable: true }
+        storage_url: { type: string, format: uri, nullable: true }
+        error_code: { type: string, nullable: true }
+        error_message: { type: string, nullable: true, maxLength: 512 }
     IngestResponse:
       allOf:
         - $ref: '#/components/schemas/IngestAcceptedResponse'
@@ -769,6 +886,77 @@ components:
         score_bps: { type: integer, minimum: 0, maximum: 10000 }
         shared_token_count: { type: integer, format: int64, minimum: 0 }
         token_overlap_bps: { type: integer, format: int64, minimum: 0, maximum: 10000 }
+    DashboardResponse:
+      type: object
+      required: [counts, attention]
+      properties:
+        counts: { $ref: '#/components/schemas/DashboardCounts' }
+        attention: { $ref: '#/components/schemas/DashboardAttention' }
+    DashboardCounts:
+      type: object
+      required: [ready_media, future_queued_posts, active_ingests, technical_jobs_queued, technical_jobs_running, technical_duplicate_decisions, publication_repeat_decisions, caption_sync_failures]
+      properties:
+        ready_media: { type: integer, format: int64, minimum: 0 }
+        future_queued_posts: { type: integer, format: int64, minimum: 0 }
+        active_ingests: { type: integer, format: int64, minimum: 0 }
+        technical_jobs_queued: { type: integer, format: int64, minimum: 0 }
+        technical_jobs_running: { type: integer, format: int64, minimum: 0 }
+        technical_duplicate_decisions: { type: integer, format: int64, minimum: 0 }
+        publication_repeat_decisions: { type: integer, format: int64, minimum: 0 }
+        caption_sync_failures: { type: integer, format: int64, minimum: 0 }
+    DashboardAttention:
+      type: object
+      required: [technical_duplicates, publication_repeats, caption_sync_failures]
+      properties:
+        technical_duplicates:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/TechnicalDuplicateAttention' }
+        publication_repeats:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/PublicationRepeatAttention' }
+        caption_sync_failures:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/CaptionSyncFailureAttention' }
+    TechnicalDuplicateAttention:
+      type: object
+      required: [ingest_id, candidates]
+      properties:
+        ingest_id: { type: string, format: uuid }
+        source_url: { type: string, nullable: true }
+        candidates:
+          type: array
+          maxItems: 3
+          items: { $ref: '#/components/schemas/TechnicalDuplicateCandidate' }
+    TechnicalDuplicateCandidate:
+      type: object
+      required: [media_id, classification, score_bps, storage_state]
+      properties:
+        media_id: { type: string, format: uuid }
+        classification: { type: string, enum: [strong_duplicate, partial_match] }
+        score_bps: { type: integer, minimum: 0, maximum: 10000 }
+        storage_state: { type: string }
+        storage_url: { type: string, format: uri, nullable: true }
+    PublicationRepeatAttention:
+      type: object
+      required: [post_id, media_id, requested_action, status, revision]
+      properties:
+        post_id: { type: string, format: uuid }
+        media_id: { type: string, format: uuid }
+        requested_action: { type: string, enum: [queue, post_now] }
+        requested_publish_at: { type: string, format: date-time, nullable: true }
+        caption: { type: string, nullable: true }
+        status: { type: string, enum: [draft, queued, sending, published, unknown, failed, cancelled] }
+        repeat_evidence: { $ref: '#/components/schemas/RepeatEvidence' }
+        revision: { type: integer, format: int64, minimum: 0 }
+    CaptionSyncFailureAttention:
+      type: object
+      required: [media_id]
+      properties:
+        media_id: { type: string, format: uuid }
+        error_message: { type: string, nullable: true, maxLength: 512 }
     MediaKind:
       type: string
       enum: [video, image, animation, audio]
@@ -786,7 +974,9 @@ components:
         description: { type: string, nullable: true }
         notes: { type: string, nullable: true }
         storage_state: { type: string, enum: [pending_storage, ready, storage_unknown, missing], nullable: true }
+        storage_url: { type: string, format: uri, nullable: true }
         source_url: { type: string, nullable: true }
+        source_original_url: { type: string, format: uri, nullable: true }
         source_metadata: { type: object, additionalProperties: true, nullable: true }
         mime_type: { type: string, nullable: true }
         container: { type: string, nullable: true }
@@ -842,6 +1032,21 @@ components:
         interval_minutes: { type: integer, minimum: 1, default: 30 }
         default_parse_mode: { type: string, enum: [HTML, MarkdownV2], nullable: true }
         default_disable_notification: { type: boolean, default: false }
+    ChannelUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_updated_at]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 128 }
+        telegram_chat_id: { type: integer, format: int64, description: Negative Telegram chat ID. }
+        is_enabled: { type: boolean }
+        time_zone: { type: string }
+        window_start: { type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$' }
+        window_end: { type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$' }
+        interval_minutes: { type: integer, minimum: 1 }
+        default_parse_mode: { type: string, enum: [HTML, MarkdownV2], nullable: true }
+        default_disable_notification: { type: boolean }
+        expected_updated_at: { type: string, format: date-time }
     Channel:
       type: object
       required: [id, name, telegram_chat_id, is_enabled, time_zone, window_start, window_end, interval_minutes, default_disable_notification, created_at, updated_at]
@@ -929,9 +1134,20 @@ components:
         status: { type: string, enum: [draft, queued, sending, published, unknown, failed, cancelled] }
         scheduled_at: { type: string, format: date-time }
         cadence_slot_at: { type: string, format: date-time, nullable: true }
+        schedule_mode: { type: string, enum: [cadence, explicit] }
+        channel_name: { type: string, nullable: true }
+        media_kind: { type: string, nullable: true, enum: [video, image, animation, audio] }
+        source_url: { type: string, format: uri, nullable: true }
+        storage_url: { type: string, format: uri, nullable: true }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         revision: { type: integer, format: int64, minimum: 0 }
+    PostPage:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/Post' } }
+        next_cursor: { type: string, nullable: true }
     RepeatEvidence:
       type: object
       required: [conflicts]

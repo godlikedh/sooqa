@@ -1,7 +1,9 @@
 use crate::{WORKSPACE_CLEANUP_RETENTION, cleanup::enqueue_workspace_cleanup};
 use std::time::Duration;
 
-use sooqa_jobs::{Job, JobCommand, JobLease, JobPayloadError, JobStatus, JobType, NewJob};
+use sooqa_jobs::{
+    Job, JobCommand, JobCounts, JobLease, JobPayloadError, JobStatus, JobType, NewJob,
+};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -467,6 +469,35 @@ impl JobRepository {
         .fetch_all(&self.pool)
         .await?)
     }
+
+    pub async fn count_technical_jobs(&self) -> Result<JobCounts, JobRepositoryError> {
+        let rows = sqlx::query_as::<_, JobCountRow>(
+            r#"
+            SELECT state, count(*) AS count
+            FROM queue.jobs
+            WHERE kind NOT IN ('publish_post', 'materialize_publication')
+              AND state IN ('queued', 'running')
+            GROUP BY state
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut counts = JobCounts::default();
+        for row in rows {
+            match row.state.as_str() {
+                "queued" => {
+                    counts.queued =
+                        u64::try_from(row.count).map_err(|_| JobRepositoryError::InvalidCount)?
+                }
+                "running" => {
+                    counts.running =
+                        u64::try_from(row.count).map_err(|_| JobRepositoryError::InvalidCount)?
+                }
+                _ => {}
+            }
+        }
+        Ok(counts)
+    }
 }
 
 fn lease_seconds(duration: Duration) -> Result<f64, JobRepositoryError> {
@@ -496,6 +527,12 @@ struct JobRow {
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     completed_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, FromRow)]
+struct JobCountRow {
+    state: String,
+    count: i64,
 }
 
 #[derive(Debug, FromRow)]
@@ -790,6 +827,8 @@ impl JobRow {
 
 #[derive(Debug, Error)]
 pub enum JobRepositoryError {
+    #[error("database count was negative")]
+    InvalidCount,
     #[error("job max_attempts must be greater than zero")]
     InvalidMaxAttempts,
     #[error("job lease duration must be greater than zero")]

@@ -7,10 +7,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sooqa_library::{
-    MediaCursor, MediaDetails, MediaKind, MediaPage, MediaSearchQuery, MediaStatus, MediaSummary,
-    MediaUpdate, NewTag,
+    MediaCursor, MediaDetails, MediaKind, MediaLookup, MediaPage, MediaSearchQuery, MediaStatus,
+    MediaSummary, MediaUpdate, NewTag,
 };
 use time::OffsetDateTime;
+use url::Url;
 use uuid::Uuid;
 
 use super::{ApiError, ApiState, authorize, map_library_error};
@@ -30,12 +31,22 @@ async fn search_media(
     Query(params): Query<SearchParams>,
 ) -> Result<Json<MediaPageResponse>, ApiError> {
     authorize(&state.api_token, &headers).await?;
+    let mut params = params;
+    let lookup_input = params.q.take().filter(|value| !value.trim().is_empty());
     let query = params.into_domain(&headers)?;
-    let page = state
-        .library
-        .search_media(query)
-        .await
-        .map_err(|error| map_library_error(error, &headers))?;
+    let page = if let Some(lookup_input) = lookup_input {
+        state
+            .library
+            .lookup_media(parse_media_lookup(&lookup_input, &headers)?, query.limit, query.cursor)
+            .await
+            .map_err(|error| map_library_error(error, &headers))?
+    } else {
+        state
+            .library
+            .search_media(query)
+            .await
+            .map_err(|error| map_library_error(error, &headers))?
+    };
     Ok(Json(MediaPageResponse::from_page(&page)))
 }
 
@@ -179,15 +190,15 @@ impl SearchParams {
             .map_err(|_| {
                 ApiError::bad_request(
                     "invalid_limit",
-                    "The limit must be between 1 and 100",
+                    "The limit must be between 1 and 50",
                     headers,
                 )
             })?
-            .unwrap_or(20);
-        if !(1..=100).contains(&limit) {
+            .unwrap_or(50);
+        if !(1..=50).contains(&limit) {
             return Err(ApiError::bad_request(
                 "invalid_limit",
-                "The limit must be between 1 and 100",
+                "The limit must be between 1 and 50",
                 headers,
             ));
         }
@@ -203,6 +214,131 @@ impl SearchParams {
             cursor,
         })
     }
+}
+
+fn parse_media_lookup(value: &str, headers: &HeaderMap) -> Result<MediaLookup, ApiError> {
+    if let Ok(id) = Uuid::parse_str(value.trim()) {
+        return Ok(MediaLookup::Identifier(id));
+    }
+    let url = Url::parse(value.trim()).map_err(|_| {
+        ApiError::bad_request(
+            "invalid_media_lookup",
+            "The media lookup must be a UUID, source URL, or private Telegram storage link",
+            headers,
+        )
+    })?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ApiError::bad_request(
+            "invalid_media_lookup",
+            "The source URL must not include credentials",
+            headers,
+        ));
+    }
+    if url.host_str().is_none() || !matches!(url.scheme(), "http" | "https") {
+        return Err(ApiError::bad_request(
+            "invalid_media_lookup",
+            "The media lookup URL must use HTTP or HTTPS and include a host",
+            headers,
+        ));
+    }
+    if url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("t.me")) {
+        if url.scheme() != "https" || url.query().is_some() || url.fragment().is_some() {
+            return Err(ApiError::bad_request(
+                "invalid_media_lookup",
+                "The Telegram storage link must be an exact HTTPS path",
+                headers,
+            ));
+        }
+        let segments = url.path_segments().map(|segments| segments.collect::<Vec<_>>());
+        let Some(segments) = segments else {
+            return Err(ApiError::bad_request(
+                "invalid_media_lookup",
+                "The Telegram storage link is invalid",
+                headers,
+            ));
+        };
+        if segments.len() == 3 && segments[0] == "c" {
+            let internal_id = segments[1].parse::<i64>().map_err(|_| {
+                ApiError::bad_request(
+                    "invalid_media_lookup",
+                    "The Telegram storage link is invalid",
+                    headers,
+                )
+            })?;
+            let message_id = segments[2].parse::<i64>().map_err(|_| {
+                ApiError::bad_request(
+                    "invalid_media_lookup",
+                    "The Telegram storage link is invalid",
+                    headers,
+                )
+            })?;
+            if internal_id > 0 && message_id > 0 {
+                let chat_id = format!("-100{internal_id}").parse::<i64>().map_err(|_| {
+                    ApiError::bad_request(
+                        "invalid_media_lookup",
+                        "The Telegram storage link is invalid",
+                        headers,
+                    )
+                })?;
+                return Ok(MediaLookup::StorageMessage { chat_id, message_id });
+            }
+        }
+        return Err(ApiError::bad_request(
+            "invalid_media_lookup",
+            "The Telegram storage link is invalid",
+            headers,
+        ));
+    }
+    let mut normalized = url;
+    let scheme = normalized.scheme().to_ascii_lowercase();
+    if normalized.scheme() != scheme {
+        normalized.set_scheme(&scheme).map_err(|_| {
+            ApiError::bad_request("invalid_media_lookup", "The source URL is invalid", headers)
+        })?;
+    }
+    let host = normalized.host_str().unwrap_or_default().to_ascii_lowercase();
+    normalized.set_host(Some(&host)).map_err(|_| {
+        ApiError::bad_request("invalid_media_lookup", "The source URL is invalid", headers)
+    })?;
+    if (scheme == "http" && normalized.port() == Some(80))
+        || (scheme == "https" && normalized.port() == Some(443))
+    {
+        normalized.set_port(None).map_err(|_| {
+            ApiError::bad_request("invalid_media_lookup", "The source URL is invalid", headers)
+        })?;
+    }
+    normalized.set_fragment(None);
+    let query_pairs = normalized
+        .query_pairs()
+        .filter(|(name, _)| !is_tracking_parameter(name))
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if query_pairs.is_empty() {
+        normalized.set_query(None);
+    } else {
+        let mut query = normalized.query_pairs_mut();
+        query.clear();
+        query.extend_pairs(query_pairs.iter().map(|(name, value)| (&**name, &**value)));
+    }
+    if matches!(host.as_str(), "2ch.org" | "2ch.su" | "2ch.life") {
+        let variants = ["2ch.org", "2ch.su", "2ch.life"]
+            .into_iter()
+            .map(|mirror| {
+                let mut variant = normalized.clone();
+                variant.set_host(Some(mirror)).expect("known mirror host is valid");
+                variant.to_string()
+            })
+            .collect();
+        Ok(MediaLookup::SourceUrls(variants))
+    } else {
+        Ok(MediaLookup::SourceUrls(vec![normalized.to_string()]))
+    }
+}
+
+fn is_tracking_parameter(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("utm_")
+        || matches!(name.as_str(), "fbclid" | "gclid" | "dclid" | "msclkid" | "mc_cid" | "mc_eid")
 }
 
 fn encode_cursor(cursor: &MediaCursor) -> String {
@@ -259,7 +395,9 @@ struct MediaResponse {
     description: Option<String>,
     notes: Option<String>,
     storage_state: String,
+    storage_url: Option<String>,
     source_url: Option<String>,
+    source_original_url: Option<String>,
     source_metadata: Option<Value>,
     mime_type: Option<String>,
     container: Option<String>,
@@ -286,7 +424,9 @@ impl MediaResponse {
             &summary.media,
             &summary.tags,
             summary.source_url.clone(),
+            summary.source_original_url.clone(),
             summary.source_metadata.clone(),
+            summary.storage_url.clone(),
         )
     }
 
@@ -295,7 +435,9 @@ impl MediaResponse {
             &details.media,
             &details.tags,
             details.source.as_ref().and_then(|source| source.normalized_url.clone()),
+            details.source.as_ref().and_then(|source| source.original_url.clone()),
             details.source.as_ref().map(|source| source.metadata.clone()),
+            details.storage_url.clone(),
         )
     }
 
@@ -303,7 +445,9 @@ impl MediaResponse {
         media: &sooqa_library::Media,
         tags: &[sooqa_library::Tag],
         source_url: Option<String>,
+        source_original_url: Option<String>,
         source_metadata: Option<Value>,
+        storage_url: Option<String>,
     ) -> Self {
         Self {
             id: media.id,
@@ -313,7 +457,9 @@ impl MediaResponse {
             description: media.description.clone(),
             notes: media.notes.clone(),
             storage_state: media.storage_state.as_str().to_owned(),
+            storage_url,
             source_url,
+            source_original_url,
             source_metadata,
             mime_type: media.mime_type.clone(),
             container: media.container.clone(),
@@ -393,7 +539,7 @@ mod tests {
         assert_eq!(query.tags, ["rust", "media"]);
         assert_eq!(query.kind, Some(MediaKind::Video));
         assert_eq!(query.status, Some(MediaStatus::Active));
-        assert_eq!(query.limit, 20);
+        assert_eq!(query.limit, 50);
     }
 
     #[test]
@@ -403,5 +549,30 @@ mod tests {
             .into_domain(&headers)
             .expect_err("limit 101 must be rejected");
         assert_eq!(error.code, "invalid_limit");
+    }
+
+    #[test]
+    fn media_lookup_parses_private_telegram_storage_links() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            parse_media_lookup("https://t.me/c/3971341583/57", &headers).unwrap(),
+            MediaLookup::StorageMessage { chat_id: -1003971341583, message_id: 57 }
+        );
+    }
+
+    #[test]
+    fn media_lookup_accepts_http_source_urls() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            parse_media_lookup("http://example.test/video?id=7&utm_source=test", &headers).unwrap(),
+            MediaLookup::SourceUrls(vec!["http://example.test/video?id=7".to_owned()])
+        );
+    }
+
+    #[test]
+    fn media_lookup_rejects_non_exact_telegram_storage_paths() {
+        let headers = HeaderMap::new();
+        assert!(parse_media_lookup("https://user@t.me/c/3971341583/57", &headers).is_err());
+        assert!(parse_media_lookup("https://t.me/c/3971341583/57?preview=1", &headers).is_err());
     }
 }

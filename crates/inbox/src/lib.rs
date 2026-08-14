@@ -524,6 +524,38 @@ pub struct Ingest {
     pub completed_at: Option<time::OffsetDateTime>,
 }
 
+/// Stable cursor for the newest-first operational ingest view. The UUID
+/// breaks ties when concurrent inserts share a database timestamp.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct IngestCursor {
+    pub created_at: time::OffsetDateTime,
+    pub id: Uuid,
+}
+
+/// Bounded fields used by the read-only admin ingest list. Pipeline input and
+/// job payloads stay out of this contract.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IngestListItem {
+    pub id: Uuid,
+    pub source_url: Option<String>,
+    pub page_url: Option<String>,
+    pub requested_action: RequestedAction,
+    pub status: IngestStatus,
+    pub created_at: time::OffsetDateTime,
+    pub updated_at: time::OffsetDateTime,
+    pub completed_at: Option<time::OffsetDateTime>,
+    pub media_id: Option<Uuid>,
+    pub storage_url: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IngestPage {
+    pub items: Vec<IngestListItem>,
+    pub next_cursor: Option<IngestCursor>,
+}
+
 impl Ingest {
     pub fn from_submission(id: Uuid, submission: &IngestSubmission) -> Self {
         let now = time::OffsetDateTime::now_utc();

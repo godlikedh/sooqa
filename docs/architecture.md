@@ -337,6 +337,17 @@ its reorder/swap callbacks. It remains responsible for capture, duplicate
 decisions, and publication transport; bounded web-admin slices own durable
 publication inspection and editing through the API.
 
+The bounded admin API is owned by `sooqa-api` and reads through the Inbox,
+Library, Jobs, and Publisher repositories. Repository queries return small
+read models with stable timestamp-plus-UUID cursors and a maximum page size of
+50; the API does not expose queue payloads, lease tokens, secrets, or complete
+error logs. Dashboard counts are aggregate SQL reads, while attention cards
+carry only bounded duplicate, repeat-decision, and caption-sync evidence.
+Media `q` lookups are exact identifiers/URLs rather than semantic search. The
+channel settings patch locks and validates the complete candidate, uses
+`updated_at` for stale-write rejection, and serializes enablement so at most
+one active publication target can be configured.
+
 ## Security and filesystem rules
 
 The API compares the configured bearer secret; no token administration data is

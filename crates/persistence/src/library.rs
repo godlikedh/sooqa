@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use sooqa_jobs::NewJob;
 use sooqa_library::{
-    MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, Media, MediaCursor,
-    MediaDetails, MediaIngest, MediaKind, MediaMetadata, MediaPage, MediaSearchQuery, MediaSource,
-    MediaSourceInput, MediaStatus, MediaStorageState, MediaSummary, MediaUpdate, NewTag,
-    SourceKind, StorageCaptionMetadata, StorageReceipt, StorageUploadAttachment, StorageUploadInfo,
-    StorageUploadReservation, StorageUploadReservationRequest, StorageUploadStore, Tag,
-    VideoDuplicateClassification, VideoDuplicateEvidence, VideoDuplicateMatch,
-    VideoIdentityOutcome,
+    CaptionSyncFailure, MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, Media,
+    MediaCursor, MediaDetails, MediaIngest, MediaKind, MediaLookup, MediaMetadata, MediaPage,
+    MediaSearchQuery, MediaSource, MediaSourceInput, MediaStatus, MediaStorageState, MediaSummary,
+    MediaUpdate, NewTag, SourceKind, StorageCaptionMetadata, StorageReceipt,
+    StorageUploadAttachment, StorageUploadInfo, StorageUploadReservation,
+    StorageUploadReservationRequest, StorageUploadStore, Tag, VideoDuplicateClassification,
+    VideoDuplicateEvidence, VideoDuplicateMatch, VideoIdentityOutcome,
 };
 use sooqa_media::{
     SequenceAlignmentConfig, SequenceClassification, VideoSequenceFingerprint,
@@ -135,14 +135,22 @@ impl LibraryRepository {
         let media = row.clone().into_media()?;
         let tags = row.tags.iter().map(|tag| tag_from_name(tag, row.updated_at)).collect();
         let source = source_from_row(&row)?;
-        Ok(Some(MediaDetails { media, tags, source }))
+        Ok(Some(MediaDetails {
+            storage_url: storage_message_url(
+                row.telegram_storage_chat_id,
+                row.telegram_storage_message_id,
+            ),
+            media,
+            tags,
+            source,
+        }))
     }
 
     pub async fn search_media(
         &self,
         query: MediaSearchQuery,
     ) -> Result<MediaPage, LibraryRepositoryError> {
-        if !(1..=100).contains(&query.limit) {
+        if !(1..=50).contains(&query.limit) {
             return Err(LibraryRepositoryError::InvalidLimit { value: query.limit });
         }
         let text = query.text.filter(|value| !value.trim().is_empty());
@@ -182,6 +190,117 @@ impl LibraryRepository {
             .map(|row| self.summary_from_row(row))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(MediaPage { items, next_cursor })
+    }
+
+    /// Resolve one of the exact admin lookup forms without loading the media
+    /// catalogue into memory. Source URL lookups accept the bounded list of
+    /// official 2ch mirror variants prepared by the API layer.
+    pub async fn lookup_media(
+        &self,
+        lookup: MediaLookup,
+        limit: u32,
+        cursor: Option<MediaCursor>,
+    ) -> Result<MediaPage, LibraryRepositoryError> {
+        if !(1..=50).contains(&limit) {
+            return Err(LibraryRepositoryError::InvalidLimit { value: limit });
+        }
+        let (media_id, ingest_id, source_urls, storage_chat_id, storage_message_id) = match lookup {
+            MediaLookup::Identifier(id) => (Some(id), Some(id), None, None, None),
+            MediaLookup::MediaId(id) => (Some(id), None, None, None, None),
+            MediaLookup::IngestId(id) => (None, Some(id), None, None, None),
+            MediaLookup::SourceUrls(urls) => (None, None, Some(urls), None, None),
+            MediaLookup::StorageMessage { chat_id, message_id } => {
+                (None, None, None, Some(chat_id), Some(message_id))
+            }
+        };
+        let rows = sqlx::query_as::<_, MediaRow>(
+            r#"
+            SELECT m.*
+            FROM media AS m
+            WHERE (
+                ($1::uuid IS NOT NULL AND m.id = $1)
+                OR ($2::uuid IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM ingests AS i WHERE i.id = $2 AND i.media_id = m.id
+                ))
+                OR ($3::text[] IS NOT NULL AND m.source_url = ANY($3::text[]))
+                OR ($4::bigint IS NOT NULL AND m.telegram_storage_chat_id = $4
+                    AND m.telegram_storage_message_id = $5)
+            )
+              AND ($6::timestamptz IS NULL OR (m.updated_at, m.id) < ($6, $7))
+            ORDER BY m.updated_at DESC, m.id DESC
+            LIMIT $8
+            "#,
+        )
+        .bind(media_id)
+        .bind(ingest_id)
+        .bind(source_urls)
+        .bind(storage_chat_id)
+        .bind(storage_message_id)
+        .bind(cursor.as_ref().map(|value| value.updated_at))
+        .bind(cursor.as_ref().map(|value| value.id))
+        .bind(i64::from(limit) + 1)
+        .fetch_all(&self.pool)
+        .await?;
+        let has_more = rows.len() > limit as usize;
+        let rows = rows.into_iter().take(limit as usize).collect::<Vec<_>>();
+        let next_cursor = has_more
+            .then(|| rows.last())
+            .flatten()
+            .map(|row| MediaCursor { updated_at: row.updated_at, id: row.id });
+        let items = rows
+            .into_iter()
+            .map(|row| self.summary_from_row(row))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(MediaPage { items, next_cursor })
+    }
+
+    pub async fn count_ready_media(&self) -> Result<u64, LibraryRepositoryError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media WHERE storage_state = 'ready'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        u64::try_from(count).map_err(|_| LibraryRepositoryError::InvalidCount)
+    }
+
+    /// #82 stores caption-sync state in the media aggregate metadata. Until
+    /// that slice writes the field this bounded aggregate naturally returns
+    /// zero, without introducing a preview/sync table in #81.
+    pub async fn count_caption_sync_failures(&self) -> Result<u64, LibraryRepositoryError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media WHERE source_metadata->>'caption_sync_state' = 'failed'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        u64::try_from(count).map_err(|_| LibraryRepositoryError::InvalidCount)
+    }
+
+    pub async fn list_caption_sync_failures(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<CaptionSyncFailure>, LibraryRepositoryError> {
+        if !(1..=50).contains(&limit) {
+            return Err(LibraryRepositoryError::InvalidLimit { value: limit });
+        }
+        #[derive(Debug, sqlx::FromRow)]
+        struct CaptionSyncFailureRow {
+            media_id: Uuid,
+            error_message: Option<String>,
+        }
+
+        let rows = sqlx::query_as::<_, CaptionSyncFailureRow>(
+            "SELECT id AS media_id, left(source_metadata->>'caption_sync_error', 512) AS error_message FROM media WHERE source_metadata->>'caption_sync_state' = 'failed' ORDER BY updated_at DESC, id DESC LIMIT $1",
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| CaptionSyncFailure {
+                media_id: row.media_id,
+                error_message: row.error_message,
+            })
+            .collect())
     }
 
     pub async fn update_media(
@@ -806,7 +925,12 @@ impl LibraryRepository {
             tags,
             source_count: u64::from(source.is_some()),
             source_url: row.source_url,
+            source_original_url: source.as_ref().and_then(|value| value.original_url.clone()),
             source_metadata: source.map(|source| source.metadata),
+            storage_url: storage_message_url(
+                row.telegram_storage_chat_id,
+                row.telegram_storage_message_id,
+            ),
         })
     }
 }
@@ -1265,6 +1389,16 @@ fn source_from_row(row: &MediaRow) -> Result<Option<MediaSource>, LibraryReposit
     }))
 }
 
+fn storage_message_url(chat_id: Option<i64>, message_id: Option<i64>) -> Option<String> {
+    let (chat_id, message_id) = chat_id.zip(message_id)?;
+    if chat_id >= 0 || message_id <= 0 {
+        return None;
+    }
+    let raw_id = chat_id.to_string();
+    let internal_id = raw_id.strip_prefix("-100").unwrap_or_else(|| raw_id.trim_start_matches('-'));
+    (!internal_id.is_empty()).then(|| format!("https://t.me/c/{internal_id}/{message_id}"))
+}
+
 fn source_to_value(source: &MediaSourceInput) -> Value {
     json!({
         "ingest_id": source.ingest_id.map(|id| id.to_string()),
@@ -1403,6 +1537,8 @@ pub enum LibraryRepositoryError {
     TagNotAttached,
     #[error("media search limit must be between 1 and 100, got {value}")]
     InvalidLimit { value: u32 },
+    #[error("database count was negative")]
+    InvalidCount,
     #[error("media SHA-256 is required")]
     MissingSha256,
     #[error("video identity requires a fingerprint when the exact SHA is absent")]

@@ -18,6 +18,8 @@ pub use library::{LibraryRepository, LibraryRepositoryError, VideoFingerprintCan
 pub use publisher::{
     CreatePostResult, PublishLease, PublisherRepository, PublisherRepositoryError,
 };
+pub use sooqa_inbox::{IngestListItem, IngestPage};
+pub use sooqa_publisher::{PostListItem, PostPage};
 
 use sooqa_config::SecretString;
 use sqlx::{

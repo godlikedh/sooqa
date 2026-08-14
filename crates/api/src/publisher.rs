@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Json as JsonExtractor, Path, State, rejection::JsonRejection},
+    extract::{Json as JsonExtractor, Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize, de::Deserializer};
 use sha2::{Digest, Sha256};
 use sooqa_library::{MediaStatus, MediaStorageState};
 use sooqa_publisher::{
-    Channel, NewChannel, NewPost, Post, PostExactSchedule, PostSchedule, PostState, PostUpdate,
-    PublicationAction, PublicationDecision, PublicationIntent,
+    Channel, ChannelUpdate, NewChannel, NewPost, Post, PostCursor, PostExactSchedule, PostListItem,
+    PostPage, PostSchedule, PostState, PostUpdate, PublicationAction, PublicationDecision,
+    PublicationIntent,
 };
 use time::{OffsetDateTime, Time};
 use uuid::Uuid;
@@ -23,9 +24,9 @@ const MAX_CAPTION_LENGTH: usize = 1_024;
 pub(crate) fn routes() -> Router<ApiState> {
     Router::new()
         .route("/api/v1/channels", get(list_channels).post(create_channel))
-        .route("/api/v1/channels/{id}", get(get_channel))
+        .route("/api/v1/channels/{id}", get(get_channel).patch(update_channel))
         .route("/api/v1/media/{id}/publication-intent", post(create_media_publication_intent))
-        .route("/api/v1/posts", post(create_post))
+        .route("/api/v1/posts", get(list_posts).post(create_post))
         .route("/api/v1/posts/{id}", get(get_post).patch(update_post))
         .route("/api/v1/posts/{id}/schedule", post(schedule_post))
         .route("/api/v1/posts/{id}/schedule-exact", post(schedule_post_exact))
@@ -77,7 +78,7 @@ async fn create_channel(
     channel.default_disable_notification = payload.default_disable_notification;
     let channel = state
         .publisher
-        .create_channel(channel)
+        .create_channel_unambiguous(channel)
         .await
         .map_err(|error| map_publisher_error(error, &headers))?;
     Ok((StatusCode::CREATED, Json(ChannelResponse::from_channel(&channel))))
@@ -97,6 +98,49 @@ async fn get_channel(
         .ok_or_else(|| {
             ApiError::not_found("channel_not_found", "The channel was not found", &headers)
         })?;
+    Ok(Json(ChannelResponse::from_channel(&channel)))
+}
+
+async fn update_channel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    body: Result<JsonExtractor<UpdateChannelRequest>, JsonRejection>,
+) -> Result<Json<ChannelResponse>, ApiError> {
+    authorize(&state.api_token, &headers).await?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    let window_start =
+        payload.window_start.as_deref().map(|value| parse_time(value, &headers)).transpose()?;
+    let window_end =
+        payload.window_end.as_deref().map(|value| parse_time(value, &headers)).transpose()?;
+    let default_parse_mode = payload.default_parse_mode.into_option();
+    let expected_updated_at = payload.expected_updated_at.ok_or_else(|| {
+        ApiError::bad_request(
+            "expected_updated_at_required",
+            "expected_updated_at is required for channel updates",
+            &headers,
+        )
+    })?;
+    let channel = state
+        .publisher
+        .update_channel(
+            id,
+            ChannelUpdate {
+                name: payload.name,
+                telegram_chat_id: payload.telegram_chat_id,
+                is_enabled: payload.is_enabled,
+                time_zone: payload.time_zone,
+                window_start,
+                window_end,
+                interval_minutes: payload.interval_minutes,
+                default_parse_mode,
+                default_disable_notification: payload.default_disable_notification,
+                expected_updated_at: Some(expected_updated_at),
+            },
+        )
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
     Ok(Json(ChannelResponse::from_channel(&channel)))
 }
 
@@ -185,6 +229,31 @@ async fn schedule_post_exact(
         .await
         .map_err(|error| map_publisher_error(error, &headers))?;
     Ok((StatusCode::ACCEPTED, Json(PostResponse::from_post(&post))))
+}
+
+async fn list_posts(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(params): Query<PostListParams>,
+) -> Result<Json<PostPageResponse>, ApiError> {
+    authorize(&state.api_token, &headers).await?;
+    let limit = params.limit.unwrap_or(50);
+    if !(1..=50).contains(&limit) {
+        return Err(ApiError::bad_request(
+            "invalid_limit",
+            "The schedule list limit must be between 1 and 50",
+            &headers,
+        ));
+    }
+    let cursor = params.cursor.as_deref().map(decode_post_cursor).transpose().map_err(|_| {
+        ApiError::bad_request("invalid_cursor", "The schedule cursor is invalid", &headers)
+    })?;
+    let page = state
+        .publisher
+        .list_posts(limit, cursor, params.include_history.unwrap_or(false))
+        .await
+        .map_err(|error| map_publisher_error(error, &headers))?;
+    Ok(Json(PostPageResponse::from_page(&page)))
 }
 
 async fn create_post(
@@ -630,6 +699,40 @@ struct MutationRequest {
     expected_revision: i64,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct PostListParams {
+    limit: Option<u32>,
+    cursor: Option<String>,
+    include_history: Option<bool>,
+}
+
+fn encode_post_cursor(cursor: &PostCursor) -> String {
+    format!("{}:{}", cursor.scheduled_at.unix_timestamp_nanos(), cursor.id)
+}
+
+fn decode_post_cursor(value: &str) -> Result<PostCursor, ()> {
+    let (timestamp, id) = value.split_once(':').ok_or(())?;
+    let timestamp = timestamp.parse::<i128>().map_err(|_| ())?;
+    let scheduled_at = OffsetDateTime::from_unix_timestamp_nanos(timestamp).map_err(|_| ())?;
+    let id = Uuid::parse_str(id).map_err(|_| ())?;
+    Ok(PostCursor { scheduled_at, id })
+}
+
+#[derive(Debug, Serialize)]
+struct PostPageResponse {
+    items: Vec<PostResponse>,
+    next_cursor: Option<String>,
+}
+
+impl PostPageResponse {
+    fn from_page(page: &PostPage) -> Self {
+        Self {
+            items: page.items.iter().map(PostResponse::from_list_item).collect(),
+            next_cursor: page.next_cursor.as_ref().map(encode_post_cursor),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct PostResponse {
     id: Uuid,
@@ -648,6 +751,11 @@ struct PostResponse {
     scheduled_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339::option")]
     cadence_slot_at: Option<OffsetDateTime>,
+    schedule_mode: String,
+    channel_name: Option<String>,
+    media_kind: Option<String>,
+    source_url: Option<String>,
+    storage_url: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -657,6 +765,26 @@ struct PostResponse {
 
 impl PostResponse {
     fn from_post(post: &Post) -> Self {
+        Self::from_post_with_metadata(post, None, None, None, None)
+    }
+
+    fn from_list_item(item: &PostListItem) -> Self {
+        Self::from_post_with_metadata(
+            &item.post,
+            Some(item.channel_name.clone()),
+            Some(item.media_kind.clone()),
+            item.source_url.clone(),
+            item.storage_url.clone(),
+        )
+    }
+
+    fn from_post_with_metadata(
+        post: &Post,
+        channel_name: Option<String>,
+        media_kind: Option<String>,
+        source_url: Option<String>,
+        storage_url: Option<String>,
+    ) -> Self {
         Self {
             id: post.id,
             media_id: post.media_id,
@@ -671,6 +799,18 @@ impl PostResponse {
             status: post.state,
             scheduled_at: post.scheduled_at,
             cadence_slot_at: post.cadence_slot_at,
+            schedule_mode: if post.cadence_slot_at.is_some()
+                && post.requested_action == PublicationAction::Queue
+                && post.requested_publish_at.is_none()
+            {
+                "cadence".to_owned()
+            } else {
+                "explicit".to_owned()
+            },
+            channel_name,
+            media_kind,
+            source_url,
+            storage_url,
             created_at: post.created_at,
             updated_at: post.updated_at,
             revision: post.revision,
@@ -695,6 +835,33 @@ struct CreateChannelRequest {
     default_parse_mode: Option<String>,
     #[serde(default)]
     default_disable_notification: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateChannelRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    telegram_chat_id: Option<i64>,
+    #[serde(default)]
+    is_enabled: Option<bool>,
+    #[serde(default)]
+    time_zone: Option<String>,
+    #[serde(default)]
+    window_start: Option<String>,
+    #[serde(default)]
+    window_end: Option<String>,
+    #[serde(default)]
+    interval_minutes: Option<i32>,
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_patch_field")]
+    default_parse_mode: PatchField<String>,
+    #[serde(default)]
+    default_disable_notification: Option<bool>,
+    #[serde(default)]
+    #[serde(with = "time::serde::rfc3339::option")]
+    expected_updated_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Serialize)]

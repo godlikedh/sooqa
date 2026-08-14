@@ -8,9 +8,9 @@ use crate::{
 };
 use serde_json::json;
 use sooqa_inbox::{
-    AssetNormalization, Ingest, IngestFinalization, IngestKind, IngestStateError, IngestStatus,
-    IngestSubmission, RequestedAction, SourceDownload, SourceInspection, SourceMediaKind,
-    SubmittedVia,
+    AssetNormalization, Ingest, IngestCursor, IngestFinalization, IngestKind, IngestListItem,
+    IngestPage, IngestStateError, IngestStatus, IngestSubmission, RequestedAction, SourceDownload,
+    SourceInspection, SourceMediaKind, SubmittedVia,
 };
 use sooqa_jobs::{JobAttempt, NewJob};
 use sooqa_library::{
@@ -58,6 +58,10 @@ pub struct AcceptDuplicateResult {
 impl InboxRepository {
     pub(crate) fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub fn job_repository(&self) -> crate::JobRepository {
+        crate::JobRepository::new(self.pool.clone())
     }
 
     pub async fn create_ingest(
@@ -206,6 +210,64 @@ impl InboxRepository {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Return a bounded newest-first operational page. The cursor is based on
+    /// the immutable creation timestamp plus UUID, so inserts after the first
+    /// page cannot shift rows into or out of a later page.
+    pub async fn list_admin(
+        &self,
+        limit: u32,
+        cursor: Option<IngestCursor>,
+    ) -> Result<IngestPage, InboxRepositoryError> {
+        if !(1..=50).contains(&limit) {
+            return Err(InboxRepositoryError::InvalidLimit { value: limit, max: 50 });
+        }
+        let rows = sqlx::query_as::<_, IngestListRow>(
+            r#"
+            SELECT i.id, i.source_url, i.page_url, i.requested_action, i.state,
+                   i.created_at, i.updated_at, i.completed_at, i.media_id,
+                   i.error_code, i.error_message,
+                   m.telegram_storage_chat_id, m.telegram_storage_message_id
+            FROM ingests AS i
+            LEFT JOIN media AS m ON m.id = i.media_id
+            WHERE ($1::timestamptz IS NULL OR (i.created_at, i.id) < ($1, $2))
+            ORDER BY i.created_at DESC, i.id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(cursor.as_ref().map(|value| value.created_at))
+        .bind(cursor.as_ref().map(|value| value.id))
+        .bind(i64::from(limit) + 1)
+        .fetch_all(&self.pool)
+        .await?;
+        let has_more = rows.len() > limit as usize;
+        let rows = rows.into_iter().take(limit as usize).collect::<Vec<_>>();
+        let next_cursor = has_more
+            .then(|| rows.last())
+            .flatten()
+            .map(|row| IngestCursor { created_at: row.created_at, id: row.id });
+        let items =
+            rows.into_iter().map(IngestListRow::into_item).collect::<Result<Vec<_>, _>>()?;
+        Ok(IngestPage { items, next_cursor })
+    }
+
+    pub async fn count_active(&self) -> Result<u64, InboxRepositoryError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM ingests WHERE state NOT IN ('completed', 'failed_terminal', 'cancelled')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        u64::try_from(count).map_err(|_| InboxRepositoryError::InvalidCount)
+    }
+
+    pub async fn count_duplicate_pending(&self) -> Result<u64, InboxRepositoryError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM ingests WHERE state = 'duplicate_pending'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        u64::try_from(count).map_err(|_| InboxRepositoryError::InvalidCount)
     }
 
     /// Accept one already-evidenced media candidate without creating a media
@@ -2004,6 +2066,56 @@ impl IngestRow {
 }
 
 #[derive(Debug, FromRow)]
+struct IngestListRow {
+    id: Uuid,
+    source_url: Option<String>,
+    page_url: Option<String>,
+    requested_action: String,
+    state: String,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+    completed_at: Option<OffsetDateTime>,
+    media_id: Option<Uuid>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    telegram_storage_chat_id: Option<i64>,
+    telegram_storage_message_id: Option<i64>,
+}
+
+impl IngestListRow {
+    fn into_item(self) -> Result<IngestListItem, InboxRepositoryError> {
+        Ok(IngestListItem {
+            id: self.id,
+            source_url: self.source_url,
+            page_url: self.page_url,
+            requested_action: RequestedAction::try_from(self.requested_action.as_str())
+                .map_err(InboxRepositoryError::UnknownRequestedAction)?,
+            status: IngestStatus::try_from(self.state.as_str())
+                .map_err(InboxRepositoryError::UnknownIngestStatus)?,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            completed_at: self.completed_at,
+            media_id: self.media_id,
+            storage_url: self
+                .telegram_storage_chat_id
+                .zip(self.telegram_storage_message_id)
+                .and_then(storage_message_url),
+            error_code: self.error_code,
+            error_message: self.error_message.map(|value| value.chars().take(512).collect()),
+        })
+    }
+}
+
+fn storage_message_url((chat_id, message_id): (i64, i64)) -> Option<String> {
+    if chat_id >= 0 || message_id <= 0 {
+        return None;
+    }
+    let raw_id = chat_id.to_string();
+    let internal_id = raw_id.strip_prefix("-100").unwrap_or_else(|| raw_id.trim_start_matches('-'));
+    (!internal_id.is_empty()).then(|| format!("https://t.me/c/{internal_id}/{message_id}"))
+}
+
+#[derive(Debug, FromRow)]
 struct IngestIdentityRow {
     id: Uuid,
     request_hash: Vec<u8>,
@@ -2011,6 +2123,10 @@ struct IngestIdentityRow {
 
 #[derive(Debug, Error)]
 pub enum InboxRepositoryError {
+    #[error("ingest list limit {value} exceeds the maximum {max}")]
+    InvalidLimit { value: u32, max: u32 },
+    #[error("database count was negative")]
+    InvalidCount,
     #[error("idempotency key already belongs to a different request: {key}")]
     IdempotencyConflict { key: String },
     #[error("ingest {0} was not found")]
