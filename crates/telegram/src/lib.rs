@@ -2013,6 +2013,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn superseded_queue_commands_and_callbacks_have_no_publication_effect() {
+        let api = MockApi::default();
+        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+
+        assert_eq!(
+            service.handle_message(message(11, Some(123), "/queue")).await.unwrap(),
+            HandleOutcome::UnrecognizedIgnored
+        );
+        assert_eq!(
+            service
+                .handle_callback(IncomingCallback {
+                    update_id: 12,
+                    callback_id: "legacy-queue".to_owned(),
+                    user_id: 123,
+                    chat_id: Some(123),
+                    is_private: true,
+                    data: Some("v1:queue_publish:00000000-0000-0000-0000-000000000001".to_owned()),
+                })
+                .await
+                .unwrap(),
+            HandleOutcome::CallbackHandled
+        );
+        assert!(api.messages.lock().unwrap().is_empty());
+        assert!(api.keyboards.lock().unwrap().is_empty());
+        assert_eq!(api.callback_answers.lock().unwrap().as_slice(), &["legacy-queue"]);
+    }
+
+    #[tokio::test]
     async fn unauthorized_private_user_gets_generic_response() {
         let api = MockApi::default();
         let service = TelegramService::new(api.clone(), MockStore::default(), [123]);

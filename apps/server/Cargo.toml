@@ -13,13 +13,11 @@ sooqa-config = { path = "../../crates/config" }
 sooqa-inbox = { path = "../../crates/inbox" }
 sooqa-library = { path = "../../crates/library" }
 sooqa-persistence = { path = "../../crates/persistence" }
-sooqa-publisher = { path = "../../crates/publisher" }
 sooqa-runtime = { path = "../../crates/runtime" }
 sooqa-telegram = { path = "../../crates/telegram" }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-time.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
