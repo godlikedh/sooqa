@@ -16,7 +16,9 @@ test("admin shell uses local assets and has no inline executable content", () =>
   assert.match(html, /id="token-form"/);
   assert.match(html, /id="dashboard-page"/);
   assert.match(html, /id="ingests-page"/);
+  assert.match(html, /id="media-page"/);
   assert.match(html, /id="settings-page"/);
+  assert.match(html, /id="publication-dialog"/);
 });
 
 test("admin client keeps the token in session storage and renders backend text safely", () => {
@@ -33,6 +35,11 @@ test("admin client keeps the token in session storage and renders backend text s
   assert.match(script, /repeat_evidence\?\.conflicts/);
   assert.match(script, /formatDuration/);
   assert.match(script, /appLink\("#media"/);
+  assert.match(script, /URL\.createObjectURL/);
+  assert.match(script, /URL\.revokeObjectURL/);
+  assert.match(script, /localFutureTimeToIso/);
+  assert.match(script, /caption-sync\/retry/);
+  assert.match(script, /publication-intent/);
   assert.match(html, /<th>ID<\/th>/);
   assert.match(html, /colspan="7"/);
 });
@@ -61,6 +68,7 @@ class FakeNode {
     this.value = "";
     this.checked = false;
     this.href = "";
+    this.open = false;
   }
 
   get firstChild() {
@@ -131,6 +139,14 @@ class FakeNode {
 
   focus() {}
 
+  showModal() {
+    this.open = true;
+  }
+
+  close() {
+    this.open = false;
+  }
+
   reportValidity() {
     return true;
   }
@@ -200,14 +216,22 @@ function makeAdminDocument() {
     ["span", "duplicate-count"], ["div", "duplicate-list"], ["span", "repeat-count"],
     ["div", "repeat-list"], ["span", "caption-failure-count"], ["div", "caption-failure-list"],
     ["button", "dashboard-refresh"], ["tbody", "ingest-rows"], ["button", "ingests-refresh"],
-    ["button", "ingests-next"], ["button", "settings-refresh"], ["form", "settings-form"],
+    ["button", "ingests-next"], ["button", "media-refresh"], ["form", "media-search-form"],
+    ["input", "media-search"], ["button", "media-search-button"], ["button", "media-clear-search"],
+    ["div", "media-status"], ["div", "media-grid"], ["button", "media-next"],
+    ["button", "settings-refresh"], ["form", "settings-form"],
     ["input", "channel-id"], ["input", "channel-updated-at"], ["input", "channel-name"],
     ["input", "channel-chat-id"], ["input", "channel-time-zone"], ["input", "channel-window-start"],
     ["input", "channel-window-end"], ["input", "channel-interval"], ["select", "channel-parse-mode"],
     ["input", "channel-enabled"], ["input", "channel-disable-notification"], ["button", "settings-save"],
     ["span", "settings-mode"], ["div", "settings-warning"],
+    ["dialog", "publication-dialog"], ["form", "publication-form"], ["h2", "publication-dialog-title"],
+    ["p", "publication-dialog-context"], ["textarea", "publication-caption"], ["div", "publication-time-field"],
+    ["input", "publication-time"], ["p", "publication-error"], ["button", "publication-cancel"],
+    ["button", "publication-submit"],
   ];
   for (const [tagName, id] of ids) document.add(tagName, id);
+  document.getElementById("media-search-form").append(document.getElementById("media-search-button"));
   for (const page of ["dashboard", "ingests", "media", "schedule", "settings"]) {
     document.add("section", `${page}-page`, document.body, { page });
     document.add("a", `${page}-nav`, document.body, { pageLink: page });
@@ -226,9 +250,20 @@ function jsonResponse(payload, status = 200) {
   };
 }
 
+function binaryResponse(mimeType = "image/jpeg", status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: () => mimeType },
+    blob: async () => ({ type: mimeType }),
+  };
+}
+
 function createAdminRuntime({ token = "", handler }) {
   const document = makeAdminDocument();
   const storage = new Map(token ? [["sooqa.admin.api_token", token]] : []);
+  const objectUrls = new Set();
+  let objectUrlNumber = 0;
   const windowListeners = new Map();
   const window = {
     document,
@@ -237,6 +272,14 @@ function createAdminRuntime({ token = "", handler }) {
       getItem: (key) => storage.get(key) || null,
       setItem: (key, value) => storage.set(key, String(value)),
       removeItem: (key) => storage.delete(key),
+    },
+    URL: {
+      createObjectURL: () => {
+        const value = `blob:test-${++objectUrlNumber}`;
+        objectUrls.add(value);
+        return value;
+      },
+      revokeObjectURL: (value) => objectUrls.delete(value),
     },
     crypto: { randomUUID: () => "admin-test-key" },
     addEventListener: (type, listener) => windowListeners.set(type, listener),
@@ -257,6 +300,7 @@ function createAdminRuntime({ token = "", handler }) {
     document,
     window,
     storage,
+    objectUrls,
     dispatchWindow(type) {
       windowListeners.get(type)?.({ type });
     },
@@ -393,4 +437,94 @@ test("admin runtime sends the settings fence and reloads after a stale save", as
   assert.equal(JSON.parse(patch.options.body).expected_updated_at, channel.updated_at);
   assert.equal(paths.filter(({ pathName }) => pathName === "/api/v1/channels").length, 2);
   assert.match(runtime.document.getElementById("toast").textContent, /stale/);
+});
+
+test("admin runtime keeps media lookup, preview fetches, edits, retry, and publication fields separate", async () => {
+  const calls = [];
+  const media = {
+    id: "media-1", kind: "video", status: "active", title: "<unsafe title>", description: "internal",
+    storage_state: "ready", storage_url: "https://t.me/c/1/2", source_url: "https://example.test/<img>",
+    preview: { url: "/api/v1/media/media-1/preview", mime_type: "image/jpeg" },
+    caption_sync: { state: "failed", error: "<unsafe error>" },
+    tags: [{ normalized_name: "cats", display_name: "Cats" }], file_size_bytes: 2048, duration_ms: 61_000,
+    updated_at: "2026-01-01T00:00:00Z",
+  };
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (pathName, options) => {
+      calls.push({ pathName, options });
+      assert.equal(options.headers.get("Authorization"), "Bearer secret");
+      if (pathName === "/api/v1/media/media-1/preview") return binaryResponse();
+      if (pathName === "/api/v1/media/media-1/caption-sync/retry") {
+        return jsonResponse({ ...media, caption_sync: { state: "pending", error: null } });
+      }
+      if (pathName === "/api/v1/media/media-1") {
+        return jsonResponse({ ...media, description: "updated", tags: [{ normalized_name: "dogs", display_name: "Dogs" }], caption_sync: { state: "pending", error: null } });
+      }
+      if (pathName.includes("/publication-intent")) return jsonResponse({ state: "queued" });
+      if (pathName.startsWith("/api/v1/media?")) return jsonResponse({ items: [media], next_cursor: null });
+      return jsonResponse({ counts: {}, attention: {} });
+    },
+  });
+  await settle();
+  runtime.window.location.hash = "#media";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+
+  const grid = runtime.document.getElementById("media-grid");
+  assert.match(grid.textContent, /<unsafe title>/);
+  assert.match(grid.textContent, /<unsafe error>/);
+  assert.equal(grid.querySelector("script"), null);
+  const previewCall = calls.find(({ pathName }) => pathName.endsWith("/preview"));
+  assert.equal(previewCall.pathName, "/api/v1/media/media-1/preview");
+  assert.equal([...runtime.objectUrls].length, 1);
+  const firstObjectUrl = [...runtime.objectUrls][0];
+  assert.match(firstObjectUrl, /^blob:/);
+
+  const retry = buttonWithText(grid, "Retry sync");
+  retry.dispatchEvent({ type: "click" });
+  await settle();
+  assert.equal(calls.filter(({ pathName }) => pathName.endsWith("/caption-sync/retry")).length, 1);
+
+  runtime.document.getElementById("media-search").value = "https://2ch.org/thread/<exact>";
+  runtime.document.getElementById("media-search-form").dispatchEvent({ type: "submit" });
+  await settle();
+  const lookupCall = calls.filter(({ pathName }) => pathName.startsWith("/api/v1/media?" )).at(-1);
+  assert.match(lookupCall.pathName, /\/api\/v1\/media\?limit=50&q=https%3A%2F%2F2ch.org%2Fthread%2F%3Cexact%3E/);
+  const card = runtime.document.getElementById("media-grid").querySelector("article");
+  const tagInput = card.querySelectorAll("input")[0];
+  const description = card.querySelectorAll("textarea")[0];
+  tagInput.value = "Dogs, Cats, dogs";
+  description.value = "<new internal>";
+  buttonWithText(card, "Save edits").dispatchEvent({ type: "click" });
+  await settle();
+  const patch = calls.find(({ pathName }) => pathName === "/api/v1/media/media-1");
+  assert.deepEqual(JSON.parse(patch.options.body), {
+    description: "<new internal>",
+    tags: ["Dogs", "Cats"],
+    expected_updated_at: media.updated_at,
+  });
+
+  buttonWithText(runtime.document.getElementById("media-grid"), "Post now").dispatchEvent({ type: "click" });
+  await settle();
+  const plainPublication = calls.filter(({ pathName }) => pathName.includes("/publication-intent")).at(-1);
+  assert.deepEqual(JSON.parse(plainPublication.options.body), { requested_action: "post_now" });
+  assert.match(plainPublication.options.headers.get("Idempotency-Key"), /^admin-ui:/);
+
+  buttonWithText(runtime.document.getElementById("media-grid"), "Queue…").dispatchEvent({ type: "click" });
+  const future = new Date(Date.now() + 3_600_000);
+  const pad = (value) => String(value).padStart(2, "0");
+  runtime.document.getElementById("publication-caption").value = "<public text>";
+  runtime.document.getElementById("publication-time").value = `${future.getFullYear()}-${pad(future.getMonth() + 1)}-${pad(future.getDate())}T${pad(future.getHours())}:${pad(future.getMinutes())}`;
+  runtime.document.getElementById("publication-form").dispatchEvent({ type: "submit" });
+  await settle();
+  const exactPublication = calls.filter(({ pathName }) => pathName.includes("/publication-intent")).at(-1);
+  const exactBody = JSON.parse(exactPublication.options.body);
+  assert.equal(exactBody.requested_action, "queue");
+  assert.equal(exactBody.requested_post_caption, "<public text>");
+  assert.equal(exactBody.requested_publish_at, new Date(runtime.document.getElementById("publication-time").value).toISOString());
+
+  runtime.document.getElementById("media-refresh").dispatchEvent({ type: "click" });
+  await settle();
+  assert.equal(runtime.objectUrls.has(firstObjectUrl), false);
 });

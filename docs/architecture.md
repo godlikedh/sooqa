@@ -361,8 +361,11 @@ separate service is part of the deployment. The page stores the configured
 bearer token only in browser `sessionStorage`, calls same-origin API routes,
 and uses a restrictive asset CSP. It renders backend strings through DOM text
 nodes and uses the existing API/repository fences for duplicate, publication,
-and channel decisions. Media and Schedule navigation are intentionally left
-to their later slices.
+and channel decisions. Schedule navigation is intentionally left to its later
+slice. The Media slice uses the same API boundary for bounded
+50-row catalogue pages, exact lookup, complete metadata edits, caption-sync
+retry, authenticated preview bytes, and publication intents; it does not add a
+browser-side media or scheduling authority.
 
 ## Security and filesystem rules
 

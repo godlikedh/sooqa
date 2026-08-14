@@ -8,6 +8,12 @@
     page: "dashboard",
     ingestCursor: null,
     channels: [],
+    mediaQuery: "",
+    mediaCursor: null,
+    mediaItems: [],
+    mediaPreviewUrls: new Set(),
+    mediaRenderGeneration: 0,
+    publication: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -77,6 +83,12 @@
     return anchor;
   }
 
+  function mediaNavigationLink(mediaId, label) {
+    const anchor = appLink("#media", label);
+    anchor.addEventListener("click", () => { state.mediaQuery = mediaId || ""; });
+    return anchor;
+  }
+
   function formatDate(value) {
     if (!value) return "—";
     const date = new Date(value);
@@ -87,6 +99,24 @@
     if (!value) return "—";
     const text = String(value);
     return text.length > 18 ? `${text.slice(0, 8)}…${text.slice(-6)}` : text;
+  }
+
+  function formatBytes(value) {
+    if (!Number.isFinite(Number(value)) || Number(value) < 0) return "—";
+    const bytes = Number(value);
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
+  }
+
+  function formatMediaDuration(value) {
+    if (!Number.isFinite(Number(value)) || Number(value) < 0) return "—";
+    const totalSeconds = Math.floor(Number(value) / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    return hours ? `${hours}h ${String(minutes).padStart(2, "0")}m` : `${minutes}:${String(seconds).padStart(2, "0")}`;
   }
 
   function showToast(message, error) {
@@ -117,7 +147,7 @@
     $("api-token").focus();
   }
 
-  async function api(path, options) {
+  async function request(path, options) {
     if (!state.token) throw new UiError("Unlock the admin before making requests.");
     const requestOptions = options || {};
     const headers = new Headers(requestOptions.headers || {});
@@ -127,16 +157,22 @@
       headers.set("Content-Type", "application/json");
     }
     const response = await fetch(path, { ...requestOptions, headers, credentials: "same-origin" });
-    const contentType = response.headers.get("content-type") || "";
-    const payload = contentType.includes("json") ? await response.json() : null;
     if (response.status === 401) {
       lock();
       throw new UiError("The token was rejected. Enter it again.", response.status);
     }
     if (!response.ok) {
+      const contentType = response.headers.get("content-type") || "";
+      const payload = contentType.includes("json") ? await response.json() : null;
       throw new UiError(payload?.error?.message || `Request failed (${response.status}).`, response.status);
     }
-    return payload;
+    return response;
+  }
+
+  async function api(path, options) {
+    const response = await request(path, options);
+    const contentType = response.headers.get("content-type") || "";
+    return contentType.includes("json") ? response.json() : null;
   }
 
   async function withBusy(button, operation) {
@@ -287,7 +323,7 @@
     for (const item of items) {
       const card = node("article", "decision-card");
       const target = node("p");
-      target.append(appLink("#media", `Media ${formatId(item.media_id)} · open Media / Retry`));
+      target.append(mediaNavigationLink(item.media_id, `Media ${formatId(item.media_id)} · open Media / Retry`));
       card.append(target, node("p", "meta", item.error_message || "Telegram storage caption sync failed."));
       container.append(card);
     }
@@ -363,6 +399,300 @@
     const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
     const data = await api(`/api/v1/ingests?limit=50${suffix}`);
     renderIngests(data);
+  }
+
+  function revokeMediaPreviews() {
+    if (window.URL && typeof window.URL.revokeObjectURL === "function") {
+      for (const objectUrl of state.mediaPreviewUrls) window.URL.revokeObjectURL(objectUrl);
+    }
+    state.mediaPreviewUrls.clear();
+  }
+
+  function sameOriginApiPath(value) {
+    if (!value) return null;
+    try {
+      const url = new URL(value, window.location.origin);
+      if (url.origin !== window.location.origin || !url.pathname.startsWith("/api/v1/")) return null;
+      return `${url.pathname}${url.search}`;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function mediaTagValue(tags) {
+    return (tags || []).map((tag) => tag.normalized_name || tag.display_name).filter(Boolean).join(", ");
+  }
+
+  function parseMediaTags(value) {
+    const tags = [];
+    const seen = new Set();
+    for (const part of String(value || "").split(",")) {
+      const tag = part.trim();
+      const normalized = tag.toLowerCase();
+      if (tag && !seen.has(normalized)) {
+        seen.add(normalized);
+        tags.push(tag);
+      }
+    }
+    return tags;
+  }
+
+  function captionSyncLabel(value) {
+    return ({
+      not_required: "Not required",
+      pending: "Syncing",
+      syncing: "Syncing",
+      synced: "Synced",
+      failed: "Sync failed",
+    })[value] || "Unknown sync state";
+  }
+
+  function mediaPlaceholder(media, message) {
+    const placeholder = node("div", "media-placeholder");
+    placeholder.append(
+      node("span", "media-placeholder-icon", String(media.kind || "media").slice(0, 3).toUpperCase()),
+      node("span", "media-kind", media.kind || "MEDIA"),
+      node("span", "muted", message || "No bounded preview"),
+    );
+    return placeholder;
+  }
+
+  async function loadMediaPreview(path, image, placeholder, renderGeneration) {
+    const safePath = sameOriginApiPath(path);
+    if (!safePath || !window.URL || typeof window.URL.createObjectURL !== "function") return;
+    try {
+      const response = await request(safePath, { headers: { Accept: "image/*" } });
+      const blob = await response.blob();
+      const objectUrl = window.URL.createObjectURL(blob);
+      if (renderGeneration !== state.mediaRenderGeneration) {
+        window.URL.revokeObjectURL(objectUrl);
+        return;
+      }
+      state.mediaPreviewUrls.add(objectUrl);
+      image.src = objectUrl;
+      image.hidden = false;
+      placeholder.hidden = true;
+    } catch (_error) {
+      placeholder.lastChild.textContent = "Preview unavailable";
+    }
+  }
+
+  function replaceMediaItem(updated) {
+    const index = state.mediaItems.findIndex((item) => item.id === updated.id);
+    if (index >= 0) state.mediaItems[index] = updated;
+    renderMedia({ items: state.mediaItems, next_cursor: state.mediaCursor });
+  }
+
+  async function saveMediaMetadata(media, tagsInput, descriptionInput) {
+    const updated = await api(`/api/v1/media/${encodeURIComponent(media.id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        description: descriptionInput.value.trim() || null,
+        tags: parseMediaTags(tagsInput.value),
+        expected_updated_at: media.updated_at,
+      }),
+    });
+    replaceMediaItem(updated);
+    showToast("Catalogue edits saved; storage caption sync is durable.");
+  }
+
+  async function retryMediaCaptionSync(media) {
+    const updated = await api(`/api/v1/media/${encodeURIComponent(media.id)}/caption-sync/retry`, { method: "POST" });
+    replaceMediaItem(updated);
+    showToast("Caption sync requeued.");
+  }
+
+  function renderMediaCard(media, renderGeneration) {
+    const card = node("article", "media-card");
+    card.dataset.mediaId = media.id || "";
+    const visual = node("div", "media-visual");
+    const placeholder = mediaPlaceholder(media);
+    visual.append(placeholder);
+    if (media.preview?.url) {
+      const image = node("img");
+      image.alt = `Bounded preview for media ${formatId(media.id)}`;
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.hidden = true;
+      visual.append(image);
+      void loadMediaPreview(media.preview.url, image, placeholder, renderGeneration);
+    }
+
+    const main = node("div", "media-main");
+    const heading = node("div", "media-heading");
+    const title = media.title || `${media.kind || "Media"} item`;
+    heading.append(node("h2", "", title), node("span", "media-kind", media.kind || "MEDIA"));
+    main.append(heading);
+    const meta = node("div", "media-meta");
+    const id = node("span", "mono", formatId(media.id));
+    id.title = media.id || "";
+    meta.append(id, node("span", "meta", media.status || "unknown"), node("span", "meta", media.storage_state || "unknown"));
+    if (media.file_size_bytes !== null && media.file_size_bytes !== undefined) meta.append(node("span", "meta", formatBytes(media.file_size_bytes)));
+    if (media.duration_ms !== null && media.duration_ms !== undefined) meta.append(node("span", "meta", formatMediaDuration(media.duration_ms)));
+    main.append(meta);
+
+    const source = node("p", "media-source");
+    source.append(node("strong", "", "Canonical source: "));
+    source.append(media.source_url ? link(media.source_url, media.source_url) : node("span", "muted", "Not recorded"));
+    main.append(source);
+    const storage = node("p", "media-source");
+    storage.append(node("strong", "", "Telegram storage: "));
+    storage.append(media.storage_url ? link(media.storage_url, "Open in Telegram") : node("span", "muted", "Not ready"));
+    main.append(storage);
+
+    const tags = node("ul", "tag-list");
+    if (media.tags?.length) {
+      for (const tag of media.tags) tags.append(node("li", "tag", tag.display_name || tag.normalized_name));
+    } else {
+      tags.append(node("li", "muted", "No tags"));
+    }
+    main.append(tags);
+
+    const editor = node("form", "media-editor");
+    const tagsLabel = node("label", "", "Tags · comma separated");
+    const tagsInput = node("input");
+    tagsInput.type = "text";
+    tagsInput.value = mediaTagValue(media.tags);
+    tagsLabel.append(tagsInput);
+    const descriptionLabel = node("label", "", "Internal description");
+    const descriptionInput = document.createElement("textarea");
+    descriptionInput.rows = 3;
+    descriptionInput.value = media.description || "";
+    descriptionLabel.append(descriptionInput);
+    const editorActions = node("div", "media-editor-actions");
+    const sync = node("span", "sync-state", captionSyncLabel(media.caption_sync?.state));
+    sync.dataset.state = media.caption_sync?.state || "";
+    editorActions.append(sync);
+    if (media.caption_sync?.error) editorActions.append(node("span", "muted", media.caption_sync.error));
+    const saveButton = actionButton("Save edits", async () => saveMediaMetadata(media, tagsInput, descriptionInput), "button button-small button-primary");
+    editorActions.append(saveButton);
+    if (media.caption_sync?.state === "failed") {
+      editorActions.append(actionButton("Retry sync", async () => retryMediaCaptionSync(media), "button button-small button-secondary"));
+    }
+    editor.append(tagsLabel, descriptionLabel, editorActions);
+    editor.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (!saveButton.disabled) saveButton.click();
+    });
+    main.append(editor);
+
+    const publication = node("div", "publication-actions");
+    if (media.status === "active" && media.storage_state === "ready") {
+      publication.append(
+        actionButton("Post now", async () => submitPublication(media, "post_now")),
+        actionButton("Post now…", () => openPublicationDialog(media, "post_now")),
+        actionButton("Queue", async () => submitPublication(media, "queue")),
+        actionButton("Queue…", () => openPublicationDialog(media, "queue_exact")),
+      );
+    } else {
+      publication.append(node("span", "muted", "Publication actions appear when storage is ready."));
+    }
+    main.append(publication);
+    card.append(visual, main);
+    return card;
+  }
+
+  function renderMedia(data) {
+    state.mediaRenderGeneration += 1;
+    const renderGeneration = state.mediaRenderGeneration;
+    revokeMediaPreviews();
+    state.mediaItems = data.items || [];
+    state.mediaCursor = data.next_cursor || null;
+    const grid = $("media-grid");
+    clear(grid);
+    if (!state.mediaItems.length) {
+      grid.append(node("p", "empty-state media-empty", state.mediaQuery ? "No exact media match." : "No media found."));
+    } else {
+      for (const media of state.mediaItems) grid.append(renderMediaCard(media, renderGeneration));
+    }
+    const status = $("media-status");
+    if (state.mediaQuery) {
+      status.textContent = `Exact lookup: ${state.mediaQuery}`;
+      status.hidden = false;
+    } else {
+      status.hidden = true;
+    }
+    $("media-next").hidden = !state.mediaCursor;
+  }
+
+  async function loadMedia(cursor) {
+    let path = "/api/v1/media?limit=50";
+    if (state.mediaQuery) path += `&q=${encodeURIComponent(state.mediaQuery)}`;
+    if (cursor) path += `&cursor=${encodeURIComponent(cursor)}`;
+    const data = await api(path);
+    renderMedia(data);
+  }
+
+  function localDateTimeValue(date) {
+    const pad = (value) => String(value).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  function localFutureTimeToIso(value) {
+    const date = new Date(value);
+    if (!value || Number.isNaN(date.valueOf()) || date.getTime() <= Date.now()) {
+      throw new UiError("Choose a future local time for exact queueing.");
+    }
+    return date.toISOString();
+  }
+
+  function openPublicationDialog(media, action) {
+    state.publication = { media, action };
+    const dialog = $("publication-dialog");
+    const exact = action === "queue_exact";
+    $("publication-dialog-title").textContent = exact ? "Queue at an exact time" : "Post now with public text";
+    $("publication-dialog-context").textContent = `Media ${formatId(media.id)} · internal description and tags stay separate.`;
+    $("publication-caption").value = "";
+    $("publication-time").value = "";
+    $("publication-time").min = localDateTimeValue(new Date(Date.now() + 60_000));
+    $("publication-time").required = exact;
+    $("publication-time-field").hidden = !exact;
+    $("publication-error").hidden = true;
+    $("publication-submit").textContent = exact ? "Queue intent" : "Post intent";
+    if (!dialog.open) dialog.showModal();
+    $("publication-caption").focus();
+  }
+
+  function closePublicationDialog() {
+    state.publication = null;
+    const dialog = $("publication-dialog");
+    if (dialog.open) dialog.close();
+  }
+
+  async function submitPublication(media, action, caption, requestedPublishAt) {
+    const body = { requested_action: action === "queue_exact" ? "queue" : action };
+    if (caption) body.requested_post_caption = caption;
+    if (requestedPublishAt) body.requested_publish_at = requestedPublishAt;
+    const result = await api(`/api/v1/media/${encodeURIComponent(media.id)}/publication-intent`, {
+      method: "POST",
+      headers: { "Idempotency-Key": `admin-ui:${randomKey()}` },
+      body: JSON.stringify(body),
+    });
+    if (result?.state === "draft" && result.repeat_evidence) {
+      showToast("Publication repeat needs a decision on the Dashboard.");
+      window.location.hash = "#dashboard";
+      await route();
+    } else {
+      showToast("Publication intent saved.");
+    }
+  }
+
+  async function submitPublicationDialog(event) {
+    event.preventDefault();
+    const current = state.publication;
+    if (!current) return;
+    const caption = $("publication-caption").value.trim() || undefined;
+    let requestedPublishAt;
+    try {
+      if (current.action === "queue_exact") requestedPublishAt = localFutureTimeToIso($("publication-time").value);
+    } catch (error) {
+      $("publication-error").textContent = error instanceof Error ? error.message : "The exact time is invalid.";
+      $("publication-error").hidden = false;
+      return;
+    }
+    const button = $("publication-submit");
+    closePublicationDialog();
+    await withBusy(button, () => submitPublication(current.media, current.action, caption, requestedPublishAt));
   }
 
   function timeValue(value, fallback) {
@@ -455,6 +785,10 @@
     try {
       if (state.page === "dashboard") await loadDashboard();
       if (state.page === "ingests") await loadIngests(null);
+      if (state.page === "media") {
+        $("media-search").value = state.mediaQuery;
+        await loadMedia(null);
+      }
       if (state.page === "settings") await loadSettings();
     } catch (error) {
       showToast(error instanceof Error ? error.message : "The page could not be loaded.", true);
@@ -483,9 +817,30 @@
     const cursor = state.ingestCursor;
     if (cursor) void withBusy(event.currentTarget, () => loadIngests(cursor));
   });
+  $("media-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, () => loadMedia(null)); });
+  $("media-search-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    state.mediaQuery = $("media-search").value.trim();
+    void withBusy($("media-search-form").querySelector("button"), () => loadMedia(null));
+  });
+  $("media-clear-search").addEventListener("click", (event) => {
+    state.mediaQuery = "";
+    $("media-search").value = "";
+    void withBusy(event.currentTarget, () => loadMedia(null));
+  });
+  $("media-next").addEventListener("click", (event) => {
+    const cursor = state.mediaCursor;
+    if (cursor) void withBusy(event.currentTarget, () => loadMedia(cursor));
+  });
   $("settings-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, loadSettings); });
   $("settings-form").addEventListener("submit", (event) => { void saveSettings(event); });
+  $("publication-form").addEventListener("submit", (event) => { void submitPublicationDialog(event); });
+  $("publication-cancel").addEventListener("click", closePublicationDialog);
   window.addEventListener("hashchange", () => { void route(); });
+  window.addEventListener("pagehide", () => {
+    state.mediaRenderGeneration += 1;
+    revokeMediaPreviews();
+  });
 
   setAuthView(Boolean(state.token));
   void route();
