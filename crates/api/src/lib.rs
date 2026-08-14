@@ -114,7 +114,7 @@ async fn create_ingest(
     headers: HeaderMap,
     body: Result<JsonExtractor<IngestCreateRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<IngestAcceptedResponse>), ApiError> {
-    authorize(&state.api_token, &headers, "ingest:create").await?;
+    authorize(&state.api_token, &headers).await?;
     let idempotency_key = required_header(&headers, "idempotency-key")?;
     let JsonExtractor(payload) = body.map_err(|rejection| {
         if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -141,7 +141,6 @@ async fn create_ingest(
         .transpose()?;
 
     let mut input = IngestSubmissionInput::new(payload.url, SubmittedVia::Api);
-    input.submitted_by_admin_id = None;
     input.page_url = payload.page_url;
     input.page_title = payload.page_title;
     input.supplied_caption = payload.selected_text;
@@ -179,7 +178,7 @@ async fn get_ingest(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<IngestResponse>), ApiError> {
-    authorize(&state.api_token, &headers, "ingest:read").await?;
+    authorize(&state.api_token, &headers).await?;
     let request = state
         .inbox
         .find(id)
@@ -197,7 +196,7 @@ async fn force_save(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<IngestResponse>), ApiError> {
-    authorize(&state.api_token, &headers, "ingest:force_save").await?;
+    authorize(&state.api_token, &headers).await?;
     let result =
         state.inbox.force_save(id).await.map_err(|error| map_repository_error(error, &headers))?;
     let status = if result.resumed { StatusCode::ACCEPTED } else { StatusCode::OK };
@@ -210,7 +209,7 @@ async fn accept_duplicate(
     Path(id): Path<Uuid>,
     body: Result<JsonExtractor<AcceptDuplicateRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<IngestResponse>), ApiError> {
-    authorize(&state.api_token, &headers, "ingest:accept_duplicate").await?;
+    authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) = body.map_err(|rejection| {
         if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
             ApiError::payload_too_large(&headers)
@@ -231,11 +230,7 @@ async fn accept_duplicate(
     Ok((status, Json(IngestResponse::from_ingest(&result.ingest))))
 }
 
-async fn authorize(
-    expected_token: &str,
-    headers: &HeaderMap,
-    required_scope: &str,
-) -> Result<(), ApiError> {
+async fn authorize(expected_token: &str, headers: &HeaderMap) -> Result<(), ApiError> {
     let token = bearer_token(headers)?;
     let expected = Sha256::digest(expected_token.as_bytes());
     let actual = Sha256::digest(token.as_bytes());
@@ -253,7 +248,6 @@ async fn authorize(
             headers,
         ));
     }
-    let _ = required_scope;
     Ok(())
 }
 

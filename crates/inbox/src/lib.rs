@@ -284,7 +284,6 @@ impl TryFrom<&str> for IngestStatus {
 pub struct IngestSubmissionInput {
     pub source_url: String,
     pub submitted_via: SubmittedVia,
-    pub submitted_by_admin_id: Option<Uuid>,
     pub page_url: Option<String>,
     pub page_title: Option<String>,
     pub supplied_caption: Option<String>,
@@ -300,7 +299,6 @@ pub struct IngestSubmissionInput {
 pub struct TelegramSubmissionInput {
     pub source_reference: String,
     pub submitted_via: SubmittedVia,
-    pub submitted_by_admin_id: Option<Uuid>,
     pub original_input: Value,
     pub supplied_caption: Option<String>,
     pub idempotency_key: Option<String>,
@@ -311,7 +309,6 @@ impl IngestSubmissionInput {
         Self {
             source_url: source_url.into(),
             submitted_via,
-            submitted_by_admin_id: None,
             page_url: None,
             page_title: None,
             supplied_caption: None,
@@ -329,7 +326,6 @@ impl IngestSubmissionInput {
 pub struct IngestSubmission {
     pub kind: IngestKind,
     pub submitted_via: SubmittedVia,
-    pub submitted_by_admin_id: Option<Uuid>,
     pub original_url: String,
     pub normalized_url: String,
     pub original_input: Value,
@@ -405,7 +401,6 @@ impl IngestSubmission {
         Ok(Self {
             kind: IngestKind::Url,
             submitted_via: input.submitted_via,
-            submitted_by_admin_id: input.submitted_by_admin_id,
             original_url,
             normalized_url,
             original_input,
@@ -430,7 +425,6 @@ impl IngestSubmission {
         Ok(Self {
             kind: IngestKind::TelegramMessage,
             submitted_via: input.submitted_via,
-            submitted_by_admin_id: input.submitted_by_admin_id,
             original_url: source_reference.clone(),
             normalized_url: source_reference,
             original_input: input.original_input,
@@ -465,7 +459,6 @@ pub struct Ingest {
     pub kind: IngestKind,
     pub status: IngestStatus,
     pub submitted_via: SubmittedVia,
-    pub submitted_by_admin_id: Option<Uuid>,
     pub original_input: Value,
     pub source_url: String,
     pub page_url: Option<String>,
@@ -499,7 +492,6 @@ impl Ingest {
             kind: submission.kind,
             status: IngestStatus::Received,
             submitted_via: submission.submitted_via,
-            submitted_by_admin_id: submission.submitted_by_admin_id,
             original_input: submission.original_input(),
             source_url: submission.normalized_url.clone(),
             page_url: submission.page_url.clone(),
@@ -901,7 +893,6 @@ mod tests {
         let submission = IngestSubmission::try_new_telegram(TelegramSubmissionInput {
             source_reference: " telegram://42/99 ".to_owned(),
             submitted_via: SubmittedVia::TelegramBot,
-            submitted_by_admin_id: None,
             original_input: json!({
                 "telegram_message_id": 99,
                 "telegram_file_unique_id": "unique-file",
