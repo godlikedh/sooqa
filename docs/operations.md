@@ -74,6 +74,17 @@ Post now/Queue actions create publication intents; ellipsis variants collect
 only public text and, for exact queueing, a future local browser time. A repeat
 draft is resolved from Dashboard rather than in the Media page.
 
+Schedule loads `GET /api/v1/posts?limit=50` in scheduled-time/UUID order and
+does not request publication history. Cadence rows are marked separately from
+explicit-time rows. Draft, queued, and failed cards may patch only the public
+caption, cancel the post, request immediate publication, or call
+`/schedule-exact` with a future browser-local instant. Exact scheduling writes
+only the selected post, allows collisions, bypasses cadence/window rules, and
+leaves other posts untouched. Sending and unknown rows remain visible but
+read-only. Each mutation includes the current post revision; a conflict
+clears the local edit and reloads the item, while a first-page refresh leaves an
+actively edited form in place.
+
 The server emits the admin HTML, CSS, and JavaScript from the binary, so no
 Node process, frontend service, CDN, or asset volume is required. Keep `/admin`
 behind the same trusted-LAN boundary as the bearer API; the page's CSP and

@@ -108,10 +108,18 @@
         <div class="pager"><button id="media-next" class="button button-secondary" type="button" hidden>Next page</button></div>
       </section>
 
-      <section id="schedule-page" class="page placeholder-page" data-page="schedule" aria-labelledby="schedule-title" hidden>
-        <p class="eyebrow">Publication</p>
-        <h1 id="schedule-title">Schedule</h1>
-        <p class="muted">The future schedule editor is the next admin slice. Publication decisions remain on the Dashboard until then.</p>
+      <section id="schedule-page" class="page" data-page="schedule" aria-labelledby="schedule-title" hidden>
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Publication</p>
+            <h1 id="schedule-title">Schedule</h1>
+            <p class="muted">Chronological unpublished work. Exact times are browser-local, durable, and may collide safely.</p>
+          </div>
+          <button id="schedule-refresh" class="button button-secondary" type="button">Refresh</button>
+        </div>
+        <div id="schedule-notice" class="notice" hidden></div>
+        <div id="schedule-list" class="schedule-list" aria-live="polite"><p class="loading-state">Loading schedule…</p></div>
+        <div class="pager"><button id="schedule-next" class="button button-secondary" type="button" hidden>Next page</button></div>
       </section>
 
       <section id="settings-page" class="page" data-page="settings" aria-labelledby="settings-title" hidden>
