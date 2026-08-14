@@ -8,8 +8,8 @@ use sooqa_library::{
 };
 use sooqa_persistence::{Database, PublisherRepositoryError};
 use sooqa_publisher::{
-    NewChannel, NewPost, PostExactSchedule, PostState, PublicationAction, PublicationDecision,
-    PublicationIntent,
+    NewChannel, NewPost, PostExactSchedule, PostSchedule, PostState, PublicationAction,
+    PublicationDecision, PublicationIntent,
 };
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -391,6 +391,43 @@ async fn repeat_evaluation_uses_the_intended_send_instant_and_persists_evidence(
         Some("https://t.me/c/123456789/42")
     );
     assert_eq!(publish_job_count(&database, conflict.id).await, 0);
+    assert!(matches!(
+        database
+            .publisher()
+            .schedule_post(
+                PostSchedule::try_new(
+                    conflict.id,
+                    intended_at,
+                    "repeat-cadence",
+                    conflict.revision
+                )
+                .unwrap(),
+            )
+            .await,
+        Err(PublisherRepositoryError::RepeatDecisionRequired { .. })
+    ));
+    assert!(matches!(
+        database
+            .publisher()
+            .publish_now(conflict.id, "repeat-now".to_owned(), conflict.revision)
+            .await,
+        Err(PublisherRepositoryError::RepeatDecisionRequired { .. })
+    ));
+    assert!(matches!(
+        database
+            .publisher()
+            .schedule_post_exact(
+                PostExactSchedule::try_new(
+                    conflict.id,
+                    intended_at + Duration::hours(1),
+                    "repeat-exact",
+                    conflict.revision,
+                )
+                .unwrap(),
+            )
+            .await,
+        Err(PublisherRepositoryError::RepeatDecisionRequired { .. })
+    ));
 
     let allowed = database
         .publisher()
@@ -404,6 +441,28 @@ async fn repeat_evaluation_uses_the_intended_send_instant_and_persists_evidence(
         .post;
     assert_eq!(allowed.state, PostState::Queued);
     assert!(allowed.repeat_evidence.is_none());
+
+    let boundary_media = stored_media(&database).await;
+    published_post(
+        &database,
+        boundary_media,
+        channel.id,
+        intended_at - Duration::days(14),
+        "published-boundary",
+    )
+    .await;
+    let boundary = database
+        .publisher()
+        .create_publication_intent(
+            boundary_media,
+            PublicationIntent::try_new(PublicationAction::Queue, Some(intended_at), None).unwrap(),
+            "repeat-boundary-allowed".to_owned(),
+        )
+        .await
+        .unwrap()
+        .post;
+    assert_eq!(boundary.state, PostState::Queued);
+    assert!(boundary.repeat_evidence.is_none());
 
     let first_queued = database
         .publisher()

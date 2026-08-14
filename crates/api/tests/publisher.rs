@@ -43,6 +43,32 @@ async fn send(app: &Router, method: Method, uri: &str, body: Value) -> StatusCod
         .status()
 }
 
+async fn send_json(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    idempotency_key: &str,
+) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-api-token")
+                .header("idempotency-key", idempotency_key)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&body).expect("API response should be JSON"))
+}
+
 async fn stored_media(database: &Database) -> Uuid {
     let media = database
         .library()
@@ -198,4 +224,82 @@ async fn stale_edit_is_rejected_by_the_http_revision_fence(pool: sqlx::PgPool) {
         database.publisher().find_post(queued.id).await.unwrap().unwrap().caption.as_deref(),
         Some("original")
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn publication_intent_routes_materialize_exact_and_repeat_decisions(pool: sqlx::PgPool) {
+    let (database, app) = app(pool);
+    let _channel = channel(&database).await;
+    let media_id = stored_media(&database).await;
+    let exact_at = OffsetDateTime::now_utc() + time::Duration::hours(2);
+    let exact_at_text = exact_at.format(&time::format_description::well_known::Rfc3339).unwrap();
+    let (status, created) = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/media/{media_id}/publication-intent"),
+        json!({
+            "requested_action": "queue",
+            "requested_publish_at": exact_at_text,
+            "requested_post_caption": "public caption"
+        }),
+        "api-exact-intent",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["requested_action"], "queue");
+    assert!(created["cadence_slot_at"].is_null());
+    assert!(created["repeat_evidence"].is_null());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM ingests")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+
+    let post_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    let exact_overwrite = exact_at + time::Duration::hours(1);
+    let (status, scheduled) = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/posts/{post_id}/schedule-exact"),
+        json!({
+            "publish_at": exact_overwrite.format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "expected_revision": created["revision"].as_i64().unwrap()
+        }),
+        "api-exact-overwrite",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(scheduled["cadence_slot_at"].is_null());
+    assert_eq!(scheduled["status"], "queued");
+
+    let (status, repeat) = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/media/{media_id}/publication-intent"),
+        json!({ "requested_action": "post_now" }),
+        "api-repeat-intent",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(repeat["status"], "draft");
+    let conflict = &repeat["repeat_evidence"]["conflicts"][0];
+    assert!(conflict["at"].as_str().is_some());
+    assert_eq!(conflict["state"], "queued");
+
+    let (status, cancelled) = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/posts/{}/decision", repeat["id"].as_str().unwrap()),
+        json!({
+            "decision": "cancel",
+            "expected_revision": repeat["revision"].as_i64().unwrap()
+        }),
+        "api-repeat-cancel",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled["status"], "cancelled");
 }

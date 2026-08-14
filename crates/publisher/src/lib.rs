@@ -229,6 +229,7 @@ impl TryFrom<&str> for PublicationAction {
 #[serde(rename_all = "snake_case")]
 pub struct PublicationIntent {
     pub action: PublicationAction,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub requested_publish_at: Option<OffsetDateTime>,
     pub caption: Option<String>,
 }
@@ -282,6 +283,7 @@ pub struct RepeatEvidence {
 pub struct RepeatConflict {
     pub post_id: Uuid,
     pub state: PostState,
+    #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
     pub target_message_link: Option<String>,
 }

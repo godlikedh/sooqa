@@ -218,6 +218,7 @@ impl PublisherRepository {
         let request_key = sooqa_publisher::normalize_request_key(request_key)?;
         let request_hash = publication_intent_hash(media_id, &intent)?;
         let mut transaction = self.pool.begin().await?;
+        lock_publication_request(&mut transaction, &request_key).await?;
         if let Some(existing) =
             sqlx::query_as::<_, PostRow>("SELECT * FROM posts WHERE request_key = $1 FOR UPDATE")
                 .bind(&request_key)
@@ -413,6 +414,7 @@ impl PublisherRepository {
             });
         }
         check_expected_revision(&current, schedule.expected_revision)?;
+        ensure_repeat_decision_resolved(&current)?;
         ensure_channel_enabled(&channel)?;
         ensure_media_ready(&mut transaction, current.media_id).await?;
         let slot =
@@ -476,6 +478,7 @@ impl PublisherRepository {
             return Err(PublisherRepositoryError::PostCannotBeScheduled { id: current.id, state });
         }
         check_expected_revision(&current, schedule.expected_revision)?;
+        ensure_repeat_decision_resolved(&current)?;
         ensure_channel_enabled(&channel)?;
         ensure_media_ready(&mut transaction, current.media_id).await?;
         let row = apply_exact_schedule(
@@ -638,6 +641,7 @@ impl PublisherRepository {
             return Err(PublisherRepositoryError::PostCannotBeScheduled { id, state });
         }
         check_expected_revision(&current, expected_revision)?;
+        ensure_repeat_decision_resolved(&current)?;
         ensure_channel_enabled(&channel)?;
         ensure_media_ready(&mut transaction, current.media_id).await?;
         let now = OffsetDateTime::now_utc();
@@ -962,6 +966,28 @@ async fn lock_media_state(
         .ok_or(PublisherRepositoryError::MediaMissing(media_id))
 }
 
+async fn lock_publication_request(
+    transaction: &mut Transaction<'_, Postgres>,
+    request_key: &str,
+) -> Result<(), PublisherRepositoryError> {
+    let digest = Sha256::digest(request_key.as_bytes());
+    let mut key_bytes = [0_u8; 8];
+    key_bytes.copy_from_slice(&digest[..8]);
+    let lock_key = i64::from_be_bytes(key_bytes);
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+fn ensure_repeat_decision_resolved(current: &PostRow) -> Result<(), PublisherRepositoryError> {
+    if current.repeat_evidence.is_some() {
+        return Err(PublisherRepositoryError::RepeatDecisionRequired { id: current.id });
+    }
+    Ok(())
+}
+
 async fn single_enabled_channel(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<Uuid, PublisherRepositoryError> {
@@ -1075,7 +1101,7 @@ async fn find_repeat_conflicts(
               OR (
                   posts.state = 'published'
                   AND posts.published_at IS NOT NULL
-                  AND posts.published_at >= $3 - interval '14 days'
+                  AND posts.published_at > $3 - interval '14 days'
                   AND posts.published_at < $3
               )
           )
@@ -1598,6 +1624,8 @@ pub enum PublisherRepositoryError {
     InvalidPublicationDecision { id: Uuid, decision: PublicationDecision },
     #[error("post {id} cannot consume a publication decision in state {state:?}")]
     PostDecisionNotAllowed { id: Uuid, state: PostState },
+    #[error("post {id} requires a repeat publication decision")]
+    RepeatDecisionRequired { id: Uuid },
     #[error("post {0} has no exact requested publication time")]
     ExactTimeMissing(Uuid),
     #[error("post {id} is not claimable in state {state:?}")]

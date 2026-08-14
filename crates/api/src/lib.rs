@@ -481,6 +481,11 @@ fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> 
             "The post is no longer waiting for a publication decision",
             headers,
         ),
+        PublisherRepositoryError::RepeatDecisionRequired { .. } => ApiError::conflict(
+            "publication_decision_required",
+            "The post requires an explicit repeat-publication decision",
+            headers,
+        ),
         PublisherRepositoryError::ExactScheduleInPast => ApiError::bad_request(
             "exact_schedule_in_past",
             "The exact publication time must be in the future",
