@@ -32,7 +32,7 @@ async fn list_channels(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> Result<Json<ChannelListResponse>, ApiError> {
-    authorize(&state.api_token, &headers, "channels:read").await?;
+    authorize(&state.api_token, &headers).await?;
     let channels = state
         .publisher
         .list_channels(false)
@@ -48,7 +48,7 @@ async fn create_channel(
     headers: HeaderMap,
     body: Result<JsonExtractor<CreateChannelRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ChannelResponse>), ApiError> {
-    authorize(&state.api_token, &headers, "channels:write").await?;
+    authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     let mut channel =
@@ -82,7 +82,7 @@ async fn get_channel(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ChannelResponse>, ApiError> {
-    authorize(&state.api_token, &headers, "channels:read").await?;
+    authorize(&state.api_token, &headers).await?;
     let channel = state
         .publisher
         .find_channel(id)
@@ -99,7 +99,7 @@ async fn create_post(
     headers: HeaderMap,
     body: Result<JsonExtractor<CreatePostRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<PostResponse>), ApiError> {
-    authorize(&state.api_token, &headers, "publisher:write").await?;
+    authorize(&state.api_token, &headers).await?;
     let request_key = idempotency_key(&headers)?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
@@ -157,7 +157,7 @@ async fn get_post(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PostResponse>, ApiError> {
-    authorize(&state.api_token, &headers, "publisher:read").await?;
+    authorize(&state.api_token, &headers).await?;
     let post = state
         .publisher
         .find_post(id)
@@ -173,7 +173,7 @@ async fn update_post(
     Path(id): Path<Uuid>,
     body: Result<JsonExtractor<UpdatePostRequest>, JsonRejection>,
 ) -> Result<Json<PostResponse>, ApiError> {
-    authorize(&state.api_token, &headers, "publisher:write").await?;
+    authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     let caption_input = payload.caption.into_option();
@@ -244,7 +244,7 @@ async fn schedule_post(
     Path(id): Path<Uuid>,
     body: Result<JsonExtractor<ScheduleRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<PostResponse>), ApiError> {
-    authorize(&state.api_token, &headers, "publisher:write").await?;
+    authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     let requested_at = payload.publish_at.unwrap_or_else(OffsetDateTime::now_utc);
@@ -270,7 +270,7 @@ async fn publish_now(
     Path(id): Path<Uuid>,
     body: Result<JsonExtractor<MutationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<PostResponse>), ApiError> {
-    authorize(&state.api_token, &headers, "publisher:write").await?;
+    authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     validate_expected_revision(payload.expected_revision, &headers)?;
@@ -288,7 +288,7 @@ async fn cancel_post(
     Path(id): Path<Uuid>,
     body: Result<JsonExtractor<MutationRequest>, JsonRejection>,
 ) -> Result<Json<PostResponse>, ApiError> {
-    authorize(&state.api_token, &headers, "publisher:write").await?;
+    authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     validate_expected_revision(payload.expected_revision, &headers)?;
