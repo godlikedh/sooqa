@@ -284,7 +284,6 @@ impl TryFrom<&str> for IngestStatus {
 pub struct IngestSubmissionInput {
     pub source_url: String,
     pub submitted_via: SubmittedVia,
-    pub submitted_by_admin_id: Option<Uuid>,
     pub page_url: Option<String>,
     pub page_title: Option<String>,
     pub supplied_caption: Option<String>,
@@ -300,7 +299,6 @@ pub struct IngestSubmissionInput {
 pub struct TelegramSubmissionInput {
     pub source_reference: String,
     pub submitted_via: SubmittedVia,
-    pub submitted_by_admin_id: Option<Uuid>,
     pub original_input: Value,
     pub supplied_caption: Option<String>,
     pub idempotency_key: Option<String>,
@@ -311,7 +309,6 @@ impl IngestSubmissionInput {
         Self {
             source_url: source_url.into(),
             submitted_via,
-            submitted_by_admin_id: None,
             page_url: None,
             page_title: None,
             supplied_caption: None,
@@ -329,7 +326,6 @@ impl IngestSubmissionInput {
 pub struct IngestSubmission {
     pub kind: IngestKind,
     pub submitted_via: SubmittedVia,
-    pub submitted_by_admin_id: Option<Uuid>,
     pub original_url: String,
     pub normalized_url: String,
     pub original_input: Value,
@@ -342,6 +338,30 @@ pub struct IngestSubmission {
     pub requested_publish_at: Option<time::OffsetDateTime>,
     pub requested_post_caption: Option<String>,
     pub idempotency_key: Option<String>,
+}
+
+/// The request-hash wire shape used before the unused admin identity was
+/// removed from the domain model. Existing ingests store hashes of this
+/// shape, so new requests must keep hashing the explicit `null` field while
+/// the field itself stays out of the submission API and persisted ingest
+/// state.
+#[derive(Serialize)]
+struct LegacyIngestSubmission<'a> {
+    kind: IngestKind,
+    submitted_via: SubmittedVia,
+    submitted_by_admin_id: Option<Uuid>,
+    original_url: &'a str,
+    normalized_url: &'a str,
+    original_input: &'a Value,
+    page_url: &'a Option<String>,
+    page_title: &'a Option<String>,
+    supplied_caption: &'a Option<String>,
+    supplied_description: &'a Option<String>,
+    supplied_tags: &'a Vec<String>,
+    requested_action: RequestedAction,
+    requested_publish_at: &'a Option<time::OffsetDateTime>,
+    requested_post_caption: &'a Option<String>,
+    idempotency_key: &'a Option<String>,
 }
 
 impl IngestSubmission {
@@ -405,7 +425,6 @@ impl IngestSubmission {
         Ok(Self {
             kind: IngestKind::Url,
             submitted_via: input.submitted_via,
-            submitted_by_admin_id: input.submitted_by_admin_id,
             original_url,
             normalized_url,
             original_input,
@@ -430,7 +449,6 @@ impl IngestSubmission {
         Ok(Self {
             kind: IngestKind::TelegramMessage,
             submitted_via: input.submitted_via,
-            submitted_by_admin_id: input.submitted_by_admin_id,
             original_url: source_reference.clone(),
             normalized_url: source_reference,
             original_input: input.original_input,
@@ -451,7 +469,24 @@ impl IngestSubmission {
     }
 
     pub fn request_hash(&self) -> [u8; 32] {
-        let serialized = serde_json::to_vec(self).expect("ingest submission must be serializable");
+        let serialized = serde_json::to_vec(&LegacyIngestSubmission {
+            kind: self.kind,
+            submitted_via: self.submitted_via,
+            submitted_by_admin_id: None,
+            original_url: &self.original_url,
+            normalized_url: &self.normalized_url,
+            original_input: &self.original_input,
+            page_url: &self.page_url,
+            page_title: &self.page_title,
+            supplied_caption: &self.supplied_caption,
+            supplied_description: &self.supplied_description,
+            supplied_tags: &self.supplied_tags,
+            requested_action: self.requested_action,
+            requested_publish_at: &self.requested_publish_at,
+            requested_post_caption: &self.requested_post_caption,
+            idempotency_key: &self.idempotency_key,
+        })
+        .expect("ingest submission must be serializable");
         Sha256::digest(serialized).into()
     }
 }
@@ -465,7 +500,6 @@ pub struct Ingest {
     pub kind: IngestKind,
     pub status: IngestStatus,
     pub submitted_via: SubmittedVia,
-    pub submitted_by_admin_id: Option<Uuid>,
     pub original_input: Value,
     pub source_url: String,
     pub page_url: Option<String>,
@@ -499,7 +533,6 @@ impl Ingest {
             kind: submission.kind,
             status: IngestStatus::Received,
             submitted_via: submission.submitted_via,
-            submitted_by_admin_id: submission.submitted_by_admin_id,
             original_input: submission.original_input(),
             source_url: submission.normalized_url.clone(),
             page_url: submission.page_url.clone(),
@@ -901,7 +934,6 @@ mod tests {
         let submission = IngestSubmission::try_new_telegram(TelegramSubmissionInput {
             source_reference: " telegram://42/99 ".to_owned(),
             submitted_via: SubmittedVia::TelegramBot,
-            submitted_by_admin_id: None,
             original_input: json!({
                 "telegram_message_id": 99,
                 "telegram_file_unique_id": "unique-file",

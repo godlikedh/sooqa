@@ -59,7 +59,14 @@ async fn fresh_migration_contains_only_the_five_application_tables(pool: sqlx::P
         .fetch_one(database.pool())
         .await
         .expect("migration table should exist");
-    assert_eq!(migration_count, 6);
+    assert_eq!(migration_count, 7);
+    let status_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns WHERE table_name = 'ingests' AND column_name IN ('telegram_status_chat_id', 'telegram_status_message_id')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("ingest column inventory should load");
+    assert_eq!(status_columns, 0);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -149,9 +156,29 @@ async fn workspace_migration_preserves_legacy_ids_and_reconciliation_protection(
         vec![(telegram_ingest_id, telegram_workspace_id), (url_ingest_id, url_ingest_id)]
     );
 
+    sqlx::raw_sql(include_str!("../../../migrations/0004_publisher_queue_revision.sql"))
+        .execute(&target_pool)
+        .await
+        .expect("0004 should upgrade the legacy database");
+    sqlx::raw_sql(include_str!("../../../migrations/0005_ingest_requested_intent.sql"))
+        .execute(&target_pool)
+        .await
+        .expect("0005 should upgrade the legacy database");
+    sqlx::raw_sql(include_str!("../../../migrations/0006_remove_unused_ingest_status.sql"))
+        .execute(&target_pool)
+        .await
+        .expect("0006 should remove unused ingest status columns");
+
     let database = Database::connect(target_url.as_str(), 5)
         .await
         .expect("upgraded database should connect through the repository");
+    let remaining_status_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns WHERE table_name = 'ingests' AND column_name IN ('telegram_status_chat_id', 'telegram_status_message_id')",
+    )
+    .fetch_one(&target_pool)
+    .await
+    .expect("upgraded ingest column inventory should load");
+    assert_eq!(remaining_status_columns, 0);
     let protected = database
         .jobs()
         .protected_workspace_ids()

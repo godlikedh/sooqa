@@ -244,7 +244,6 @@ impl IngestService for DatabaseIngestService {
         let submission = IngestSubmission::try_new_telegram(TelegramSubmissionInput {
             source_reference,
             submitted_via: SubmittedVia::TelegramBot,
-            submitted_by_admin_id: None,
             original_input,
             supplied_caption: command.caption,
             idempotency_key: Some(command.idempotency_key),

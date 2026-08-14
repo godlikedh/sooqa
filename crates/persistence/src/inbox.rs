@@ -1978,7 +1978,6 @@ impl IngestRow {
                 .map_err(InboxRepositoryError::UnknownIngestStatus)?,
             submitted_via: SubmittedVia::try_from(self.submitted_via.as_str())
                 .map_err(InboxRepositoryError::UnknownSubmittedVia)?,
-            submitted_by_admin_id: None,
             original_input: self.input_json,
             source_url: self.source_url.ok_or(InboxRepositoryError::MissingSourceUrl(self.id))?,
             page_url: self.page_url,
