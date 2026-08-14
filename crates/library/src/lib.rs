@@ -82,6 +82,71 @@ pub enum MediaStorageState {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptionSyncState {
+    NotRequired,
+    Pending,
+    Syncing,
+    Synced,
+    Failed,
+}
+
+impl CaptionSyncState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Pending => "pending",
+            Self::Syncing => "syncing",
+            Self::Synced => "synced",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl TryFrom<&str> for CaptionSyncState {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "not_required" => Ok(Self::NotRequired),
+            "pending" => Ok(Self::Pending),
+            "syncing" => Ok(Self::Syncing),
+            "synced" => Ok(Self::Synced),
+            "failed" => Ok(Self::Failed),
+            unknown => Err(unknown.to_owned()),
+        }
+    }
+}
+
+pub const MAX_MEDIA_PREVIEW_BYTES: usize = 128 * 1024;
+pub const MAX_MEDIA_PREVIEW_WIDTH: u32 = 320;
+pub const MAX_MEDIA_PREVIEW_HEIGHT: u32 = 320;
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MediaPreviewMetadata {
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub size_bytes: u32,
+    pub sha256: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MediaPreviewInput {
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub sha256: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MediaPreviewData {
+    pub metadata: MediaPreviewMetadata,
+    pub bytes: Vec<u8>,
+}
+
 impl MediaStorageState {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -164,6 +229,10 @@ pub struct Media {
     pub sha256: Option<Vec<u8>>,
     pub local_work_path: Option<String>,
     pub storage_state: MediaStorageState,
+    pub preview: Option<MediaPreviewMetadata>,
+    pub caption_sync_generation: i32,
+    pub caption_sync_state: CaptionSyncState,
+    pub caption_sync_error: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub archived_at: Option<OffsetDateTime>,
@@ -197,6 +266,7 @@ pub struct MediaMetadata {
     pub file_size_bytes: Option<u64>,
     pub sha256: Option<Vec<u8>>,
     pub local_work_path: Option<String>,
+    pub preview: Option<MediaPreviewInput>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -303,7 +373,7 @@ pub struct MediaPage {
     pub next_cursor: Option<MediaCursor>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct MediaUpdate {
     pub title: Option<Option<String>>,
     pub description: Option<Option<String>>,
@@ -438,6 +508,21 @@ pub struct StorageCaptionMetadata {
     pub description: Option<String>,
     pub tags: Vec<String>,
     pub source_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CaptionSyncClaim {
+    pub media_id: Uuid,
+    pub generation: i32,
+    pub storage_chat_id: i64,
+    pub storage_message_id: i64,
+    pub metadata: StorageCaptionMetadata,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CaptionSyncCompletion {
+    Applied,
+    Stale,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

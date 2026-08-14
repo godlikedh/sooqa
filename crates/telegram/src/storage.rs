@@ -7,9 +7,14 @@ use sooqa_library::{
 };
 use sooqa_media::sha256_file;
 use teloxide::{
-    payloads::{SendAnimationSetters, SendAudioSetters, SendPhotoSetters, SendVideoSetters},
+    payloads::{
+        EditMessageCaptionSetters, SendAnimationSetters, SendAudioSetters, SendPhotoSetters,
+        SendVideoSetters,
+    },
     prelude::{Request, Requester},
-    types::{ChatFullInfoKind, ChatFullInfoPublicKind, ChatId, ChatMemberKind, InputFile},
+    types::{
+        ChatFullInfoKind, ChatFullInfoPublicKind, ChatId, ChatMemberKind, InputFile, MessageId,
+    },
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -40,6 +45,13 @@ pub struct StorageUploadResult {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StorageCaptionEditRequest {
+    pub storage_chat_id: i64,
+    pub storage_message_id: i64,
+    pub caption: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum StorageUploadOutcome {
     Uploaded(StorageReceipt),
     Reused(StorageReceipt),
@@ -63,6 +75,18 @@ pub trait TelegramStorageApi: Clone + Send + Sync + 'static {
     }
 }
 
+#[async_trait]
+pub trait TelegramStorageCaptionApi: Clone + Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn edit_storage_caption(
+        &self,
+        request: StorageCaptionEditRequest,
+    ) -> Result<(), Self::Error>;
+
+    fn is_retryable_error(error: &Self::Error) -> bool;
+}
+
 #[derive(Debug, Error)]
 pub enum StorageUploadApiError {
     #[error("Telegram storage API request failed: {0}")]
@@ -75,6 +99,14 @@ pub enum StorageUploadApiError {
     StorageBotNotAdministrator,
     #[error("Telegram bot administrator cannot post messages to the storage channel")]
     StorageBotCannotPost,
+}
+
+#[derive(Debug, Error)]
+pub enum StorageCaptionApiError {
+    #[error("Telegram storage caption API request failed: {0}")]
+    Api(#[source] teloxide::RequestError),
+    #[error("Telegram storage message ID does not fit the adapter type: {0}")]
+    InvalidMessageId(i64),
 }
 
 #[derive(Debug, Error)]
@@ -369,7 +401,7 @@ where
 const MAX_STORAGE_CAPTION_CHARS: usize = 1_024;
 const MAX_STORAGE_CAPTION_TAGS: usize = 32;
 
-fn storage_caption(metadata: &StorageCaptionMetadata) -> String {
+pub fn storage_caption(metadata: &StorageCaptionMetadata) -> String {
     let mut lines = Vec::new();
     if let Some(description) = &metadata.description {
         let description = clean_caption_value(description, 512);
@@ -544,6 +576,39 @@ impl TelegramStorageApi for TeloxideApi {
             ChatMemberKind::Administrator(_) => Err(StorageUploadApiError::StorageBotCannotPost),
             _ => Err(StorageUploadApiError::StorageBotNotAdministrator),
         }
+    }
+}
+
+#[async_trait]
+impl TelegramStorageCaptionApi for TeloxideApi {
+    type Error = StorageCaptionApiError;
+
+    async fn edit_storage_caption(
+        &self,
+        request: StorageCaptionEditRequest,
+    ) -> Result<(), Self::Error> {
+        let message_id = i32::try_from(request.storage_message_id)
+            .map_err(|_| StorageCaptionApiError::InvalidMessageId(request.storage_message_id))?;
+        self.bot()
+            .edit_message_caption(ChatId(request.storage_chat_id), MessageId(message_id))
+            .caption(request.caption)
+            .send()
+            .await
+            .map_err(StorageCaptionApiError::Api)?;
+        Ok(())
+    }
+
+    fn is_retryable_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            StorageCaptionApiError::Api(
+                teloxide::RequestError::Api(teloxide::errors::ApiError::Unknown(_))
+                    | teloxide::RequestError::Network(_)
+                    | teloxide::RequestError::InvalidJson { .. }
+                    | teloxide::RequestError::Io(_)
+                    | teloxide::RequestError::RetryAfter(_)
+            )
+        )
     }
 }
 
@@ -738,6 +803,10 @@ mod tests {
             sha256: Some(sha256),
             local_work_path: Some(path.to_string_lossy().into_owned()),
             storage_state: MediaStorageState::Pending,
+            preview: None,
+            caption_sync_generation: 0,
+            caption_sync_state: sooqa_library::CaptionSyncState::NotRequired,
+            caption_sync_error: None,
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),
             archived_at: None,
@@ -998,6 +1067,19 @@ mod tests {
 
         assert!(<TeloxideApi as TelegramStorageApi>::is_ambiguous_error(&unknown));
         assert!(!<TeloxideApi as TelegramStorageApi>::is_ambiguous_error(&rejected));
+    }
+
+    #[test]
+    fn caption_sync_retries_known_safe_failures_only() {
+        let retry_after = StorageCaptionApiError::Api(teloxide::RequestError::RetryAfter(
+            teloxide::types::Seconds::from_seconds(1),
+        ));
+        let invalid_message_id = StorageCaptionApiError::InvalidMessageId(i64::MAX);
+
+        assert!(<TeloxideApi as TelegramStorageCaptionApi>::is_retryable_error(&retry_after));
+        assert!(!<TeloxideApi as TelegramStorageCaptionApi>::is_retryable_error(
+            &invalid_message_id
+        ));
     }
 
     #[test]

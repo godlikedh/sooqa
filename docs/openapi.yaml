@@ -277,6 +277,63 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/media/{id}/preview:
+    get:
+      tags: [media]
+      operationId: getMediaPreview
+      summary: Read a bounded private media preview
+      description: >-
+        Returns the stored bounded preview only. A media item without a safe
+        preview returns 404; the endpoint never exposes a source or workspace
+        path. The response is private-cacheable and carries an ETag.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MediaId'
+        - name: If-None-Match
+          in: header
+          schema: { type: string }
+      responses:
+        '200':
+          description: Bounded preview bytes.
+          headers:
+            ETag: { schema: { type: string } }
+            Cache-Control: { schema: { type: string } }
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary, maxLength: 131072 }
+            image/png:
+              schema: { type: string, format: binary, maxLength: 131072 }
+        '304':
+          description: The preview has not changed.
+          headers:
+            ETag: { schema: { type: string } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/media/{id}/caption-sync/retry:
+    post:
+      tags: [media]
+      operationId: retryMediaCaptionSync
+      summary: Retry synchronization of one storage caption
+      description: >-
+        Authenticated retry command. It creates a new generation-fenced
+        caption-sync job and edits the existing private storage message; it
+        never uploads or copies the media again.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MediaId'
+      responses:
+        '200':
+          description: Media row with pending caption synchronization.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Media' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/media/{id}/tags:
     post:
       tags: [media]
@@ -967,7 +1024,7 @@ components:
       enum: [active, archived, deleted]
     Media:
       type: object
-      required: [id, kind, status, tags, created_at, updated_at]
+      required: [id, kind, status, tags, caption_sync, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         kind: { $ref: '#/components/schemas/MediaKind' }
@@ -977,6 +1034,12 @@ components:
         notes: { type: string, nullable: true }
         storage_state: { type: string, enum: [pending_storage, ready, storage_unknown, missing], nullable: true }
         storage_url: { type: string, format: uri, nullable: true }
+        preview:
+          type: object
+          allOf:
+            - $ref: '#/components/schemas/MediaPreview'
+          nullable: true
+        caption_sync: { $ref: '#/components/schemas/CaptionSync' }
         source_url: { type: string, nullable: true }
         source_original_url: { type: string, format: uri, nullable: true }
         source_metadata: { type: object, additionalProperties: true, nullable: true }
@@ -994,6 +1057,23 @@ components:
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         archived_at: { type: string, format: date-time, nullable: true }
+    MediaPreview:
+      type: object
+      required: [url, mime_type, width, height, size_bytes, etag]
+      properties:
+        url: { type: string }
+        mime_type: { type: string, enum: [image/jpeg, image/png] }
+        width: { type: integer, minimum: 1, maximum: 320 }
+        height: { type: integer, minimum: 1, maximum: 320 }
+        size_bytes: { type: integer, minimum: 1, maximum: 131072 }
+        etag: { type: string }
+    CaptionSync:
+      type: object
+      required: [generation, state]
+      properties:
+        generation: { type: integer, minimum: 0 }
+        state: { type: string, enum: [not_required, pending, syncing, synced, failed] }
+        error: { type: string, nullable: true, maxLength: 512 }
     MediaPage:
       type: object
       required: [items]

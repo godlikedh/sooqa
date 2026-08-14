@@ -59,7 +59,7 @@ async fn fresh_migration_contains_only_the_five_application_tables(pool: sqlx::P
         .fetch_one(database.pool())
         .await
         .expect("migration table should exist");
-    assert_eq!(migration_count, 7);
+    assert_eq!(migration_count, 8);
     let status_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns WHERE table_name = 'ingests' AND column_name IN ('telegram_status_chat_id', 'telegram_status_message_id')",
     )

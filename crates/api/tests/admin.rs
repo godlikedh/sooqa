@@ -3,7 +3,9 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
 };
+use image::{DynamicImage, ImageBuffer, Rgb, codecs::jpeg::JpegEncoder};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sooqa_api::{ApiSettings, ApiState, router};
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
 use sooqa_library::{
@@ -49,6 +51,11 @@ async fn request(app: &Router, method: Method, uri: &str, body: Value) -> (Statu
 }
 
 async fn stored_media(database: &Database, ingest_id: Uuid) -> Uuid {
+    let mut preview_bytes = Vec::new();
+    JpegEncoder::new_with_quality(&mut preview_bytes, 85)
+        .encode_image(&DynamicImage::ImageRgb8(ImageBuffer::from_pixel(8, 4, Rgb([32, 64, 128]))))
+        .unwrap();
+    let preview_sha256 = Sha256::digest(&preview_bytes).to_vec();
     let result = database
         .library()
         .resolve_media(MediaIngest {
@@ -66,6 +73,13 @@ async fn stored_media(database: &Database, ingest_id: Uuid) -> Uuid {
                 file_size_bytes: Some(1),
                 sha256: Some(Uuid::new_v4().as_bytes().repeat(2)),
                 local_work_path: None,
+                preview: Some(sooqa_library::MediaPreviewInput {
+                    bytes: preview_bytes,
+                    mime_type: "image/jpeg".to_owned(),
+                    width: 8,
+                    height: 4,
+                    sha256: preview_sha256,
+                }),
             },
             source: MediaSourceInput {
                 ingest_id: Some(ingest_id),
@@ -118,7 +132,7 @@ async fn admin_api_lists_ingests_media_schedule_dashboard_and_channel_settings(p
         .ingest
         .id;
     let media_id = stored_media(&database, ingest).await;
-    sqlx::query("UPDATE media SET source_metadata = source_metadata || jsonb_build_object('caption_sync_state', 'failed', 'caption_sync_error', 'caption sync failed') WHERE id = $1")
+    sqlx::query("UPDATE media SET caption_sync_state = 'failed', caption_sync_error = 'caption sync failed' WHERE id = $1")
         .bind(media_id)
         .execute(database.pool())
         .await
@@ -171,6 +185,41 @@ async fn admin_api_lists_ingests_media_schedule_dashboard_and_channel_settings(p
     assert_eq!(media["items"][0]["storage_url"], "https://t.me/c/3971341583/57");
     assert_eq!(media["items"][0]["source_original_url"], "https://2ch.su/b/src/api-admin.webm");
 
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/media/{media_id}/preview"))
+                .header("authorization", "Bearer test-api-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "image/jpeg");
+    assert_eq!(response.headers()["cache-control"], "private, max-age=3600");
+    let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+    let preview_bytes = axum::body::to_bytes(response.into_body(), 128 * 1024 + 1).await.unwrap();
+    assert!(!preview_bytes.is_empty());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/media/{media_id}/preview"))
+                .header("authorization", "Bearer test-api-token")
+                .header("if-none-match", etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert!(axum::body::to_bytes(response.into_body(), 1).await.unwrap().is_empty());
+
     let (status, schedule) =
         request(&app, Method::GET, "/api/v1/posts?limit=50", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
@@ -191,6 +240,17 @@ async fn admin_api_lists_ingests_media_schedule_dashboard_and_channel_settings(p
         dashboard["attention"]["caption_sync_failures"][0]["error_message"],
         "caption sync failed"
     );
+
+    let (status, retried) = request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/media/{media_id}/caption-sync/retry"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(retried["caption_sync"]["state"], "pending");
+    assert_eq!(retried["caption_sync"]["generation"], 1);
 
     let expected_updated_at =
         channel.updated_at.format(&time::format_description::well_known::Rfc3339).unwrap();

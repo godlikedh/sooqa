@@ -1065,6 +1065,7 @@ fn test_video_ingest(ingest_id: Uuid, sha256: Vec<u8>) -> MediaIngest {
             file_size_bytes: Some(1_024),
             sha256: Some(sha256),
             local_work_path: Some(format!("/tmp/{ingest_id}.mp4")),
+            preview: None,
         },
         source: MediaSourceInput {
             ingest_id: Some(ingest_id),

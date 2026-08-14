@@ -41,6 +41,7 @@ async fn stored_media(database: &Database, ingest_id: Option<Uuid>, source_url: 
                 file_size_bytes: Some(100),
                 sha256: Some(Uuid::new_v4().as_bytes().repeat(2)),
                 local_work_path: None,
+                preview: None,
             },
             source: MediaSourceInput {
                 ingest_id,
@@ -158,7 +159,7 @@ async fn schedule_page_is_bounded_and_channel_updates_are_revision_fenced(pool: 
     channel.window_end = time::Time::from_hms(23, 59, 0).unwrap();
     let channel = database.publisher().create_channel(channel).await.unwrap();
     let media_id = stored_media(&database, None, "https://example.test/schedule.webm").await;
-    sqlx::query("UPDATE media SET source_metadata = source_metadata || jsonb_build_object('caption_sync_state', 'failed', 'caption_sync_error', 'caption sync failed') WHERE id = $1")
+    sqlx::query("UPDATE media SET caption_sync_state = 'failed', caption_sync_error = 'caption sync failed' WHERE id = $1")
         .bind(media_id)
         .execute(database.pool())
         .await

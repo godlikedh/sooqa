@@ -34,6 +34,7 @@ fn media_ingest_with_sha(source: &str, sha256: Vec<u8>) -> MediaIngest {
             file_size_bytes: Some(1_024),
             sha256: Some(sha256),
             local_work_path: Some("/tmp/workspace-test.mp4".to_owned()),
+            preview: None,
         },
         source: MediaSourceInput {
             ingest_id: None,

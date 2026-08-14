@@ -34,9 +34,10 @@ mod storage;
 
 pub use publication::{TelegramPublicationApi, TelegramPublicationRequest};
 pub use storage::{
-    StorageUploadApiError, StorageUploadError, StorageUploadInput, StorageUploadOutcome,
-    StorageUploadProvider, StorageUploadRequest, StorageUploadResult, TELEGRAM_STORAGE_PROVIDER,
-    TelegramStorageApi,
+    StorageCaptionApiError, StorageCaptionEditRequest, StorageUploadApiError, StorageUploadError,
+    StorageUploadInput, StorageUploadOutcome, StorageUploadProvider, StorageUploadRequest,
+    StorageUploadResult, TELEGRAM_STORAGE_PROVIDER, TelegramStorageApi, TelegramStorageCaptionApi,
+    storage_caption,
 };
 
 pub const START_RESPONSE: &str = "sooqa is ready. You are authorized.";

@@ -28,6 +28,7 @@ async fn stored_media(database: &Database) -> Uuid {
                 file_size_bytes: Some(1),
                 sha256: Some(vec![Uuid::new_v4().as_bytes()[0]; 32]),
                 local_work_path: None,
+                preview: None,
             },
             source: MediaSourceInput {
                 ingest_id: None,

@@ -304,6 +304,23 @@ impl JobRepository {
         .fetch_all(&mut *transaction)
         .await?;
         for job in &recovered {
+            if job.kind == JobType::SyncStorageCaption.as_str() && job.state == "queued" {
+                let media_id = job
+                    .payload
+                    .get("media_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok());
+                let generation = job.payload.get("generation").and_then(serde_json::Value::as_i64);
+                if let (Some(media_id), Some(generation)) = (media_id, generation) {
+                    sqlx::query(
+                        "UPDATE media SET caption_sync_state = 'pending', caption_sync_error = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2 AND caption_sync_state = 'syncing'",
+                    )
+                    .bind(media_id)
+                    .bind(generation)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+            }
             if job.state == "failed" && job.attempt_count >= job.max_attempts {
                 reconcile_exhausted_job(&mut transaction, job).await?;
             }
@@ -750,6 +767,25 @@ async fn reconcile_exhausted_job(
                 .await?;
             }
         }
+        return Ok(());
+    }
+    if job_type == JobType::SyncStorageCaption {
+        let Some(media_id) = job
+            .payload
+            .get("media_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+        else {
+            return Ok(());
+        };
+        let generation = job.payload.get("generation").and_then(serde_json::Value::as_i64);
+        sqlx::query(
+            "UPDATE media SET caption_sync_state = 'failed', caption_sync_error = 'caption sync job lease expired after the final attempt', updated_at = now() WHERE id = $1 AND caption_sync_state = 'syncing' AND ($2::bigint IS NULL OR caption_sync_generation = $2)",
+        )
+        .bind(media_id)
+        .bind(generation)
+        .execute(&mut **transaction)
+        .await?;
         return Ok(());
     }
     if job_type != JobType::UploadStorageAsset {

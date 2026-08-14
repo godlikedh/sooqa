@@ -67,6 +67,12 @@ pub struct FrameExtractor {
     decode_limits: FrameDecodeLimits,
 }
 
+#[derive(Debug)]
+pub struct VideoSequenceExtraction {
+    pub fingerprint: VideoSequenceFingerprint,
+    pub best_frame: Option<DynamicImage>,
+}
+
 impl FrameExtractor {
     pub fn new(ffmpeg_executable: impl Into<PathBuf>, timeout: Duration) -> Self {
         Self::with_runner(
@@ -114,6 +120,24 @@ impl FrameExtractor {
         input_name: &str,
         duration_ms: u64,
     ) -> Result<VideoSequenceFingerprint, FrameExtractionError> {
+        Ok(self
+            .extract_video_sequence_with_best_frame_from_area(
+                workspace,
+                area,
+                input_name,
+                duration_ms,
+            )
+            .await?
+            .fingerprint)
+    }
+
+    pub async fn extract_video_sequence_with_best_frame_from_area(
+        &self,
+        workspace: &MediaWorkspace,
+        area: WorkspaceArea,
+        input_name: &str,
+        duration_ms: u64,
+    ) -> Result<VideoSequenceExtraction, FrameExtractionError> {
         if duration_ms == 0 {
             return Err(FrameExtractionError::InvalidDuration);
         }
@@ -183,7 +207,7 @@ impl FrameExtractor {
         }
         .await;
         match (result, extraction_guard.cleanup().await) {
-            (Ok(fingerprint), Ok(())) => Ok(fingerprint),
+            (Ok(extraction), Ok(())) => Ok(extraction),
             (Err(error), Ok(())) => Err(error),
             (Ok(_), Err(error)) => Err(error),
             (Err(error), Err(_cleanup_error)) => Err(error),
@@ -206,7 +230,7 @@ async fn run_and_consume_sequence(
     command: ExternalCommand,
     extraction_dir: PathBuf,
     config: SequenceExtractionConfig,
-) -> Result<VideoSequenceFingerprint, FrameExtractionError> {
+) -> Result<VideoSequenceExtraction, FrameExtractionError> {
     let producer_done = Arc::new(AtomicBool::new(false));
     let producer_done_signal = Arc::clone(&producer_done);
     let producer_directory = extraction_dir.clone();
@@ -249,7 +273,8 @@ async fn run_and_consume_sequence(
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
-    Ok(builder.finish()?)
+    let (fingerprint, best_frame) = builder.finish_with_best_image()?;
+    Ok(VideoSequenceExtraction { fingerprint, best_frame })
 }
 
 async fn consume_sequence_frames(

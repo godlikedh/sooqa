@@ -423,6 +423,11 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
             "The tag is not attached to the media item",
             headers,
         ),
+        LibraryRepositoryError::CaptionSyncUnavailable(_) => ApiError::conflict(
+            "caption_sync_unavailable",
+            "The media item has no ready Telegram storage message",
+            headers,
+        ),
         LibraryRepositoryError::InvalidLimit { .. } => {
             ApiError::bad_request("invalid_limit", "The limit must be between 1 and 50", headers)
         }

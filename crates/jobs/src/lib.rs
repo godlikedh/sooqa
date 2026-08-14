@@ -21,6 +21,7 @@ pub enum JobType {
     FinalizeIngest,
     MaterializePublication,
     UploadStorageAsset,
+    SyncStorageCaption,
     PublishPost,
     CleanupWorkspace,
     RecoverStaleJobs,
@@ -37,6 +38,7 @@ impl JobType {
             Self::FinalizeIngest => "finalize_ingest",
             Self::MaterializePublication => "materialize_publication",
             Self::UploadStorageAsset => "upload_storage_asset",
+            Self::SyncStorageCaption => "sync_storage_caption",
             Self::PublishPost => "publish_post",
             Self::CleanupWorkspace => "cleanup_workspace",
             Self::RecoverStaleJobs => "recover_stale_jobs",
@@ -63,6 +65,7 @@ impl TryFrom<&str> for JobType {
             "finalize_ingest" => Ok(Self::FinalizeIngest),
             "materialize_publication" => Ok(Self::MaterializePublication),
             "upload_storage_asset" => Ok(Self::UploadStorageAsset),
+            "sync_storage_caption" => Ok(Self::SyncStorageCaption),
             "publish_post" => Ok(Self::PublishPost),
             "cleanup_workspace" => Ok(Self::CleanupWorkspace),
             "recover_stale_jobs" => Ok(Self::RecoverStaleJobs),
@@ -182,6 +185,7 @@ pub enum JobCommand {
     FinalizeIngest(IngestJobPayload),
     MaterializePublication(MaterializePublicationPayload),
     UploadStorageAsset(MediaJobPayload),
+    SyncStorageCaption(MediaJobPayload),
     PublishPost(PublishPostPayload),
     CleanupWorkspace(CleanupWorkspacePayload),
     RecoverStaleJobs(EmptyJobPayload),
@@ -198,6 +202,7 @@ impl JobCommand {
             Self::FinalizeIngest(_) => JobType::FinalizeIngest,
             Self::MaterializePublication(_) => JobType::MaterializePublication,
             Self::UploadStorageAsset(_) => JobType::UploadStorageAsset,
+            Self::SyncStorageCaption(_) => JobType::SyncStorageCaption,
             Self::PublishPost(_) => JobType::PublishPost,
             Self::CleanupWorkspace(_) => JobType::CleanupWorkspace,
             Self::RecoverStaleJobs(_) => JobType::RecoverStaleJobs,
@@ -221,6 +226,7 @@ impl JobCommand {
                 decode!(MaterializePublicationPayload, MaterializePublication)
             }
             JobType::UploadStorageAsset => decode!(MediaJobPayload, UploadStorageAsset),
+            JobType::SyncStorageCaption => decode!(MediaJobPayload, SyncStorageCaption),
             JobType::PublishPost => decode!(PublishPostPayload, PublishPost),
             JobType::CleanupWorkspace => decode!(CleanupWorkspacePayload, CleanupWorkspace),
             JobType::RecoverStaleJobs => decode!(EmptyJobPayload, RecoverStaleJobs),
@@ -237,6 +243,7 @@ impl JobCommand {
             Self::FinalizeIngest(payload) => serde_json::to_value(payload),
             Self::MaterializePublication(payload) => serde_json::to_value(payload),
             Self::UploadStorageAsset(payload) => serde_json::to_value(payload),
+            Self::SyncStorageCaption(payload) => serde_json::to_value(payload),
             Self::PublishPost(payload) => serde_json::to_value(payload),
             Self::CleanupWorkspace(payload) => serde_json::to_value(payload),
             Self::RecoverStaleJobs(payload) => serde_json::to_value(payload),
@@ -297,6 +304,11 @@ impl NewJob {
             media_id: asset_id,
             generation,
         }))
+    }
+
+    pub fn sync_storage_caption(media_id: Uuid, generation: i32) -> Self {
+        Self::new(JobCommand::SyncStorageCaption(MediaJobPayload { media_id, generation }))
+            .max_attempts(3)
     }
 
     pub fn probe_asset(ingest_id: Uuid) -> Self {

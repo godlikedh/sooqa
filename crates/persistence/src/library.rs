@@ -3,13 +3,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sooqa_jobs::NewJob;
 use sooqa_library::{
-    CaptionSyncFailure, MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, Media,
-    MediaCursor, MediaDetails, MediaIngest, MediaKind, MediaLookup, MediaMetadata, MediaPage,
-    MediaSearchQuery, MediaSource, MediaSourceInput, MediaStatus, MediaStorageState, MediaSummary,
-    MediaUpdate, NewTag, SourceKind, StorageCaptionMetadata, StorageReceipt,
-    StorageUploadAttachment, StorageUploadInfo, StorageUploadReservation,
+    CaptionSyncClaim, CaptionSyncCompletion, CaptionSyncFailure, CaptionSyncState,
+    MAX_MEDIA_PREVIEW_BYTES, MAX_MEDIA_PREVIEW_HEIGHT, MAX_MEDIA_PREVIEW_WIDTH,
+    MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, Media, MediaCursor,
+    MediaDetails, MediaIngest, MediaKind, MediaLookup, MediaMetadata, MediaPage, MediaPreviewData,
+    MediaPreviewMetadata, MediaSearchQuery, MediaSource, MediaSourceInput, MediaStatus,
+    MediaStorageState, MediaSummary, MediaUpdate, NewTag, SourceKind, StorageCaptionMetadata,
+    StorageReceipt, StorageUploadAttachment, StorageUploadInfo, StorageUploadReservation,
     StorageUploadReservationRequest, StorageUploadStore, Tag, VideoDuplicateClassification,
     VideoDuplicateEvidence, VideoDuplicateMatch, VideoIdentityOutcome,
 };
@@ -52,6 +55,11 @@ struct MediaRow {
     bit_rate: Option<i64>,
     file_size_bytes: Option<i64>,
     local_work_path: Option<String>,
+    preview_bytes: Option<Vec<u8>>,
+    preview_mime_type: Option<String>,
+    preview_width: Option<i32>,
+    preview_height: Option<i32>,
+    preview_sha256: Option<Vec<u8>>,
     telegram_storage_chat_id: Option<i64>,
     telegram_storage_message_id: Option<i64>,
     telegram_file_id: Option<String>,
@@ -62,6 +70,9 @@ struct MediaRow {
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     stored_at: Option<OffsetDateTime>,
+    caption_sync_generation: i32,
+    caption_sync_state: String,
+    caption_sync_error: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -69,6 +80,15 @@ struct StorageCaptionMetadataRow {
     description: Option<String>,
     tags: Vec<String>,
     source_url: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct MediaPreviewRow {
+    preview_bytes: Option<Vec<u8>>,
+    preview_mime_type: Option<String>,
+    preview_width: Option<i32>,
+    preview_height: Option<i32>,
+    preview_sha256: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -107,6 +127,68 @@ impl LibraryRepository {
 
     pub async fn find_media(&self, id: Uuid) -> Result<Option<Media>, LibraryRepositoryError> {
         self.load(id).await?.map(MediaRow::into_media).transpose()
+    }
+
+    pub async fn find_media_preview(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<MediaPreviewData>, LibraryRepositoryError> {
+        let row = sqlx::query_as::<_, MediaPreviewRow>(
+            "SELECT preview_bytes, preview_mime_type, preview_width, preview_height, preview_sha256 FROM media WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        let (Some(bytes), Some(mime_type), Some(width), Some(height), Some(sha256)) = (
+            row.preview_bytes,
+            row.preview_mime_type,
+            row.preview_width,
+            row.preview_height,
+            row.preview_sha256,
+        ) else {
+            return Ok(None);
+        };
+        let width = u32::try_from(width)
+            .map_err(|_| LibraryRepositoryError::InvalidPreview("preview width is invalid"))?;
+        let height = u32::try_from(height)
+            .map_err(|_| LibraryRepositoryError::InvalidPreview("preview height is invalid"))?;
+        if !matches!(mime_type.as_str(), "image/jpeg" | "image/png")
+            || bytes.is_empty()
+            || bytes.len() > MAX_MEDIA_PREVIEW_BYTES
+            || width == 0
+            || width > MAX_MEDIA_PREVIEW_WIDTH
+            || height == 0
+            || height > MAX_MEDIA_PREVIEW_HEIGHT
+            || sha256.len() != 32
+        {
+            return Err(LibraryRepositoryError::InvalidPreview("preview violates its bounds"));
+        }
+        if Sha256::digest(&bytes).as_slice() != sha256.as_slice() {
+            return Err(LibraryRepositoryError::InvalidPreview(
+                "preview SHA-256 does not match bytes",
+            ));
+        }
+        let (encoded_width, encoded_height) =
+            sooqa_media::validate_bounded_preview_for_mime(&bytes, Some(&mime_type))
+                .map_err(|error| LibraryRepositoryError::InvalidPreviewOwned(error.to_string()))?;
+        if encoded_width != width || encoded_height != height {
+            return Err(LibraryRepositoryError::InvalidPreview(
+                "preview dimensions do not match its encoded image",
+            ));
+        }
+        Ok(Some(MediaPreviewData {
+            metadata: MediaPreviewMetadata {
+                mime_type,
+                width,
+                height,
+                size_bytes: u32::try_from(bytes.len()).map_err(|_| {
+                    LibraryRepositoryError::InvalidPreview("preview size is invalid")
+                })?,
+                sha256,
+            },
+            bytes,
+        }))
     }
 
     pub async fn find_storage_caption_metadata(
@@ -263,12 +345,9 @@ impl LibraryRepository {
         u64::try_from(count).map_err(|_| LibraryRepositoryError::InvalidCount)
     }
 
-    /// #82 stores caption-sync state in the media aggregate metadata. Until
-    /// that slice writes the field this bounded aggregate naturally returns
-    /// zero, without introducing a preview/sync table in #81.
     pub async fn count_caption_sync_failures(&self) -> Result<u64, LibraryRepositoryError> {
         let count = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM media WHERE source_metadata->>'caption_sync_state' = 'failed'",
+            "SELECT count(*) FROM media WHERE caption_sync_state = 'failed'",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -289,7 +368,7 @@ impl LibraryRepository {
         }
 
         let rows = sqlx::query_as::<_, CaptionSyncFailureRow>(
-            "SELECT id AS media_id, left(source_metadata->>'caption_sync_error', 512) AS error_message FROM media WHERE source_metadata->>'caption_sync_state' = 'failed' ORDER BY updated_at DESC, id DESC LIMIT $1",
+            "SELECT id AS media_id, left(caption_sync_error, 512) AS error_message FROM media WHERE caption_sync_state = 'failed' ORDER BY updated_at DESC, id DESC LIMIT $1",
         )
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
@@ -303,6 +382,132 @@ impl LibraryRepository {
             .collect())
     }
 
+    pub async fn retry_caption_sync(&self, id: Uuid) -> Result<Media, LibraryRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        if !has_storage_message(&row) {
+            return Err(LibraryRepositoryError::CaptionSyncUnavailable(id));
+        }
+        let generation = row
+            .caption_sync_generation
+            .checked_add(1)
+            .ok_or(LibraryRepositoryError::CaptionSyncGenerationOverflow(id))?;
+        let row = sqlx::query_as::<_, MediaRow>(
+            "UPDATE media SET caption_sync_generation = $2, caption_sync_state = 'pending', caption_sync_error = NULL, updated_at = now() WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(generation)
+        .fetch_one(&mut *transaction)
+        .await?;
+        enqueue_caption_sync_job(&mut transaction, id, generation).await?;
+        transaction.commit().await?;
+        row.into_media()
+    }
+
+    pub async fn begin_caption_sync(
+        &self,
+        id: Uuid,
+        generation: i32,
+    ) -> Result<Option<CaptionSyncClaim>, LibraryRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(row) = row else {
+            return Err(LibraryRepositoryError::ResourceMissing(id));
+        };
+        if row.caption_sync_generation != generation
+            || !has_storage_message(&row)
+            || row.caption_sync_state != "pending"
+        {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        sqlx::query(
+            "UPDATE media SET caption_sync_state = 'syncing', caption_sync_error = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2",
+        )
+        .bind(id)
+        .bind(generation)
+        .execute(&mut *transaction)
+        .await?;
+        let claim = CaptionSyncClaim {
+            media_id: id,
+            generation,
+            storage_chat_id: row.telegram_storage_chat_id.expect("storage message was checked"),
+            storage_message_id: row
+                .telegram_storage_message_id
+                .expect("storage message was checked"),
+            metadata: StorageCaptionMetadata {
+                description: row.description,
+                tags: row.tags,
+                source_url: row.source_url,
+            },
+        };
+        transaction.commit().await?;
+        Ok(Some(claim))
+    }
+
+    pub async fn complete_caption_sync(
+        &self,
+        id: Uuid,
+        generation: i32,
+        succeeded: bool,
+        retryable: bool,
+        error_message: Option<&str>,
+    ) -> Result<CaptionSyncCompletion, LibraryRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        if !has_storage_message(&row) || row.caption_sync_state == "not_required" {
+            transaction.commit().await?;
+            return Ok(CaptionSyncCompletion::Stale);
+        }
+        if row.caption_sync_generation != generation {
+            sqlx::query(
+                "UPDATE media SET caption_sync_state = 'pending', caption_sync_error = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2",
+            )
+            .bind(id)
+            .bind(row.caption_sync_generation)
+            .execute(&mut *transaction)
+            .await?;
+            enqueue_caption_sync_reapply_job(
+                &mut transaction,
+                id,
+                row.caption_sync_generation,
+                generation,
+            )
+            .await?;
+            transaction.commit().await?;
+            return Ok(CaptionSyncCompletion::Stale);
+        }
+        let (state, error) = if succeeded {
+            ("synced", None)
+        } else if retryable {
+            ("pending", None)
+        } else {
+            ("failed", error_message.map(|value| truncate_sync_error(value, 512)))
+        };
+        sqlx::query(
+            "UPDATE media SET caption_sync_state = $2, caption_sync_error = $3, updated_at = now() WHERE id = $1 AND caption_sync_generation = $4",
+        )
+        .bind(id)
+        .bind(state)
+        .bind(error)
+        .bind(generation)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(CaptionSyncCompletion::Applied)
+    }
+
     pub async fn update_media(
         &self,
         id: Uuid,
@@ -311,7 +516,12 @@ impl LibraryRepository {
         if update.title.is_none() && update.description.is_none() && update.notes.is_none() {
             return Err(LibraryRepositoryError::EmptyUpdate);
         }
-        let current = self.load(id).await?.ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        let mut transaction = self.pool.begin().await?;
+        let current = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
         if update.expected_updated_at.is_some_and(|expected| expected != current.updated_at) {
             return Err(LibraryRepositoryError::OptimisticConflict(id));
         }
@@ -320,17 +530,26 @@ impl LibraryRepository {
         let notes = update.notes.unwrap_or_else(|| {
             current.source_metadata.get("notes").and_then(Value::as_str).map(str::to_owned)
         });
-        let metadata = with_notes(current.source_metadata, notes);
+        let metadata = with_notes(current.source_metadata.clone(), notes);
+        let caption_changed = description != current.description;
+        let (caption_sync_generation, caption_sync_state, caption_sync_error) =
+            next_caption_sync_values(&current, caption_changed)?;
         let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET title = $2, description = $3, source_metadata = $4, updated_at = now() WHERE id = $1 RETURNING *",
+            "UPDATE media SET title = $2, description = $3, source_metadata = $4, caption_sync_generation = $5, caption_sync_state = $6, caption_sync_error = $7, updated_at = now() WHERE id = $1 RETURNING *",
         )
         .bind(id)
         .bind(title)
         .bind(description)
         .bind(metadata)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        .bind(caption_sync_generation)
+        .bind(caption_sync_state)
+        .bind(caption_sync_error)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if caption_changed && caption_sync_state == "pending" {
+            enqueue_caption_sync_job(&mut transaction, id, caption_sync_generation).await?;
+        }
+        transaction.commit().await?;
         row.into_media()
     }
 
@@ -346,37 +565,57 @@ impl LibraryRepository {
     }
 
     pub async fn add_tag(&self, id: Uuid, tag: NewTag) -> Result<Tag, LibraryRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let current = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        let changed = !current.tags.iter().any(|value| value == &tag.normalized_name);
+        let (generation, state, error) = next_caption_sync_values(&current, changed)?;
         let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET tags = array_append(array_remove(tags, $2), $2), updated_at = now() WHERE id = $1 RETURNING *",
+            "UPDATE media SET tags = array_append(array_remove(tags, $2), $2), caption_sync_generation = $3, caption_sync_state = $4, caption_sync_error = $5, updated_at = now() WHERE id = $1 RETURNING *",
         )
         .bind(id)
         .bind(&tag.normalized_name)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        .bind(generation)
+        .bind(state)
+        .bind(error)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if changed && state == "pending" {
+            enqueue_caption_sync_job(&mut transaction, id, generation).await?;
+        }
+        transaction.commit().await?;
         Ok(tag_from_name(&tag.normalized_name, row.updated_at))
     }
 
     pub async fn remove_tag(&self, id: Uuid, tag: &str) -> Result<(), LibraryRepositoryError> {
-        let updated = sqlx::query(
-            "UPDATE media SET tags = array_remove(tags, $2), updated_at = now() WHERE id = $1 AND $2 = ANY(tags)",
+        let mut transaction = self.pool.begin().await?;
+        let current = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        if !current.tags.iter().any(|value| value == tag) {
+            return Err(LibraryRepositoryError::TagNotAttached);
+        }
+        let (generation, state, error) = next_caption_sync_values(&current, true)?;
+        sqlx::query(
+            "UPDATE media SET tags = array_remove(tags, $2), caption_sync_generation = $3, caption_sync_state = $4, caption_sync_error = $5, updated_at = now() WHERE id = $1",
         )
         .bind(id)
         .bind(tag)
-        .execute(&self.pool)
+        .bind(generation)
+        .bind(state)
+        .bind(error)
+        .execute(&mut *transaction)
         .await?;
-        if updated.rows_affected() != 0 {
-            return Ok(());
+        if state == "pending" {
+            enqueue_caption_sync_job(&mut transaction, id, generation).await?;
         }
-        let exists =
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM media WHERE id = $1)")
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await?;
-        if !exists {
-            return Err(LibraryRepositoryError::ResourceMissing(id));
-        }
-        Err(LibraryRepositoryError::TagNotAttached)
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub async fn list_tags(&self, id: Uuid) -> Result<Vec<Tag>, LibraryRepositoryError> {
@@ -391,6 +630,7 @@ impl LibraryRepository {
         validate_media_ingest(&ingest)?;
         let sha256 =
             ingest.metadata.sha256.as_deref().ok_or(LibraryRepositoryError::MissingSha256)?;
+        let preview = preview_bindings(ingest.metadata.kind, &ingest.metadata.preview)?;
         let mut transaction = self.pool.begin().await?;
         let id = Uuid::now_v7();
         let source_value = source_to_value(&ingest.source);
@@ -399,9 +639,11 @@ impl LibraryRepository {
                 id, kind, storage_state, canonical_sha256, title, description,
                 tags, source_url, source_metadata, mime_type, container,
                 video_codec, audio_codec, width, height, duration_ms, bit_rate,
-                file_size_bytes, local_work_path
+                file_size_bytes, local_work_path, preview_bytes, preview_mime_type,
+                preview_width, preview_height, preview_sha256
             ) VALUES ($1, $2, 'pending_storage', $3, $4, $5, $6, $7, $8, $9,
-                      $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                      $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                      $21, $22, $23)
             ON CONFLICT (canonical_sha256) DO NOTHING
             RETURNING *"#,
         )
@@ -423,6 +665,11 @@ impl LibraryRepository {
         .bind(to_i64(ingest.metadata.bit_rate, "bit_rate")?)
         .bind(to_i64(ingest.metadata.file_size_bytes, "file_size_bytes")?)
         .bind(&ingest.metadata.local_work_path)
+        .bind(preview.0)
+        .bind(preview.1)
+        .bind(preview.2)
+        .bind(preview.3)
+        .bind(preview.4)
         .fetch_optional(&mut *transaction)
         .await?;
 
@@ -436,8 +683,16 @@ impl LibraryRepository {
                 .fetch_one(&mut *transaction)
                 .await?;
                 let merged_tags = merge_tags(&row.tags, &ingest.tags);
+                let description_changed = ingest
+                    .media
+                    .description
+                    .as_ref()
+                    .is_some_and(|description| Some(description) != row.description.as_ref());
+                let caption_changed = description_changed || merged_tags != row.tags;
+                let (caption_sync_generation, caption_sync_state, caption_sync_error) =
+                    next_caption_sync_values(&row, caption_changed)?;
                 let row = sqlx::query_as::<_, MediaRow>(
-                    "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE description END, source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1 RETURNING *",
+                    "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE description END, source_url = COALESCE(source_url, $5), source_metadata = $6, caption_sync_generation = $7, caption_sync_state = $8, caption_sync_error = $9, updated_at = now() WHERE id = $1 RETURNING *",
                 )
                 .bind(row.id)
                 .bind(merged_tags)
@@ -445,8 +700,15 @@ impl LibraryRepository {
                 .bind(&ingest.media.description)
                 .bind(ingest.source.normalized_url.clone().or(ingest.source.original_url.clone()))
                 .bind(merge_missing_source_metadata(&row.source_metadata, &source_value))
+                .bind(caption_sync_generation)
+                .bind(caption_sync_state)
+                .bind(caption_sync_error)
                 .fetch_one(&mut *transaction)
                 .await?;
+                if caption_changed && caption_sync_state == "pending" {
+                    enqueue_caption_sync_job(&mut transaction, row.id, caption_sync_generation)
+                        .await?;
+                }
                 (row, false)
             }
         };
@@ -501,6 +763,7 @@ impl LibraryRepository {
             .transpose()?;
         let search_tokens =
             fingerprint.map(VideoSequenceFingerprint::search_tokens).unwrap_or_default();
+        let preview = preview_bindings(ingest.metadata.kind, &ingest.metadata.preview)?;
         let source_value = source_to_value(&ingest.source);
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(VIDEO_IDENTITY_ADVISORY_LOCK)
@@ -515,8 +778,16 @@ impl LibraryRepository {
         .await?
         {
             let merged_tags = merge_tags(&row.tags, &ingest.tags);
+            let description_changed = ingest
+                .media
+                .description
+                .as_ref()
+                .is_some_and(|description| Some(description) != row.description.as_ref());
+            let caption_changed = description_changed || merged_tags != row.tags;
+            let (caption_sync_generation, caption_sync_state, caption_sync_error) =
+                next_caption_sync_values(&row, caption_changed)?;
             sqlx::query(
-                "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE description END, source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1",
+                "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE description END, source_url = COALESCE(source_url, $5), source_metadata = $6, caption_sync_generation = $7, caption_sync_state = $8, caption_sync_error = $9, updated_at = now() WHERE id = $1",
             )
             .bind(row.id)
             .bind(merged_tags)
@@ -524,8 +795,14 @@ impl LibraryRepository {
             .bind(&ingest.media.description)
             .bind(ingest.source.normalized_url.clone().or(ingest.source.original_url.clone()))
             .bind(merge_missing_source_metadata(&row.source_metadata, &source_value))
+            .bind(caption_sync_generation)
+            .bind(caption_sync_state)
+            .bind(caption_sync_error)
             .execute(&mut **transaction)
             .await?;
+            if caption_changed && caption_sync_state == "pending" {
+                enqueue_caption_sync_job(transaction, row.id, caption_sync_generation).await?;
+            }
             return Ok(VideoIdentityOutcome::ExactDuplicate { media_id: row.id });
         }
 
@@ -596,10 +873,11 @@ impl LibraryRepository {
                 fingerprint_data, fingerprint_search_tokens, title, description,
                 tags, source_url, source_metadata, mime_type, container,
                 video_codec, audio_codec, width, height, duration_ms, bit_rate,
-                file_size_bytes, local_work_path
+                file_size_bytes, local_work_path, preview_bytes, preview_mime_type,
+                preview_width, preview_height, preview_sha256
             ) VALUES ($1, 'video', 'pending_storage', $2, $3, $4, $5, $6, $7,
                       $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                      $19, $20)
+                      $19, $20, $21, $22, $23, $24, $25)
             ON CONFLICT (canonical_sha256) DO NOTHING
             RETURNING *"#,
         )
@@ -623,6 +901,11 @@ impl LibraryRepository {
         .bind(to_i64(ingest.metadata.bit_rate, "bit_rate")?)
         .bind(to_i64(ingest.metadata.file_size_bytes, "file_size_bytes")?)
         .bind(&ingest.metadata.local_work_path)
+        .bind(preview.0)
+        .bind(preview.1)
+        .bind(preview.2)
+        .bind(preview.3)
+        .bind(preview.4)
         .fetch_optional(&mut **transaction)
         .await?;
         if let Some(row) = inserted {
@@ -662,11 +945,14 @@ impl LibraryRepository {
         id: Uuid,
         metadata: MediaMetadata,
     ) -> Result<Media, LibraryRepositoryError> {
+        let preview = preview_bindings(metadata.kind, &metadata.preview)?;
         let row = sqlx::query_as::<_, MediaRow>(
             r#"UPDATE media SET kind = $2, canonical_sha256 = $3,
                 mime_type = $4, container = $5, video_codec = $6, audio_codec = $7,
                 width = $8, height = $9, duration_ms = $10, bit_rate = $11,
                 file_size_bytes = $12, local_work_path = $13,
+                preview_bytes = $14, preview_mime_type = $15, preview_width = $16,
+                preview_height = $17, preview_sha256 = $18,
                 storage_state = CASE WHEN storage_state IN ('ready', 'storage_unknown')
                     THEN storage_state ELSE 'pending_storage' END,
                 updated_at = now() WHERE id = $1 RETURNING *"#,
@@ -684,6 +970,11 @@ impl LibraryRepository {
         .bind(to_i64(metadata.bit_rate, "bit_rate")?)
         .bind(to_i64(metadata.file_size_bytes, "file_size_bytes")?)
         .bind(metadata.local_work_path)
+        .bind(preview.0)
+        .bind(preview.1)
+        .bind(preview.2)
+        .bind(preview.3)
+        .bind(preview.4)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
@@ -859,7 +1150,7 @@ impl LibraryRepository {
             .checked_add(1)
             .ok_or(LibraryRepositoryError::StorageGenerationOverflow(id))?;
         sqlx::query(
-            "UPDATE media SET storage_state = 'pending_storage', storage_generation = $2, telegram_storage_chat_id = NULL, telegram_storage_message_id = NULL, telegram_file_id = NULL, telegram_file_unique_id = NULL, storage_token = NULL, storage_started_at = NULL, stored_at = NULL, updated_at = now() WHERE id = $1",
+            "UPDATE media SET storage_state = 'pending_storage', storage_generation = $2, telegram_storage_chat_id = NULL, telegram_storage_message_id = NULL, telegram_file_id = NULL, telegram_file_unique_id = NULL, storage_token = NULL, storage_started_at = NULL, stored_at = NULL, caption_sync_state = 'not_required', caption_sync_error = NULL, updated_at = now() WHERE id = $1",
         )
         .bind(id)
         .bind(generation)
@@ -891,7 +1182,7 @@ impl LibraryRepository {
         validate_attachment(&attachment)?;
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $3, telegram_storage_message_id = $4, telegram_file_id = $5, telegram_file_unique_id = $6, storage_token = NULL, storage_started_at = NULL, local_work_path = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_generation = $2 AND storage_state = 'storage_unknown' RETURNING *",
+            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $3, telegram_storage_message_id = $4, telegram_file_id = $5, telegram_file_unique_id = $6, storage_token = NULL, storage_started_at = NULL, local_work_path = NULL, caption_sync_state = 'synced', caption_sync_error = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_generation = $2 AND storage_state = 'storage_unknown' RETURNING *",
         )
         .bind(id)
         .bind(generation)
@@ -1149,7 +1440,7 @@ impl StorageUploadStore for LibraryRepository {
         validate_attachment(&attachment)?;
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $2, telegram_storage_message_id = $3, telegram_file_id = $4, telegram_file_unique_id = $5, storage_token = NULL, storage_started_at = NULL, local_work_path = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_token = $6 AND storage_state = 'pending_storage' RETURNING *",
+            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $2, telegram_storage_message_id = $3, telegram_file_id = $4, telegram_file_unique_id = $5, storage_token = NULL, storage_started_at = NULL, local_work_path = NULL, caption_sync_state = 'synced', caption_sync_error = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_token = $6 AND storage_state = 'pending_storage' RETURNING *",
         )
         .bind(media_id)
         .bind(attachment.storage_chat_id)
@@ -1262,6 +1553,7 @@ async fn complete_linked_ingests_for_storage(
 
 impl MediaRow {
     fn into_media(self) -> Result<Media, LibraryRepositoryError> {
+        let preview = self.preview_metadata()?;
         Ok(Media {
             id: self.id,
             kind: MediaKind::try_from(self.kind.as_str())
@@ -1287,12 +1579,75 @@ impl MediaRow {
             local_work_path: self.local_work_path,
             storage_state: MediaStorageState::try_from(self.storage_state.as_str())
                 .map_err(LibraryRepositoryError::UnknownStorageState)?,
+            preview,
+            caption_sync_generation: self.caption_sync_generation,
+            caption_sync_state: CaptionSyncState::try_from(self.caption_sync_state.as_str())
+                .map_err(LibraryRepositoryError::UnknownCaptionSyncState)?,
+            caption_sync_error: self.caption_sync_error,
             created_at: self.created_at,
             updated_at: self.updated_at,
             archived_at: (self.source_metadata.get("archived").and_then(Value::as_bool)
                 == Some(true))
             .then_some(self.updated_at),
         })
+    }
+
+    fn preview_metadata(&self) -> Result<Option<MediaPreviewMetadata>, LibraryRepositoryError> {
+        let fields = (
+            self.preview_bytes.as_ref(),
+            self.preview_mime_type.as_ref(),
+            self.preview_width,
+            self.preview_height,
+            self.preview_sha256.as_ref(),
+        );
+        if fields.0.is_none()
+            && fields.1.is_none()
+            && fields.2.is_none()
+            && fields.3.is_none()
+            && fields.4.is_none()
+        {
+            return Ok(None);
+        }
+        let (Some(bytes), Some(mime_type), Some(width), Some(height), Some(sha256)) = fields else {
+            return Err(LibraryRepositoryError::InvalidPreview("preview fields are incomplete"));
+        };
+        let width = u32::try_from(width)
+            .map_err(|_| LibraryRepositoryError::InvalidPreview("preview width is invalid"))?;
+        let height = u32::try_from(height)
+            .map_err(|_| LibraryRepositoryError::InvalidPreview("preview height is invalid"))?;
+        if !matches!(mime_type.as_str(), "image/jpeg" | "image/png")
+            || bytes.is_empty()
+            || bytes.len() > MAX_MEDIA_PREVIEW_BYTES
+            || width == 0
+            || width > MAX_MEDIA_PREVIEW_WIDTH
+            || height == 0
+            || height > MAX_MEDIA_PREVIEW_HEIGHT
+            || sha256.len() != 32
+        {
+            return Err(LibraryRepositoryError::InvalidPreview("preview violates its bounds"));
+        }
+        if Sha256::digest(bytes).as_slice() != sha256.as_slice() {
+            return Err(LibraryRepositoryError::InvalidPreview(
+                "preview SHA-256 does not match bytes",
+            ));
+        }
+        let (encoded_width, encoded_height) =
+            sooqa_media::validate_bounded_preview_for_mime(bytes, Some(mime_type))
+                .map_err(|error| LibraryRepositoryError::InvalidPreviewOwned(error.to_string()))?;
+        if encoded_width != width || encoded_height != height {
+            return Err(LibraryRepositoryError::InvalidPreview(
+                "preview dimensions do not match its encoded image",
+            ));
+        }
+        Ok(Some(MediaPreviewMetadata {
+            mime_type: mime_type.clone(),
+            width,
+            height,
+            size_bytes: u32::try_from(bytes.len()).map_err(|_| {
+                LibraryRepositoryError::InvalidPreview("preview size does not fit the domain")
+            })?,
+            sha256: sha256.clone(),
+        }))
     }
 
     fn into_storage_info(self) -> Result<StorageUploadInfo, LibraryRepositoryError> {
@@ -1453,6 +1808,105 @@ fn merge_tags(existing: &[String], incoming: &[String]) -> Vec<String> {
     tags
 }
 
+fn next_caption_sync_values(
+    row: &MediaRow,
+    changed: bool,
+) -> Result<(i32, &'static str, Option<String>), LibraryRepositoryError> {
+    if !changed {
+        return Ok((
+            row.caption_sync_generation,
+            match row.caption_sync_state.as_str() {
+                "not_required" | "pending" | "syncing" | "synced" | "failed" => {
+                    // The value is checked when the row is converted to the
+                    // domain object; preserving it here avoids rewriting an
+                    // unrelated metadata edit into a sync transition.
+                    match row.caption_sync_state.as_str() {
+                        "not_required" => "not_required",
+                        "pending" => "pending",
+                        "syncing" => "syncing",
+                        "synced" => "synced",
+                        "failed" => "failed",
+                        _ => unreachable!(),
+                    }
+                }
+                _ => {
+                    return Err(LibraryRepositoryError::UnknownCaptionSyncState(
+                        row.caption_sync_state.clone(),
+                    ));
+                }
+            },
+            row.caption_sync_error.clone(),
+        ));
+    }
+    if !has_storage_message(row) {
+        return Ok((row.caption_sync_generation, "not_required", None));
+    }
+    let generation = row
+        .caption_sync_generation
+        .checked_add(1)
+        .ok_or(LibraryRepositoryError::CaptionSyncGenerationOverflow(row.id))?;
+    Ok((generation, "pending", None))
+}
+
+fn has_storage_message(row: &MediaRow) -> bool {
+    row.storage_state == "ready"
+        && row.telegram_storage_chat_id.is_some()
+        && row.telegram_storage_message_id.is_some()
+}
+
+fn truncate_sync_error(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+async fn enqueue_caption_sync_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    media_id: Uuid,
+    generation: i32,
+) -> Result<(), sqlx::Error> {
+    enqueue_caption_sync_job_with_key(
+        transaction,
+        media_id,
+        generation,
+        format!("media:{media_id}:caption_sync:v1:{generation}"),
+    )
+    .await
+}
+
+async fn enqueue_caption_sync_reapply_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    media_id: Uuid,
+    generation: i32,
+    stale_generation: i32,
+) -> Result<(), sqlx::Error> {
+    enqueue_caption_sync_job_with_key(
+        transaction,
+        media_id,
+        generation,
+        format!("media:{media_id}:caption_sync:v1:{generation}:after:{stale_generation}"),
+    )
+    .await
+}
+
+async fn enqueue_caption_sync_job_with_key(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    media_id: Uuid,
+    generation: i32,
+    dedupe_key: String,
+) -> Result<(), sqlx::Error> {
+    let job = NewJob::sync_storage_caption(media_id, generation).dedupe_key(dedupe_key);
+    sqlx::query(
+        "INSERT INTO queue.jobs (kind, payload, state, run_at, max_attempts, dedupe_key) VALUES ($1, $2, 'queued', COALESCE($3, now()), $4, $5) ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING",
+    )
+    .bind(job.job_type().as_str())
+    .bind(job.payload_json())
+    .bind(job.run_at_value())
+    .bind(job.max_attempts_value())
+    .bind(job.dedupe_key_value())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 fn tag_from_name(name: &str, created_at: OffsetDateTime) -> Tag {
     Tag { normalized_name: name.to_owned(), display_name: name.to_owned(), created_at }
 }
@@ -1481,7 +1935,58 @@ fn validate_media_ingest(ingest: &MediaIngest) -> Result<(), LibraryRepositoryEr
     if sha256.len() != 32 {
         return Err(LibraryRepositoryError::InvalidSha256Length { actual: sha256.len() });
     }
+    let _ = preview_bindings(ingest.metadata.kind, &ingest.metadata.preview)?;
     Ok(())
+}
+
+type PreviewBindings = (Option<Vec<u8>>, Option<String>, Option<i32>, Option<i32>, Option<Vec<u8>>);
+
+fn preview_bindings(
+    kind: MediaKind,
+    preview: &Option<sooqa_library::MediaPreviewInput>,
+) -> Result<PreviewBindings, LibraryRepositoryError> {
+    let Some(preview) = preview else {
+        return Ok((None, None, None, None, None));
+    };
+    if kind == MediaKind::Audio {
+        return Err(LibraryRepositoryError::InvalidPreview(
+            "audio media must not have a bitmap preview",
+        ));
+    }
+    if !matches!(preview.mime_type.as_str(), "image/jpeg" | "image/png")
+        || preview.bytes.is_empty()
+        || preview.bytes.len() > MAX_MEDIA_PREVIEW_BYTES
+        || preview.width == 0
+        || preview.width > MAX_MEDIA_PREVIEW_WIDTH
+        || preview.height == 0
+        || preview.height > MAX_MEDIA_PREVIEW_HEIGHT
+        || preview.sha256.len() != 32
+    {
+        return Err(LibraryRepositoryError::InvalidPreview("preview violates its bounds"));
+    }
+    let digest = Sha256::digest(&preview.bytes);
+    if digest.as_slice() != preview.sha256.as_slice() {
+        return Err(LibraryRepositoryError::InvalidPreview("preview SHA-256 does not match bytes"));
+    }
+    let (width, height) =
+        sooqa_media::validate_bounded_preview_for_mime(&preview.bytes, Some(&preview.mime_type))
+            .map_err(|error| LibraryRepositoryError::InvalidPreviewOwned(error.to_string()))?;
+    if width != preview.width || height != preview.height {
+        return Err(LibraryRepositoryError::InvalidPreview(
+            "preview dimensions do not match its encoded image",
+        ));
+    }
+    Ok((
+        Some(preview.bytes.clone()),
+        Some(preview.mime_type.clone()),
+        Some(i32::try_from(preview.width).map_err(|_| {
+            LibraryRepositoryError::InvalidPreview("preview width does not fit the schema")
+        })?),
+        Some(i32::try_from(preview.height).map_err(|_| {
+            LibraryRepositoryError::InvalidPreview("preview height does not fit the schema")
+        })?),
+        Some(preview.sha256.clone()),
+    ))
 }
 
 fn validate_attachment(attachment: &StorageUploadAttachment) -> Result<(), LibraryRepositoryError> {
@@ -1545,10 +2050,20 @@ pub enum LibraryRepositoryError {
     MissingFingerprint,
     #[error("media SHA-256 must contain 32 bytes, got {actual}")]
     InvalidSha256Length { actual: usize },
+    #[error("media preview is invalid: {0}")]
+    InvalidPreview(&'static str),
+    #[error("media preview is invalid: {0}")]
+    InvalidPreviewOwned(String),
+    #[error("media {0} has no ready Telegram storage message for caption synchronization")]
+    CaptionSyncUnavailable(Uuid),
+    #[error("caption-sync generation for media {0} overflowed")]
+    CaptionSyncGenerationOverflow(Uuid),
     #[error("media {0} has an invalid kind")]
     UnknownMediaKind(String),
     #[error("media has an invalid storage state: {0}")]
     UnknownStorageState(String),
+    #[error("media has an invalid caption-sync state: {0}")]
+    UnknownCaptionSyncState(String),
     #[error("media source has an invalid kind: {0}")]
     UnknownSourceKind(String),
     #[error("media violates a repository invariant: {0}")]

@@ -20,15 +20,16 @@ use sooqa_inbox::{
 };
 use sooqa_jobs::{Job, JobCommand, JobLease, JobStatus, JobType};
 use sooqa_library::{
-    MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
-    StorageUploadStore,
+    MAX_MEDIA_PREVIEW_BYTES, MediaIngest, MediaKind, MediaMetadata, MediaPreviewInput,
+    MediaSourceInput, NewMedia, SourceKind, StorageUploadStore,
 };
 use sooqa_media::{
     ArtifactPublicationError, DownloadError, DownloadLimits, DownloadedSource, FfmpegExecutor,
     FfprobeAdapter, FrameExtractionError, FrameExtractor, ImageNormalizer, MediaProbe,
     MediaStreamKind, MediaWorkspace, NormalizationExecutionError, NormalizationPlanner,
     SequenceAlignmentConfig, SourceDownloader, SourceInput, WorkspaceArea, WorkspaceError,
-    publish_artifact, sha256_file,
+    decode_first_preview_frame, encode_bounded_preview, publish_artifact, sha256_file,
+    validate_bounded_preview_for_mime,
 };
 use sooqa_persistence::{
     AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
@@ -38,8 +39,9 @@ use sooqa_persistence::{
 };
 use sooqa_telegram::StorageUploadError;
 use sooqa_telegram::{
-    StorageUploadInput, StorageUploadProvider, TelegramApi, TelegramPublicationApi,
-    TelegramPublicationRequest, TelegramStorageApi,
+    StorageCaptionEditRequest, StorageUploadInput, StorageUploadProvider, TelegramApi,
+    TelegramPublicationApi, TelegramPublicationRequest, TelegramStorageApi,
+    TelegramStorageCaptionApi, storage_caption,
 };
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -213,6 +215,75 @@ where
     })
 }
 
+pub fn sync_storage_caption_handler<A>(library: LibraryRepository, api: A) -> HandlerFn
+where
+    A: TelegramStorageCaptionApi,
+{
+    Arc::new(move |job| {
+        let library = library.clone();
+        let api = api.clone();
+        Box::pin(async move { sync_storage_caption(&library, &api, job).await })
+    })
+}
+
+async fn sync_storage_caption<A>(
+    library: &LibraryRepository,
+    api: &A,
+    job: Job,
+) -> Result<(), HandlerFailure>
+where
+    A: TelegramStorageCaptionApi,
+{
+    let (media_id, generation) = match &job.command {
+        JobCommand::SyncStorageCaption(payload) => (payload.media_id, payload.generation),
+        _ => {
+            return Err(HandlerFailure::permanent(
+                "invalid_payload",
+                "sync_storage_caption handler received a different job command",
+            ));
+        }
+    };
+    let _job_attempt = job.attempt().ok_or_else(|| {
+        HandlerFailure::permanent(
+            "invalid_job_state",
+            "sync_storage_caption handler requires a running job lease",
+        )
+    })?;
+    let Some(claim) =
+        library.begin_caption_sync(media_id, generation).await.map_err(map_library_error)?
+    else {
+        return Ok(());
+    };
+    let caption = storage_caption(&claim.metadata);
+    let request = StorageCaptionEditRequest {
+        storage_chat_id: claim.storage_chat_id,
+        storage_message_id: claim.storage_message_id,
+        caption,
+    };
+    match api.edit_storage_caption(request).await {
+        Ok(()) => {
+            library
+                .complete_caption_sync(media_id, generation, true, false, None)
+                .await
+                .map_err(map_library_error)?;
+            Ok(())
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let retryable = A::is_retryable_error(&error) && job.attempt_count < job.max_attempts;
+            library
+                .complete_caption_sync(media_id, generation, false, retryable, Some(&message))
+                .await
+                .map_err(map_library_error)?;
+            Err(if retryable {
+                HandlerFailure::retryable("caption_sync", message)
+            } else {
+                HandlerFailure::permanent("caption_sync", message)
+            })
+        }
+    }
+}
+
 pub fn publish_post_handler<A>(
     publisher: sooqa_persistence::PublisherRepository,
     library: LibraryRepository,
@@ -293,11 +364,17 @@ pub fn normalize_asset_handler(
     })
 }
 
-pub fn finalize_ingest_handler(inbox: InboxRepository, library: LibraryRepository) -> HandlerFn {
+pub fn finalize_ingest_handler(
+    inbox: InboxRepository,
+    library: LibraryRepository,
+    work_root: impl Into<PathBuf>,
+) -> HandlerFn {
+    let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
         let library = library.clone();
-        Box::pin(async move { finalize_ingest(&inbox, &library, job).await })
+        let work_root = work_root.clone();
+        Box::pin(async move { finalize_ingest(&inbox, &library, &work_root, job).await })
     })
 }
 
@@ -959,6 +1036,57 @@ async fn normalize_exact_asset(
     {
         return fail_normalization(inbox, ingest_request_id, job_attempt, failure).await;
     }
+    let thumbnail = if media_kind == SourceMediaKind::Animation {
+        match decode_first_preview_frame(&canonical_path).await {
+            Ok(frame) => match encode_bounded_preview(&frame) {
+                Ok(preview) => {
+                    let thumbnail_path = workspace
+                        .path(WorkspaceArea::Previews, "animation-preview.jpg")
+                        .map_err(map_workspace_error)?;
+                    let temporary_path = workspace
+                        .path(
+                            WorkspaceArea::Previews,
+                            &format!(".animation-preview-{}.tmp", Uuid::new_v4()),
+                        )
+                        .map_err(map_workspace_error)?;
+                    tokio::fs::write(&temporary_path, &preview.bytes).await.map_err(|error| {
+                        HandlerFailure::permanent(
+                            "normalize_animation_preview",
+                            format!("animation preview could not be staged: {error}"),
+                        )
+                    })?;
+                    let published = publish_artifact(&temporary_path, &thumbnail_path).await;
+                    let _ = tokio::fs::remove_file(&temporary_path).await;
+                    match published {
+                        Ok(()) | Err(ArtifactPublicationError::DestinationConflict) => {
+                            Some(AssetThumbnailNormalization {
+                                local_work_path: thumbnail_path.to_string_lossy().into_owned(),
+                                file_size_bytes: preview.digest.bytes,
+                                sha256: preview.digest.sha256,
+                                mime_type: Some("image/jpeg".to_owned()),
+                                width: Some(preview.width),
+                                height: Some(preview.height),
+                            })
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "animation preview publication was skipped");
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(error = %error, "animation preview encoding was skipped");
+                    None
+                }
+            },
+            Err(error) => {
+                debug!(error = %error, "animation decoder could not produce a safe preview frame");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let video = probe.streams.iter().find(|stream| stream.kind == MediaStreamKind::Video);
     let audio = probe.streams.iter().find(|stream| stream.kind == MediaStreamKind::Audio);
     let normalization = AssetNormalization {
@@ -974,7 +1102,7 @@ async fn normalize_exact_asset(
         height: video.and_then(|stream| stream.height),
         duration_ms: probe.duration_ms,
         bit_rate: probe.bit_rate,
-        thumbnail: None,
+        thumbnail,
     };
     inbox
         .complete_asset_normalization(ingest_request_id, job_attempt, normalization)
@@ -1144,6 +1272,7 @@ async fn fail_normalization(
 async fn finalize_ingest(
     inbox: &InboxRepository,
     library: &LibraryRepository,
+    work_root: &Path,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
@@ -1195,8 +1324,20 @@ async fn finalize_ingest(
             .await;
         }
     };
-    let metadata = match normalization_to_media_metadata(&normalization) {
+    let mut metadata = match normalization_to_media_metadata(&normalization) {
         Ok(metadata) => metadata,
+        Err(failure) => {
+            return fail_finalization(inbox, ingest_request_id, &job_attempt, failure).await;
+        }
+    };
+    metadata.preview = match load_thumbnail_preview(
+        work_root,
+        request.workspace_id,
+        normalization.thumbnail.as_ref(),
+    )
+    .await
+    {
+        Ok(preview) => preview,
         Err(failure) => {
             return fail_finalization(inbox, ingest_request_id, &job_attempt, failure).await;
         }
@@ -1326,7 +1467,7 @@ async fn compute_fingerprint(
             return fail_fingerprint(inbox, ingest_request_id, &job_attempt, failure).await;
         }
     };
-    let media_ingest = MediaIngest {
+    let mut media_ingest = MediaIngest {
         media: NewMedia {
             kind: MediaKind::Video,
             title: request.page_title.clone(),
@@ -1395,8 +1536,8 @@ async fn compute_fingerprint(
             )
             .await;
         }
-        match extractor
-            .extract_video_sequence_from_area(
+        let extraction = match extractor
+            .extract_video_sequence_with_best_frame_from_area(
                 &workspace,
                 WorkspaceArea::Normalized,
                 "canonical.mp4",
@@ -1404,7 +1545,7 @@ async fn compute_fingerprint(
             )
             .await
         {
-            Ok(result) => Some(result),
+            Ok(result) => result,
             Err(error) => {
                 return fail_fingerprint(
                     inbox,
@@ -1414,7 +1555,29 @@ async fn compute_fingerprint(
                 )
                 .await;
             }
+        };
+        if let Some(best_frame) = extraction.best_frame.as_ref() {
+            let preview = match encode_bounded_preview(best_frame) {
+                Ok(preview) => preview,
+                Err(error) => {
+                    return fail_fingerprint(
+                        inbox,
+                        ingest_request_id,
+                        &job_attempt,
+                        HandlerFailure::permanent("preview_encode", error.to_string()),
+                    )
+                    .await;
+                }
+            };
+            media_ingest.metadata.preview = Some(MediaPreviewInput {
+                bytes: preview.bytes,
+                mime_type: "image/jpeg".to_owned(),
+                width: preview.width,
+                height: preview.height,
+                sha256: decode_sha256(&preview.digest.sha256)?,
+            });
         }
+        Some(extraction.fingerprint)
     };
 
     inbox
@@ -1465,6 +1628,94 @@ async fn fail_fingerprint(
     Err(failure)
 }
 
+async fn load_thumbnail_preview(
+    work_root: &Path,
+    workspace_id: Uuid,
+    thumbnail: Option<&AssetThumbnailNormalization>,
+) -> Result<Option<MediaPreviewInput>, HandlerFailure> {
+    let Some(thumbnail) = thumbnail else {
+        return Ok(None);
+    };
+    let mime_type = thumbnail.mime_type.as_deref().ok_or_else(|| {
+        HandlerFailure::permanent("invalid_preview", "preview MIME type is missing")
+    })?;
+    if !matches!(mime_type, "image/jpeg" | "image/png") {
+        return Err(HandlerFailure::permanent(
+            "invalid_preview",
+            format!("preview MIME type {mime_type:?} is not supported"),
+        ));
+    }
+    let workspace =
+        MediaWorkspace::create(work_root, workspace_id).await.map_err(map_workspace_error)?;
+    workspace.validate().map_err(map_workspace_error)?;
+    let stored_path = PathBuf::from(&thumbnail.local_work_path);
+    let file_name = stored_path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+        HandlerFailure::permanent("invalid_preview", "preview path has no safe file name")
+    })?;
+    let expected_path =
+        workspace.path(WorkspaceArea::Previews, file_name).map_err(map_workspace_error)?;
+    if stored_path != expected_path {
+        return Err(HandlerFailure::permanent(
+            "invalid_preview",
+            "preview path is outside the workspace preview area",
+        ));
+    }
+    let metadata = tokio::fs::symlink_metadata(&expected_path).await.map_err(|error| {
+        HandlerFailure::permanent(
+            "invalid_preview",
+            format!("preview artifact metadata could not be read: {error}"),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(HandlerFailure::permanent(
+            "invalid_preview",
+            "preview artifact is not a regular file",
+        ));
+    }
+    let size = usize::try_from(metadata.len()).map_err(|_| {
+        HandlerFailure::permanent("invalid_preview", "preview artifact size does not fit memory")
+    })?;
+    if size == 0 || size > MAX_MEDIA_PREVIEW_BYTES || metadata.len() != thumbnail.file_size_bytes {
+        return Err(HandlerFailure::permanent(
+            "invalid_preview",
+            "preview artifact exceeds its persisted bounds",
+        ));
+    }
+    let bytes = tokio::fs::read(&expected_path).await.map_err(|error| {
+        HandlerFailure::permanent(
+            "invalid_preview",
+            format!("preview artifact could not be read: {error}"),
+        )
+    })?;
+    let digest = sha256_file(&expected_path).await.map_err(|error| {
+        HandlerFailure::permanent(
+            "invalid_preview",
+            format!("preview artifact could not be hashed: {error}"),
+        )
+    })?;
+    if digest.sha256 != thumbnail.sha256 {
+        return Err(HandlerFailure::permanent(
+            "invalid_preview",
+            "preview artifact SHA-256 does not match normalization metadata",
+        ));
+    }
+    let (width, height) = validate_bounded_preview_for_mime(&bytes, Some(mime_type))
+        .map_err(|error| HandlerFailure::permanent("invalid_preview", error.to_string()))?;
+    if thumbnail.width != Some(width) || thumbnail.height != Some(height) {
+        return Err(HandlerFailure::permanent(
+            "invalid_preview",
+            "preview artifact dimensions do not match normalization metadata",
+        ));
+    }
+    Ok(Some(MediaPreviewInput {
+        bytes,
+        mime_type: mime_type.to_owned(),
+        width,
+        height,
+        sha256: decode_sha256(&thumbnail.sha256)?,
+    }))
+}
+
 fn normalization_to_media_metadata(
     normalization: &AssetNormalization,
 ) -> Result<MediaMetadata, HandlerFailure> {
@@ -1481,6 +1732,7 @@ fn normalization_to_media_metadata(
         file_size_bytes: Some(normalization.file_size_bytes),
         sha256: Some(decode_sha256(&normalization.sha256)?),
         local_work_path: Some(normalization.local_work_path.clone()),
+        preview: None,
     })
 }
 
