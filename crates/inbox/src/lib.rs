@@ -340,6 +340,30 @@ pub struct IngestSubmission {
     pub idempotency_key: Option<String>,
 }
 
+/// The request-hash wire shape used before the unused admin identity was
+/// removed from the domain model. Existing ingests store hashes of this
+/// shape, so new requests must keep hashing the explicit `null` field while
+/// the field itself stays out of the submission API and persisted ingest
+/// state.
+#[derive(Serialize)]
+struct LegacyIngestSubmission<'a> {
+    kind: IngestKind,
+    submitted_via: SubmittedVia,
+    submitted_by_admin_id: Option<Uuid>,
+    original_url: &'a str,
+    normalized_url: &'a str,
+    original_input: &'a Value,
+    page_url: &'a Option<String>,
+    page_title: &'a Option<String>,
+    supplied_caption: &'a Option<String>,
+    supplied_description: &'a Option<String>,
+    supplied_tags: &'a Vec<String>,
+    requested_action: RequestedAction,
+    requested_publish_at: &'a Option<time::OffsetDateTime>,
+    requested_post_caption: &'a Option<String>,
+    idempotency_key: &'a Option<String>,
+}
+
 impl IngestSubmission {
     pub fn try_new(input: IngestSubmissionInput) -> Result<Self, IngestValidationError> {
         Self::try_new_inner(input, true)
@@ -445,7 +469,24 @@ impl IngestSubmission {
     }
 
     pub fn request_hash(&self) -> [u8; 32] {
-        let serialized = serde_json::to_vec(self).expect("ingest submission must be serializable");
+        let serialized = serde_json::to_vec(&LegacyIngestSubmission {
+            kind: self.kind,
+            submitted_via: self.submitted_via,
+            submitted_by_admin_id: None,
+            original_url: &self.original_url,
+            normalized_url: &self.normalized_url,
+            original_input: &self.original_input,
+            page_url: &self.page_url,
+            page_title: &self.page_title,
+            supplied_caption: &self.supplied_caption,
+            supplied_description: &self.supplied_description,
+            supplied_tags: &self.supplied_tags,
+            requested_action: self.requested_action,
+            requested_publish_at: &self.requested_publish_at,
+            requested_post_caption: &self.requested_post_caption,
+            idempotency_key: &self.idempotency_key,
+        })
+        .expect("ingest submission must be serializable");
         Sha256::digest(serialized).into()
     }
 }

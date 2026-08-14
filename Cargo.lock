@@ -2204,6 +2204,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "chrono-tz",
+ "serde",
  "serde_json",
  "sha2",
  "sooqa-config",
