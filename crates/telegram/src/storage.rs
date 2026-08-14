@@ -222,12 +222,6 @@ where
             return Ok(StorageUploadOutcome::Reused(receipt));
         }
 
-        let caption_metadata = self
-            .store
-            .find_storage_caption_metadata(input.media_id)
-            .await
-            .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
-
         let expected_sha256_bytes =
             media.sha256.clone().ok_or(StorageUploadError::MediaMissingSha256(input.media_id))?;
         if expected_sha256_bytes.len() != 32 {
@@ -299,8 +293,10 @@ where
             })
             .await
             .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
-        let (media_id, owner_token) = match reservation {
-            StorageUploadReservation::Reserved { media_id, owner_token } => (media_id, owner_token),
+        let (media_id, owner_token, caption_metadata) = match reservation {
+            StorageUploadReservation::Reserved { media_id, owner_token, caption_metadata } => {
+                (media_id, owner_token, caption_metadata)
+            }
             StorageUploadReservation::Reused(object) => {
                 return Ok(StorageUploadOutcome::Reused(object));
             }
@@ -380,6 +376,7 @@ where
                     storage_message_id: uploaded.storage_message_id,
                     telegram_file_id: Some(uploaded.telegram_file_id),
                     telegram_file_unique_id: Some(uploaded.telegram_file_unique_id),
+                    caption_metadata: Some(caption_metadata),
                 },
             )
             .await
@@ -726,6 +723,11 @@ mod tests {
             Ok(StorageUploadReservation::Reserved {
                 media_id: Uuid::from_u128(3),
                 owner_token: Uuid::from_u128(5),
+                caption_metadata: StorageCaptionMetadata {
+                    description: Some("internal note".to_owned()),
+                    tags: vec!["cats".to_owned()],
+                    source_url: Some("https://example.test/clip.webm".to_owned()),
+                },
             })
         }
 

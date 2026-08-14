@@ -334,47 +334,6 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/media/{id}/tags:
-    post:
-      tags: [media]
-      operationId: addMediaTag
-      summary: Add a normalized tag
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/MediaId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/TagRequest' }
-      responses:
-        '200':
-          description: The attached tag.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Tag' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '413': { $ref: '#/components/responses/PayloadTooLarge' }
-        '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/media/{id}/tags/{tag}:
-    delete:
-      tags: [media]
-      operationId: removeMediaTag
-      summary: Remove a normalized tag
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/MediaId'
-        - { name: tag, in: path, required: true, schema: { type: string } }
-      responses:
-        '204': { description: Tag removed. }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/channels:
     get:
       tags: [channels]
@@ -1087,13 +1046,8 @@ components:
         title: { type: string, nullable: true }
         description: { type: string, nullable: true }
         notes: { type: string, nullable: true }
+        tags: { type: array, items: { type: string, minLength: 1 } }
         expected_updated_at: { type: string, format: date-time, nullable: true }
-    TagRequest:
-      type: object
-      required: [tag]
-      additionalProperties: false
-      properties:
-        tag: { type: string, minLength: 1 }
     Tag:
       type: object
       required: [normalized_name, display_name, created_at]

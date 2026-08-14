@@ -243,14 +243,16 @@ where
             ));
         }
     };
-    let _job_attempt = job.attempt().ok_or_else(|| {
+    let job_attempt = job.attempt().ok_or_else(|| {
         HandlerFailure::permanent(
             "invalid_job_state",
             "sync_storage_caption handler requires a running job lease",
         )
     })?;
-    let Some(claim) =
-        library.begin_caption_sync(media_id, generation).await.map_err(map_library_error)?
+    let Some(claim) = library
+        .begin_caption_sync(media_id, generation, job_attempt.lease_token)
+        .await
+        .map_err(map_library_error)?
     else {
         return Ok(());
     };
@@ -263,7 +265,14 @@ where
     match api.edit_storage_caption(request).await {
         Ok(()) => {
             library
-                .complete_caption_sync(media_id, generation, true, false, None)
+                .complete_caption_sync(
+                    media_id,
+                    generation,
+                    job_attempt.lease_token,
+                    true,
+                    false,
+                    None,
+                )
                 .await
                 .map_err(map_library_error)?;
             Ok(())
@@ -272,7 +281,14 @@ where
             let message = error.to_string();
             let retryable = A::is_retryable_error(&error) && job.attempt_count < job.max_attempts;
             library
-                .complete_caption_sync(media_id, generation, false, retryable, Some(&message))
+                .complete_caption_sync(
+                    media_id,
+                    generation,
+                    job_attempt.lease_token,
+                    false,
+                    retryable,
+                    Some(&message),
+                )
                 .await
                 .map_err(map_library_error)?;
             Err(if retryable {

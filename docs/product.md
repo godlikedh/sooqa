@@ -79,11 +79,13 @@ boundary; animations make one safe representative-frame attempt; audio has no
 bitmap preview. Existing media rows are not downloaded or backfilled.
 
 Telegram storage captions contain only the bounded internal description,
-normalized tags, and source URL. Metadata edits atomically advance a
-generation, mark sync pending, and enqueue durable fenced work. The worker
-edits the existing storage message after commit and records only a matching
-generation's result. Public post text, IDs, hashes, workflow state, and
-schedule data never enter storage captions. The authenticated
+normalized tags, and source URL. One revision-fenced metadata command replaces
+the complete tag set and description atomically, advances a generation, marks
+sync pending, and enqueues durable fenced work; there are no separate
+one-tag mutation routes. The worker edits the existing storage message after
+commit and records only a matching generation/claim's result. Public post
+text, IDs, hashes, workflow state, and schedule data never enter storage
+captions. The authenticated
 `POST /api/v1/media/{id}/caption-sync/retry` command creates a new generation
 for a failed sync.
 

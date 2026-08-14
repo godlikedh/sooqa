@@ -167,6 +167,7 @@ async fn storage_completion_enqueues_materialization_in_the_ready_transaction(po
                 storage_message_id: 77,
                 telegram_file_id: Some("file-77".to_owned()),
                 telegram_file_unique_id: Some("unique-77".to_owned()),
+                caption_metadata: None,
             },
         )
         .await

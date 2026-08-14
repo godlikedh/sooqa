@@ -418,11 +418,6 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
             "The request must contain at least one editable field",
             headers,
         ),
-        LibraryRepositoryError::TagNotAttached => ApiError::not_found(
-            "tag_not_attached",
-            "The tag is not attached to the media item",
-            headers,
-        ),
         LibraryRepositoryError::CaptionSyncUnavailable(_) => ApiError::conflict(
             "caption_sync_unavailable",
             "The media item has no ready Telegram storage message",

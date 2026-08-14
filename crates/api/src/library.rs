@@ -4,7 +4,7 @@ use axum::{
     extract::{Json as JsonExtractor, Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,8 +25,6 @@ pub(crate) fn routes() -> Router<ApiState> {
         .route("/api/v1/media/{id}/preview", get(get_preview))
         .route("/api/v1/media/{id}/caption-sync/retry", post(retry_caption_sync))
         .route("/api/v1/media/{id}/archive", post(archive_media))
-        .route("/api/v1/media/{id}/tags", post(add_tag))
-        .route("/api/v1/media/{id}/tags/{tag}", delete(remove_tag))
 }
 
 async fn search_media(
@@ -73,6 +71,18 @@ fn take_lookup_input(
         ));
     }
     Ok(lookup_input)
+}
+
+fn normalize_tags(values: Vec<String>, headers: &HeaderMap) -> Result<Vec<String>, ApiError> {
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let tag = NewTag::try_new(value)
+            .map_err(|_| ApiError::bad_request("invalid_tag", "The tag is invalid", headers))?;
+        if !normalized.iter().any(|current| current == &tag.normalized_name) {
+            normalized.push(tag.normalized_name);
+        }
+    }
+    Ok(normalized)
 }
 
 async fn get_media(
@@ -166,10 +176,12 @@ async fn update_media(
     authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
+    let tags = payload.tags.map(|values| normalize_tags(values, &headers)).transpose()?;
     let update = MediaUpdate {
         title: payload.title,
         description: payload.description,
         notes: payload.notes,
+        tags,
         expected_updated_at: payload.expected_updated_at,
     };
     state
@@ -204,38 +216,6 @@ async fn archive_media(
             ApiError::not_found("media_not_found", "The media item was not found", &headers)
         })?;
     Ok(Json(MediaResponse::from_details(&media)))
-}
-
-async fn add_tag(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-    body: Result<JsonExtractor<TagRequest>, JsonRejection>,
-) -> Result<Json<TagResponse>, ApiError> {
-    authorize(&state.api_token, &headers).await?;
-    let JsonExtractor(payload) =
-        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
-    let tag = NewTag::try_new(payload.tag)
-        .map_err(|_| ApiError::bad_request("invalid_tag", "The tag is invalid", &headers))?;
-    let tag =
-        state.library.add_tag(id, tag).await.map_err(|error| map_library_error(error, &headers))?;
-    Ok(Json(TagResponse::from_tag(&tag)))
-}
-
-async fn remove_tag(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Path((id, tag)): Path<(Uuid, String)>,
-) -> Result<StatusCode, ApiError> {
-    authorize(&state.api_token, &headers).await?;
-    let tag = NewTag::try_new(tag)
-        .map_err(|_| ApiError::bad_request("invalid_tag", "The tag is invalid", &headers))?;
-    state
-        .library
-        .remove_tag(id, &tag.normalized_name)
-        .await
-        .map_err(|error| map_library_error(error, &headers))?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -452,13 +432,10 @@ struct UpdateMediaRequest {
     #[serde(default)]
     notes: Option<Option<String>>,
     #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
     #[serde(with = "time::serde::rfc3339::option")]
     expected_updated_at: Option<OffsetDateTime>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TagRequest {
-    tag: String,
 }
 
 #[derive(Debug, Serialize)]

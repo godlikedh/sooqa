@@ -11,7 +11,7 @@ use sooqa_library::{
     MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, Media, MediaCursor,
     MediaDetails, MediaIngest, MediaKind, MediaLookup, MediaMetadata, MediaPage, MediaPreviewData,
     MediaPreviewMetadata, MediaSearchQuery, MediaSource, MediaSourceInput, MediaStatus,
-    MediaStorageState, MediaSummary, MediaUpdate, NewTag, SourceKind, StorageCaptionMetadata,
+    MediaStorageState, MediaSummary, MediaUpdate, SourceKind, StorageCaptionMetadata,
     StorageReceipt, StorageUploadAttachment, StorageUploadInfo, StorageUploadReservation,
     StorageUploadReservationRequest, StorageUploadStore, Tag, VideoDuplicateClassification,
     VideoDuplicateEvidence, VideoDuplicateMatch, VideoIdentityOutcome,
@@ -28,6 +28,7 @@ use uuid::Uuid;
 pub use sooqa_library::VideoFingerprintCandidate;
 
 const VIDEO_IDENTITY_ADVISORY_LOCK: i64 = 0x736f_6f71_615f_6964;
+type CaptionSyncValues = (i32, &'static str, Option<String>, Option<Uuid>);
 
 #[derive(Clone)]
 pub struct LibraryRepository {
@@ -73,6 +74,7 @@ struct MediaRow {
     caption_sync_generation: i32,
     caption_sync_state: String,
     caption_sync_error: Option<String>,
+    caption_sync_claim_token: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -392,12 +394,16 @@ impl LibraryRepository {
         if !has_storage_message(&row) {
             return Err(LibraryRepositoryError::CaptionSyncUnavailable(id));
         }
+        if row.caption_sync_state != "failed" {
+            transaction.commit().await?;
+            return row.into_media();
+        }
         let generation = row
             .caption_sync_generation
             .checked_add(1)
             .ok_or(LibraryRepositoryError::CaptionSyncGenerationOverflow(id))?;
         let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET caption_sync_generation = $2, caption_sync_state = 'pending', caption_sync_error = NULL, updated_at = now() WHERE id = $1 RETURNING *",
+            "UPDATE media SET caption_sync_generation = $2, caption_sync_state = 'pending', caption_sync_error = NULL, caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 RETURNING *",
         )
         .bind(id)
         .bind(generation)
@@ -412,6 +418,7 @@ impl LibraryRepository {
         &self,
         id: Uuid,
         generation: i32,
+        claim_token: Uuid,
     ) -> Result<Option<CaptionSyncClaim>, LibraryRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
@@ -429,15 +436,17 @@ impl LibraryRepository {
             return Ok(None);
         }
         sqlx::query(
-            "UPDATE media SET caption_sync_state = 'syncing', caption_sync_error = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2",
+            "UPDATE media SET caption_sync_state = 'syncing', caption_sync_error = NULL, caption_sync_claim_token = $3, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2 AND caption_sync_state = 'pending'",
         )
         .bind(id)
         .bind(generation)
+        .bind(claim_token)
         .execute(&mut *transaction)
         .await?;
         let claim = CaptionSyncClaim {
             media_id: id,
             generation,
+            claim_token,
             storage_chat_id: row.telegram_storage_chat_id.expect("storage message was checked"),
             storage_message_id: row
                 .telegram_storage_message_id
@@ -456,6 +465,7 @@ impl LibraryRepository {
         &self,
         id: Uuid,
         generation: i32,
+        claim_token: Uuid,
         succeeded: bool,
         retryable: bool,
         error_message: Option<&str>,
@@ -472,7 +482,7 @@ impl LibraryRepository {
         }
         if row.caption_sync_generation != generation {
             sqlx::query(
-                "UPDATE media SET caption_sync_state = 'pending', caption_sync_error = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2",
+                "UPDATE media SET caption_sync_state = 'pending', caption_sync_error = NULL, caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2",
             )
             .bind(id)
             .bind(row.caption_sync_generation)
@@ -488,6 +498,11 @@ impl LibraryRepository {
             transaction.commit().await?;
             return Ok(CaptionSyncCompletion::Stale);
         }
+        if row.caption_sync_state != "syncing" || row.caption_sync_claim_token != Some(claim_token)
+        {
+            transaction.commit().await?;
+            return Ok(CaptionSyncCompletion::Stale);
+        }
         let (state, error) = if succeeded {
             ("synced", None)
         } else if retryable {
@@ -496,12 +511,13 @@ impl LibraryRepository {
             ("failed", error_message.map(|value| truncate_sync_error(value, 512)))
         };
         sqlx::query(
-            "UPDATE media SET caption_sync_state = $2, caption_sync_error = $3, updated_at = now() WHERE id = $1 AND caption_sync_generation = $4",
+            "UPDATE media SET caption_sync_state = $2, caption_sync_error = $3, caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $4 AND caption_sync_claim_token = $5 AND caption_sync_state = 'syncing'",
         )
         .bind(id)
         .bind(state)
         .bind(error)
         .bind(generation)
+        .bind(claim_token)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
@@ -513,7 +529,11 @@ impl LibraryRepository {
         id: Uuid,
         update: MediaUpdate,
     ) -> Result<Media, LibraryRepositoryError> {
-        if update.title.is_none() && update.description.is_none() && update.notes.is_none() {
+        if update.title.is_none()
+            && update.description.is_none()
+            && update.notes.is_none()
+            && update.tags.is_none()
+        {
             return Err(LibraryRepositoryError::EmptyUpdate);
         }
         let mut transaction = self.pool.begin().await?;
@@ -530,20 +550,27 @@ impl LibraryRepository {
         let notes = update.notes.unwrap_or_else(|| {
             current.source_metadata.get("notes").and_then(Value::as_str).map(str::to_owned)
         });
+        let tags = update.tags.unwrap_or_else(|| current.tags.clone());
         let metadata = with_notes(current.source_metadata.clone(), notes);
-        let caption_changed = description != current.description;
-        let (caption_sync_generation, caption_sync_state, caption_sync_error) =
-            next_caption_sync_values(&current, caption_changed)?;
+        let caption_changed = description != current.description || tags != current.tags;
+        let (
+            caption_sync_generation,
+            caption_sync_state,
+            caption_sync_error,
+            caption_sync_claim_token,
+        ) = next_caption_sync_values(&current, caption_changed)?;
         let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET title = $2, description = $3, source_metadata = $4, caption_sync_generation = $5, caption_sync_state = $6, caption_sync_error = $7, updated_at = now() WHERE id = $1 RETURNING *",
+            "UPDATE media SET title = $2, description = $3, tags = $4, source_metadata = $5, caption_sync_generation = $6, caption_sync_state = $7, caption_sync_error = $8, caption_sync_claim_token = $9, updated_at = now() WHERE id = $1 RETURNING *",
         )
         .bind(id)
         .bind(title)
         .bind(description)
+        .bind(tags)
         .bind(metadata)
         .bind(caption_sync_generation)
         .bind(caption_sync_state)
         .bind(caption_sync_error)
+        .bind(caption_sync_claim_token)
         .fetch_one(&mut *transaction)
         .await?;
         if caption_changed && caption_sync_state == "pending" {
@@ -562,60 +589,6 @@ impl LibraryRepository {
         .await?
         .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
         row.into_media()
-    }
-
-    pub async fn add_tag(&self, id: Uuid, tag: NewTag) -> Result<Tag, LibraryRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let current = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
-        let changed = !current.tags.iter().any(|value| value == &tag.normalized_name);
-        let (generation, state, error) = next_caption_sync_values(&current, changed)?;
-        let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET tags = array_append(array_remove(tags, $2), $2), caption_sync_generation = $3, caption_sync_state = $4, caption_sync_error = $5, updated_at = now() WHERE id = $1 RETURNING *",
-        )
-        .bind(id)
-        .bind(&tag.normalized_name)
-        .bind(generation)
-        .bind(state)
-        .bind(error)
-        .fetch_one(&mut *transaction)
-        .await?;
-        if changed && state == "pending" {
-            enqueue_caption_sync_job(&mut transaction, id, generation).await?;
-        }
-        transaction.commit().await?;
-        Ok(tag_from_name(&tag.normalized_name, row.updated_at))
-    }
-
-    pub async fn remove_tag(&self, id: Uuid, tag: &str) -> Result<(), LibraryRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let current = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
-        if !current.tags.iter().any(|value| value == tag) {
-            return Err(LibraryRepositoryError::TagNotAttached);
-        }
-        let (generation, state, error) = next_caption_sync_values(&current, true)?;
-        sqlx::query(
-            "UPDATE media SET tags = array_remove(tags, $2), caption_sync_generation = $3, caption_sync_state = $4, caption_sync_error = $5, updated_at = now() WHERE id = $1",
-        )
-        .bind(id)
-        .bind(tag)
-        .bind(generation)
-        .bind(state)
-        .bind(error)
-        .execute(&mut *transaction)
-        .await?;
-        if state == "pending" {
-            enqueue_caption_sync_job(&mut transaction, id, generation).await?;
-        }
-        transaction.commit().await?;
-        Ok(())
     }
 
     pub async fn list_tags(&self, id: Uuid) -> Result<Vec<Tag>, LibraryRepositoryError> {
@@ -689,10 +662,14 @@ impl LibraryRepository {
                     .as_ref()
                     .is_some_and(|description| Some(description) != row.description.as_ref());
                 let caption_changed = description_changed || merged_tags != row.tags;
-                let (caption_sync_generation, caption_sync_state, caption_sync_error) =
-                    next_caption_sync_values(&row, caption_changed)?;
+                let (
+                    caption_sync_generation,
+                    caption_sync_state,
+                    caption_sync_error,
+                    caption_sync_claim_token,
+                ) = next_caption_sync_values(&row, caption_changed)?;
                 let row = sqlx::query_as::<_, MediaRow>(
-                    "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE description END, source_url = COALESCE(source_url, $5), source_metadata = $6, caption_sync_generation = $7, caption_sync_state = $8, caption_sync_error = $9, updated_at = now() WHERE id = $1 RETURNING *",
+                    "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE description END, source_url = COALESCE(source_url, $5), source_metadata = $6, caption_sync_generation = $7, caption_sync_state = $8, caption_sync_error = $9, caption_sync_claim_token = $10, updated_at = now() WHERE id = $1 RETURNING *",
                 )
                 .bind(row.id)
                 .bind(merged_tags)
@@ -703,6 +680,7 @@ impl LibraryRepository {
                 .bind(caption_sync_generation)
                 .bind(caption_sync_state)
                 .bind(caption_sync_error)
+                .bind(caption_sync_claim_token)
                 .fetch_one(&mut *transaction)
                 .await?;
                 if caption_changed && caption_sync_state == "pending" {
@@ -784,10 +762,14 @@ impl LibraryRepository {
                 .as_ref()
                 .is_some_and(|description| Some(description) != row.description.as_ref());
             let caption_changed = description_changed || merged_tags != row.tags;
-            let (caption_sync_generation, caption_sync_state, caption_sync_error) =
-                next_caption_sync_values(&row, caption_changed)?;
+            let (
+                caption_sync_generation,
+                caption_sync_state,
+                caption_sync_error,
+                caption_sync_claim_token,
+            ) = next_caption_sync_values(&row, caption_changed)?;
             sqlx::query(
-                "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE description END, source_url = COALESCE(source_url, $5), source_metadata = $6, caption_sync_generation = $7, caption_sync_state = $8, caption_sync_error = $9, updated_at = now() WHERE id = $1",
+                "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE description END, source_url = COALESCE(source_url, $5), source_metadata = $6, caption_sync_generation = $7, caption_sync_state = $8, caption_sync_error = $9, caption_sync_claim_token = $10, updated_at = now() WHERE id = $1",
             )
             .bind(row.id)
             .bind(merged_tags)
@@ -798,6 +780,7 @@ impl LibraryRepository {
             .bind(caption_sync_generation)
             .bind(caption_sync_state)
             .bind(caption_sync_error)
+            .bind(caption_sync_claim_token)
             .execute(&mut **transaction)
             .await?;
             if caption_changed && caption_sync_state == "pending" {
@@ -1150,7 +1133,7 @@ impl LibraryRepository {
             .checked_add(1)
             .ok_or(LibraryRepositoryError::StorageGenerationOverflow(id))?;
         sqlx::query(
-            "UPDATE media SET storage_state = 'pending_storage', storage_generation = $2, telegram_storage_chat_id = NULL, telegram_storage_message_id = NULL, telegram_file_id = NULL, telegram_file_unique_id = NULL, storage_token = NULL, storage_started_at = NULL, stored_at = NULL, caption_sync_state = 'not_required', caption_sync_error = NULL, updated_at = now() WHERE id = $1",
+            "UPDATE media SET storage_state = 'pending_storage', storage_generation = $2, telegram_storage_chat_id = NULL, telegram_storage_message_id = NULL, telegram_file_id = NULL, telegram_file_unique_id = NULL, storage_token = NULL, storage_started_at = NULL, stored_at = NULL, caption_sync_state = 'not_required', caption_sync_error = NULL, caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1",
         )
         .bind(id)
         .bind(generation)
@@ -1182,7 +1165,7 @@ impl LibraryRepository {
         validate_attachment(&attachment)?;
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $3, telegram_storage_message_id = $4, telegram_file_id = $5, telegram_file_unique_id = $6, storage_token = NULL, storage_started_at = NULL, local_work_path = NULL, caption_sync_state = 'synced', caption_sync_error = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_generation = $2 AND storage_state = 'storage_unknown' RETURNING *",
+            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $3, telegram_storage_message_id = $4, telegram_file_id = $5, telegram_file_unique_id = $6, storage_token = NULL, storage_started_at = NULL, local_work_path = NULL, caption_sync_state = 'synced', caption_sync_error = NULL, caption_sync_claim_token = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_generation = $2 AND storage_state = 'storage_unknown' RETURNING *",
         )
         .bind(id)
         .bind(generation)
@@ -1408,7 +1391,11 @@ impl StorageUploadStore for LibraryRepository {
         if updated.rows_affected() != 1 {
             return Ok(StorageUploadReservation::InProgress { retry_at: None });
         }
-        Ok(StorageUploadReservation::Reserved { media_id: request.media_id, owner_token })
+        Ok(StorageUploadReservation::Reserved {
+            media_id: request.media_id,
+            owner_token,
+            caption_metadata: storage_caption_metadata_from_row(&row),
+        })
     }
 
     async fn renew_storage_upload(
@@ -1439,8 +1426,8 @@ impl StorageUploadStore for LibraryRepository {
     ) -> Result<StorageReceipt, Self::Error> {
         validate_attachment(&attachment)?;
         let mut transaction = self.pool.begin().await?;
-        let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $2, telegram_storage_message_id = $3, telegram_file_id = $4, telegram_file_unique_id = $5, storage_token = NULL, storage_started_at = NULL, local_work_path = NULL, caption_sync_state = 'synced', caption_sync_error = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_token = $6 AND storage_state = 'pending_storage' RETURNING *",
+        let mut row = sqlx::query_as::<_, MediaRow>(
+            "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = $2, telegram_storage_message_id = $3, telegram_file_id = $4, telegram_file_unique_id = $5, storage_token = NULL, storage_started_at = NULL, local_work_path = NULL, caption_sync_state = 'synced', caption_sync_error = NULL, caption_sync_claim_token = NULL, stored_at = now(), updated_at = now() WHERE id = $1 AND storage_token = $6 AND storage_state = 'pending_storage' RETURNING *",
         )
         .bind(media_id)
         .bind(attachment.storage_chat_id)
@@ -1451,6 +1438,22 @@ impl StorageUploadStore for LibraryRepository {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(LibraryRepositoryError::StorageUploadLeaseLost(media_id))?;
+        if let Some(caption_metadata) = attachment.caption_metadata.as_ref()
+            && !storage_caption_metadata_matches(&row, caption_metadata)
+        {
+            let (generation, state, error, claim_token) = next_caption_sync_values(&row, true)?;
+            row = sqlx::query_as::<_, MediaRow>(
+                "UPDATE media SET caption_sync_generation = $2, caption_sync_state = $3, caption_sync_error = $4, caption_sync_claim_token = $5, updated_at = now() WHERE id = $1 RETURNING *",
+            )
+            .bind(media_id)
+            .bind(generation)
+            .bind(state)
+            .bind(error)
+            .bind(claim_token)
+            .fetch_one(&mut *transaction)
+            .await?;
+            enqueue_caption_sync_job(&mut transaction, media_id, generation).await?;
+        }
         complete_linked_ingests_for_storage(&mut transaction, media_id).await?;
         enqueue_workspace_cleanup_for_media(&mut transaction, media_id, OffsetDateTime::now_utc())
             .await?;
@@ -1811,7 +1814,7 @@ fn merge_tags(existing: &[String], incoming: &[String]) -> Vec<String> {
 fn next_caption_sync_values(
     row: &MediaRow,
     changed: bool,
-) -> Result<(i32, &'static str, Option<String>), LibraryRepositoryError> {
+) -> Result<CaptionSyncValues, LibraryRepositoryError> {
     if !changed {
         return Ok((
             row.caption_sync_generation,
@@ -1836,22 +1839,37 @@ fn next_caption_sync_values(
                 }
             },
             row.caption_sync_error.clone(),
+            row.caption_sync_claim_token,
         ));
     }
     if !has_storage_message(row) {
-        return Ok((row.caption_sync_generation, "not_required", None));
+        return Ok((row.caption_sync_generation, "not_required", None, None));
     }
     let generation = row
         .caption_sync_generation
         .checked_add(1)
         .ok_or(LibraryRepositoryError::CaptionSyncGenerationOverflow(row.id))?;
-    Ok((generation, "pending", None))
+    Ok((generation, "pending", None, None))
 }
 
 fn has_storage_message(row: &MediaRow) -> bool {
     row.storage_state == "ready"
         && row.telegram_storage_chat_id.is_some()
         && row.telegram_storage_message_id.is_some()
+}
+
+fn storage_caption_metadata_from_row(row: &MediaRow) -> StorageCaptionMetadata {
+    StorageCaptionMetadata {
+        description: row.description.clone(),
+        tags: row.tags.clone(),
+        source_url: row.source_url.clone(),
+    }
+}
+
+fn storage_caption_metadata_matches(row: &MediaRow, metadata: &StorageCaptionMetadata) -> bool {
+    row.description == metadata.description
+        && row.tags == metadata.tags
+        && row.source_url == metadata.source_url
 }
 
 fn truncate_sync_error(value: &str, max_chars: usize) -> String {
@@ -2038,8 +2056,6 @@ pub enum LibraryRepositoryError {
     EmptyUpdate,
     #[error("media {0} was modified by another request")]
     OptimisticConflict(Uuid),
-    #[error("tag is not attached")]
-    TagNotAttached,
     #[error("media search limit must be between 1 and 100, got {value}")]
     InvalidLimit { value: u32 },
     #[error("database count was negative")]

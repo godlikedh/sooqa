@@ -171,6 +171,7 @@ async fn run_storage_command(
                         storage_message_id,
                         telegram_file_id: Some(telegram_file_id),
                         telegram_file_unique_id: Some(telegram_file_unique_id),
+                        caption_metadata: None,
                     },
                 )
                 .await?;

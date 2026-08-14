@@ -8,7 +8,8 @@ ALTER TABLE media
     ADD COLUMN preview_sha256 bytea,
     ADD COLUMN caption_sync_generation integer NOT NULL DEFAULT 0,
     ADD COLUMN caption_sync_state text NOT NULL DEFAULT 'not_required',
-    ADD COLUMN caption_sync_error text;
+    ADD COLUMN caption_sync_error text,
+    ADD COLUMN caption_sync_claim_token uuid;
 
 ALTER TABLE media
     ADD CONSTRAINT media_preview_fields_check CHECK (

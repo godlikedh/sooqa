@@ -350,7 +350,10 @@ route serves private-cache JPEG/PNG bytes without exposing workspace paths;
 audio and unsupported/older rows simply have no preview. The channel settings
 patch locks and validates the complete candidate, uses `updated_at` for
 stale-write rejection, and serializes enablement so at most one active
-publication target can be configured.
+publication target can be configured. Media metadata editing uses one
+revision-fenced command for the complete tags plus internal description; the
+caption-sync claim token prevents a recovered old worker from overwriting a
+newer same-generation attempt.
 
 ## Security and filesystem rules
 

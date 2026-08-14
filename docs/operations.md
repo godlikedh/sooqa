@@ -133,10 +133,12 @@ first-frame decode attempt. No preview path triggers a second full video
 decode, an ffmpeg process per sample, an original-media retention rule, or an
 automatic backfill.
 
-After a storage message exists, description or tag edits enqueue a durable
-`sync_storage_caption` job after the database commit. The job edits the
-existing storage message and uses the media caption generation as a fence.
-Retries are bounded; an expired final lease records a failure for the current
+After a storage message exists, the revision-fenced media metadata command
+replaces the complete description and tag set in one transaction and enqueues
+a durable `sync_storage_caption` job after the database commit. The job edits
+the existing storage message and uses both the media caption generation and a
+claim token as fences. Retries are bounded and restore a pending claim before
+re-running; an expired final lease records a failure for the current
 generation. A late old-generation completion schedules a current-generation
 reapply so the final Telegram caption cannot remain stale.
 

@@ -378,6 +378,10 @@ pub struct MediaUpdate {
     pub title: Option<Option<String>>,
     pub description: Option<Option<String>>,
     pub notes: Option<Option<String>>,
+    /// The complete normalized tag set. Updating tags and description through
+    /// one command keeps the catalogue edit and caption-sync generation in a
+    /// single transaction.
+    pub tags: Option<Vec<String>>,
     pub expected_updated_at: Option<OffsetDateTime>,
 }
 
@@ -514,6 +518,7 @@ pub struct StorageCaptionMetadata {
 pub struct CaptionSyncClaim {
     pub media_id: Uuid,
     pub generation: i32,
+    pub claim_token: Uuid,
     pub storage_chat_id: i64,
     pub storage_message_id: i64,
     pub metadata: StorageCaptionMetadata,
@@ -531,6 +536,9 @@ pub struct StorageUploadAttachment {
     pub storage_message_id: i64,
     pub telegram_file_id: Option<String>,
     pub telegram_file_unique_id: Option<String>,
+    /// Present for a newly uploaded Telegram object. Reconciliation attaches
+    /// an already-existing object and therefore has no caption snapshot.
+    pub caption_metadata: Option<StorageCaptionMetadata>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -541,7 +549,7 @@ pub struct StorageUploadReservationRequest {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum StorageUploadReservation {
-    Reserved { media_id: Uuid, owner_token: Uuid },
+    Reserved { media_id: Uuid, owner_token: Uuid, caption_metadata: StorageCaptionMetadata },
     Reused(StorageReceipt),
     InProgress { retry_at: Option<OffsetDateTime> },
     ReconciliationRequired,
