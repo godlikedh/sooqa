@@ -32,7 +32,7 @@ async fn search_media(
 ) -> Result<Json<MediaPageResponse>, ApiError> {
     authorize(&state.api_token, &headers).await?;
     let mut params = params;
-    let lookup_input = params.q.take().filter(|value| !value.trim().is_empty());
+    let lookup_input = take_lookup_input(&mut params, &headers)?;
     let query = params.into_domain(&headers)?;
     let page = if let Some(lookup_input) = lookup_input {
         state
@@ -48,6 +48,27 @@ async fn search_media(
             .map_err(|error| map_library_error(error, &headers))?
     };
     Ok(Json(MediaPageResponse::from_page(&page)))
+}
+
+fn take_lookup_input(
+    params: &mut SearchParams,
+    headers: &HeaderMap,
+) -> Result<Option<String>, ApiError> {
+    let lookup_input = params.q.take().filter(|value| !value.trim().is_empty());
+    let has_catalogue_filter = params
+        .tags
+        .as_ref()
+        .is_some_and(|value| value.split(',').any(|tag| !tag.trim().is_empty()))
+        || params.kind.is_some()
+        || params.status.is_some();
+    if lookup_input.is_some() && has_catalogue_filter {
+        return Err(ApiError::bad_request(
+            "lookup_filters_not_allowed",
+            "Exact media lookup cannot be combined with catalogue filters",
+            headers,
+        ));
+    }
+    Ok(lookup_input)
 }
 
 async fn get_media(
@@ -549,6 +570,19 @@ mod tests {
             .into_domain(&headers)
             .expect_err("limit 101 must be rejected");
         assert_eq!(error.code, "invalid_limit");
+    }
+
+    #[test]
+    fn exact_media_lookup_rejects_catalogue_filters() {
+        let headers = HeaderMap::new();
+        let mut params = SearchParams {
+            q: Some(Uuid::from_u128(7).to_string()),
+            kind: Some("video".to_owned()),
+            ..SearchParams::default()
+        };
+        let error = take_lookup_input(&mut params, &headers)
+            .expect_err("exact lookup and catalogue filters must not be combined");
+        assert_eq!(error.code, "lookup_filters_not_allowed");
     }
 
     #[test]

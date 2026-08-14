@@ -42,7 +42,7 @@ async fn list_channels(
     authorize(&state.api_token, &headers).await?;
     let channels = state
         .publisher
-        .list_channels(false)
+        .list_channels(true)
         .await
         .map_err(|error| map_publisher_error(error, &headers))?;
     Ok(Json(ChannelListResponse {
@@ -799,14 +799,8 @@ impl PostResponse {
             status: post.state,
             scheduled_at: post.scheduled_at,
             cadence_slot_at: post.cadence_slot_at,
-            schedule_mode: if post.cadence_slot_at.is_some()
-                && post.requested_action == PublicationAction::Queue
-                && post.requested_publish_at.is_none()
-            {
-                "cadence".to_owned()
-            } else {
-                "explicit".to_owned()
-            },
+            schedule_mode: schedule_mode(post.requested_action, post.requested_publish_at)
+                .to_owned(),
             channel_name,
             media_kind,
             source_url,
@@ -815,6 +809,17 @@ impl PostResponse {
             updated_at: post.updated_at,
             revision: post.revision,
         }
+    }
+}
+
+fn schedule_mode(
+    requested_action: PublicationAction,
+    requested_publish_at: Option<OffsetDateTime>,
+) -> &'static str {
+    if requested_action == PublicationAction::Queue && requested_publish_at.is_none() {
+        "cadence"
+    } else {
+        "explicit"
     }
 }
 
@@ -931,5 +936,18 @@ mod tests {
             serde_json::from_str(r#"{"caption":null,"expected_revision":0}"#)
                 .expect("null caption is valid");
         assert!(matches!(request.caption, PatchField::Set(None)));
+    }
+
+    #[test]
+    fn schedule_mode_keeps_cadence_repeat_drafts_on_the_cadence_path() {
+        assert_eq!(schedule_mode(PublicationAction::Queue, None), "cadence");
+        assert_eq!(
+            schedule_mode(
+                PublicationAction::Queue,
+                Some(OffsetDateTime::from_unix_timestamp(42).unwrap())
+            ),
+            "explicit"
+        );
+        assert_eq!(schedule_mode(PublicationAction::PostNow, None), "explicit");
     }
 }

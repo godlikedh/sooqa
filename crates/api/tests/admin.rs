@@ -204,6 +204,41 @@ async fn admin_api_lists_ingests_media_schedule_dashboard_and_channel_settings(p
     assert_eq!(status, StatusCode::OK);
     assert_eq!(settings["name"], "updated");
 
+    let (status, disabled) = request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/channels/{}", channel.id),
+        json!({
+            "is_enabled": false,
+            "expected_updated_at": settings["updated_at"].as_str().unwrap()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(disabled["is_enabled"], false);
+
+    let (status, channels) = request(&app, Method::GET, "/api/v1/channels", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        channels["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["id"] == channel.id.to_string() && item["is_enabled"] == false })
+    );
+
+    let (status, _) = request(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/channels/{}", channel.id),
+        json!({
+            "is_enabled": true,
+            "expected_updated_at": disabled["updated_at"].as_str().unwrap()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
     let (status, _) = request(
         &app,
         Method::POST,

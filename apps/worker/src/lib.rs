@@ -1568,7 +1568,7 @@ fn source_record_for_request(request: &sooqa_inbox::Ingest) -> MediaSourceInput 
     MediaSourceInput {
         ingest_id: Some(request.id),
         kind,
-        original_url: Some(request.source_url.clone()),
+        original_url: Some(original_source_url(request)),
         normalized_url,
         platform,
         platform_content_id,
@@ -1584,6 +1584,22 @@ fn source_record_for_request(request: &sooqa_inbox::Ingest) -> MediaSourceInput 
         published_at: None,
         metadata: source_provenance_for_request(request),
     }
+}
+
+fn original_source_url(request: &sooqa_inbox::Ingest) -> String {
+    request
+        .original_input
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            request
+                .original_input
+                .get("source")
+                .and_then(|value| value.get("url"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or(&request.source_url)
+        .to_owned()
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2787,5 +2803,22 @@ mod tests {
         assert_eq!(metadata["page_url"], "https://2ch.life/b/res/123");
         assert_eq!(metadata["two_ch_mirror"]["submitted_host"], "2ch.life");
         assert_eq!(metadata["two_ch_mirror"]["selected_host"], "2ch.org");
+    }
+
+    #[test]
+    fn source_record_preserves_the_submitted_url_separately_from_normalized_url() {
+        let submission = IngestSubmission::try_new(IngestSubmissionInput::new(
+            "HTTPS://Example.COM:443/clip.webm?utm_source=feed&id=7#frame",
+            SubmittedVia::Companion,
+        ))
+        .expect("submission should validate");
+        let request = Ingest::from_submission(Uuid::new_v4(), &submission);
+
+        let source = source_record_for_request(&request);
+        assert_eq!(
+            source.original_url.as_deref(),
+            Some("HTTPS://Example.COM:443/clip.webm?utm_source=feed&id=7#frame")
+        );
+        assert_eq!(source.normalized_url.as_deref(), Some("https://example.com/clip.webm?id=7"));
     }
 }

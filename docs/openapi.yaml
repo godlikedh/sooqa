@@ -191,7 +191,8 @@ paths:
         With no q parameter this returns newest-first bounded catalogue pages.
         q accepts only a media UUID, ingest UUID, normalized HTTP(S) source URL, or
         private HTTPS Telegram storage link. The three official 2ch mirror hosts
-        resolve to one source identity while stored provenance is retained.
+        resolve to one source identity while stored provenance is retained. q
+        cannot be combined with tags, kind, or status catalogue filters.
       security:
         - bearerAuth: []
       parameters:
@@ -322,6 +323,7 @@ paths:
       tags: [channels]
       operationId: listChannels
       summary: List configured target channels
+      description: Includes disabled channels so the settings client can re-enable them.
       security:
         - bearerAuth: []
       responses:
