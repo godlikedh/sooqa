@@ -1164,7 +1164,15 @@ fn source_from_row(row: &MediaRow) -> Result<Option<MediaSource>, LibraryReposit
                     .ok()
             },
         ),
-        retrieved_at: row.updated_at,
+        retrieved_at: row
+            .source_metadata
+            .get("retrieved_at")
+            .and_then(Value::as_str)
+            .and_then(|value| {
+                time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .unwrap_or(row.created_at),
         metadata: row
             .source_metadata
             .get("metadata")
@@ -1183,10 +1191,16 @@ fn source_to_value(source: &MediaSourceInput) -> Value {
         "author_name": source.author_name,
         "title": source.title,
         "description": source.description,
-        "published_at": source.published_at.map(|value| value.to_string()),
-        "retrieved_at": OffsetDateTime::now_utc().to_string(),
+        "published_at": source.published_at.map(format_rfc3339),
+        "retrieved_at": format_rfc3339(OffsetDateTime::now_utc()),
         "metadata": source.metadata,
     })
+}
+
+fn format_rfc3339(value: OffsetDateTime) -> String {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("RFC 3339 formatting for an OffsetDateTime cannot fail")
 }
 
 fn merge_missing_source_metadata(existing: &Value, incoming: &Value) -> Value {

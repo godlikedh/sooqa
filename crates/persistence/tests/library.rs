@@ -84,6 +84,7 @@ async fn media_update_replaces_complete_metadata_under_revision_fence(pool: sqlx
         .resolve_media(ingest(vec![9_u8; 32], "https://example.test/editable"))
         .await
         .unwrap();
+    let retrieved_at = resolution.source.retrieved_at;
 
     let updated = repository
         .update_media(
@@ -98,6 +99,8 @@ async fn media_update_replaces_complete_metadata_under_revision_fence(pool: sqlx
         .unwrap();
     assert_eq!(updated.description.as_deref(), Some("edited description"));
     assert_eq!(updated.tags, ["rust", "reaction"]);
+    let details = repository.find_media_details(resolution.media.id).await.unwrap().unwrap();
+    assert_eq!(details.source.unwrap().retrieved_at, retrieved_at);
 
     let conflict = repository
         .update_media(
