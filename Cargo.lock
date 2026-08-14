@@ -2271,13 +2271,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
- "chrono",
- "chrono-tz",
  "reqwest",
  "serde_json",
  "sooqa-library",
  "sooqa-media",
- "sooqa-publisher",
  "teloxide",
  "thiserror",
  "time",

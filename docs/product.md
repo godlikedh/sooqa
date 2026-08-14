@@ -26,26 +26,14 @@ The first release is intentionally narrow:
 - searchable stored media with captions/descriptions and normalized tags;
 - immediate publication or a simple per-channel cadence queue.
 
-Publisher queue commands are durable PostgreSQL mutations: enqueue assigns the
-next valid channel-local cadence slot, adjacent and explicit slot moves swap
-only the affected posts, captions can be edited or explicitly cleared, and
-publish-now makes the existing post job due immediately without consuming its
-future cadence slot. Each queued post has one fixed-dedupe job and a revision
-fence; stale admin views and claimed jobs cannot overwrite newer queue state.
-
-The private administrator bot exposes `/queue` as a bounded control surface.
-It first offers count choices on the `1, 2, 5 x 10^n` scale, then renders
-text-only cards with localized cadence slots, catalogue metadata, separate
-public post text, and links to the existing storage messages. Card actions
-call the Publisher commands for moves, slot changes, caption edits, immediate
-publication, and removal; callback payloads carry the post revision, and old
-views are harmlessly rejected or cleaned up from bounded process-local state.
-Caption and slot prompts are accepted only as replies to their own ForceReply
-message; ordinary messages and commands do not accidentally become captions.
-Draft and failed rows remain visible for editable actions, while cadence moves
-and slot assignment are rendered only for queued rows. Queue cards are paced
-per chat and retry bounded Telegram flood-control responses without replaying a
-completed update.
+Publisher mutations are durable PostgreSQL operations: normal cadence enqueue
+assigns the next valid channel-local slot, captions can be edited or explicitly
+cleared, and publish-now makes the existing post job due immediately without
+consuming its future cadence slot. Each queued post has one fixed-dedupe job
+and a revision fence; stale admin views and claimed jobs cannot overwrite newer
+publication state. The superseded Telegram queue presentation and its
+earlier/later and occupied-slot swap commands are removed; web-admin editing is
+introduced in the bounded admin slices below.
 
 HTTP ingest requests may carry one versioned follow-up intent on the same
 `ingests` row: `save`, normal-cadence `queue`, exact-time `queue`, or

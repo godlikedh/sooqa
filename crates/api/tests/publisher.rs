@@ -100,10 +100,9 @@ async fn channel(database: &Database) -> sooqa_publisher::Channel {
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn queue_mutation_api_requires_nonnegative_expected_revision(pool: sqlx::PgPool) {
+async fn mutation_api_requires_nonnegative_expected_revision(pool: sqlx::PgPool) {
     let (_database, app) = app(pool);
     let id = Uuid::now_v7();
-    let slot = "2030-01-01T08:00:00Z";
     let cases = [
         (
             Method::PATCH,
@@ -125,24 +124,6 @@ async fn queue_mutation_api_requires_nonnegative_expected_revision(pool: sqlx::P
         ),
         (
             Method::POST,
-            format!("/api/v1/posts/{id}/earlier"),
-            json!({}),
-            json!({"expected_revision": -1}),
-        ),
-        (
-            Method::POST,
-            format!("/api/v1/posts/{id}/later"),
-            json!({}),
-            json!({"expected_revision": -1}),
-        ),
-        (
-            Method::POST,
-            format!("/api/v1/posts/{id}/slot"),
-            json!({"slot": slot}),
-            json!({"slot": slot, "expected_revision": -1}),
-        ),
-        (
-            Method::POST,
             format!("/api/v1/posts/{id}/cancel"),
             json!({}),
             json!({"expected_revision": -1}),
@@ -159,6 +140,20 @@ async fn queue_mutation_api_requires_nonnegative_expected_revision(pool: sqlx::P
             StatusCode::BAD_REQUEST,
             "negative revision for {uri}"
         );
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn superseded_queue_mutation_routes_are_not_registered(pool: sqlx::PgPool) {
+    let (_database, app) = app(pool);
+    let id = Uuid::now_v7();
+    for path in [
+        format!("/api/v1/posts/{id}/earlier"),
+        format!("/api/v1/posts/{id}/later"),
+        format!("/api/v1/posts/{id}/slot"),
+    ] {
+        assert_eq!(send(&app, Method::POST, &path, json!({})).await, StatusCode::NOT_FOUND);
     }
 }
 
@@ -203,79 +198,4 @@ async fn stale_edit_is_rejected_by_the_http_revision_fence(pool: sqlx::PgPool) {
         database.publisher().find_post(queued.id).await.unwrap().unwrap().caption.as_deref(),
         Some("original")
     );
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires PostgreSQL"]
-async fn repeated_adjacent_move_with_the_same_revision_performs_one_swap(pool: sqlx::PgPool) {
-    let (database, app) = app(pool);
-    let channel = channel(&database).await;
-    let first = database
-        .publisher()
-        .create_post_idempotent(
-            NewPost {
-                media_id: stored_media(&database).await,
-                channel_id: channel.id,
-                caption: Some("first".to_owned()),
-                parse_mode: None,
-                disable_notification: false,
-            },
-            format!("post-{}", Uuid::new_v4()),
-            b"api-first",
-        )
-        .await
-        .unwrap()
-        .post;
-    let second = database
-        .publisher()
-        .create_post_idempotent(
-            NewPost {
-                media_id: stored_media(&database).await,
-                channel_id: channel.id,
-                caption: Some("second".to_owned()),
-                parse_mode: None,
-                disable_notification: false,
-            },
-            format!("post-{}", Uuid::new_v4()),
-            b"api-second",
-        )
-        .await
-        .unwrap()
-        .post;
-    let first = database
-        .publisher()
-        .schedule_post(
-            PostSchedule::try_new(first.id, OffsetDateTime::now_utc(), "first-schedule", 0)
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let second = database
-        .publisher()
-        .schedule_post(
-            PostSchedule::try_new(second.id, OffsetDateTime::now_utc(), "second-schedule", 0)
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = json!({"expected_revision": second.revision});
-    let status =
-        send(&app, Method::POST, &format!("/api/v1/posts/{}/earlier", second.id), body.clone())
-            .await;
-    assert_eq!(status, StatusCode::OK);
-    let after_first = database.publisher().find_post(second.id).await.unwrap().unwrap();
-    let first_after_swap = database.publisher().find_post(first.id).await.unwrap().unwrap();
-    assert_eq!(after_first.revision, second.revision + 1);
-    assert_eq!(after_first.cadence_slot_at, first.cadence_slot_at);
-    assert_eq!(first_after_swap.cadence_slot_at, second.cadence_slot_at);
-
-    let status =
-        send(&app, Method::POST, &format!("/api/v1/posts/{}/earlier", second.id), body).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    let after_retry = database.publisher().find_post(second.id).await.unwrap().unwrap();
-    let first_after_retry = database.publisher().find_post(first.id).await.unwrap().unwrap();
-    assert_eq!(after_retry.revision, after_first.revision);
-    assert_eq!(after_retry.cadence_slot_at, after_first.cadence_slot_at);
-    assert_eq!(first_after_retry.revision, first_after_swap.revision);
-    assert_eq!(first_after_retry.cadence_slot_at, first_after_swap.cadence_slot_at);
 }
