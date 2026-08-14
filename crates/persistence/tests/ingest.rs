@@ -981,7 +981,6 @@ fn test_video_ingest(ingest_id: Uuid, sha256: Vec<u8>) -> MediaIngest {
             kind: MediaKind::Video,
             title: Some("stale-finalizer-test".to_owned()),
             description: None,
-            notes: None,
         },
         metadata: MediaMetadata {
             kind: MediaKind::Video,

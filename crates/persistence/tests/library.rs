@@ -1,8 +1,8 @@
 use serde_json::json;
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
 use sooqa_library::{
-    MediaIngest, MediaKind, MediaMetadata, MediaSearchQuery, MediaSourceInput, MediaStatus,
-    NewMedia, NewTag, SourceKind, StorageUploadAttachment, StorageUploadReservation,
+    MediaIngest, MediaKind, MediaMetadata, MediaSearchQuery, MediaSourceInput, MediaUpdate,
+    NewMedia, SourceKind, StorageUploadAttachment, StorageUploadReservation,
     StorageUploadReservationRequest, StorageUploadStore, VideoIdentityOutcome,
 };
 use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint, VideoSequenceSample};
@@ -14,7 +14,6 @@ fn ingest(sha256: Vec<u8>, source: &str) -> MediaIngest {
             kind: MediaKind::Video,
             title: Some("test".to_owned()),
             description: None,
-            notes: None,
         },
         metadata: MediaMetadata {
             kind: MediaKind::Video,
@@ -63,29 +62,57 @@ async fn media_aggregate_contains_source_and_tags_without_child_tables(pool: sql
         .resolve_media(ingest(vec![7_u8; 32], "https://example.test/video"))
         .await
         .unwrap();
-    database
-        .library()
-        .add_tag(resolution.media.id, NewTag::try_new("Rust").unwrap())
-        .await
-        .unwrap();
     let details =
         database.library().find_media_details(resolution.media.id).await.unwrap().unwrap();
-    assert_eq!(details.tags.len(), 1);
+    assert_eq!(details.media.tags, ["rust"]);
     assert!(details.source.is_some());
     assert_eq!(details.media.storage_state.as_str(), "pending_storage");
     let page = database
         .library()
-        .search_media(MediaSearchQuery {
-            text: None,
-            tags: vec!["rust".to_owned()],
-            kind: Some(MediaKind::Video),
-            status: Some(MediaStatus::Active),
-            limit: 10,
-            cursor: None,
-        })
+        .search_media(MediaSearchQuery { limit: 10, cursor: None })
         .await
         .unwrap();
     assert_eq!(page.items.iter().filter(|item| item.media.id == resolution.media.id).count(), 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn media_update_replaces_complete_metadata_under_revision_fence(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let repository = database.library();
+    let resolution = repository
+        .resolve_media(ingest(vec![9_u8; 32], "https://example.test/editable"))
+        .await
+        .unwrap();
+
+    let updated = repository
+        .update_media(
+            resolution.media.id,
+            MediaUpdate {
+                description: Some("edited description".to_owned()),
+                tags: vec![" Rust ".to_owned(), "REACTION".to_owned(), "rust".to_owned()],
+                expected_updated_at: resolution.media.updated_at,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.description.as_deref(), Some("edited description"));
+    assert_eq!(updated.tags, ["rust", "reaction"]);
+
+    let conflict = repository
+        .update_media(
+            resolution.media.id,
+            MediaUpdate {
+                description: None,
+                tags: Vec::new(),
+                expected_updated_at: resolution.media.updated_at,
+            },
+        )
+        .await
+        .expect_err("the stale revision must be rejected");
+    assert!(
+        matches!(conflict, LibraryRepositoryError::OptimisticConflict(id) if id == resolution.media.id)
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

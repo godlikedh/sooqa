@@ -152,15 +152,6 @@ paths:
       security:
         - bearerAuth: []
       parameters:
-        - { name: q, in: query, schema: { type: string } }
-        - { name: tags, in: query, description: Comma-separated normalized tags., schema: { type: string } }
-        - { name: kind, in: query, schema: { $ref: '#/components/schemas/MediaKind' } }
-        - name: status
-          in: query
-          schema:
-            allOf:
-              - $ref: '#/components/schemas/MediaStatus'
-            default: active
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
         - { name: cursor, in: query, schema: { type: string } }
       responses:
@@ -213,66 +204,6 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
-        '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/media/{id}/archive:
-    post:
-      tags: [media]
-      operationId: archiveMedia
-      summary: Archive media
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/MediaId'
-      responses:
-        '200':
-          description: Archived media row.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Media' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/media/{id}/tags:
-    post:
-      tags: [media]
-      operationId: addMediaTag
-      summary: Add a normalized tag
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/MediaId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/TagRequest' }
-      responses:
-        '200':
-          description: The attached tag.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Tag' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '413': { $ref: '#/components/responses/PayloadTooLarge' }
-        '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/media/{id}/tags/{tag}:
-    delete:
-      tags: [media]
-      operationId: removeMediaTag
-      summary: Remove a normalized tag
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/MediaId'
-        - { name: tag, in: path, required: true, schema: { type: string } }
-      responses:
-        '204': { description: Tag removed. }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/channels:
     get:
@@ -755,19 +686,15 @@ components:
     MediaKind:
       type: string
       enum: [video, image, animation, audio]
-    MediaStatus:
-      type: string
-      enum: [active, archived, deleted]
     Media:
       type: object
-      required: [id, kind, status, tags, created_at, updated_at]
+      required: [id, kind, tags, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         kind: { $ref: '#/components/schemas/MediaKind' }
-        status: { $ref: '#/components/schemas/MediaStatus' }
         title: { type: string, nullable: true }
         description: { type: string, nullable: true }
-        notes: { type: string, nullable: true }
+        tags: { type: array, items: { type: string, minLength: 1, maxLength: 100 } }
         storage_state: { type: string, enum: [pending_storage, ready, storage_unknown, missing], nullable: true }
         source_url: { type: string, nullable: true }
         source_metadata: { type: object, additionalProperties: true, nullable: true }
@@ -781,10 +708,8 @@ components:
         bit_rate: { type: integer, format: int64, nullable: true }
         file_size_bytes: { type: integer, format: int64, nullable: true }
         sha256: { type: string, nullable: true }
-        tags: { type: array, items: { $ref: '#/components/schemas/Tag' } }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
-        archived_at: { type: string, format: date-time, nullable: true }
     MediaPage:
       type: object
       required: [items]
@@ -793,25 +718,12 @@ components:
         next_cursor: { type: string, nullable: true }
     MediaUpdateRequest:
       type: object
+      required: [tags, description, expected_updated_at]
       additionalProperties: false
       properties:
-        title: { type: string, nullable: true }
+        tags: { type: array, items: { type: string, minLength: 1, maxLength: 100 } }
         description: { type: string, nullable: true }
-        notes: { type: string, nullable: true }
-        expected_updated_at: { type: string, format: date-time, nullable: true }
-    TagRequest:
-      type: object
-      required: [tag]
-      additionalProperties: false
-      properties:
-        tag: { type: string, minLength: 1 }
-    Tag:
-      type: object
-      required: [normalized_name, display_name, created_at]
-      properties:
-        normalized_name: { type: string }
-        display_name: { type: string }
-        created_at: { type: string, format: date-time }
+        expected_updated_at: { type: string, format: date-time }
     ChannelCreateRequest:
       type: object
       required: [name, telegram_chat_id]

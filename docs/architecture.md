@@ -70,7 +70,8 @@ this baseline.
 ## Boundaries
 
 - `sooqa-inbox` validates source submissions and defines typed ingest metadata.
-- `sooqa-library` defines media, source, tag, and storage domain values.
+- `sooqa-library` defines media, source, normalized tag values, and storage
+  domain values; tags remain embedded in the media aggregate.
 - `sooqa-publisher` defines channels, posts, and publication transitions.
 - `sooqa-jobs` defines typed job kinds and payloads. Persistence decodes the
   JSON envelope once; handlers receive a typed `JobCommand`.
@@ -236,6 +237,11 @@ state machine on the same row: `pending_storage`, `ready`,
 `storage_unknown`, or `missing`, with generation/token fields for retries and
 ambiguous results. Exact-SHA deduplication preserves the first source identity
 and only fills missing non-identity metadata from later observations.
+
+The administrator library list is cursor-bounded. Its single metadata update
+command replaces the complete normalized tag set and description while holding
+the media row revision fence; the transaction commits before any later
+integration work such as caption synchronization.
 
 The issue #44 implementation stores `video_sequence_v1` as bounded binary
 `fingerprint_data` plus a partial-GIN-searchable token array. PostgreSQL only

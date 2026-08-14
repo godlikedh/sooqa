@@ -680,7 +680,6 @@ fn video_media_ingest(sha256: Vec<u8>, source: &str) -> MediaIngest {
             kind: MediaKind::Video,
             title: Some("worker test".to_owned()),
             description: None,
-            notes: None,
         },
         metadata: MediaMetadata {
             kind: MediaKind::Video,
