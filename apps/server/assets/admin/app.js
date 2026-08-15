@@ -2,11 +2,15 @@
   "use strict";
 
   const TOKEN_KEY = "sooqa.admin.api_token";
+  const INGEST_AUTO_REFRESH_MS = 15_000;
   const PAGE_NAMES = new Set(["dashboard", "ingests", "media", "schedule", "settings"]);
   const state = {
     token: readToken(),
     page: "dashboard",
+    ingestPageCursor: null,
     ingestCursor: null,
+    ingestLoading: false,
+    ingestRefreshTimer: null,
     channels: [],
     mediaQuery: "",
     mediaCursor: null,
@@ -139,6 +143,8 @@
   }
 
   function lock() {
+    stopIngestAutoRefresh();
+    invalidateMediaPreviews();
     state.token = "";
     try {
       writeToken("");
@@ -399,9 +405,39 @@
   }
 
   async function loadIngests(cursor) {
+    if (state.ingestLoading) return;
+    state.ingestLoading = true;
+    state.ingestPageCursor = cursor || null;
     const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
-    const data = await api(`/api/v1/ingests?limit=50${suffix}`);
-    renderIngests(data);
+    try {
+      const data = await api(`/api/v1/ingests?limit=50${suffix}`);
+      renderIngests(data);
+      if (state.ingestPageCursor === null) startIngestAutoRefresh();
+      else stopIngestAutoRefresh();
+    } finally {
+      state.ingestLoading = false;
+    }
+  }
+
+  function stopIngestAutoRefresh() {
+    if (state.ingestRefreshTimer !== null) {
+      window.clearInterval(state.ingestRefreshTimer);
+      state.ingestRefreshTimer = null;
+    }
+  }
+
+  function startIngestAutoRefresh() {
+    stopIngestAutoRefresh();
+    if (!state.token || state.page !== "ingests" || state.ingestPageCursor !== null) return;
+    state.ingestRefreshTimer = window.setInterval(() => {
+      if (state.page !== "ingests" || state.ingestPageCursor !== null) {
+        stopIngestAutoRefresh();
+        return;
+      }
+      void loadIngests(null).catch((error) => {
+        showToast(error instanceof Error ? error.message : "The ingests could not be refreshed.", true);
+      });
+    }, INGEST_AUTO_REFRESH_MS);
   }
 
   function revokeMediaPreviews() {
@@ -409,6 +445,11 @@
       for (const objectUrl of state.mediaPreviewUrls) window.URL.revokeObjectURL(objectUrl);
     }
     state.mediaPreviewUrls.clear();
+  }
+
+  function invalidateMediaPreviews() {
+    state.mediaRenderGeneration += 1;
+    revokeMediaPreviews();
   }
 
   function sameOriginApiPath(value) {
@@ -423,7 +464,7 @@
   }
 
   function mediaTagValue(tags) {
-    return (tags || []).map((tag) => tag.normalized_name || tag.display_name).filter(Boolean).join(", ");
+    return (tags || []).filter((tag) => typeof tag === "string").join(", ");
   }
 
   function parseMediaTags(value) {
@@ -529,7 +570,7 @@
     const meta = node("div", "media-meta");
     const id = node("span", "mono", formatId(media.id));
     id.title = media.id || "";
-    meta.append(id, node("span", "meta", media.status || "unknown"), node("span", "meta", media.storage_state || "unknown"));
+    meta.append(id, node("span", "meta", media.storage_state || "unknown"));
     if (media.file_size_bytes !== null && media.file_size_bytes !== undefined) meta.append(node("span", "meta", formatBytes(media.file_size_bytes)));
     if (media.duration_ms !== null && media.duration_ms !== undefined) meta.append(node("span", "meta", formatMediaDuration(media.duration_ms)));
     main.append(meta);
@@ -545,7 +586,7 @@
 
     const tags = node("ul", "tag-list");
     if (media.tags?.length) {
-      for (const tag of media.tags) tags.append(node("li", "tag", tag.display_name || tag.normalized_name));
+      for (const tag of media.tags) tags.append(node("li", "tag", tag));
     } else {
       tags.append(node("li", "muted", "No tags"));
     }
@@ -580,7 +621,7 @@
     main.append(editor);
 
     const publication = node("div", "publication-actions");
-    if (media.status === "active" && media.storage_state === "ready") {
+    if (media.storage_state === "ready") {
       publication.append(
         actionButton("Post now", async () => submitPublication(media, "post_now")),
         actionButton("Post now…", () => openPublicationDialog(media, "post_now")),
@@ -596,9 +637,8 @@
   }
 
   function renderMedia(data) {
-    state.mediaRenderGeneration += 1;
+    invalidateMediaPreviews();
     const renderGeneration = state.mediaRenderGeneration;
-    revokeMediaPreviews();
     state.mediaItems = data.items || [];
     state.mediaCursor = data.next_cursor || null;
     const grid = $("media-grid");
@@ -964,6 +1004,8 @@
   }
 
   async function route() {
+    stopIngestAutoRefresh();
+    if (state.page === "media") invalidateMediaPreviews();
     const requested = window.location.hash.slice(1);
     state.page = PAGE_NAMES.has(requested) ? requested : "dashboard";
     for (const page of document.querySelectorAll("[data-page]")) page.hidden = page.dataset.page !== state.page;
@@ -1007,7 +1049,10 @@
   $("ingests-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, () => loadIngests(null)); });
   $("ingests-next").addEventListener("click", (event) => {
     const cursor = state.ingestCursor;
-    if (cursor) void withBusy(event.currentTarget, () => loadIngests(cursor));
+    if (cursor) {
+      stopIngestAutoRefresh();
+      void withBusy(event.currentTarget, () => loadIngests(cursor));
+    }
   });
   $("media-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, () => loadMedia(null)); });
   $("media-search-form").addEventListener("submit", (event) => {
@@ -1039,8 +1084,8 @@
   $("publication-cancel").addEventListener("click", closePublicationDialog);
   window.addEventListener("hashchange", () => { void route(); });
   window.addEventListener("pagehide", () => {
-    state.mediaRenderGeneration += 1;
-    revokeMediaPreviews();
+    stopIngestAutoRefresh();
+    invalidateMediaPreviews();
   });
 
   setAuthView(Boolean(state.token));

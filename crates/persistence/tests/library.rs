@@ -2,9 +2,9 @@ use serde_json::json;
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
 use sooqa_library::{
     CaptionSyncCompletion, CaptionSyncState, MediaIngest, MediaKind, MediaMetadata,
-    MediaSearchQuery, MediaSourceInput, MediaStatus, MediaUpdate, NewMedia, SourceKind,
-    StorageUploadAttachment, StorageUploadReservation, StorageUploadReservationRequest,
-    StorageUploadStore, VideoIdentityOutcome,
+    MediaSearchQuery, MediaSourceInput, MediaUpdate, NewMedia, SourceKind, StorageUploadAttachment,
+    StorageUploadReservation, StorageUploadReservationRequest, StorageUploadStore,
+    VideoIdentityOutcome,
 };
 use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint, VideoSequenceSample};
 use sooqa_persistence::{Database, LibraryRepositoryError};
@@ -16,7 +16,6 @@ fn ingest(sha256: Vec<u8>, source: &str) -> MediaIngest {
             kind: MediaKind::Video,
             title: Some("test".to_owned()),
             description: None,
-            notes: None,
         },
         metadata: MediaMetadata {
             kind: MediaKind::Video,
@@ -66,29 +65,14 @@ async fn media_aggregate_contains_source_and_tags_without_child_tables(pool: sql
         .resolve_media(ingest(vec![7_u8; 32], "https://example.test/video"))
         .await
         .unwrap();
-    database
-        .library()
-        .update_media(
-            resolution.media.id,
-            MediaUpdate { tags: Some(vec!["rust".to_owned()]), ..MediaUpdate::default() },
-        )
-        .await
-        .unwrap();
     let details =
         database.library().find_media_details(resolution.media.id).await.unwrap().unwrap();
-    assert_eq!(details.tags.len(), 1);
+    assert_eq!(details.media.tags, ["rust"]);
     assert!(details.source.is_some());
     assert_eq!(details.media.storage_state.as_str(), "pending_storage");
     let page = database
         .library()
-        .search_media(MediaSearchQuery {
-            text: None,
-            tags: vec!["rust".to_owned()],
-            kind: Some(MediaKind::Video),
-            status: Some(MediaStatus::Active),
-            limit: 10,
-            cursor: None,
-        })
+        .search_media(MediaSearchQuery { limit: 10, cursor: None })
         .await
         .unwrap();
     assert_eq!(page.items.iter().filter(|item| item.media.id == resolution.media.id).count(), 1);
@@ -109,17 +93,18 @@ async fn caption_sync_is_generation_fenced_and_caption_metadata_is_bounded(pool:
     )
     .bind(media.id)
     .execute(database.pool())
-    .await
-    .unwrap();
+        .await
+        .unwrap();
+    let current = database.library().find_media(media.id).await.unwrap().unwrap();
 
     let updated = database
         .library()
         .update_media(
             media.id,
             MediaUpdate {
-                description: Some(Some("first internal description".to_owned())),
-                tags: Some(vec!["rust".to_owned(), "reviewed".to_owned()]),
-                ..MediaUpdate::default()
+                description: Some("first internal description".to_owned()),
+                tags: vec!["rust".to_owned(), "reviewed".to_owned()],
+                expected_updated_at: current.updated_at,
             },
         )
         .await
@@ -135,14 +120,16 @@ async fn caption_sync_is_generation_fenced_and_caption_metadata_is_bounded(pool:
         .unwrap();
     assert_eq!(first_claim.metadata.description.as_deref(), Some("first internal description"));
     assert_eq!(first_claim.metadata.tags, vec!["rust".to_owned(), "reviewed".to_owned()]);
+    let after_first_claim = database.library().find_media(media.id).await.unwrap().unwrap();
 
     let newer = database
         .library()
         .update_media(
             media.id,
             MediaUpdate {
-                description: Some(Some("newer internal description".to_owned())),
-                ..MediaUpdate::default()
+                description: Some("newer internal description".to_owned()),
+                tags: updated.tags.clone(),
+                expected_updated_at: after_first_claim.updated_at,
             },
         )
         .await
@@ -170,6 +157,24 @@ async fn caption_sync_is_generation_fenced_and_caption_metadata_is_bounded(pool:
         .unwrap()
         .unwrap();
     assert_eq!(second_claim.metadata.description.as_deref(), Some("newer internal description"));
+    let another_stale_claim_token = Uuid::from_u128(104);
+    assert_eq!(
+        database
+            .library()
+            .complete_caption_sync(media.id, 1, another_stale_claim_token, true, false, None)
+            .await
+            .unwrap(),
+        CaptionSyncCompletion::Stale
+    );
+    let reapply_jobs: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT dedupe_key) FROM queue.jobs WHERE kind = 'sync_storage_caption' AND payload->>'media_id' = $1 AND dedupe_key LIKE $2",
+    )
+    .bind(media.id.to_string())
+    .bind(format!("media:{}:caption_sync:v1:2:after:1:claim:%", media.id))
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(reapply_jobs, 2);
     sqlx::query(
         "UPDATE media SET caption_sync_state = 'pending', caption_sync_claim_token = NULL WHERE id = $1",
     )
@@ -210,7 +215,7 @@ async fn caption_sync_is_generation_fenced_and_caption_metadata_is_bounded(pool:
     .fetch_one(database.pool())
     .await
     .unwrap();
-    assert_eq!(jobs, 3);
+    assert_eq!(jobs, 4);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -629,14 +634,16 @@ async fn storage_completion_requeues_caption_when_metadata_changes_during_upload
         }
         other => panic!("expected a fresh storage reservation, got {other:?}"),
     };
+    let reserved_media = database.library().find_media(media.id).await.unwrap().unwrap();
 
     database
         .library()
         .update_media(
             media.id,
             MediaUpdate {
-                description: Some(Some("after upload started".to_owned())),
-                ..MediaUpdate::default()
+                description: Some("after upload started".to_owned()),
+                tags: media.tags.clone(),
+                expected_updated_at: reserved_media.updated_at,
             },
         )
         .await
@@ -741,6 +748,9 @@ async fn storage_reconciliation_reopens_and_completes_linked_ingest(pool: sqlx::
     assert_eq!(initially_ready.storage_message_id, 40);
     let initially_completed = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
     assert_eq!(initially_completed.status.as_str(), "completed");
+    let initially_synced = database.library().find_media(media.media.id).await.unwrap().unwrap();
+    assert_eq!(initially_synced.caption_sync_generation, 1);
+    assert_eq!(initially_synced.caption_sync_state, CaptionSyncState::Pending);
 
     database.library().mark_storage_upload_unknown(media.media.id, true).await.unwrap();
     let failed = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
@@ -775,6 +785,19 @@ async fn storage_reconciliation_reopens_and_completes_linked_ingest(pool: sqlx::
         .unwrap();
     let attached = database.inbox().find(ingest.ingest.id).await.unwrap().unwrap();
     assert_eq!(attached.status.as_str(), "completed");
+    let reconciled = database.library().find_media(media.media.id).await.unwrap().unwrap();
+    assert_eq!(reconciled.caption_sync_generation, 2);
+    assert_eq!(reconciled.caption_sync_state, CaptionSyncState::Pending);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'sync_storage_caption' AND payload->>'media_id' = $1",
+        )
+        .bind(media.media.id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        2
+    );
 
     assert!(matches!(
         database.library().reset_storage_upload(media.media.id).await,
