@@ -73,6 +73,7 @@ impl SourceDownloader for ReconstructingDirectSource {
             path: destination.to_owned(),
             bytes: bytes.len() as u64,
             mime_type: Some("video/mp4".to_owned()),
+            selected_format: None,
         })
     }
 }

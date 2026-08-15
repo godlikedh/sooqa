@@ -310,7 +310,12 @@ impl SourceDownloader for DirectHttpDownloader {
         };
         temporary.remove().await;
 
-        Ok(DownloadedSource { path: PathBuf::from(destination), bytes, mime_type })
+        Ok(DownloadedSource {
+            path: PathBuf::from(destination),
+            bytes,
+            mime_type,
+            selected_format: None,
+        })
     }
 }
 

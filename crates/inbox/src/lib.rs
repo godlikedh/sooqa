@@ -43,6 +43,8 @@ pub struct SourceDownload {
     pub bytes: u64,
     pub mime_type: Option<String>,
     pub media_kind: SourceMediaKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

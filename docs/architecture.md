@@ -384,5 +384,10 @@ browser-side media or scheduling authority.
 The API compares the configured bearer secret; no token administration data is
 stored in PostgreSQL. Telegram admin IDs remain configuration. Direct HTTP
 validates and pins destinations, and external commands receive argument arrays,
-bounded output, timeouts, and no shell. Workspaces are derived from UUIDs and
-are cleaned only in known paths.
+bounded output, timeouts, and no shell. For allowlisted yt-dlp pages, the
+submitted URL remains provenance while the inspected canonical URL is
+revalidated against the same scheme, credential, port, and host rules before
+download. A specific media-byte 403 gets one fresh high-quality attempt and
+one combined progressive fallback; private, account-required, removed, and
+other extractor outcomes remain terminal. Workspaces are derived from UUIDs
+and are cleaned only in known paths.

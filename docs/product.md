@@ -20,7 +20,8 @@ The first release is intentionally narrow:
 - one administrator and one self-hosted installation;
 - PostgreSQL as the source of truth;
 - direct HTTP media, explicitly allowlisted public YouTube/Shorts pages through
-  yt-dlp subject to the current limitations in the
+  yt-dlp with bounded high-quality recovery and progressive fallback, as
+  described in the
   [operations guide](operations.md), plus the already-supported Telegram ingest
   paths;
 - durable download, probe, normalization, fingerprint, identity-gate, and

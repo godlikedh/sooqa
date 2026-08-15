@@ -2416,9 +2416,10 @@ async fn download_source(
     {
         return fail_download(inbox, ingest_request_id, &job_attempt, failure).await;
     }
+    let selected_format = downloaded.selected_format.clone();
     let downloaded = match publish_artifact(attempt.path(), &source_path).await {
         Ok(()) => {
-            let published =
+            let mut published =
                 match read_source_artifact(&workspace, &source_path, downloaded.mime_type.clone())
                     .await
                 {
@@ -2428,6 +2429,7 @@ async fn download_source(
                             .await;
                     }
                 };
+            published.selected_format = selected_format.clone();
             if published.bytes != downloaded.bytes {
                 return fail_download(
                     inbox,
@@ -2445,7 +2447,10 @@ async fn download_source(
         Err(ArtifactPublicationError::DestinationConflict) => {
             match read_source_artifact(&workspace, &source_path, downloaded.mime_type.clone()).await
             {
-                Ok(published) => published,
+                Ok(mut published) => {
+                    published.selected_format = selected_format;
+                    published
+                }
                 Err(failure) => {
                     return fail_download(inbox, ingest_request_id, &job_attempt, failure).await;
                 }
@@ -2470,6 +2475,7 @@ async fn download_source(
                 bytes: downloaded.bytes,
                 mime_type: downloaded.mime_type,
                 media_kind: inspection.media_kind,
+                selected_format: downloaded.selected_format,
             },
         )
         .await
@@ -2527,7 +2533,12 @@ async fn read_source_artifact(
             "downloaded source is not a regular file",
         ));
     }
-    Ok(DownloadedSource { path: source_path.to_owned(), bytes: metadata.len(), mime_type })
+    Ok(DownloadedSource {
+        path: source_path.to_owned(),
+        bytes: metadata.len(),
+        mime_type,
+        selected_format: None,
+    })
 }
 
 async fn fail_download(
