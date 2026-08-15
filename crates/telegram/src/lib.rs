@@ -1615,7 +1615,9 @@ mod tests {
     #[tokio::test]
     async fn superseded_commands_and_callbacks_are_harmless() {
         let api = MockApi::default();
-        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+        let ingest = MockIngestService::default();
+        let service =
+            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
 
         assert_eq!(
             service.handle_message(message(11, Some(123), "/queue")).await.unwrap(),
@@ -1633,12 +1635,21 @@ mod tests {
                         serde_json::from_value(serde_json::json!({
                             "id": "stale-duplicate-card",
                             "from": {
-                                "id": 456,
+                                "id": 123,
                                 "is_bot": false,
-                                "first_name": "Former reviewer"
+                                "first_name": "Admin"
+                            },
+                            "message": {
+                                "message_id": 44,
+                                "chat": {
+                                    "id": 123,
+                                    "type": "private",
+                                    "first_name": "Admin"
+                                },
+                                "date": 1
                             },
                             "chat_instance": "stale-card",
-                            "data": "v1:duplicate_use:stale:payload"
+                            "data": "v1:duplicate_use:AAAAAAAAAAAAAAAAAAAAAQ:AAAAAAAAAAAAAAAAAAAAAg"
                         }))
                         .expect("callback fixture should deserialize"),
                     ),
@@ -1649,6 +1660,8 @@ mod tests {
         );
         assert!(api.messages.lock().unwrap().is_empty());
         assert_eq!(api.callback_answers.lock().unwrap().as_slice(), &["stale-duplicate-card"]);
+        assert!(ingest.commands.lock().unwrap().is_empty());
+        assert!(ingest.media_commands.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
