@@ -31,6 +31,23 @@ If the final lease expires, recovery marks the owning ingest terminal instead
 of leaving it in an intermediate state. Inspect the row and its lease token
 when diagnosing a crash.
 
+## Admin API
+
+Use the configured bearer token to inspect the bounded operational slices:
+`/api/v1/dashboard`, `/api/v1/ingests`, `/api/v1/media?q=...`, and
+`/api/v1/posts`. Lists default to at most 50 rows and use opaque cursors that
+combine the ordering timestamp with a stable UUID; retain the cursor returned
+by one response for the next request. The schedule list omits published and
+cancelled posts unless `include_history=true`. Media `q` is an exact UUID,
+credential-free source URL, supported 2ch mirror URL, or private Telegram
+storage link; it is not full-text search.
+
+Channel settings are editable through the revision-fenced
+`PATCH /api/v1/channels/{id}` endpoint. Reload after a `channel_changed` or
+`channel_configuration_ambiguous` conflict. Do not place API or Telegram
+secrets in channel rows or query strings. Caption-sync failure cards appear
+when the later #82 worker writes the bounded media metadata marker.
+
 ## Telegram and media
 
 Telegram polling is enabled only when its bot token and configured admin IDs

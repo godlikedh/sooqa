@@ -8,6 +8,14 @@ based; PostgreSQL stores no administrator or device-token records. Request
 bodies and timeouts are bounded, and stable errors expose a request ID without
 secrets.
 
+The bounded admin routes use the same bearer authorization. Dashboard and list
+responses contain only aggregate counts and capped operational cards; they do
+not return queue payloads, lease tokens, bearer values, Telegram credentials,
+or unbounded error logs. Media lookup accepts only UUIDs, credential-free HTTP(S)
+source URLs, the allowlisted 2ch mirror identity, or HTTPS private Telegram
+storage links. The API canonicalizes lookup input without changing stored
+source provenance, and generated storage links remain behind authentication.
+
 The Windows companion is a loopback-only fixed proxy. It accepts only
 `POST /v1/submit`, requires a separate local bearer token, caps JSON bodies, and
 forwards only the backend ingest route with a bounded timeout and a stable

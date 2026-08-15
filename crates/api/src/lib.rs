@@ -1,5 +1,6 @@
 //! HTTP API boundary for sooqa.
 
+mod admin;
 mod library;
 mod publisher;
 
@@ -20,8 +21,8 @@ use sooqa_inbox::{
     SubmittedVia,
 };
 use sooqa_persistence::{
-    InboxRepository, InboxRepositoryError, LibraryRepository, LibraryRepositoryError,
-    PublisherRepository, PublisherRepositoryError,
+    InboxRepository, InboxRepositoryError, JobRepository, LibraryRepository,
+    LibraryRepositoryError, PublisherRepository, PublisherRepositoryError,
 };
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
@@ -49,6 +50,7 @@ impl Default for ApiSettings {
 #[derive(Clone)]
 pub struct ApiState {
     inbox: InboxRepository,
+    jobs: JobRepository,
     pub(crate) api_token: String,
     library: LibraryRepository,
     publisher: PublisherRepository,
@@ -61,19 +63,21 @@ impl ApiState {
         library: LibraryRepository,
         publisher: PublisherRepository,
     ) -> Self {
-        Self { inbox, api_token: api_token.into(), library, publisher }
+        let jobs = inbox.job_repository();
+        Self { inbox, jobs, api_token: api_token.into(), library, publisher }
     }
 }
 
 pub fn router(settings: ApiSettings, state: ApiState) -> Router {
     let router = Router::new()
         .route("/health/live", get(health_live))
-        .route("/api/v1/ingests", post(create_ingest))
+        .route("/api/v1/ingests", post(create_ingest).get(admin::list_ingests))
         .route("/api/v1/ingests/{id}", get(get_ingest))
         .route("/api/v1/ingests/{id}/accept-duplicate", post(accept_duplicate))
         .route("/api/v1/ingests/{id}/force-save", post(force_save))
         .merge(library::routes())
         .merge(publisher::routes())
+        .merge(admin::routes())
         .with_state(state);
 
     add_layers(router, settings)
@@ -344,6 +348,11 @@ fn map_validation_error(error: IngestValidationError, headers: &HeaderMap) -> Ap
 
 fn map_repository_error(error: InboxRepositoryError, headers: &HeaderMap) -> ApiError {
     match error {
+        InboxRepositoryError::InvalidLimit { .. } => ApiError::bad_request(
+            "invalid_limit",
+            "The ingest list limit must be between 1 and 50",
+            headers,
+        ),
         InboxRepositoryError::IdempotencyConflict { .. } => ApiError::conflict(
             "idempotency_conflict",
             "The Idempotency-Key payload conflicts with the original request",
@@ -408,7 +417,7 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
             ApiError::bad_request("invalid_tag", "The tag is invalid", headers)
         }
         LibraryRepositoryError::InvalidLimit { .. } => {
-            ApiError::bad_request("invalid_limit", "The limit must be between 1 and 100", headers)
+            ApiError::bad_request("invalid_limit", "The limit must be between 1 and 50", headers)
         }
         error => {
             error!(error = %error, "library API repository operation failed");
@@ -425,6 +434,19 @@ fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> 
         PublisherRepositoryError::ChannelDisabled(_) => {
             ApiError::conflict("channel_disabled", "The channel is disabled", headers)
         }
+        PublisherRepositoryError::ChannelOptimisticConflict(_) => {
+            ApiError::conflict("channel_changed", "The channel changed since it was read", headers)
+        }
+        PublisherRepositoryError::EmptyChannelUpdate => ApiError::bad_request(
+            "empty_update",
+            "The request must contain at least one editable channel field",
+            headers,
+        ),
+        PublisherRepositoryError::ChannelEnablementAmbiguous => ApiError::conflict(
+            "channel_configuration_ambiguous",
+            "Only one enabled publication channel may be configured",
+            headers,
+        ),
         PublisherRepositoryError::PublicationChannelNotConfigured => ApiError::conflict(
             "requested_channel_not_configured",
             "A publication request requires exactly one enabled publication channel",
@@ -437,6 +459,9 @@ fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> 
         ),
         PublisherRepositoryError::PostMissing(_) => {
             ApiError::not_found("post_not_found", "The post was not found", headers)
+        }
+        PublisherRepositoryError::InvalidLimit { .. } => {
+            ApiError::bad_request("invalid_limit", "The limit must be between 1 and 50", headers)
         }
         PublisherRepositoryError::MediaMissing(_) => {
             ApiError::not_found("media_not_found", "The media item was not found", headers)

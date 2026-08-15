@@ -39,6 +39,22 @@ pub struct NewChannel {
     pub default_disable_notification: bool,
 }
 
+/// Partial channel settings update. The persistence boundary merges these
+/// fields with the locked current row and validates the complete candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChannelUpdate {
+    pub name: Option<String>,
+    pub telegram_chat_id: Option<i64>,
+    pub is_enabled: Option<bool>,
+    pub time_zone: Option<String>,
+    pub window_start: Option<Time>,
+    pub window_end: Option<Time>,
+    pub interval_minutes: Option<i32>,
+    pub default_parse_mode: Option<Option<String>>,
+    pub default_disable_notification: Option<bool>,
+    pub expected_updated_at: Option<OffsetDateTime>,
+}
+
 impl NewChannel {
     pub fn try_new(
         name: impl Into<String>,
@@ -67,6 +83,15 @@ impl NewChannel {
     }
 
     pub fn validate(&self) -> Result<(), ChannelValidationError> {
+        if self.name.trim().is_empty() {
+            return Err(ChannelValidationError::EmptyName);
+        }
+        if self.name.chars().count() > MAX_CHANNEL_NAME_LENGTH {
+            return Err(ChannelValidationError::NameTooLong { max: MAX_CHANNEL_NAME_LENGTH });
+        }
+        if self.telegram_chat_id >= 0 {
+            return Err(ChannelValidationError::InvalidTelegramChatId(self.telegram_chat_id));
+        }
         if self.time_zone.trim().is_empty() {
             return Err(ChannelValidationError::EmptyTimeZone);
         }
@@ -186,6 +211,27 @@ pub struct Post {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub revision: i64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PostCursor {
+    pub scheduled_at: OffsetDateTime,
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PostListItem {
+    pub post: Post,
+    pub channel_name: String,
+    pub media_kind: String,
+    pub source_url: Option<String>,
+    pub storage_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PostPage {
+    pub items: Vec<PostListItem>,
+    pub next_cursor: Option<PostCursor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

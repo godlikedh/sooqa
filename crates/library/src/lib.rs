@@ -215,13 +215,33 @@ pub struct MediaResolution {
 pub struct MediaDetails {
     pub media: Media,
     pub source: Option<MediaSource>,
+    pub storage_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MediaSummary {
     pub media: Media,
     pub source_url: Option<String>,
+    pub source_original_url: Option<String>,
     pub source_metadata: Option<Value>,
+    pub storage_url: Option<String>,
+}
+
+/// A bounded read model for media whose storage-caption synchronization needs attention.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CaptionSyncFailure {
+    pub media_id: Uuid,
+    pub error_message: Option<String>,
+}
+
+/// Exact lookup forms supported by the bounded admin catalogue API.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum MediaLookup {
+    Identifier(Uuid),
+    MediaId(Uuid),
+    IngestId(Uuid),
+    SourceUrls(Vec<String>),
+    StorageMessage { chat_id: i64, message_id: i64 },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

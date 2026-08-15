@@ -80,6 +80,12 @@ pub enum JobStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub struct JobCounts {
+    pub queued: u64,
+    pub running: u64,
+}
+
 impl JobStatus {
     pub const fn as_str(self) -> &'static str {
         match self {

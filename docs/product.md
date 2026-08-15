@@ -50,6 +50,27 @@ materialization evaluates repeat conflicts at the intended send instant and
 persists bounded evidence on a draft when a decision is required. Decisions
 are revision-fenced and replay-safe.
 
+## Bounded admin API
+
+The private API exposes bounded operational slices for the single administrator:
+`GET /api/v1/dashboard` returns aggregate counts plus capped duplicate,
+publication-repeat, and caption-sync attention cards; `GET /api/v1/ingests`
+returns newest-first ingest cards with a timestamp-and-UUID cursor;
+`GET /api/v1/media?q=...` performs one exact lookup by media/ingest UUID,
+normalized source URL, supported 2ch mirror identity, or private Telegram
+storage link; and `GET /api/v1/posts` returns scheduled posts with the same
+bounded cursor discipline. The schedule view excludes published and cancelled
+posts by default and can opt into history. Post responses distinguish explicit
+times from cadence slots.
+
+Channel settings are read and patched through `/api/v1/channels/{id}` with
+validated time windows, IANA time zones, an optimistic `updated_at` fence, and
+a conflict when enabling a second target would make publication ambiguous.
+These routes never return raw job payloads, lease tokens, secrets, or complete
+error logs. Caption-sync failure cards read the bounded media marker reserved
+for the follow-up preview/sync slice in issue #82; that slice owns producing
+and clearing the marker.
+
 Large-media capture uses Telegram's official local Bot API server when the home
 deployment is cut over manually. URL/link source downloads, Telegram-source
 downloads, and canonical normalized storage output have separate budgets. The

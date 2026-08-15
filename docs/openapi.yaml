@@ -149,10 +149,16 @@ paths:
       tags: [media]
       operationId: searchMedia
       summary: Search normalized media
+      description: >-
+        With no q parameter this returns newest-first bounded catalogue pages.
+        q accepts a media or ingest UUID, a normalized HTTP(S) source URL, or a
+        private HTTPS Telegram storage link. Official 2ch mirror hosts resolve
+        to one source identity while stored provenance is retained.
       security:
         - bearerAuth: []
       parameters:
-        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: q, in: query, description: "Exact media UUID, ingest UUID, source URL, or Telegram storage link.", schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 50 } }
         - { name: cursor, in: query, schema: { type: string } }
       responses:
         '200':
@@ -260,42 +266,6 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/media/{id}/publication-intent:
-    post:
-      tags: [media]
-      operationId: createMediaPublicationIntent
-      summary: Queue or publish ready media
-      description: >-
-        Creates the one intended post for a ready media item. A recent or
-        queued publication of the same media returns a draft with bounded
-        repeat evidence for a later decision.
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/MediaId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/PublicationIntentRequest' }
-      responses:
-        '200':
-          description: The intent was replayed.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Post' }
-        '201':
-          description: The publication intent was materialized.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Post' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '413': { $ref: '#/components/responses/PayloadTooLarge' }
-        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/posts:
     post:
       tags: [posts]
@@ -387,67 +357,11 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/posts/{id}/schedule-exact:
-    post:
-      tags: [posts]
-      operationId: schedulePostExact
-      summary: Set one post to an explicit future instant
-      description: >-
-        Schedules only the selected post at the requested future instant. It
-        permits exact-time collisions and does not validate or move unrelated
-        cadence slots.
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/PostId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/ExactScheduleRequest' }
-      responses:
-        '202':
-          description: Post scheduled at the exact instant.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Post' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/posts/{id}/decision:
-    post:
-      tags: [posts]
-      operationId: decidePostPublication
-      summary: Resolve a repeat-publication decision
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/PostId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/PublicationDecisionRequest' }
-      responses:
-        '200':
-          description: The decision was applied or replayed.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Post' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/posts/{id}/publish:
     post:
       tags: [posts]
       operationId: publishPostNow
-      summary: Request immediate publication for a post
+      summary: Queue a post for immediate publication
       security:
         - bearerAuth: []
       parameters:
@@ -457,10 +371,85 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/PostMutationRequest' }
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
       responses:
         '202':
-          description: Post accepted for immediate publication.
+          description: Post queued for immediate publication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/posts/{id}/earlier:
+    post:
+      tags: [posts]
+      operationId: movePostEarlier
+      summary: Swap a queued post with its adjacent earlier post
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
+      responses:
+        '200':
+          description: Current post after the swap or boundary no-op.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/posts/{id}/later:
+    post:
+      tags: [posts]
+      operationId: movePostLater
+      summary: Swap a queued post with its adjacent later post
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
+      responses:
+        '200':
+          description: Current post after the swap or boundary no-op.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/posts/{id}/slot:
+    post:
+      tags: [posts]
+      operationId: setPostSlot
+      summary: Move a queued post to a valid cadence slot
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetSlotRequest' }
+      responses:
+        '200':
+          description: Current post after moving or swapping the slot.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Post' }
@@ -482,7 +471,7 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/PostMutationRequest' }
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
       responses:
         '200':
           description: Cancelled post.
@@ -713,7 +702,9 @@ components:
         description: { type: string, nullable: true }
         tags: { type: array, items: { type: string, minLength: 1, maxLength: 100 } }
         storage_state: { type: string, enum: [pending_storage, ready, storage_unknown, missing], nullable: true }
+        storage_url: { type: string, format: uri, nullable: true }
         source_url: { type: string, nullable: true }
+        source_original_url: { type: string, format: uri, nullable: true }
         source_metadata: { type: object, additionalProperties: true, nullable: true }
         mime_type: { type: string, nullable: true }
         container: { type: string, nullable: true }
@@ -784,32 +775,6 @@ components:
         channel_id: { type: string, format: uuid }
         caption: { type: string, nullable: true, maxLength: 1024 }
         parse_mode: { type: string, enum: [HTML, MarkdownV2], nullable: true }
-    PublicationIntentRequest:
-      type: object
-      required: [requested_action]
-      additionalProperties: false
-      properties:
-        requested_action: { type: string, enum: [queue, post_now] }
-        requested_publish_at:
-          type: string
-          format: date-time
-          nullable: true
-          description: Future exact instant for queue; omit for normal cadence or post_now.
-        requested_post_caption: { type: string, nullable: true, maxLength: 1024 }
-    PublicationDecisionRequest:
-      type: object
-      required: [decision, expected_revision]
-      additionalProperties: false
-      properties:
-        decision: { type: string, enum: [post_now_anyway, queue_anyway, keep_exact_time, cancel] }
-        expected_revision: { type: integer, format: int64, minimum: 0 }
-    ExactScheduleRequest:
-      type: object
-      required: [publish_at, expected_revision]
-      additionalProperties: false
-      properties:
-        publish_at: { type: string, format: date-time }
-        expected_revision: { type: integer, format: int64, minimum: 0 }
     PostUpdateRequest:
       type: object
       required: [expected_revision]
@@ -822,19 +787,11 @@ components:
         expected_revision: { type: integer, format: int64, minimum: 0 }
     Post:
       type: object
-      required: [id, media_id, channel_id, origin_ingest_id, requested_action, requested_publish_at, repeat_evidence, disable_notification, status, scheduled_at, revision, created_at, updated_at]
+      required: [id, media_id, channel_id, disable_notification, status, scheduled_at, revision, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         media_id: { type: string, format: uuid }
         channel_id: { type: string, format: uuid }
-        origin_ingest_id: { type: string, format: uuid, nullable: true }
-        requested_action: { type: string, enum: [queue, post_now] }
-        requested_publish_at: { type: string, format: date-time, nullable: true }
-        repeat_evidence:
-          type: object
-          allOf:
-            - $ref: '#/components/schemas/RepeatEvidence'
-          nullable: true
         caption: { type: string, nullable: true }
         parse_mode: { type: string, nullable: true }
         disable_notification: { type: boolean }
@@ -844,22 +801,6 @@ components:
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         revision: { type: integer, format: int64, minimum: 0 }
-    RepeatEvidence:
-      type: object
-      required: [conflicts]
-      properties:
-        conflicts:
-          type: array
-          maxItems: 8
-          items: { $ref: '#/components/schemas/RepeatConflict' }
-    RepeatConflict:
-      type: object
-      required: [post_id, state, at, target_message_link]
-      properties:
-        post_id: { type: string, format: uuid }
-        state: { type: string, enum: [draft, queued, sending, published, unknown, failed, cancelled] }
-        at: { type: string, format: date-time }
-        target_message_link: { type: string, nullable: true }
     ScheduleRequest:
       type: object
       required: [expected_revision]
@@ -867,9 +808,16 @@ components:
       properties:
         publish_at: { type: string, format: date-time, nullable: true }
         expected_revision: { type: integer, format: int64, minimum: 0 }
-    PostMutationRequest:
+    QueueMutationRequest:
       type: object
       required: [expected_revision]
       additionalProperties: false
       properties:
+        expected_revision: { type: integer, format: int64, minimum: 0 }
+    SetSlotRequest:
+      type: object
+      required: [slot, expected_revision]
+      additionalProperties: false
+      properties:
+        slot: { type: string, format: date-time }
         expected_revision: { type: integer, format: int64, minimum: 0 }
