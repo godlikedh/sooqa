@@ -264,11 +264,15 @@ The home deployment adds the official `tdlib/telegram-bot-api` service in
 `--local` mode. It is built at a pinned upstream commit, has a dedicated
 persistent working volume, and is reachable only as
 `http://telegram-bot-api:8081` on the Compose network. The application server
-and worker share the sooqa work-root volume with each other; the Bot API data
-volume is separate. Telegram downloads and uploads remain path-based or
-streamed, so large files do not enter JSON or a `Vec<u8>`. Cloud/local bot
-cutover is an owner-authorized operational procedure, never an application
-state transition.
+and worker share the sooqa work-root volume with each other; only the worker
+also mounts the Bot API data volume read-only at its configured local file root.
+Relative file paths and cloud downloads use the bounded Bot API HTTP stream.
+Absolute local paths are canonicalized and accepted only beneath that root,
+then copied through a size-limited temporary file and atomically published.
+Internal Bot API paths never become durable ingest data or API output. Telegram
+downloads and uploads remain streamed, so large files do not enter JSON or a
+`Vec<u8>`. Cloud/local bot cutover is an owner-authorized operational procedure,
+never an application state transition.
 
 ## Publisher
 

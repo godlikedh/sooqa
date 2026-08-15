@@ -90,8 +90,14 @@ dedicated persistent volume and no host-published HTTP port. Configuration
 rejects credential-bearing URLs and public HTTP Bot API hosts. The configured
 normalized-output ceiling is below Telegram's documented local upload maximum,
 while source budgets remain independent so a large input can still normalize
-successfully. The worker and storage provider both enforce the canonical-output
-ceiling before an upload effect.
+successfully. Only the worker mounts the Bot API volume, and it does so
+read-only. An absolute `getFile` path is canonicalized against the configured
+root before opening; traversal, outside-root paths, symlink escapes, directories,
+and other non-regular files are rejected. Local copies stay size-limited and
+atomic, while relative/cloud paths retain bounded HTTP downloads. Internal Bot
+API paths are not persisted, returned by the API, or emitted in normal logs.
+The worker and storage provider both enforce the canonical-output ceiling before
+an upload effect.
 
 Media previews are private derived bytes on the existing media row. The API
 requires the normal bearer authorization, serves only validated JPEG/PNG data

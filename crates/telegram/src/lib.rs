@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     error::Error,
     io,
-    path::Path,
+    path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -220,6 +220,18 @@ pub enum TelegramApiError {
     Download(#[source] teloxide::DownloadError),
     #[error("Telegram download destination could not be opened: {0}")]
     Io(#[source] io::Error),
+    #[error("Telegram absolute file path requires a configured local Bot API file root")]
+    LocalFileRootNotConfigured,
+    #[error("Telegram local Bot API file root is unavailable")]
+    LocalFileRootUnavailable,
+    #[error("Telegram local Bot API file path is outside the configured file root")]
+    LocalFilePathRejected,
+    #[error("Telegram local Bot API file is not a regular file")]
+    LocalFileNotRegular,
+    #[error(
+        "Telegram file size changed while copying: reported {reported} bytes, copied {actual} bytes"
+    )]
+    DownloadSizeMismatch { reported: u64, actual: u64 },
     #[error("Telegram Bot API download limit is {limit} bytes; file is {size} bytes")]
     DownloadLimit { size: u64, limit: u64 },
     #[error("Telegram storage receipt has no file reference for {media_kind:?}")]
@@ -941,6 +953,7 @@ pub struct TeloxideApi {
     cloud_download_limit_bytes: Option<u64>,
     cloud_upload_limit_bytes: Option<u64>,
     source_download_max_bytes: u64,
+    local_file_root: Option<PathBuf>,
 }
 
 impl TeloxideApi {
@@ -1003,11 +1016,17 @@ impl TeloxideApi {
             cloud_download_limit_bytes: is_cloud.then_some(TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES),
             cloud_upload_limit_bytes: is_cloud.then_some(TELEGRAM_CLOUD_UPLOAD_LIMIT_BYTES),
             source_download_max_bytes: DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
+            local_file_root: None,
         })
     }
 
     pub fn with_source_download_max_bytes(mut self, max_bytes: u64) -> Self {
         self.source_download_max_bytes = max_bytes;
+        self
+    }
+
+    pub fn with_local_file_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.local_file_root = Some(root.into());
         self
     }
 
@@ -1114,6 +1133,11 @@ impl TelegramApi for TeloxideApi {
             | TelegramApiError::MissingFileReference { .. }
             | TelegramApiError::InvalidParseMode
             | TelegramApiError::InvalidMessageId(_)
+            | TelegramApiError::LocalFileRootNotConfigured
+            | TelegramApiError::LocalFileRootUnavailable
+            | TelegramApiError::LocalFilePathRejected
+            | TelegramApiError::LocalFileNotRegular
+            | TelegramApiError::DownloadSizeMismatch { .. }
             | TelegramApiError::Api(_)
             | TelegramApiError::Download(_)
             | TelegramApiError::Io(_) => false,
@@ -1144,6 +1168,27 @@ impl TelegramApi for TeloxideApi {
             .await
             .map_err(TelegramApiError::Api)?;
         let size = u64::from(file.meta.size);
+        if Path::new(&file.path).is_absolute() {
+            let limit = self.source_download_max_bytes;
+            if size > limit {
+                return Err(TelegramApiError::DownloadLimit { size, limit });
+            }
+            let local_root = self
+                .local_file_root
+                .as_deref()
+                .ok_or(TelegramApiError::LocalFileRootNotConfigured)?;
+            let local_file = resolve_local_file(local_root, Path::new(&file.path)).await?;
+            if local_file.size > limit {
+                return Err(TelegramApiError::DownloadLimit { size: local_file.size, limit });
+            }
+            if local_file.size != size {
+                return Err(TelegramApiError::DownloadSizeMismatch {
+                    reported: size,
+                    actual: local_file.size,
+                });
+            }
+            return copy_local_file(&local_file.path, destination, size, limit).await;
+        }
         let limit =
             self.cloud_download_limit_bytes.map_or(self.source_download_max_bytes, |cloud_limit| {
                 cloud_limit.min(self.source_download_max_bytes)
@@ -1151,14 +1196,7 @@ impl TelegramApi for TeloxideApi {
         if size > limit {
             return Err(TelegramApiError::DownloadLimit { size, limit });
         }
-        let temporary =
-            destination.with_file_name(format!(".sooqa-download-{}.tmp", Uuid::new_v4()));
-        let mut output = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .await
-            .map_err(TelegramApiError::Io)?;
+        let (temporary, mut output) = open_temporary_download(destination).await?;
         let (download_result, exceeded, written) = {
             let mut limited_output = LimitedWriter::new(&mut output, limit);
             let download_result = teloxide::net::Download::download_file(
@@ -1170,34 +1208,135 @@ impl TelegramApi for TeloxideApi {
             (download_result, limited_output.exceeded(), limited_output.written())
         };
         if exceeded {
-            let _ = tokio::fs::remove_file(&temporary).await;
             return Err(TelegramApiError::DownloadLimit { size: written.saturating_add(1), limit });
         }
         if let Err(error) = download_result {
-            let _ = tokio::fs::remove_file(&temporary).await;
             return Err(TelegramApiError::Download(error));
         }
-        if let Err(error) = tokio::io::AsyncWriteExt::flush(&mut output).await {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(TelegramApiError::Io(error));
+        finish_temporary_download(temporary, output, destination, size, limit).await
+    }
+}
+
+struct LocalFile {
+    path: PathBuf,
+    size: u64,
+}
+
+async fn resolve_local_file(root: &Path, candidate: &Path) -> Result<LocalFile, TelegramApiError> {
+    if candidate.components().any(|component| matches!(component, Component::ParentDir)) {
+        return Err(TelegramApiError::LocalFilePathRejected);
+    }
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|_| TelegramApiError::LocalFileRootUnavailable)?;
+    let root_metadata =
+        tokio::fs::metadata(&root).await.map_err(|_| TelegramApiError::LocalFileRootUnavailable)?;
+    if !root_metadata.is_dir() {
+        return Err(TelegramApiError::LocalFileRootUnavailable);
+    }
+    let candidate = tokio::fs::canonicalize(candidate)
+        .await
+        .map_err(|_| TelegramApiError::LocalFilePathRejected)?;
+    if candidate.strip_prefix(&root).is_err() {
+        return Err(TelegramApiError::LocalFilePathRejected);
+    }
+    let metadata = tokio::fs::metadata(&candidate)
+        .await
+        .map_err(|_| TelegramApiError::LocalFilePathRejected)?;
+    if !metadata.is_file() {
+        return Err(TelegramApiError::LocalFileNotRegular);
+    }
+    Ok(LocalFile { path: candidate, size: metadata.len() })
+}
+
+async fn copy_local_file(
+    source: &Path,
+    destination: &Path,
+    expected_size: u64,
+    limit: u64,
+) -> Result<(), TelegramApiError> {
+    let mut input = tokio::fs::File::open(source).await.map_err(TelegramApiError::Io)?;
+    let (temporary, mut output) = open_temporary_download(destination).await?;
+    let (copy_result, exceeded, written) = {
+        let mut limited_output = LimitedWriter::new(&mut output, limit);
+        let copy_result = tokio::io::copy(&mut input, &mut limited_output).await;
+        (copy_result, limited_output.exceeded(), limited_output.written())
+    };
+    if exceeded {
+        return Err(TelegramApiError::DownloadLimit { size: written.saturating_add(1), limit });
+    }
+    if let Err(error) = copy_result {
+        return Err(TelegramApiError::Io(error));
+    }
+    finish_temporary_download(temporary, output, destination, expected_size, limit).await
+}
+
+async fn open_temporary_download(
+    destination: &Path,
+) -> Result<(TemporaryDownload, tokio::fs::File), TelegramApiError> {
+    let temporary_path =
+        destination.with_file_name(format!(".sooqa-download-{}.tmp", Uuid::new_v4()));
+    let temporary = TemporaryDownload::new(temporary_path);
+    let output = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temporary.path())
+        .await
+        .map_err(TelegramApiError::Io)?;
+    Ok((temporary, output))
+}
+
+async fn finish_temporary_download(
+    mut temporary: TemporaryDownload,
+    mut output: tokio::fs::File,
+    destination: &Path,
+    expected_size: u64,
+    limit: u64,
+) -> Result<(), TelegramApiError> {
+    if let Err(error) = tokio::io::AsyncWriteExt::flush(&mut output).await {
+        return Err(TelegramApiError::Io(error));
+    }
+    drop(output);
+    let actual_size =
+        tokio::fs::metadata(temporary.path()).await.map_err(TelegramApiError::Io)?.len();
+    if actual_size > limit {
+        return Err(TelegramApiError::DownloadLimit { size: actual_size, limit });
+    }
+    if actual_size != expected_size {
+        return Err(TelegramApiError::DownloadSizeMismatch {
+            reported: expected_size,
+            actual: actual_size,
+        });
+    }
+    tokio::fs::rename(temporary.path(), destination).await.map_err(TelegramApiError::Io)?;
+    temporary.commit();
+    Ok(())
+}
+
+struct TemporaryDownload {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl TemporaryDownload {
+    fn new(path: PathBuf) -> Self {
+        Self { path, committed: false }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TemporaryDownload {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
         }
-        drop(output);
-        let actual_size = match tokio::fs::metadata(&temporary).await {
-            Ok(metadata) => metadata.len(),
-            Err(error) => {
-                let _ = tokio::fs::remove_file(&temporary).await;
-                return Err(TelegramApiError::Io(error));
-            }
-        };
-        if actual_size > limit {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(TelegramApiError::DownloadLimit { size: actual_size, limit });
-        }
-        if let Err(error) = tokio::fs::rename(&temporary, destination).await {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(TelegramApiError::Io(error));
-        }
-        Ok(())
     }
 }
 
@@ -2266,12 +2405,20 @@ mod tests {
     }
 
     async fn serve_file_metadata(listener: TcpListener, file_size: usize) -> String {
+        serve_file_metadata_at_path(listener, file_size, "files/payload.bin".to_owned()).await
+    }
+
+    async fn serve_file_metadata_at_path(
+        listener: TcpListener,
+        file_size: usize,
+        file_path: String,
+    ) -> String {
         let (stream, _) = listener.accept().await.expect("fake API should accept getFile");
         let mut reader = BufReader::new(stream);
         let request = read_http_request(&mut reader).await.expect("getFile should be readable");
         let response = format!(
-            r#"{{"ok":true,"result":{{"file_id":"file-id","file_unique_id":"file-unique-id","file_size":{},"file_path":"/var/lib/telegram-bot-api/files/payload.bin"}}}}"#,
-            file_size
+            r#"{{"ok":true,"result":{{"file_id":"file-id","file_unique_id":"file-unique-id","file_size":{},"file_path":"{}"}}}}"#,
+            file_size, file_path
         );
         let mut stream = reader.into_inner();
         write_http_response(&mut stream, "application/json", response.as_bytes())
@@ -2290,7 +2437,7 @@ mod tests {
         let mut reader = BufReader::new(stream);
         let get_file = read_http_request(&mut reader).await.expect("getFile should be readable");
         let file_response = format!(
-            r#"{{"ok":true,"result":{{"file_id":"file-id","file_unique_id":"file-unique-id","file_size":{},"file_path":"/var/lib/telegram-bot-api/files/payload.bin"}}}}"#,
+            r#"{{"ok":true,"result":{{"file_id":"file-id","file_unique_id":"file-unique-id","file_size":{},"file_path":"files/payload.bin"}}}}"#,
             payload.len()
         );
         let mut stream = reader.into_inner();
@@ -2379,22 +2526,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_bot_api_downloads_absolute_file_path_above_cloud_ceiling() {
+    async fn local_bot_api_copies_confined_absolute_file_path_without_http_file_request() {
         const PAYLOAD: &[u8] = b"local transfer payload";
         const SOURCE_LIMIT: u64 = 64;
         const REDUCED_CLOUD_CEILING: u64 = 4;
         assert!(PAYLOAD.len() as u64 > REDUCED_CLOUD_CEILING);
 
+        let directory =
+            std::env::temp_dir().join(format!("sooqa-telegram-local-{}", Uuid::new_v4()));
+        let root = directory.join("telegram-bot-api");
+        let source = root.join("files/payload.bin");
+        let output = directory.join("output");
+        tokio::fs::create_dir_all(source.parent().expect("source should have a parent"))
+            .await
+            .expect("local Bot API fixture directory should be created");
+        tokio::fs::create_dir(&output).await.expect("output directory should be created");
+        tokio::fs::write(&source, PAYLOAD).await.expect("local fixture should be written");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
         let address = listener.local_addr().expect("fake API address should be available");
-        let server = tokio::spawn(serve_download(listener, PAYLOAD.to_vec(), Duration::ZERO));
-        let directory = std::env::temp_dir().join(format!("sooqa-telegram-{}", Uuid::new_v4()));
-        tokio::fs::create_dir(&directory).await.expect("test directory should be created");
-        let destination = directory.join("download.webm");
+        let server = tokio::spawn(serve_file_metadata_at_path(
+            listener,
+            PAYLOAD.len(),
+            source.to_string_lossy().into_owned(),
+        ));
+        let destination = output.join("download.webm");
         let api =
             TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
                 .expect("fake API URL should be accepted")
-                .with_source_download_max_bytes(SOURCE_LIMIT);
+                .with_source_download_max_bytes(SOURCE_LIMIT)
+                .with_test_cloud_limits(REDUCED_CLOUD_CEILING)
+                .with_local_file_root(root);
 
         api.download_file("file-id", &destination)
             .await
@@ -2404,17 +2565,332 @@ mod tests {
             PAYLOAD
         );
         let mut entries =
-            tokio::fs::read_dir(&directory).await.expect("directory should be readable");
+            tokio::fs::read_dir(&output).await.expect("output directory should be readable");
         while let Some(entry) =
             entries.next_entry().await.expect("directory entry should be readable")
         {
             let name = entry.file_name();
             assert!(!name.to_string_lossy().starts_with(".sooqa-download-"));
         }
-        let (get_file_target, download_target) = server.await.expect("fake API task should finish");
+        let get_file_target = server.await.expect("getFile task should finish");
         assert!(get_file_target.contains("/bottest-token/GetFile"));
-        assert!(download_target.contains("/file/bottest-token/"));
+        assert!(!get_file_target.contains("/file/bottest-token/"));
         tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn absolute_local_file_path_without_root_is_terminal_and_never_downloaded_over_http() {
+        let directory =
+            std::env::temp_dir().join(format!("sooqa-telegram-local-{}", Uuid::new_v4()));
+        let source = directory.join("telegram-bot-api/files/payload.bin");
+        let output = directory.join("output");
+        tokio::fs::create_dir_all(source.parent().expect("source should have a parent"))
+            .await
+            .expect("local Bot API fixture directory should be created");
+        tokio::fs::create_dir(&output).await.expect("output directory should be created");
+        tokio::fs::write(&source, b"local payload").await.expect("local fixture should be written");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(serve_file_metadata_at_path(
+            listener,
+            13,
+            source.to_string_lossy().into_owned(),
+        ));
+        let destination = output.join("download.bin");
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted")
+                .with_source_download_max_bytes(64);
+
+        assert!(matches!(
+            api.download_file("file-id", &destination).await,
+            Err(TelegramApiError::LocalFileRootNotConfigured)
+        ));
+        let get_file_target = server.await.expect("getFile task should finish");
+        assert!(get_file_target.contains("/bottest-token/GetFile"));
+        assert!(tokio::fs::metadata(&destination).await.is_err());
+        assert_no_temporary_downloads(&output).await;
+        tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn local_file_path_must_remain_beneath_the_configured_root() {
+        let directory =
+            std::env::temp_dir().join(format!("sooqa-telegram-local-{}", Uuid::new_v4()));
+        let root = directory.join("telegram-bot-api");
+        let source = directory.join("outside/payload.bin");
+        let output = directory.join("output");
+        tokio::fs::create_dir_all(&root).await.expect("local root should be created");
+        tokio::fs::create_dir_all(source.parent().expect("source should have a parent"))
+            .await
+            .expect("outside fixture directory should be created");
+        tokio::fs::create_dir(&output).await.expect("output directory should be created");
+        tokio::fs::write(&source, b"outside payload")
+            .await
+            .expect("outside fixture should be written");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(serve_file_metadata_at_path(
+            listener,
+            15,
+            source.to_string_lossy().into_owned(),
+        ));
+        let destination = output.join("download.bin");
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted")
+                .with_source_download_max_bytes(64)
+                .with_local_file_root(root);
+
+        assert!(matches!(
+            api.download_file("file-id", &destination).await,
+            Err(TelegramApiError::LocalFilePathRejected)
+        ));
+        server.await.expect("getFile task should finish");
+        assert!(tokio::fs::metadata(&destination).await.is_err());
+        assert_no_temporary_downloads(&output).await;
+        tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn local_file_path_rejects_parent_directory_traversal() {
+        let directory =
+            std::env::temp_dir().join(format!("sooqa-telegram-local-{}", Uuid::new_v4()));
+        let root = directory.join("telegram-bot-api");
+        let source = directory.join("outside/payload.bin");
+        let output = directory.join("output");
+        tokio::fs::create_dir_all(&root).await.expect("local root should be created");
+        tokio::fs::create_dir_all(source.parent().expect("source should have a parent"))
+            .await
+            .expect("outside fixture directory should be created");
+        tokio::fs::create_dir(&output).await.expect("output directory should be created");
+        tokio::fs::write(&source, b"outside payload")
+            .await
+            .expect("outside fixture should be written");
+        let candidate = root.join("../outside/payload.bin");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(serve_file_metadata_at_path(
+            listener,
+            15,
+            candidate.to_string_lossy().into_owned(),
+        ));
+        let destination = output.join("download.bin");
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted")
+                .with_source_download_max_bytes(64)
+                .with_local_file_root(root);
+
+        assert!(matches!(
+            api.download_file("file-id", &destination).await,
+            Err(TelegramApiError::LocalFilePathRejected)
+        ));
+        server.await.expect("getFile task should finish");
+        assert!(tokio::fs::metadata(&destination).await.is_err());
+        assert_no_temporary_downloads(&output).await;
+        tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_file_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let directory =
+            std::env::temp_dir().join(format!("sooqa-telegram-local-{}", Uuid::new_v4()));
+        let root = directory.join("telegram-bot-api");
+        let outside = directory.join("outside/payload.bin");
+        let link = root.join("files/escape.bin");
+        let output = directory.join("output");
+        tokio::fs::create_dir_all(link.parent().expect("link should have a parent"))
+            .await
+            .expect("local root should be created");
+        tokio::fs::create_dir_all(outside.parent().expect("outside should have a parent"))
+            .await
+            .expect("outside fixture directory should be created");
+        tokio::fs::create_dir(&output).await.expect("output directory should be created");
+        tokio::fs::write(&outside, b"outside payload")
+            .await
+            .expect("outside fixture should be written");
+        symlink(&outside, &link).expect("symlink fixture should be created");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(serve_file_metadata_at_path(
+            listener,
+            15,
+            link.to_string_lossy().into_owned(),
+        ));
+        let destination = output.join("download.bin");
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted")
+                .with_source_download_max_bytes(64)
+                .with_local_file_root(root);
+
+        assert!(matches!(
+            api.download_file("file-id", &destination).await,
+            Err(TelegramApiError::LocalFilePathRejected)
+        ));
+        server.await.expect("getFile task should finish");
+        assert!(tokio::fs::metadata(&destination).await.is_err());
+        assert_no_temporary_downloads(&output).await;
+        tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn local_file_size_mismatch_is_terminal_and_cleans_temporary_output() {
+        let directory =
+            std::env::temp_dir().join(format!("sooqa-telegram-local-{}", Uuid::new_v4()));
+        let root = directory.join("telegram-bot-api");
+        let source = root.join("files/payload.bin");
+        let output = directory.join("output");
+        tokio::fs::create_dir_all(source.parent().expect("source should have a parent"))
+            .await
+            .expect("local root should be created");
+        tokio::fs::create_dir(&output).await.expect("output directory should be created");
+        tokio::fs::write(&source, b"actual payload").await.expect("fixture should be written");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(serve_file_metadata_at_path(
+            listener,
+            5,
+            source.to_string_lossy().into_owned(),
+        ));
+        let destination = output.join("download.bin");
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted")
+                .with_source_download_max_bytes(64)
+                .with_local_file_root(root);
+
+        assert!(matches!(
+            api.download_file("file-id", &destination).await,
+            Err(TelegramApiError::DownloadSizeMismatch { reported: 5, actual: 14 })
+        ));
+        server.await.expect("getFile task should finish");
+        assert!(tokio::fs::metadata(&destination).await.is_err());
+        assert_no_temporary_downloads(&output).await;
+        tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn local_file_size_overflow_is_rejected_before_temporary_publication() {
+        let directory =
+            std::env::temp_dir().join(format!("sooqa-telegram-local-{}", Uuid::new_v4()));
+        let root = directory.join("telegram-bot-api");
+        let source = root.join("files/payload.bin");
+        let output = directory.join("output");
+        tokio::fs::create_dir_all(source.parent().expect("source should have a parent"))
+            .await
+            .expect("local root should be created");
+        tokio::fs::create_dir(&output).await.expect("output directory should be created");
+        tokio::fs::write(&source, b"oversized payload").await.expect("fixture should be written");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(serve_file_metadata_at_path(
+            listener,
+            17,
+            source.to_string_lossy().into_owned(),
+        ));
+        let destination = output.join("download.bin");
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted")
+                .with_source_download_max_bytes(8)
+                .with_local_file_root(root);
+
+        assert!(matches!(
+            api.download_file("file-id", &destination).await,
+            Err(TelegramApiError::DownloadLimit { size: 17, limit: 8 })
+        ));
+        server.await.expect("getFile task should finish");
+        assert!(tokio::fs::metadata(&destination).await.is_err());
+        assert_no_temporary_downloads(&output).await;
+        tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn dropped_temporary_download_removes_partial_output() {
+        let directory =
+            std::env::temp_dir().join(format!("sooqa-telegram-local-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.expect("test directory should be created");
+        let destination = directory.join("download.bin");
+        let (temporary, mut output) =
+            open_temporary_download(&destination).await.expect("temporary file should open");
+        tokio::io::AsyncWriteExt::write_all(&mut output, b"partial")
+            .await
+            .expect("partial output should be writable");
+        drop(output);
+        let temporary_path = temporary.path().to_owned();
+        drop(temporary);
+        assert!(tokio::fs::metadata(temporary_path).await.is_err());
+        tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn local_file_path_rejects_directories_and_missing_roots() {
+        let directory =
+            std::env::temp_dir().join(format!("sooqa-telegram-local-{}", Uuid::new_v4()));
+        let root = directory.join("telegram-bot-api");
+        let candidate = root.join("files");
+        let output = directory.join("output");
+        tokio::fs::create_dir_all(&candidate).await.expect("local root should be created");
+        tokio::fs::create_dir(&output).await.expect("output directory should be created");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(serve_file_metadata_at_path(
+            listener,
+            0,
+            candidate.to_string_lossy().into_owned(),
+        ));
+        let destination = output.join("download.bin");
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted")
+                .with_source_download_max_bytes(64)
+                .with_local_file_root(root);
+
+        assert!(matches!(
+            api.download_file("file-id", &destination).await,
+            Err(TelegramApiError::LocalFileNotRegular)
+        ));
+        server.await.expect("getFile task should finish");
+
+        let missing_root = directory.join("missing");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("fake API should bind");
+        let address = listener.local_addr().expect("fake API address should be available");
+        let server = tokio::spawn(serve_file_metadata_at_path(
+            listener,
+            0,
+            candidate.to_string_lossy().into_owned(),
+        ));
+        let api =
+            TeloxideApi::new("test-token", &format!("http://{address}"), Duration::from_secs(1))
+                .expect("fake API URL should be accepted")
+                .with_source_download_max_bytes(64)
+                .with_local_file_root(missing_root);
+
+        assert!(matches!(
+            api.download_file("file-id", &destination).await,
+            Err(TelegramApiError::LocalFileRootUnavailable)
+        ));
+        server.await.expect("getFile task should finish");
+        assert_no_temporary_downloads(&output).await;
+        tokio::fs::remove_dir_all(directory).await.expect("test directory should be removed");
+    }
+
+    async fn assert_no_temporary_downloads(directory: &Path) {
+        let mut entries =
+            tokio::fs::read_dir(directory).await.expect("directory should be readable");
+        while let Some(entry) =
+            entries.next_entry().await.expect("directory entry should be readable")
+        {
+            assert!(
+                !entry.file_name().to_string_lossy().starts_with(".sooqa-download-"),
+                "temporary download should be cleaned up"
+            );
+        }
     }
 
     #[tokio::test]

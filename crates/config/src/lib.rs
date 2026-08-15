@@ -281,6 +281,7 @@ pub struct TelegramConfig {
     pub poll_timeout_seconds: u64,
     pub upload_timeout_seconds: u64,
     pub source_download_max_bytes: u64,
+    pub local_file_root: Option<PathBuf>,
     pub storage_chat_id: Option<i64>,
 }
 
@@ -463,6 +464,11 @@ impl AppConfig {
                     .telegram
                     .source_download_max_bytes
                     .unwrap_or(DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES),
+                local_file_root: raw
+                    .telegram
+                    .local_file_root
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from),
                 storage_chat_id: raw.telegram.storage_chat_id,
             },
             observability: ObservabilityConfig { log_format, log_level },
@@ -658,6 +664,10 @@ impl AppConfig {
                     reason: "expected a positive integer",
                 })?;
         }
+        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_LOCAL_FILE_ROOT")? {
+            self.telegram.local_file_root =
+                if value.is_empty() { None } else { Some(PathBuf::from(value)) };
+        }
         if let Some(value) = optional_env_string("SOOQA_TELEGRAM_STORAGE_CHAT_ID")? {
             self.telegram.storage_chat_id =
                 Some(value.parse().map_err(|_| ConfigError::InvalidValue {
@@ -800,6 +810,12 @@ impl AppConfig {
                 reason: "must be greater than zero",
             });
         }
+        if self.telegram.local_file_root.as_ref().is_some_and(|path| !path.is_absolute()) {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.local_file_root".to_owned(),
+                reason: "must be an absolute path",
+            });
+        }
         if self.media.source_download_max_bytes == 0 {
             return Err(ConfigError::InvalidValue {
                 name: "media.source_download_max_bytes".to_owned(),
@@ -898,6 +914,7 @@ struct RawTelegramConfig {
     poll_timeout_seconds: Option<u64>,
     upload_timeout_seconds: Option<u64>,
     source_download_max_bytes: Option<u64>,
+    local_file_root: Option<String>,
     storage_chat_id: Option<i64>,
 }
 
@@ -1546,7 +1563,7 @@ mod tests {
         let config = AppConfig::from_toml_str(
             AppRole::Server,
             None,
-            "[telegram]\napi_base_url = \"http://telegram-bot-api:8081\"\nadmin_user_ids = [123456789]\npoll_timeout_seconds = 45\nupload_timeout_seconds = 7200\nstorage_chat_id = -1001234567890\n",
+            "[telegram]\napi_base_url = \"http://telegram-bot-api:8081\"\nadmin_user_ids = [123456789]\npoll_timeout_seconds = 45\nupload_timeout_seconds = 7200\nlocal_file_root = \"/var/lib/telegram-bot-api\"\nstorage_chat_id = -1001234567890\n",
         )
         .expect("TOML should parse");
 
@@ -1559,9 +1576,28 @@ mod tests {
             config.telegram.source_download_max_bytes,
             DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES
         );
+        assert_eq!(
+            config.telegram.local_file_root,
+            Some(PathBuf::from("/var/lib/telegram-bot-api"))
+        );
         assert_eq!(config.media.source_download_max_bytes, DEFAULT_SOURCE_DOWNLOAD_MAX_BYTES);
         assert_eq!(config.media.normalized_storage_max_bytes, DEFAULT_NORMALIZED_STORAGE_MAX_BYTES);
         assert_eq!(config.telegram.storage_chat_id, Some(-1001234567890));
+    }
+
+    #[test]
+    fn telegram_local_file_root_must_be_absolute() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[telegram]\nlocal_file_root = \"telegram-bot-api\"\n",
+        )
+        .expect("TOML should parse");
+
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue { name, .. }) if name == "telegram.local_file_root"
+        ));
     }
 
     #[test]
