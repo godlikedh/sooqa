@@ -466,11 +466,11 @@ test("admin runtime sends the settings fence and reloads after a stale save", as
 test("admin runtime keeps media lookup, preview fetches, edits, retry, and publication fields separate", async () => {
   const calls = [];
   const media = {
-    id: "media-1", kind: "video", status: "active", title: "<unsafe title>", description: "internal",
+    id: "media-1", kind: "video", title: "<unsafe title>", description: "internal",
     storage_state: "ready", storage_url: "https://t.me/c/1/2", source_url: "https://example.test/<img>",
     preview: { url: "/api/v1/media/media-1/preview", mime_type: "image/jpeg" },
     caption_sync: { state: "failed", error: "<unsafe error>" },
-    tags: [{ normalized_name: "cats", display_name: "Cats" }], file_size_bytes: 2048, duration_ms: 61_000,
+    tags: ["cats"], file_size_bytes: 2048, duration_ms: 61_000,
     updated_at: "2026-01-01T00:00:00Z",
   };
   const runtime = createAdminRuntime({
@@ -483,7 +483,7 @@ test("admin runtime keeps media lookup, preview fetches, edits, retry, and publi
         return jsonResponse({ ...media, caption_sync: { state: "pending", error: null } });
       }
       if (pathName === "/api/v1/media/media-1") {
-        return jsonResponse({ ...media, description: "updated", tags: [{ normalized_name: "dogs", display_name: "Dogs" }], caption_sync: { state: "pending", error: null } });
+        return jsonResponse({ ...media, description: "updated", tags: ["dogs"], caption_sync: { state: "pending", error: null } });
       }
       if (pathName.includes("/publication-intent")) return jsonResponse({ state: "queued" });
       if (pathName.startsWith("/api/v1/media?")) return jsonResponse({ items: [media], next_cursor: null });
@@ -551,4 +551,8 @@ test("admin runtime keeps media lookup, preview fetches, edits, retry, and publi
   runtime.document.getElementById("media-refresh").dispatchEvent({ type: "click" });
   await settle();
   assert.equal(runtime.objectUrls.has(firstObjectUrl), false);
+  runtime.window.location.hash = "#dashboard";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+  assert.equal(runtime.objectUrls.size, 0);
 });

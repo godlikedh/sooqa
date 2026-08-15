@@ -141,6 +141,7 @@
 
   function lock() {
     stopIngestAutoRefresh();
+    invalidateMediaPreviews();
     state.token = "";
     try {
       writeToken("");
@@ -443,6 +444,11 @@
     state.mediaPreviewUrls.clear();
   }
 
+  function invalidateMediaPreviews() {
+    state.mediaRenderGeneration += 1;
+    revokeMediaPreviews();
+  }
+
   function sameOriginApiPath(value) {
     if (!value) return null;
     try {
@@ -455,7 +461,7 @@
   }
 
   function mediaTagValue(tags) {
-    return (tags || []).map((tag) => tag.normalized_name || tag.display_name).filter(Boolean).join(", ");
+    return (tags || []).filter((tag) => typeof tag === "string").join(", ");
   }
 
   function parseMediaTags(value) {
@@ -561,7 +567,7 @@
     const meta = node("div", "media-meta");
     const id = node("span", "mono", formatId(media.id));
     id.title = media.id || "";
-    meta.append(id, node("span", "meta", media.status || "unknown"), node("span", "meta", media.storage_state || "unknown"));
+    meta.append(id, node("span", "meta", media.storage_state || "unknown"));
     if (media.file_size_bytes !== null && media.file_size_bytes !== undefined) meta.append(node("span", "meta", formatBytes(media.file_size_bytes)));
     if (media.duration_ms !== null && media.duration_ms !== undefined) meta.append(node("span", "meta", formatMediaDuration(media.duration_ms)));
     main.append(meta);
@@ -577,7 +583,7 @@
 
     const tags = node("ul", "tag-list");
     if (media.tags?.length) {
-      for (const tag of media.tags) tags.append(node("li", "tag", tag.display_name || tag.normalized_name));
+      for (const tag of media.tags) tags.append(node("li", "tag", tag));
     } else {
       tags.append(node("li", "muted", "No tags"));
     }
@@ -612,7 +618,7 @@
     main.append(editor);
 
     const publication = node("div", "publication-actions");
-    if (media.status === "active" && media.storage_state === "ready") {
+    if (media.storage_state === "ready") {
       publication.append(
         actionButton("Post now", async () => submitPublication(media, "post_now")),
         actionButton("Post now…", () => openPublicationDialog(media, "post_now")),
@@ -628,9 +634,8 @@
   }
 
   function renderMedia(data) {
-    state.mediaRenderGeneration += 1;
+    invalidateMediaPreviews();
     const renderGeneration = state.mediaRenderGeneration;
-    revokeMediaPreviews();
     state.mediaItems = data.items || [];
     state.mediaCursor = data.next_cursor || null;
     const grid = $("media-grid");
@@ -809,6 +814,7 @@
 
   async function route() {
     stopIngestAutoRefresh();
+    if (state.page === "media") invalidateMediaPreviews();
     const requested = window.location.hash.slice(1);
     state.page = PAGE_NAMES.has(requested) ? requested : "dashboard";
     for (const page of document.querySelectorAll("[data-page]")) page.hidden = page.dataset.page !== state.page;
@@ -877,8 +883,8 @@
   $("publication-cancel").addEventListener("click", closePublicationDialog);
   window.addEventListener("hashchange", () => { void route(); });
   window.addEventListener("pagehide", () => {
-    state.mediaRenderGeneration += 1;
-    revokeMediaPreviews();
+    stopIngestAutoRefresh();
+    invalidateMediaPreviews();
   });
 
   setAuthView(Boolean(state.token));

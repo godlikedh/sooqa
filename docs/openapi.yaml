@@ -192,19 +192,11 @@ paths:
         q accepts only a media UUID, ingest UUID, normalized HTTP(S) source URL, or
         private HTTPS Telegram storage link. The three official 2ch mirror hosts
         resolve to one source identity while stored provenance is retained. q
-        cannot be combined with tags, kind, or status catalogue filters.
+        is an exact lookup and cannot be combined with catalogue filters.
       security:
         - bearerAuth: []
       parameters:
         - { name: q, in: query, description: "Exact media UUID, ingest UUID, source URL, or Telegram storage link.", schema: { type: string } }
-        - { name: tags, in: query, description: Comma-separated normalized tags., schema: { type: string } }
-        - { name: kind, in: query, schema: { $ref: '#/components/schemas/MediaKind' } }
-        - name: status
-          in: query
-          schema:
-            allOf:
-              - $ref: '#/components/schemas/MediaStatus'
-            default: active
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 50 } }
         - { name: cursor, in: query, schema: { type: string } }
       responses:
@@ -257,25 +249,6 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
-        '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/media/{id}/archive:
-    post:
-      tags: [media]
-      operationId: archiveMedia
-      summary: Archive media
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/MediaId'
-      responses:
-        '200':
-          description: Archived media row.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Media' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/media/{id}/preview:
     get:
@@ -978,20 +951,16 @@ components:
     MediaKind:
       type: string
       enum: [video, image, animation, audio]
-    MediaStatus:
-      type: string
-      enum: [active, archived, deleted]
     Media:
       type: object
-      required: [id, kind, status, tags, caption_sync, created_at, updated_at]
+      required: [id, kind, tags, storage_state, caption_sync, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         kind: { $ref: '#/components/schemas/MediaKind' }
-        status: { $ref: '#/components/schemas/MediaStatus' }
         title: { type: string, nullable: true }
         description: { type: string, nullable: true }
-        notes: { type: string, nullable: true }
-        storage_state: { type: string, enum: [pending_storage, ready, storage_unknown, missing], nullable: true }
+        tags: { type: array, items: { type: string, minLength: 1, maxLength: 100 } }
+        storage_state: { type: string, enum: [pending_storage, ready, storage_unknown, missing] }
         storage_url: { type: string, format: uri, nullable: true }
         preview:
           type: object
@@ -1012,10 +981,8 @@ components:
         bit_rate: { type: integer, format: int64, nullable: true }
         file_size_bytes: { type: integer, format: int64, nullable: true }
         sha256: { type: string, nullable: true }
-        tags: { type: array, items: { $ref: '#/components/schemas/Tag' } }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
-        archived_at: { type: string, format: date-time, nullable: true }
     MediaPreview:
       type: object
       required: [url, mime_type, width, height, size_bytes, etag]
@@ -1041,20 +1008,12 @@ components:
         next_cursor: { type: string, nullable: true }
     MediaUpdateRequest:
       type: object
+      required: [tags, description, expected_updated_at]
       additionalProperties: false
       properties:
-        title: { type: string, nullable: true }
         description: { type: string, nullable: true }
-        notes: { type: string, nullable: true }
-        tags: { type: array, items: { type: string, minLength: 1 } }
-        expected_updated_at: { type: string, format: date-time, nullable: true }
-    Tag:
-      type: object
-      required: [normalized_name, display_name, created_at]
-      properties:
-        normalized_name: { type: string }
-        display_name: { type: string }
-        created_at: { type: string, format: date-time }
+        tags: { type: array, items: { type: string, minLength: 1, maxLength: 100 } }
+        expected_updated_at: { type: string, format: date-time }
     ChannelCreateRequest:
       type: object
       required: [name, telegram_chat_id]
