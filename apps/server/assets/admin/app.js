@@ -2,11 +2,15 @@
   "use strict";
 
   const TOKEN_KEY = "sooqa.admin.api_token";
+  const INGEST_AUTO_REFRESH_MS = 15_000;
   const PAGE_NAMES = new Set(["dashboard", "ingests", "media", "schedule", "settings"]);
   const state = {
     token: readToken(),
     page: "dashboard",
+    ingestPageCursor: null,
     ingestCursor: null,
+    ingestLoading: false,
+    ingestRefreshTimer: null,
     channels: [],
   };
 
@@ -106,6 +110,7 @@
   }
 
   function lock() {
+    stopIngestAutoRefresh();
     state.token = "";
     try {
       writeToken("");
@@ -360,9 +365,39 @@
   }
 
   async function loadIngests(cursor) {
+    if (state.ingestLoading) return;
+    state.ingestLoading = true;
+    state.ingestPageCursor = cursor || null;
     const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
-    const data = await api(`/api/v1/ingests?limit=50${suffix}`);
-    renderIngests(data);
+    try {
+      const data = await api(`/api/v1/ingests?limit=50${suffix}`);
+      renderIngests(data);
+      if (state.ingestPageCursor === null) startIngestAutoRefresh();
+      else stopIngestAutoRefresh();
+    } finally {
+      state.ingestLoading = false;
+    }
+  }
+
+  function stopIngestAutoRefresh() {
+    if (state.ingestRefreshTimer !== null) {
+      window.clearInterval(state.ingestRefreshTimer);
+      state.ingestRefreshTimer = null;
+    }
+  }
+
+  function startIngestAutoRefresh() {
+    stopIngestAutoRefresh();
+    if (!state.token || state.page !== "ingests" || state.ingestPageCursor !== null) return;
+    state.ingestRefreshTimer = window.setInterval(() => {
+      if (state.page !== "ingests" || state.ingestPageCursor !== null) {
+        stopIngestAutoRefresh();
+        return;
+      }
+      void loadIngests(null).catch((error) => {
+        showToast(error instanceof Error ? error.message : "The ingests could not be refreshed.", true);
+      });
+    }, INGEST_AUTO_REFRESH_MS);
   }
 
   function timeValue(value, fallback) {
@@ -443,6 +478,7 @@
   }
 
   async function route() {
+    stopIngestAutoRefresh();
     const requested = window.location.hash.slice(1);
     state.page = PAGE_NAMES.has(requested) ? requested : "dashboard";
     for (const page of document.querySelectorAll("[data-page]")) page.hidden = page.dataset.page !== state.page;
@@ -481,7 +517,10 @@
   $("ingests-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, () => loadIngests(null)); });
   $("ingests-next").addEventListener("click", (event) => {
     const cursor = state.ingestCursor;
-    if (cursor) void withBusy(event.currentTarget, () => loadIngests(cursor));
+    if (cursor) {
+      stopIngestAutoRefresh();
+      void withBusy(event.currentTarget, () => loadIngests(cursor));
+    }
   });
   $("settings-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, loadSettings); });
   $("settings-form").addEventListener("submit", (event) => { void saveSettings(event); });
