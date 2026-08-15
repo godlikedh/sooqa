@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -18,8 +19,14 @@ use crate::{
 };
 
 const DEFAULT_DENO_PATH: &str = "deno";
+const DEFAULT_YTDLP_POT_PROVIDER_URL: &str = "http://127.0.0.1:4416";
 const MIN_SUPPORTED_DENO_VERSION: (u32, u32, u32) = (2, 3, 0);
+const MAX_POT_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024;
 const YTDLP_ATTEMPT_MAX_BYTES_MULTIPLIER: u64 = 3;
+pub const YTDLP_POT_PROVIDER_VERSION: &str = "1.3.1";
+pub const YTDLP_PLUGIN_DIRECTORY: &str = "/usr/local/share/sooqa/yt-dlp-plugins";
+pub const YTDLP_PLUGIN_ARCHIVE_PATH: &str =
+    "/usr/local/share/sooqa/yt-dlp-plugins/bgutil-ytdlp-pot-provider-1.3.1.zip";
 pub const MAX_YTDLP_FORMAT_SELECTION_BYTES: usize = 1024;
 pub const YTDLP_PROGRESSIVE_FALLBACK_FORMAT: &str =
     "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]";
@@ -43,6 +50,7 @@ pub struct YtDlpConfig {
     deno_path: PathBuf,
     max_output_bytes: usize,
     metadata_max_output_bytes: usize,
+    pot_provider_url: String,
 }
 
 impl YtDlpConfig {
@@ -58,6 +66,7 @@ impl YtDlpConfig {
             deno_path: PathBuf::from(DEFAULT_DENO_PATH),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             metadata_max_output_bytes: DEFAULT_YTDLP_METADATA_MAX_OUTPUT_BYTES,
+            pot_provider_url: DEFAULT_YTDLP_POT_PROVIDER_URL.to_owned(),
         })
     }
 
@@ -77,6 +86,11 @@ impl YtDlpConfig {
 
     pub fn with_metadata_max_output_bytes(mut self, max_output_bytes: usize) -> Self {
         self.metadata_max_output_bytes = max_output_bytes;
+        self
+    }
+
+    pub fn with_pot_provider_url(mut self, url: impl Into<String>) -> Self {
+        self.pot_provider_url = url.into();
         self
     }
 }
@@ -211,13 +225,14 @@ impl YtDlpDownloader {
         Ok(output)
     }
 
-    /// Verifies the pinned standalone runtime without contacting a provider.
+    /// Verifies the pinned standalone runtime and plugin without contacting a provider.
     ///
     /// The local info fixture makes yt-dlp initialize its normal extractor
     /// process with the configured EJS/runtime flags, while the verbose
-    /// diagnostics confirm that the bundled EJS package and Deno provider are
-    /// discoverable. A separate Deno eval proves that the configured runtime
-    /// can actually execute code before the worker accepts page jobs.
+    /// diagnostics confirm that the bundled EJS package, pinned PO-token
+    /// plugin, and Deno provider are discoverable. A separate Deno eval proves
+    /// that the configured runtime can actually execute code before the worker
+    /// accepts page jobs.
     pub async fn verify_runtime(&self, timeout: Duration) -> Result<(), String> {
         if timeout.is_zero() {
             return Err("yt-dlp runtime check timeout must be greater than zero".to_owned());
@@ -285,6 +300,12 @@ impl YtDlpDownloader {
                 "yt-dlp runtime probe did not discover the configured Deno runtime".to_owned()
             );
         }
+        let expected_plugin_directory = format!("{YTDLP_PLUGIN_ARCHIVE_PATH}/yt_dlp_plugins");
+        if !diagnostics.contains(&expected_plugin_directory) {
+            return Err(format!(
+                "yt-dlp runtime probe did not discover the pinned PO-token provider plugin archive ({YTDLP_PLUGIN_ARCHIVE_PATH})"
+            ));
+        }
 
         let deno_command = ExternalCommand::new(self.config.deno_path.clone())
             .arg("eval")
@@ -312,13 +333,71 @@ impl YtDlpDownloader {
         Ok(())
     }
 
-    fn security_args(&self) -> [String; 5] {
-        [
+    /// Verifies the private HTTP provider and its pinned version before page
+    /// jobs can enter the queue.
+    pub async fn verify_pot_provider(&self, timeout: Duration) -> Result<(), String> {
+        if timeout.is_zero() {
+            return Err("PO-token provider check timeout must be greater than zero".to_owned());
+        }
+        let ping_url = pot_provider_ping_url(&self.config.pot_provider_url)?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(timeout)
+            .build()
+            .map_err(|error| format!("could not build PO-token provider client: {error}"))?;
+        let response = client
+            .get(ping_url)
+            .send()
+            .await
+            .map_err(|error| format!("PO-token provider is unavailable: {error}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("PO-token provider returned HTTP {status}"));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_POT_PROVIDER_RESPONSE_BYTES as u64)
+        {
+            return Err("PO-token provider returned an oversized health response".to_owned());
+        }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                format!("could not read PO-token provider health response: {error}")
+            })?;
+            if chunk.len() > MAX_POT_PROVIDER_RESPONSE_BYTES.saturating_sub(body.len()) {
+                return Err("PO-token provider returned an oversized health response".to_owned());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let payload: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("PO-token provider returned invalid health JSON: {error}"))?;
+        let version = payload.get("version").and_then(serde_json::Value::as_str);
+        if version != Some(YTDLP_POT_PROVIDER_VERSION) {
+            return Err(format!(
+                "PO-token provider version mismatch: expected {YTDLP_POT_PROVIDER_VERSION}, got {}",
+                version.unwrap_or("<missing>")
+            ));
+        }
+        Ok(())
+    }
+
+    fn security_args(&self) -> Vec<String> {
+        vec![
             "--ignore-config".to_owned(),
             "--no-plugin-dirs".to_owned(),
+            "--plugin-dirs".to_owned(),
+            YTDLP_PLUGIN_DIRECTORY.to_owned(),
             "--no-remote-components".to_owned(),
+            "--no-cookies".to_owned(),
+            "--no-cookies-from-browser".to_owned(),
             "--js-runtimes".to_owned(),
             format!("deno:{}", self.config.deno_path.display()),
+            "--extractor-args".to_owned(),
+            "youtube:player-client=mweb".to_owned(),
+            "--extractor-args".to_owned(),
+            format!("youtubepot-bgutilhttp:base_url={}", self.config.pot_provider_url),
         ]
     }
 }
@@ -723,6 +802,26 @@ fn validate_source_url(value: &str) -> Result<String, DownloadError> {
     Ok(url.to_string())
 }
 
+fn pot_provider_ping_url(value: &str) -> Result<Url, String> {
+    let mut url =
+        Url::parse(value).map_err(|_| "PO-token provider URL could not be parsed".to_owned())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(
+            "PO-token provider URL must be an HTTP(S) origin without credentials, path, query, or fragment"
+                .to_owned(),
+        );
+    }
+    url.set_path("/ping");
+    Ok(url)
+}
+
 fn validate_limits(limits: &DownloadLimits, timeout: Duration) -> Result<(), DownloadError> {
     if limits.max_bytes == 0 || timeout.is_zero() {
         return Err(DownloadError::terminal(
@@ -845,9 +944,14 @@ mod tests {
     };
 
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     struct RuntimeProbeRunner {
         calls: Mutex<Vec<ExternalCommand>>,
+        plugin_discovered: bool,
     }
 
     #[async_trait]
@@ -873,7 +977,15 @@ mod tests {
                     success: true,
                     exit_code: Some(0),
                     stdout: b"{}\n".to_vec(),
-                    stderr: b"[debug] Optional libraries: yt_dlp_ejs-0.8.0\n[debug] JS runtimes: deno-2.8.1\n".to_vec(),
+                    stderr: format!(
+                        "[debug] Optional libraries: yt_dlp_ejs-0.8.0\n[debug] JS runtimes: deno-2.8.1\n{}",
+                        if self.plugin_discovered {
+                            "[debug] Plugin directories: /usr/local/share/sooqa/yt-dlp-plugins/bgutil-ytdlp-pot-provider-1.3.1.zip/yt_dlp_plugins\n"
+                        } else {
+                            ""
+                        }
+                    )
+                    .into_bytes(),
                     stdout_truncated: false,
                     stderr_truncated: false,
                 }
@@ -883,7 +995,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_probe_requires_bundled_ejs_and_executes_deno() {
-        let runner = Arc::new(RuntimeProbeRunner { calls: Mutex::new(Vec::new()) });
+        let runner =
+            Arc::new(RuntimeProbeRunner { calls: Mutex::new(Vec::new()), plugin_discovered: true });
         let downloader = YtDlpDownloader::with_runner(
             YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
             DownloadLimits::default(),
@@ -902,6 +1015,101 @@ mod tests {
         assert!(calls[0].args().iter().any(|arg| arg == "--load-info-json"));
         assert!(calls[1].clears_environment());
         assert_eq!(calls[1].args()[0], "eval");
+    }
+
+    #[tokio::test]
+    async fn runtime_probe_rejects_a_missing_pinned_plugin() {
+        let runner = Arc::new(RuntimeProbeRunner {
+            calls: Mutex::new(Vec::new()),
+            plugin_discovered: false,
+        });
+        let downloader = YtDlpDownloader::with_runner(
+            YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
+            DownloadLimits::default(),
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+        );
+
+        let error = downloader
+            .verify_runtime(Duration::from_secs(1))
+            .await
+            .expect_err("missing plugin should fail the runtime preflight");
+        assert!(error.contains("pinned PO-token provider plugin"));
+    }
+
+    async fn provider_fixture(status: &str, body: &str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").await.expect("provider fixture should bind");
+        let address = listener.local_addr().expect("provider fixture address should be known");
+        let status = status.to_owned();
+        let body = body.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("provider request should arrive");
+            let mut request = [0_u8; 1024];
+            let read =
+                stream.read(&mut request).await.expect("provider request should be readable");
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /ping"));
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("provider response should be writable");
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn provider_preflight_requires_the_pinned_provider_version() {
+        let (provider_url, server) =
+            provider_fixture("200 OK", r#"{"server_uptime":1.0,"version":"1.3.1"}"#).await;
+        let downloader = YtDlpDownloader::new(
+            YtDlpConfig::new("yt-dlp", "best")
+                .expect("format selection should be valid")
+                .with_pot_provider_url(provider_url),
+        );
+
+        downloader
+            .verify_pot_provider(Duration::from_secs(1))
+            .await
+            .expect("pinned provider fixture should pass");
+        server.await.expect("provider fixture should finish");
+    }
+
+    #[tokio::test]
+    async fn provider_preflight_reports_unavailable_provider_without_media_details() {
+        let (provider_url, server) = provider_fixture("503 Service Unavailable", "{}").await;
+        let downloader = YtDlpDownloader::new(
+            YtDlpConfig::new("yt-dlp", "best")
+                .expect("format selection should be valid")
+                .with_pot_provider_url(provider_url),
+        );
+
+        let error = downloader
+            .verify_pot_provider(Duration::from_secs(1))
+            .await
+            .expect_err("unavailable provider should fail preflight");
+        assert!(error.contains("PO-token provider returned HTTP 503"));
+        server.await.expect("provider fixture should finish");
+    }
+
+    #[tokio::test]
+    async fn provider_preflight_bounds_health_response_bytes() {
+        let oversized_body = "x".repeat(MAX_POT_PROVIDER_RESPONSE_BYTES + 1);
+        let (provider_url, server) = provider_fixture("200 OK", &oversized_body).await;
+        let downloader = YtDlpDownloader::new(
+            YtDlpConfig::new("yt-dlp", "best")
+                .expect("format selection should be valid")
+                .with_pot_provider_url(provider_url),
+        );
+
+        let error = downloader
+            .verify_pot_provider(Duration::from_secs(1))
+            .await
+            .expect_err("oversized provider response should fail preflight");
+        assert!(error.contains("oversized health response"));
+        server.await.expect("provider fixture should finish");
     }
 
     #[tokio::test]
@@ -950,9 +1158,16 @@ mod tests {
         for argument in [
             "--ignore-config",
             "--no-plugin-dirs",
+            "--plugin-dirs",
+            YTDLP_PLUGIN_DIRECTORY,
             "--no-remote-components",
+            "--no-cookies",
+            "--no-cookies-from-browser",
             "--js-runtimes",
             "deno:deno",
+            "--extractor-args",
+            "youtube:player-client=mweb",
+            "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
         ] {
             assert!(
                 inspect_args.lines().any(|line| line == argument),

@@ -134,16 +134,28 @@ dot-delimited subdomains; `youtu.be` is an exact host entry. Credentials, IP
 literals, wildcards, paths, and non-default ports are rejected. Direct MP4 and
 WebM responses continue to use the direct HTTP adapter even when their host is
 not in this list. The worker logs whether yt-dlp is disabled or enabled and
-fails startup if an enabled yt-dlp or Deno capability is missing or too old.
+fails startup if an enabled yt-dlp, pinned plugin, Deno capability, or
+PO-token provider is missing or too old.
 
 The home Compose deployment uses `youtube.com,youtu.be` when the variable is
 unset; set it to an empty value in `deploy/home/.env` for direct-only operation.
-The initial URL host is the allowlist decision point. yt-dlp is run without
-configuration files, browser cookies, netrc, plugins, or remote components, but
-an accepted provider page can still follow provider redirects and fetch its
-CDN media URLs. The supported home path is public regular videos and Shorts;
+The initial URL host is the allowlist decision point. yt-dlp is run with
+`--ignore-config`, explicit no-cookie and no-browser-cookie flags, a cleared
+environment, and no remote components. It discovers only the pinned bgutil
+plugin from `/usr/local/share/sooqa/yt-dlp-plugins`; no browser state or netrc
+credentials are available to the child. An accepted provider page can still
+follow provider redirects and fetch its CDN media URLs. The supported home
+path is public regular videos and Shorts;
 private, members-only, age-restricted, geo-bypassed, and cookie-authenticated
 media are intentionally outside this setup.
+
+The home Compose deployment starts `brainicism/bgutil-ytdlp-pot-provider` as a
+private, health-checked service with no published host port and configures the
+worker with `http://pot-provider:4416`. The image is pinned by its multi-
+architecture digest. The worker checks `/ping` for provider version `1.3.1`
+before enabling page jobs; a missing provider or version mismatch fails startup
+with a provider-specific diagnostic. Standalone deployments can set
+`SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL` to another validated provider origin.
 
 The submitted URL remains the ingest provenance. After inspection, the worker
 uses the validated canonical `resolved_url` for yt-dlp execution and checks its
@@ -159,20 +171,23 @@ terminal, while a failed progressive attempt returns to the existing bounded
 job retry policy. Every attempt has its own directory and failed or partial
 files are removed before another attempt.
 
-The home image downloads the official standalone `yt-dlp` distribution, which
-contains the bundled `yt-dlp-ejs` component, and a pinned Deno runtime. The
-current Dockerfile pins yt-dlp `2026.06.09` and Deno `2.8.1` with architecture-
-specific SHA-256 checksums. When the allowlist is enabled, worker startup runs
-an offline local-info fixture through yt-dlp with the configured EJS/Deno
-flags, checks that the bundled EJS component is discoverable, and executes a
-small Deno probe. Each yt-dlp download runs inside a unique attempt directory:
+The home image downloads the official standalone `yt-dlp` distribution, the
+`bgutil-ytdlp-pot-provider` plugin `1.3.1`, and a pinned Deno runtime. The
+current Dockerfile pins yt-dlp `2026.06.09`, Deno `2.8.1`, and the plugin ZIP
+with architecture-specific or release SHA-256 checksums. When the allowlist is
+enabled, worker startup runs an offline local-info fixture through yt-dlp with
+the configured plugin/EJS/Deno flags, checks that the bundled EJS and pinned
+plugin are discoverable, executes a small Deno probe, and then performs the
+provider `/ping` preflight. Each yt-dlp download runs inside a unique attempt
+directory:
 its relative final output, temporary fragments, split streams, merge
 intermediates, and disabled-cache state are confined there. The worker monitors
 the aggregate attempt directory with a three-times-final-size budget to allow
 video/audio merging, while the final published file remains bounded by
 `SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES`; a successful attempt must contain
-exactly one regular media file. To update either dependency, change its version, asset names
-if needed, and every matching checksum together; build the home image and
+exactly one regular media file. To update any pinned dependency, change its
+version, asset names if needed, and every matching checksum together; build the
+home image and
 verify the startup diagnostics before doing an owner smoke test. CI uses fake
 executables and does not contact YouTube.
 

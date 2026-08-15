@@ -128,11 +128,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Arc::new(SourceDownloaderRouter::direct_only(direct_http))
     } else {
         let ytdlp_config =
-            YtDlpConfig::new(config.media.ytdlp_path.clone(), config.media.ytdlp_format.clone())?;
+            YtDlpConfig::new(config.media.ytdlp_path.clone(), config.media.ytdlp_format.clone())?
+                .with_pot_provider_url(config.media.ytdlp_pot_provider_url.clone());
         let ytdlp = YtDlpDownloader::with_limits(ytdlp_config, download_limits);
         if let Err(error) = ytdlp.verify_runtime(Duration::from_secs(5)).await {
             return Err(std::io::Error::other(format!(
-                "yt-dlp is enabled but its bundled EJS/Deno runtime check failed: {error}"
+                "yt-dlp is enabled but its pinned plugin/EJS/Deno runtime check failed: {error}"
+            ))
+            .into());
+        }
+        if let Err(error) = ytdlp.verify_pot_provider(Duration::from_secs(5)).await {
+            return Err(std::io::Error::other(format!(
+                "yt-dlp is enabled but its PO-token provider preflight failed: {error}"
             ))
             .into());
         }

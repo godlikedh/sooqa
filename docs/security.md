@@ -58,23 +58,29 @@ subdomains are matched, while credentials, IP literals, and non-default ports
 are rejected. The inspected canonical URL is checked against the same policy
 before it reaches the child, so metadata cannot redirect execution to a new
 host or weaken the initial SSRF boundary. Its child environment is cleared and
-rebuilt with only a fixed `PATH`; yt-dlp ignores configuration and plugins, and
-remote components are disabled. The home image pins the official yt-dlp and
-Deno distributions by version and SHA-256 checksum. yt-dlp may follow provider
-redirects and fetch provider/CDN URLs after an allowlisted page is accepted,
-which is part of the single-admin deployment's explicit trust boundary. Each
-yt-dlp attempt gets a unique job-owned directory with a relative output and
-explicit home/temp paths; the worker monitors the aggregate directory while
-the child is running, not only the final file, and removes the complete
-directory on success, failure, timeout, or cancellation. The aggregate budget
-is three times the final source limit to leave room for split-stream merging.
-A successful attempt must leave exactly one regular final media file. A
-specific `unable to download video data: HTTP Error 403` failure receives one
-fresh high-quality attempt and then one clean combined-progressive fallback;
-the bounded `input_json.download.selected_format` marker records which format
-won. Other extractor failures remain terminal, and every failed attempt
-directory is removed. The worker also refuses to enable the adapter if the
-offline EJS/Deno startup probes fail.
+rebuilt with only a fixed `PATH`; `--ignore-config`, `--no-cookies`, and
+`--no-cookies-from-browser` are explicit, and no netrc or browser state is
+available. Remote components are disabled, and plugin discovery is reset to
+the exact `/usr/local/share/sooqa/yt-dlp-plugins` directory containing the
+pinned bgutil plugin. The home image pins the official yt-dlp and Deno
+distributions by version and SHA-256 checksum, plus the plugin release ZIP by
+its release checksum. yt-dlp may follow provider redirects and fetch
+provider/CDN URLs after an allowlisted page is accepted, which is part of the
+single-admin deployment's explicit trust boundary. The home Compose PO-token
+provider is private-network-only, has no host-published port, and is checked
+for the pinned `1.3.1` version at worker startup. Each yt-dlp attempt gets a
+unique job-owned directory with a relative output and explicit home/temp paths;
+the worker monitors the aggregate directory while the child is running, not
+only the final file, and removes the complete directory on success, failure,
+timeout, or cancellation. The aggregate budget is three times the final source
+limit to leave room for split-stream merging. A successful attempt must leave
+exactly one regular final media file. A specific `unable to download video data:
+HTTP Error 403` failure receives one fresh high-quality attempt and then one
+clean combined-progressive fallback; the bounded
+`input_json.download.selected_format` marker records which format won. Other
+extractor failures remain terminal, and every failed attempt directory is
+removed. The worker also refuses to enable the adapter if the offline
+plugin/EJS/Deno probes or provider health/version check fail.
 
 The local Telegram Bot API service is a private Compose-network dependency. Its
 `api_id`, `api_hash`, and bot token are deployment secrets; the service has a

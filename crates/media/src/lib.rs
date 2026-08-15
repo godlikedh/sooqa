@@ -76,7 +76,9 @@ pub use workspace::{
     ManifestEntry, MediaWorkspace, WorkspaceArea, WorkspaceError, WorkspaceManifest,
 };
 pub use ytdlp::{
-    YtDlpConfig, YtDlpConfigError, YtDlpDownloader, YtDlpMetadata, is_supported_deno_version,
+    MAX_YTDLP_FORMAT_SELECTION_BYTES, YTDLP_PLUGIN_ARCHIVE_PATH, YTDLP_PLUGIN_DIRECTORY,
+    YTDLP_POT_PROVIDER_VERSION, YTDLP_PROGRESSIVE_FALLBACK_FORMAT, YtDlpConfig, YtDlpConfigError,
+    YtDlpDownloader, YtDlpMetadata, is_supported_deno_version,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
