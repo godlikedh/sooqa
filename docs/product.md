@@ -27,13 +27,15 @@ The first release is intentionally narrow:
 - immediate publication or a simple per-channel cadence queue.
 
 Publisher mutations are durable PostgreSQL operations: normal cadence enqueue
-assigns the next valid channel-local slot, captions can be edited or explicitly
-cleared, and publish-now makes the existing post job due immediately without
-consuming its future cadence slot. Each queued post has one fixed-dedupe job
-and a revision fence; stale admin views and claimed jobs cannot overwrite newer
-publication state. The superseded Telegram queue presentation and its
-earlier/later and occupied-slot swap commands are removed; web-admin editing is
-introduced in the bounded admin slices below.
+assigns the next valid channel-local slot, exact/manual scheduling sets only
+the selected post to one future instant, and exact posts may share an instant
+without moving unrelated cadence slots. Each queued post has one fixed-dedupe
+job and a revision fence; stale admin views and claimed jobs cannot overwrite
+newer publication state. A repeated media intent becomes a bounded-evidence
+draft until the administrator chooses the documented one-time outcome. The
+superseded Telegram queue presentation and its earlier/later and occupied-slot
+swap commands are removed; web-admin editing is introduced in the bounded
+admin slices below.
 
 HTTP ingest requests may carry one versioned follow-up intent on the same
 `ingests` row: `save`, normal-cadence `queue`, exact-time `queue`, or
@@ -41,8 +43,12 @@ HTTP ingest requests may carry one versioned follow-up intent on the same
 public post text separately from media description, tags, page context, and
 selected text. Omitting the action retains save-only behavior. This capture
 contract survives the asynchronous ingest pipeline and idempotent replays; it
-does not create a post until the later materialization and repetition-decision
-slice.
+does not create a post during capture. Once storage is ready, one typed
+materialization job creates at most one post linked by `origin_ingest_id`; save
+intents create neither a post nor a materialization job. Queue/post-now
+materialization evaluates repeat conflicts at the intended send instant and
+persists bounded evidence on a draft when a decision is required. Decisions
+are revision-fenced and replay-safe.
 
 Large-media capture uses Telegram's official local Bot API server when the home
 deployment is cut over manually. URL/link source downloads, Telegram-source
@@ -105,8 +111,11 @@ ingest has not reached `storing` yet. `storage_unknown` is an explicit
 reconciliation state: attach completes linked storage-waiting or storage-failed
 ingests, while reset opens them in a new storage generation. Marking an upload
 unknown also fails linked active ingests explicitly instead of leaving them
-waiting forever. Independently scheduled work such as `publish_post` and
-maintenance remains separate.
+waiting forever. Independently scheduled work such as
+`materialize_publication`, `publish_post`, and maintenance remains separate.
+Materialization is database-only: it locks the completed ingest, ready media,
+and captured target snapshot, then commits the intended post and its
+fixed-dedupe publication job without network I/O.
 
 For ingest stages, the product transition, successor enqueue, and current-job
 success are committed in one database transaction. Final-attempt lease recovery
@@ -118,7 +127,9 @@ final attempt expires, recovery fails the owning ingest explicitly (marks
 storage unknown for an upload job, or fences an interrupted publication as
 unknown) so a crashed worker cannot strand the workflow.
 
-Post cadence slots are assigned when a post is queued. A `publish_post` job
+Post cadence slots are assigned when a normal post is queued. Exact/manual
+posts store their requested future `scheduled_at` with `cadence_slot_at = NULL`,
+so exact collisions do not move other cadence posts. A `publish_post` job
 references the `posts` row, and one post row becomes the durable publication
 record after success. Telegram calls, HTTP downloads, ffmpeg, and ffprobe run
 outside database transactions. External effects use state plus generation or
@@ -144,7 +155,7 @@ Idempotency remains required, but it belongs to the row or effect it protects:
 | Enqueue the same work | `queue.jobs.dedupe_key UNIQUE` |
 | Store identical normalized bytes | `media.canonical_sha256 UNIQUE` |
 | Upload to Telegram storage | media storage state plus generation/token |
-| Create the same requested post | `posts.request_key UNIQUE` |
+| Create the same requested post | `posts.request_key UNIQUE`; `origin_ingest_id UNIQUE` for materialization |
 | Send a post | post state plus generation/token; ambiguous sends do not auto-retry |
 
 There is no generic idempotency table and no permanent Telegram update-receipt

@@ -25,7 +25,7 @@ async fn search_media(
     headers: HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<MediaPageResponse>, ApiError> {
-    authorize(&state.api_token, &headers, "media:read").await?;
+    authorize(&state.api_token, &headers).await?;
     let query = params.into_domain(&headers)?;
     let page = state
         .library
@@ -40,7 +40,7 @@ async fn get_media(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<MediaResponse>, ApiError> {
-    authorize(&state.api_token, &headers, "media:read").await?;
+    authorize(&state.api_token, &headers).await?;
     let media = state
         .library
         .find_media_details(id)
@@ -58,7 +58,7 @@ async fn update_media(
     Path(id): Path<Uuid>,
     body: Result<JsonExtractor<UpdateMediaRequest>, JsonRejection>,
 ) -> Result<Json<MediaResponse>, ApiError> {
-    authorize(&state.api_token, &headers, "media:write").await?;
+    authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     let description = payload.description.into_present().map_err(|_| {

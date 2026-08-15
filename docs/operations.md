@@ -102,12 +102,27 @@ are streamed or path-based; no file-sized byte buffer is used.
 Polling, downloads, and storage uploads use separate HTTP timeout policies so a
 long upload cannot inherit the long-poll or download-stall deadline.
 
-Publisher scheduling is controlled only by PostgreSQL `posts.cadence_slot_at`
-and `queue.jobs.run_at`. API publication mutations use `posts.revision` as an
-optimistic fence and keep one fixed-dedupe `publish_post` job per queued post.
-If a job is already claimed, its post cannot be edited or cancelled. A stale
-HTTP caller receives a conflict and must reload the post; Telegram is never
-contacted while these mutations are committed.
+Publisher scheduling is controlled only by PostgreSQL `posts.scheduled_at`,
+`posts.cadence_slot_at`, and `queue.jobs.run_at`. Normal queueing assigns the
+next channel cadence slot; exact/manual scheduling writes only the selected
+post's future instant, leaves `cadence_slot_at` null, permits same-instant
+collisions, and does not move unrelated cadence posts. API publication
+mutations use `posts.revision` as an optimistic fence and keep one
+fixed-dedupe `publish_post` job per queued post. If a job is already claimed,
+its post cannot be edited or cancelled. A stale HTTP caller receives a
+conflict and must reload the post; Telegram is never contacted while these
+mutations are committed.
+
+When an ingest reaches completed storage, Inbox commits its state transition,
+cleanup enqueue, and one `materialize_publication` job together. The worker
+materializer performs only database work: it replays the captured action and
+target channel through Publisher, stores `origin_ingest_id`, evaluates repeat
+conflicts at the intended send instant, and creates the fixed-dedupe publish
+job only when no decision is pending. A save-only ingest has no materializer
+job or post. Inspect `queue.jobs` by the ingest payload and then inspect the
+linked post's `repeat_evidence` when a publication is waiting in `draft`.
+Decision commands are one-time, revision-fenced, and idempotent by their
+per-post request key; cancellation leaves the media available.
 
 Publication claims the post before calling Telegram and records a fresh
 generation/token. It copies the ready storage message into the target channel;
@@ -127,8 +142,8 @@ In the administrator's private bot chat, `/duplicates` lists up to three
 pending duplicate ingests at a time. Ready candidates link to their Telegram
 storage message; `Use this` reuses the existing media item, while `Save anyway`
 starts the normal force-save pipeline. A pending-storage candidate remains on
-the existing media upload lifecycle. The HTTP equivalent and bearer scope are
-documented in `docs/openapi.yaml`.
+the existing media upload lifecycle. The HTTP equivalent is documented in
+`docs/openapi.yaml`.
 
 Video fingerprint extraction uses the `video_sequence_v1` grid without a
 per-sample subprocess or permanent frame cache. One FFmpeg process first

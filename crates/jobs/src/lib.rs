@@ -19,6 +19,7 @@ pub enum JobType {
     NormalizeAsset,
     ComputeFingerprint,
     FinalizeIngest,
+    MaterializePublication,
     UploadStorageAsset,
     PublishPost,
     CleanupWorkspace,
@@ -34,6 +35,7 @@ impl JobType {
             Self::NormalizeAsset => "normalize_asset",
             Self::ComputeFingerprint => "compute_fingerprint",
             Self::FinalizeIngest => "finalize_ingest",
+            Self::MaterializePublication => "materialize_publication",
             Self::UploadStorageAsset => "upload_storage_asset",
             Self::PublishPost => "publish_post",
             Self::CleanupWorkspace => "cleanup_workspace",
@@ -59,6 +61,7 @@ impl TryFrom<&str> for JobType {
             "normalize_asset" => Ok(Self::NormalizeAsset),
             "compute_fingerprint" => Ok(Self::ComputeFingerprint),
             "finalize_ingest" => Ok(Self::FinalizeIngest),
+            "materialize_publication" => Ok(Self::MaterializePublication),
             "upload_storage_asset" => Ok(Self::UploadStorageAsset),
             "publish_post" => Ok(Self::PublishPost),
             "cleanup_workspace" => Ok(Self::CleanupWorkspace),
@@ -131,6 +134,12 @@ pub struct IngestJobPayload {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct MaterializePublicationPayload {
+    pub ingest_id: Uuid,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MediaJobPayload {
     pub media_id: Uuid,
     pub generation: i32,
@@ -165,6 +174,7 @@ pub enum JobCommand {
     NormalizeAsset(IngestJobPayload),
     ComputeFingerprint(IngestJobPayload),
     FinalizeIngest(IngestJobPayload),
+    MaterializePublication(MaterializePublicationPayload),
     UploadStorageAsset(MediaJobPayload),
     PublishPost(PublishPostPayload),
     CleanupWorkspace(CleanupWorkspacePayload),
@@ -180,6 +190,7 @@ impl JobCommand {
             Self::NormalizeAsset(_) => JobType::NormalizeAsset,
             Self::ComputeFingerprint(_) => JobType::ComputeFingerprint,
             Self::FinalizeIngest(_) => JobType::FinalizeIngest,
+            Self::MaterializePublication(_) => JobType::MaterializePublication,
             Self::UploadStorageAsset(_) => JobType::UploadStorageAsset,
             Self::PublishPost(_) => JobType::PublishPost,
             Self::CleanupWorkspace(_) => JobType::CleanupWorkspace,
@@ -200,6 +211,9 @@ impl JobCommand {
             JobType::NormalizeAsset => decode!(IngestJobPayload, NormalizeAsset),
             JobType::ComputeFingerprint => decode!(IngestJobPayload, ComputeFingerprint),
             JobType::FinalizeIngest => decode!(IngestJobPayload, FinalizeIngest),
+            JobType::MaterializePublication => {
+                decode!(MaterializePublicationPayload, MaterializePublication)
+            }
             JobType::UploadStorageAsset => decode!(MediaJobPayload, UploadStorageAsset),
             JobType::PublishPost => decode!(PublishPostPayload, PublishPost),
             JobType::CleanupWorkspace => decode!(CleanupWorkspacePayload, CleanupWorkspace),
@@ -215,6 +229,7 @@ impl JobCommand {
             Self::NormalizeAsset(payload) => serde_json::to_value(payload),
             Self::ComputeFingerprint(payload) => serde_json::to_value(payload),
             Self::FinalizeIngest(payload) => serde_json::to_value(payload),
+            Self::MaterializePublication(payload) => serde_json::to_value(payload),
             Self::UploadStorageAsset(payload) => serde_json::to_value(payload),
             Self::PublishPost(payload) => serde_json::to_value(payload),
             Self::CleanupWorkspace(payload) => serde_json::to_value(payload),
@@ -292,6 +307,10 @@ impl NewJob {
 
     pub fn finalize_ingest(ingest_id: Uuid) -> Self {
         Self::new(JobCommand::FinalizeIngest(IngestJobPayload { ingest_id }))
+    }
+
+    pub fn materialize_publication(ingest_id: Uuid) -> Self {
+        Self::new(JobCommand::MaterializePublication(MaterializePublicationPayload { ingest_id }))
     }
 
     pub fn cleanup_workspace(ingest_id: Uuid, workspace_id: Uuid) -> Self {
@@ -422,6 +441,18 @@ mod tests {
         assert_eq!(
             command,
             JobCommand::PublishPost(PublishPostPayload { post_id, expected_revision: 7 })
+        );
+    }
+
+    #[test]
+    fn materialization_payload_carries_ingest_id() {
+        let ingest_id = Uuid::new_v4();
+        let job = NewJob::materialize_publication(ingest_id);
+        assert_eq!(job.job_type(), JobType::MaterializePublication);
+        let command = JobCommand::from_payload(job.job_type(), job.payload_json()).unwrap();
+        assert_eq!(
+            command,
+            JobCommand::MaterializePublication(MaterializePublicationPayload { ingest_id })
         );
     }
 

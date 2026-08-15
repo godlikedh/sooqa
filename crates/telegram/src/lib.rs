@@ -847,10 +847,6 @@ where
                     Err(error) => format!("⚠️ Save anyway was not applied: {error}"),
                 }
             }
-            CallbackData::IngestStatus { .. } => {
-                self.complete(claim).await?;
-                return Ok(HandleOutcome::CallbackHandled);
-            }
         };
         if let Err(error) = self.api.send_text(chat_id, &response).await {
             self.release(claim).await?;
@@ -1117,7 +1113,6 @@ fn is_safe_http_url(value: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CallbackData {
-    IngestStatus { request_id: Uuid },
     DuplicateUse { request_id: Uuid, media_id: Uuid },
     DuplicateForceSave { request_id: Uuid },
 }
@@ -1125,7 +1120,6 @@ pub enum CallbackData {
 impl CallbackData {
     pub fn encode(self) -> String {
         match self {
-            Self::IngestStatus { request_id } => format!("v1:ingest_status:{request_id}"),
             Self::DuplicateUse { request_id, media_id } => {
                 format!("v1:duplicate_use:{}:{}", encode_uuid(request_id), encode_uuid(media_id))
             }
@@ -1141,13 +1135,6 @@ impl CallbackData {
             return None;
         }
         match parts.next()? {
-            "ingest_status" => {
-                let request_id = parts.next()?.parse().ok()?;
-                if parts.next().is_some() {
-                    return None;
-                }
-                Some(Self::IngestStatus { request_id })
-            }
             "duplicate_use" => {
                 let request_id = decode_uuid(parts.next()?)?;
                 let media_id = decode_uuid(parts.next()?)?;
@@ -3161,14 +3148,10 @@ mod tests {
     #[test]
     fn callback_data_round_trips_and_rejects_unknown_shapes() {
         let request_id = Uuid::from_u128(2);
-        let encoded = CallbackData::IngestStatus { request_id }.encode();
-        assert_eq!(encoded, "v1:ingest_status:00000000-0000-0000-0000-000000000002");
-        assert_eq!(CallbackData::parse(&encoded), Some(CallbackData::IngestStatus { request_id }));
-        assert_eq!(
-            CallbackData::parse("v2:ingest_status:00000000-0000-0000-0000-000000000002"),
-            None
-        );
-        assert_eq!(CallbackData::parse(&format!("{encoded}:extra")), None);
+        let legacy_ingest_status = "v1:ingest_status:00000000-0000-0000-0000-000000000002";
+        assert_eq!(CallbackData::parse(legacy_ingest_status), None);
+        assert_eq!(CallbackData::parse("v2:duplicate_force_save:AAAAAAAAAAAAAAAAAAAAAA"), None);
+        assert_eq!(CallbackData::parse("v1:ingest_status:legacy:extra"), None);
 
         let media_id = Uuid::from_u128(3);
         let duplicate = CallbackData::DuplicateUse { request_id, media_id };

@@ -250,7 +250,6 @@ async fn force_save_reconstructs_telegram_source_after_workspace_cleanup(pool: s
             IngestSubmission::try_new_telegram(TelegramSubmissionInput {
                 source_reference: "telegram://-100/42".to_owned(),
                 submitted_via: SubmittedVia::TelegramBot,
-                submitted_by_admin_id: None,
                 original_input: json!({
                     "source_type": "telegram",
                     "telegram_file_id": "durable-file-id",

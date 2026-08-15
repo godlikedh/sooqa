@@ -1,7 +1,9 @@
+use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sooqa_inbox::{
-    IngestStatus, IngestSubmission, IngestSubmissionInput, RequestedAction, SourceInspection,
-    SourceMediaKind, SubmittedVia,
+    IngestKind, IngestStatus, IngestSubmission, IngestSubmissionInput, RequestedAction,
+    SourceInspection, SourceMediaKind, SubmittedVia,
 };
 use sooqa_jobs::{JobCommand, JobStatus, JobType};
 use sooqa_library::{
@@ -12,6 +14,47 @@ use sooqa_persistence::{Database, InboxRepositoryError, SourceInspectionStart};
 use sooqa_publisher::NewChannel;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+#[derive(Serialize)]
+struct LegacyIngestSubmission<'a> {
+    kind: IngestKind,
+    submitted_via: SubmittedVia,
+    submitted_by_admin_id: Option<Uuid>,
+    original_url: &'a str,
+    normalized_url: &'a str,
+    original_input: &'a serde_json::Value,
+    page_url: &'a Option<String>,
+    page_title: &'a Option<String>,
+    supplied_caption: &'a Option<String>,
+    supplied_description: &'a Option<String>,
+    supplied_tags: &'a Vec<String>,
+    requested_action: RequestedAction,
+    requested_publish_at: &'a Option<OffsetDateTime>,
+    requested_post_caption: &'a Option<String>,
+    idempotency_key: &'a Option<String>,
+}
+
+fn legacy_request_hash(submission: &IngestSubmission) -> Vec<u8> {
+    let serialized = serde_json::to_vec(&LegacyIngestSubmission {
+        kind: submission.kind,
+        submitted_via: submission.submitted_via,
+        submitted_by_admin_id: None,
+        original_url: &submission.original_url,
+        normalized_url: &submission.normalized_url,
+        original_input: &submission.original_input,
+        page_url: &submission.page_url,
+        page_title: &submission.page_title,
+        supplied_caption: &submission.supplied_caption,
+        supplied_description: &submission.supplied_description,
+        supplied_tags: &submission.supplied_tags,
+        requested_action: submission.requested_action,
+        requested_publish_at: &submission.requested_publish_at,
+        requested_post_caption: &submission.requested_post_caption,
+        idempotency_key: &submission.idempotency_key,
+    })
+    .unwrap();
+    Sha256::digest(serialized).to_vec()
+}
 
 async fn enabled_channel(database: &Database, chat_id: i64) -> Uuid {
     database
@@ -91,6 +134,32 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts(pool: sqlx::P
         database.inbox().begin_source_inspection(first.ingest.id, &stale_attempt).await.unwrap(),
         SourceInspectionStart::AlreadyAdvanced(_)
     ));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn legacy_request_hash_replays_after_admin_identity_removal(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let key = format!("legacy-hash-replay-{}", Uuid::new_v4());
+    let mut input =
+        IngestSubmissionInput::new("https://example.test/legacy-hash-replay", SubmittedVia::Api);
+    input.idempotency_key = Some(key);
+    let submission = IngestSubmission::try_new(input.clone()).unwrap();
+    let created = database.inbox().create_ingest(submission.clone()).await.unwrap();
+
+    // Simulate the hash persisted by the previous release, whose serialized
+    // submission included submitted_by_admin_id: null.
+    sqlx::query("UPDATE ingests SET request_hash = $2 WHERE id = $1")
+        .bind(created.ingest.id)
+        .bind(legacy_request_hash(&submission))
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let replay =
+        database.inbox().create_ingest(IngestSubmission::try_new(input).unwrap()).await.unwrap();
+    assert_eq!(replay.ingest.id, created.ingest.id);
+    assert!(!replay.created);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

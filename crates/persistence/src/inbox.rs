@@ -311,6 +311,9 @@ impl InboxRepository {
         if candidate.storage_state == "ready" {
             request.transition_to(IngestStatus::Completed)?;
             request.completed_at = Some(OffsetDateTime::now_utc());
+            if request.requested_action != RequestedAction::Save {
+                insert_materialization_job(&mut transaction, request.id).await?;
+            }
         }
         request.updated_at = OffsetDateTime::now_utc();
         update_ingest_state(&mut transaction, &request).await?;
@@ -911,13 +914,18 @@ impl InboxRepository {
     ) -> Result<u64, InboxRepositoryError> {
         let now = OffsetDateTime::now_utc();
         let mut transaction = self.pool.begin().await?;
-        let updated = sqlx::query(
-            "UPDATE ingests SET state = 'completed', completed_at = $2, error_code = NULL, error_message = NULL, updated_at = $2 WHERE media_id = $1 AND EXISTS (SELECT 1 FROM media WHERE id = $1 AND storage_state = 'ready') AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
+        let updated = sqlx::query_as::<_, (Uuid, String)>(
+            "UPDATE ingests SET state = 'completed', completed_at = $2, error_code = NULL, error_message = NULL, updated_at = $2 WHERE media_id = $1 AND EXISTS (SELECT 1 FROM media WHERE id = $1 AND storage_state = 'ready') AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown'))) RETURNING id, requested_action",
         )
         .bind(media_id)
         .bind(now)
-        .execute(&mut *transaction)
+        .fetch_all(&mut *transaction)
         .await?;
+        for (ingest_id, requested_action) in &updated {
+            if requested_action != RequestedAction::Save.as_str() {
+                insert_materialization_job(&mut transaction, *ingest_id).await?;
+            }
+        }
         sqlx::query(
             "UPDATE media SET local_work_path = NULL WHERE id = $1 AND storage_state = 'ready'",
         )
@@ -926,7 +934,7 @@ impl InboxRepository {
         .await?;
         enqueue_workspace_cleanup_for_media(&mut transaction, media_id, now).await?;
         transaction.commit().await?;
-        Ok(updated.rows_affected())
+        Ok(updated.len() as u64)
     }
 
     pub async fn fail_storage_for_media(
@@ -1445,6 +1453,9 @@ async fn advance_after_media_processing(
         "ready" => {
             request.transition_to(IngestStatus::Completed)?;
             request.completed_at = Some(OffsetDateTime::now_utc());
+            if request.requested_action != RequestedAction::Save {
+                insert_materialization_job(transaction, request.id).await?;
+            }
             enqueue_workspace_cleanup(
                 transaction,
                 request.id,
@@ -1512,6 +1523,25 @@ async fn insert_inspect_job(
         stage_dedupe_key(request, &format!("ingest:{}:inspect_source:v1", request.id)),
     )
     .await
+}
+
+async fn insert_materialization_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ingest_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let job = NewJob::materialize_publication(ingest_id)
+        .dedupe_key(format!("ingest:{ingest_id}:materialize_publication:v1"));
+    sqlx::query(
+        "INSERT INTO queue.jobs (kind, payload, state, run_at, max_attempts, dedupe_key) VALUES ($1, $2, 'queued', COALESCE($3, now()), $4, $5) ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING",
+    )
+    .bind(job.job_type().as_str())
+    .bind(job.payload_json())
+    .bind(job.run_at_value())
+    .bind(job.max_attempts_value())
+    .bind(job.dedupe_key_value())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 async fn insert_probe_job(
@@ -1948,7 +1978,6 @@ impl IngestRow {
                 .map_err(InboxRepositoryError::UnknownIngestStatus)?,
             submitted_via: SubmittedVia::try_from(self.submitted_via.as_str())
                 .map_err(InboxRepositoryError::UnknownSubmittedVia)?,
-            submitted_by_admin_id: None,
             original_input: self.input_json,
             source_url: self.source_url.ok_or(InboxRepositoryError::MissingSourceUrl(self.id))?,
             page_url: self.page_url,

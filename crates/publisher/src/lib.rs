@@ -8,6 +8,8 @@ use uuid::Uuid;
 const MAX_CHANNEL_NAME_LENGTH: usize = 128;
 const MAX_REQUEST_KEY_LENGTH: usize = 255;
 pub const MAX_CAPTION_LENGTH: usize = 1_024;
+pub const MAX_REPEAT_EVIDENCE_CONFLICTS: usize = 8;
+pub const MAX_REPEAT_EVIDENCE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Channel {
@@ -164,6 +166,10 @@ pub struct Post {
     pub id: Uuid,
     pub media_id: Uuid,
     pub channel_id: Uuid,
+    pub origin_ingest_id: Option<Uuid>,
+    pub requested_action: PublicationAction,
+    pub requested_publish_at: Option<OffsetDateTime>,
+    pub repeat_evidence: Option<RepeatEvidence>,
     pub caption: Option<String>,
     pub parse_mode: Option<String>,
     pub disable_notification: bool,
@@ -191,6 +197,97 @@ pub struct NewPost {
     pub disable_notification: bool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationAction {
+    Queue,
+    PostNow,
+}
+
+impl PublicationAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::PostNow => "post_now",
+        }
+    }
+}
+
+impl TryFrom<&str> for PublicationAction {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "queue" => Ok(Self::Queue),
+            "post_now" => Ok(Self::PostNow),
+            unknown => Err(unknown.to_owned()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PublicationIntent {
+    pub action: PublicationAction,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub requested_publish_at: Option<OffsetDateTime>,
+    pub caption: Option<String>,
+}
+
+impl PublicationIntent {
+    pub fn try_new(
+        action: PublicationAction,
+        requested_publish_at: Option<OffsetDateTime>,
+        caption: Option<String>,
+    ) -> Result<Self, PublisherValidationError> {
+        if action == PublicationAction::PostNow && requested_publish_at.is_some() {
+            return Err(PublisherValidationError::PostNowTimeNotAllowed);
+        }
+        let caption =
+            caption.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
+        if let Some(caption) = &caption {
+            validate_caption(caption)?;
+        }
+        Ok(Self { action, requested_publish_at, caption })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationDecision {
+    PostNowAnyway,
+    QueueAnyway,
+    KeepExactTime,
+    Cancel,
+}
+
+impl PublicationDecision {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PostNowAnyway => "post_now_anyway",
+            Self::QueueAnyway => "queue_anyway",
+            Self::KeepExactTime => "keep_exact_time",
+            Self::Cancel => "cancel",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RepeatEvidence {
+    pub conflicts: Vec<RepeatConflict>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RepeatConflict {
+    pub post_id: Uuid,
+    pub state: PostState,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+    pub target_message_link: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostUpdate {
     pub caption: Option<Option<String>>,
@@ -206,6 +303,27 @@ pub struct PostSchedule {
     pub requested_at: OffsetDateTime,
     pub request_key: String,
     pub expected_revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostExactSchedule {
+    pub post_id: Uuid,
+    pub requested_at: OffsetDateTime,
+    pub request_key: String,
+    pub expected_revision: i64,
+}
+
+impl PostExactSchedule {
+    pub fn try_new(
+        post_id: Uuid,
+        requested_at: OffsetDateTime,
+        request_key: impl Into<String>,
+        expected_revision: i64,
+    ) -> Result<Self, PublisherValidationError> {
+        let request_key = normalize_request_key(request_key.into())?;
+        validate_expected_revision(expected_revision)?;
+        Ok(Self { post_id, requested_at, request_key, expected_revision })
+    }
 }
 
 impl PostSchedule {
@@ -253,6 +371,8 @@ pub enum PublisherValidationError {
     InvalidParseMode,
     #[error("expected revision must be non-negative")]
     InvalidExpectedRevision,
+    #[error("post-now requests must not include an explicit time")]
+    PostNowTimeNotAllowed,
 }
 
 pub fn validate_expected_revision(expected_revision: i64) -> Result<(), PublisherValidationError> {
@@ -315,5 +435,37 @@ mod tests {
             PostSchedule::try_new(Uuid::now_v7(), OffsetDateTime::now_utc(), " ", 0),
             Err(PublisherValidationError::EmptyRequestKey)
         ));
+    }
+
+    #[test]
+    fn publication_intent_normalizes_caption_and_rejects_post_now_time() {
+        let intent = PublicationIntent::try_new(
+            PublicationAction::Queue,
+            None,
+            Some(" caption ".to_owned()),
+        )
+        .expect("queue intent should be valid");
+        assert_eq!(intent.caption.as_deref(), Some("caption"));
+        assert!(matches!(
+            PublicationIntent::try_new(
+                PublicationAction::PostNow,
+                Some(OffsetDateTime::now_utc()),
+                None,
+            ),
+            Err(PublisherValidationError::PostNowTimeNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn exact_schedule_normalizes_key_and_revision() {
+        let schedule = PostExactSchedule::try_new(
+            Uuid::now_v7(),
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+            " exact ",
+            2,
+        )
+        .expect("exact schedule should be valid");
+        assert_eq!(schedule.request_key, "exact");
+        assert_eq!(schedule.expected_revision, 2);
     }
 }

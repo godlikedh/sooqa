@@ -229,6 +229,15 @@ where
     })
 }
 
+pub fn materialize_publication_handler(
+    publisher: sooqa_persistence::PublisherRepository,
+) -> HandlerFn {
+    Arc::new(move |job| {
+        let publisher = publisher.clone();
+        Box::pin(async move { materialize_publication(&publisher, job).await })
+    })
+}
+
 pub fn probe_asset_handler(
     inbox: InboxRepository,
     work_root: impl Into<std::path::PathBuf>,
@@ -1875,6 +1884,22 @@ where
     }
 }
 
+async fn materialize_publication(
+    publisher: &sooqa_persistence::PublisherRepository,
+    job: Job,
+) -> Result<(), HandlerFailure> {
+    let ingest_id = match &job.command {
+        JobCommand::MaterializePublication(payload) => payload.ingest_id,
+        _ => {
+            return Err(HandlerFailure::permanent(
+                "invalid_payload",
+                "materialize_publication handler received a different job command",
+            ));
+        }
+    };
+    publisher.materialize_ingest(ingest_id).await.map(|_| ()).map_err(map_publisher_error)
+}
+
 async fn settle_publication_transport_error<A>(
     publisher: &sooqa_persistence::PublisherRepository,
     claim: &sooqa_publisher::PublishClaim,
@@ -1954,7 +1979,8 @@ fn map_publisher_error(error: sooqa_persistence::PublisherRepositoryError) -> Ha
             HandlerFailure::retryable("database_error", message)
         }
         sooqa_persistence::PublisherRepositoryError::ChannelDisabled(_)
-        | sooqa_persistence::PublisherRepositoryError::MediaNotReady { .. } => {
+        | sooqa_persistence::PublisherRepositoryError::MediaNotReady { .. }
+        | sooqa_persistence::PublisherRepositoryError::MaterializationNotReady { .. } => {
             HandlerFailure::retryable("publication_dependency", message)
         }
         _ => HandlerFailure::permanent("publication_state", message),
