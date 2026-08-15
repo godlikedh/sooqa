@@ -18,6 +18,9 @@
     mediaPreviewUrls: new Set(),
     mediaRenderGeneration: 0,
     publication: null,
+    scheduleCursor: null,
+    scheduleItems: [],
+    scheduleEditing: new Set(),
   };
 
   const $ = (id) => document.getElementById(id);
@@ -142,6 +145,7 @@
   function lock() {
     stopIngestAutoRefresh();
     invalidateMediaPreviews();
+    discardScheduleEdits();
     state.token = "";
     try {
       writeToken("");
@@ -663,6 +667,212 @@
     renderMedia(data);
   }
 
+  function scheduleModeLabel(value) {
+    return value === "explicit" ? "Exact time" : "Cadence";
+  }
+
+  function scheduleLocalInput(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    return Number.isNaN(date.valueOf()) ? "" : localDateTimeValue(date);
+  }
+
+  function schedulePlaceholder(item) {
+    return mediaPlaceholder({ kind: item.media_kind || "media" }, "Preview on Media");
+  }
+
+  function markScheduleEditing(postId) {
+    state.scheduleEditing.add(postId);
+  }
+
+  async function scheduleMutation(item, operation) {
+    try {
+      const result = await operation();
+      state.scheduleEditing.delete(item.id);
+      await loadSchedule(null);
+      return result;
+    } catch (error) {
+      if (error instanceof UiError && error.status === 409) state.scheduleEditing.delete(item.id);
+      throw error;
+    }
+  }
+
+  function discardScheduleEdits() {
+    state.scheduleEditing.clear();
+    const notice = $("schedule-notice");
+    if (notice) notice.hidden = true;
+  }
+
+  function scheduleRevisionBody(item) {
+    return {
+      expected_revision: item.revision,
+      expected_updated_at: item.updated_at,
+    };
+  }
+
+  function scheduleIdempotencyHeaders() {
+    return { "Idempotency-Key": `admin-ui:${randomKey()}` };
+  }
+
+  function renderScheduleCard(item) {
+    const card = node("article", "schedule-card");
+    card.dataset.postId = item.id || "";
+    const visual = node("div", "media-visual schedule-visual");
+    visual.append(schedulePlaceholder(item));
+
+    const main = node("div", "schedule-main");
+    const heading = node("div", "schedule-heading");
+    heading.append(
+      node("h2", "", `${item.media_kind || "Media"} · ${formatId(item.media_id)}`),
+      node("span", "schedule-mode", scheduleModeLabel(item.schedule_mode)),
+    );
+    main.append(heading);
+
+    const statusRow = node("div", "schedule-status-row");
+    const status = node("span", "state schedule-state", item.status || "unknown");
+    status.dataset.state = item.status || "unknown";
+    statusRow.append(status, node("span", "meta", `Post ${formatId(item.id)}`));
+    if (item.channel_name) statusRow.append(node("span", "meta", item.channel_name));
+    main.append(statusRow);
+
+    const source = node("p", "media-source");
+    source.append(node("strong", "", "Canonical source: "));
+    source.append(item.source_url ? link(item.source_url, item.source_url) : node("span", "muted", "Not recorded"));
+    main.append(source);
+    const storage = node("p", "media-source");
+    storage.append(node("strong", "", "Telegram storage: "));
+    storage.append(item.storage_url ? link(item.storage_url, "Open in Telegram") : node("span", "muted", "Not ready"));
+    main.append(storage);
+
+    const timing = node("p", "schedule-timing");
+    timing.append(
+      node("strong", "", `${scheduleModeLabel(item.schedule_mode)}: `),
+      node("span", "", formatDate(item.scheduled_at)),
+    );
+    main.append(timing);
+
+    const editable = ["draft", "queued", "failed"].includes(item.status);
+    if (editable) {
+      const editor = node("form", "schedule-editor");
+      const captionLabel = node("label", "", "Public post text");
+      const caption = document.createElement("textarea");
+      caption.rows = 4;
+      caption.maxLength = 1024;
+      caption.value = item.caption || "";
+      caption.addEventListener("input", () => markScheduleEditing(item.id));
+      captionLabel.append(caption);
+
+      const timeLabel = node("label", "", "Exact future local time");
+      const timeInput = document.createElement("input");
+      timeInput.type = "datetime-local";
+      timeInput.value = item.schedule_mode === "explicit" ? scheduleLocalInput(item.scheduled_at) : "";
+      timeInput.min = localDateTimeValue(new Date(Date.now() + 60_000));
+      timeInput.addEventListener("input", () => markScheduleEditing(item.id));
+      timeLabel.append(timeInput);
+      editor.append(
+        captionLabel,
+        timeLabel,
+        node("span", "muted", "Save text separately. Setting an exact time permits collisions and bypasses cadence rules."),
+      );
+
+      const actions = node("div", "schedule-actions");
+      actions.append(
+        actionButton("Save text", async () => {
+          await scheduleMutation(item, () => api(`/api/v1/posts/${encodeURIComponent(item.id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({
+              ...scheduleRevisionBody(item),
+              caption: caption.value.trim() || null,
+            }),
+          }));
+          showToast("Public post text saved.");
+        }, "button button-small button-primary"),
+        actionButton("Clear text", async () => {
+          caption.value = "";
+          markScheduleEditing(item.id);
+          await scheduleMutation(item, () => api(`/api/v1/posts/${encodeURIComponent(item.id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({ ...scheduleRevisionBody(item), caption: null }),
+          }));
+          showToast("Public post text cleared.");
+        }, "button button-small button-secondary"),
+        actionButton("Set exact time", async () => {
+          const publishAt = localFutureTimeToIso(timeInput.value);
+          await scheduleMutation(item, () => api(`/api/v1/posts/${encodeURIComponent(item.id)}/schedule-exact`, {
+            method: "POST",
+            headers: scheduleIdempotencyHeaders(),
+            body: JSON.stringify({ publish_at: publishAt, expected_revision: item.revision }),
+          }));
+          showToast("Exact publication time saved.");
+        }, "button button-small button-secondary"),
+        actionButton("Post now", async () => {
+          await scheduleMutation(item, () => api(`/api/v1/posts/${encodeURIComponent(item.id)}/publish`, {
+            method: "POST",
+            headers: scheduleIdempotencyHeaders(),
+            body: JSON.stringify({ expected_revision: item.revision }),
+          }));
+          showToast("Post now requested.");
+        }, "button button-small button-primary"),
+        actionButton("Remove", async () => {
+          await scheduleMutation(item, () => api(`/api/v1/posts/${encodeURIComponent(item.id)}/cancel`, {
+            method: "POST",
+            body: JSON.stringify({ expected_revision: item.revision }),
+          }));
+          showToast("Scheduled post removed; media was kept.");
+        }, "button button-small button-danger"),
+      );
+      editor.append(actions);
+      main.append(editor);
+    } else {
+      const caption = node("p", "schedule-caption", item.caption || "No public post text.");
+      main.append(caption, node("p", "schedule-readonly", "Read-only while this send state is not safely reversible."));
+    }
+
+    card.append(visual, main);
+    return card;
+  }
+
+  function renderSchedule(data) {
+    const items = (data.items || []).filter((item) => !["published", "cancelled"].includes(item.status));
+    const list = $("schedule-list");
+    state.scheduleItems = items;
+    state.scheduleCursor = data.next_cursor || null;
+    const existingCards = new Map(
+      [...list.children]
+        .filter((child) => child.dataset.postId)
+        .map((child) => [child.dataset.postId, child]),
+    );
+    clear(list);
+    if (!items.length) {
+      list.append(node("p", "empty-state", "No unpublished schedule work."));
+    } else {
+      for (const item of items) {
+        const existingCard = existingCards.get(item.id);
+        if (existingCard && state.scheduleEditing.has(item.id)) {
+          list.append(existingCard);
+        } else {
+          state.scheduleEditing.delete(item.id);
+          list.append(renderScheduleCard(item));
+        }
+      }
+    }
+    for (const postId of state.scheduleEditing) {
+      if (!items.some((item) => item.id === postId)) state.scheduleEditing.delete(postId);
+    }
+    const notice = $("schedule-notice");
+    const preservedEdit = items.some((item) => state.scheduleEditing.has(item.id));
+    notice.textContent = "Schedule refreshed without replacing active forms. Save their edits or leave the page to reload them.";
+    notice.hidden = !preservedEdit;
+    $("schedule-next").hidden = !state.scheduleCursor;
+  }
+
+  async function loadSchedule(cursor) {
+    let path = "/api/v1/posts?limit=50";
+    if (cursor) path += `&cursor=${encodeURIComponent(cursor)}`;
+    const data = await api(path);
+    renderSchedule(data);
+  }
+
   function localDateTimeValue(date) {
     const pad = (value) => String(value).padStart(2, "0");
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
@@ -816,7 +1026,9 @@
     stopIngestAutoRefresh();
     if (state.page === "media") invalidateMediaPreviews();
     const requested = window.location.hash.slice(1);
-    state.page = PAGE_NAMES.has(requested) ? requested : "dashboard";
+    const nextPage = PAGE_NAMES.has(requested) ? requested : "dashboard";
+    if (state.page === "schedule" && nextPage !== "schedule") discardScheduleEdits();
+    state.page = nextPage;
     for (const page of document.querySelectorAll("[data-page]")) page.hidden = page.dataset.page !== state.page;
     for (const navigation of document.querySelectorAll("[data-page-link]")) navigation.classList.toggle("active", navigation.dataset.pageLink === state.page);
     if (!state.token) {
@@ -831,6 +1043,7 @@
         $("media-search").value = state.mediaQuery;
         await loadMedia(null);
       }
+      if (state.page === "schedule") await loadSchedule(null);
       if (state.page === "settings") await loadSettings();
     } catch (error) {
       showToast(error instanceof Error ? error.message : "The page could not be loaded.", true);
@@ -877,6 +1090,15 @@
     const cursor = state.mediaCursor;
     if (cursor) void withBusy(event.currentTarget, () => loadMedia(cursor));
   });
+  $("schedule-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, () => loadSchedule(null)); });
+  $("schedule-next").addEventListener("click", (event) => {
+    if (state.scheduleEditing.size) {
+      showToast("Save active schedule edits before opening another page.", true);
+      return;
+    }
+    const cursor = state.scheduleCursor;
+    if (cursor) void withBusy(event.currentTarget, () => loadSchedule(cursor));
+  });
   $("settings-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, loadSettings); });
   $("settings-form").addEventListener("submit", (event) => { void saveSettings(event); });
   $("publication-form").addEventListener("submit", (event) => { void submitPublicationDialog(event); });
@@ -885,6 +1107,7 @@
   window.addEventListener("pagehide", () => {
     stopIngestAutoRefresh();
     invalidateMediaPreviews();
+    discardScheduleEdits();
   });
 
   setAuthView(Boolean(state.token));

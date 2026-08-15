@@ -367,8 +367,12 @@ separate service is part of the deployment. The page stores the configured
 bearer token only in browser `sessionStorage`, calls same-origin API routes,
 and uses a restrictive asset CSP. It renders backend strings through DOM text
 nodes and uses the existing API/repository fences for duplicate, publication,
-and channel decisions. Schedule navigation is intentionally left to its later
-slice. The Media slice uses the same API boundary for bounded
+and channel decisions. Schedule uses the same bounded API boundary for
+chronological unpublished post read models, public-caption edits, exact future
+times, Post now, and cancellation; its revision-fenced commands never make
+the browser a scheduling authority. Sending and unknown rows are exposed as
+read-only because their external outcome is ambiguous. The Media slice uses
+the same API boundary for bounded
 50-row catalogue pages, exact lookup, complete metadata edits, caption-sync
 retry, authenticated preview bytes, and publication intents; it does not add a
 browser-side media or scheduling authority.

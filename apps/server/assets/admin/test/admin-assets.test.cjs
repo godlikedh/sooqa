@@ -17,6 +17,7 @@ test("admin shell uses local assets and has no inline executable content", () =>
   assert.match(html, /id="dashboard-page"/);
   assert.match(html, /id="ingests-page"/);
   assert.match(html, /id="media-page"/);
+  assert.match(html, /id="schedule-page"/);
   assert.match(html, /id="settings-page"/);
   assert.match(html, /id="publication-dialog"/);
 });
@@ -40,6 +41,9 @@ test("admin client keeps the token in session storage and renders backend text s
   assert.match(script, /localFutureTimeToIso/);
   assert.match(script, /caption-sync\/retry/);
   assert.match(script, /publication-intent/);
+  assert.match(script, /schedule-exact/);
+  assert.match(script, /scheduleEditing/);
+  assert.match(script, /posts\?limit=50/);
   assert.match(html, /<th>ID<\/th>/);
   assert.match(html, /colspan="7"/);
 });
@@ -219,6 +223,8 @@ function makeAdminDocument() {
     ["button", "ingests-next"], ["button", "media-refresh"], ["form", "media-search-form"],
     ["input", "media-search"], ["button", "media-search-button"], ["button", "media-clear-search"],
     ["div", "media-status"], ["div", "media-grid"], ["button", "media-next"],
+    ["button", "schedule-refresh"], ["div", "schedule-notice"], ["div", "schedule-list"],
+    ["button", "schedule-next"],
     ["button", "settings-refresh"], ["form", "settings-form"],
     ["input", "channel-id"], ["input", "channel-updated-at"], ["input", "channel-name"],
     ["input", "channel-chat-id"], ["input", "channel-time-zone"], ["input", "channel-window-start"],
@@ -555,4 +561,227 @@ test("admin runtime keeps media lookup, preview fetches, edits, retry, and publi
   runtime.dispatchWindow("hashchange");
   await settle();
   assert.equal(runtime.objectUrls.size, 0);
+});
+
+test("admin runtime keeps schedule forms editable across refresh and fences every mutation", async () => {
+  const calls = [];
+  let caption = "queued text";
+  let requestedPublishAt = null;
+  let scheduleMode = "cadence";
+  let scheduledAt = "2030-01-01T01:02:03Z";
+  let revision = 3;
+  let updatedAt = "2026-01-01T00:00:00Z";
+  let removed = false;
+  const item = () => ({
+    id: "post-1", media_id: "media-1", channel_id: "channel-1", status: removed ? "cancelled" : "queued",
+    requested_action: "queue", requested_publish_at: requestedPublishAt, schedule_mode: scheduleMode,
+    scheduled_at: scheduledAt, caption,
+    revision, updated_at: updatedAt, media_kind: "video", channel_name: "Main",
+    source_url: "https://example.test/clip.webm", storage_url: "https://t.me/c/1/2",
+  });
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (pathName, options) => {
+      calls.push({ pathName, options });
+      if (pathName === "/api/v1/posts?limit=50") return jsonResponse({ items: removed ? [] : [item()], next_cursor: null });
+      if (pathName === "/api/v1/posts/post-1" && options.method === "PATCH") {
+        const body = JSON.parse(options.body);
+        caption = body.caption;
+        revision += 1;
+        updatedAt = `2026-01-01T00:00:0${revision}Z`;
+        return jsonResponse(item());
+      }
+      if (pathName === "/api/v1/posts/post-1/schedule-exact") {
+        const body = JSON.parse(options.body);
+        requestedPublishAt = body.publish_at;
+        scheduledAt = body.publish_at;
+        scheduleMode = "explicit";
+        revision += 1;
+        updatedAt = `2026-01-01T00:00:0${revision}Z`;
+        return jsonResponse(item());
+      }
+      if (pathName === "/api/v1/posts/post-1/publish") {
+        scheduledAt = "2030-03-03T03:04:05Z";
+        scheduleMode = "explicit";
+        revision += 1;
+        return jsonResponse(item());
+      }
+      if (pathName === "/api/v1/posts/post-1/cancel") {
+        removed = true;
+        return jsonResponse({ ...item(), status: "cancelled" });
+      }
+      return jsonResponse({ counts: {}, attention: {} });
+    },
+  });
+  await settle();
+  runtime.window.location.hash = "#schedule";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+
+  const list = runtime.document.getElementById("schedule-list");
+  assert.match(list.textContent, /queued/);
+  assert.match(list.textContent, /Cadence/);
+  assert.match(list.textContent, /Open in Telegram/);
+  const card = list.querySelector("article");
+  const captionInput = card.querySelectorAll("textarea")[0];
+  captionInput.value = "locally edited";
+  captionInput.dispatchEvent({ type: "input" });
+  runtime.document.getElementById("schedule-refresh").dispatchEvent({ type: "click" });
+  await settle();
+  assert.equal(captionInput.value, "locally edited");
+  assert.equal(runtime.document.getElementById("schedule-notice").hidden, false);
+
+  buttonWithText(card, "Save text").dispatchEvent({ type: "click" });
+  await settle();
+  const save = calls.find(({ pathName, options }) => pathName === "/api/v1/posts/post-1" && options.method === "PATCH");
+  assert.deepEqual(JSON.parse(save.options.body), {
+    expected_revision: 3,
+    expected_updated_at: "2026-01-01T00:00:00Z",
+    caption: "locally edited",
+  });
+  assert.equal(list.querySelector("article").querySelectorAll("textarea")[0].value, "locally edited");
+
+  const refreshedCard = list.querySelector("article");
+  buttonWithText(refreshedCard, "Clear text").dispatchEvent({ type: "click" });
+  await settle();
+  const clearCall = calls.filter(({ pathName, options }) => pathName === "/api/v1/posts/post-1" && options.method === "PATCH").at(-1);
+  assert.equal(JSON.parse(clearCall.options.body).caption, null);
+
+  const exactCard = list.querySelector("article");
+  const timeInput = exactCard.querySelectorAll("input")[0];
+  const future = new Date(Date.now() + 3_600_000);
+  const pad = (value) => String(value).padStart(2, "0");
+  timeInput.value = `${future.getFullYear()}-${pad(future.getMonth() + 1)}-${pad(future.getDate())}T${pad(future.getHours())}:${pad(future.getMinutes())}`;
+  buttonWithText(exactCard, "Set exact time").dispatchEvent({ type: "click" });
+  await settle();
+  const exact = calls.find(({ pathName }) => pathName.endsWith("/schedule-exact"));
+  const exactBody = JSON.parse(exact.options.body);
+  assert.equal(exactBody.expected_revision, 5);
+  assert.equal(exact.options.headers.get("Idempotency-Key").startsWith("admin-ui:"), true);
+  assert.equal(exactBody.publish_at, new Date(timeInput.value).toISOString());
+  assert.match(list.textContent, /Exact time/);
+
+  const pastCard = list.querySelector("article");
+  pastCard.querySelectorAll("input")[0].value = "2000-01-01T00:00";
+  buttonWithText(pastCard, "Set exact time").dispatchEvent({ type: "click" });
+  await settle();
+  assert.equal(calls.filter(({ pathName }) => pathName.endsWith("/schedule-exact")).length, 1);
+  assert.match(runtime.document.getElementById("toast").textContent, /future local time/);
+
+  buttonWithText(pastCard, "Post now").dispatchEvent({ type: "click" });
+  await settle();
+  const publish = calls.find(({ pathName }) => pathName.endsWith("/publish"));
+  assert.deepEqual(JSON.parse(publish.options.body), { expected_revision: 6 });
+  assert.equal(publish.options.headers.get("Idempotency-Key").startsWith("admin-ui:"), true);
+
+  const removeCard = list.querySelector("article");
+  buttonWithText(removeCard, "Remove").dispatchEvent({ type: "click" });
+  await settle();
+  assert.equal(calls.some(({ pathName }) => pathName.endsWith("/cancel")), true);
+  assert.match(list.textContent, /No unpublished schedule work/);
+});
+
+test("admin runtime leaves sending and unknown schedule rows read-only", async () => {
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (pathName) => {
+      if (pathName === "/api/v1/posts?limit=50") {
+        return jsonResponse({ items: [{
+          id: "post-unknown", media_id: "media-1", status: "unknown", schedule_mode: "explicit",
+          scheduled_at: "2026-01-01T00:00:00Z", requested_publish_at: "2026-01-01T00:00:00Z",
+          caption: "Do not resend", media_kind: "video", storage_url: "https://t.me/c/1/2",
+        }], next_cursor: null });
+      }
+      return jsonResponse({ counts: {}, attention: {} });
+    },
+  });
+  await settle();
+  runtime.window.location.hash = "#schedule";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+  const card = runtime.document.getElementById("schedule-list").querySelector("article");
+  assert.equal(card.querySelectorAll("textarea").length, 0);
+  assert.equal(buttonWithText(card, "Post now"), undefined);
+  assert.equal(buttonWithText(card, "Remove"), undefined);
+  assert.match(card.textContent, /not safely reversible/);
+});
+
+test("admin runtime discards schedule edits when leaving and re-entering the route", async () => {
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (pathName) => pathName === "/api/v1/posts?limit=50"
+      ? jsonResponse({ items: [{
+        id: "post-route", media_id: "media-1", status: "queued", schedule_mode: "cadence",
+        scheduled_at: "2030-01-01T01:02:03Z", caption: "server text", media_kind: "video",
+      }], next_cursor: null })
+      : jsonResponse({ counts: {}, attention: {} }),
+  });
+  await settle();
+  runtime.window.location.hash = "#schedule";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+  const card = runtime.document.getElementById("schedule-list").querySelector("article");
+  const caption = card.querySelectorAll("textarea")[0];
+  caption.value = "discard me";
+  caption.dispatchEvent({ type: "input" });
+
+  runtime.window.location.hash = "#dashboard";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+  runtime.window.location.hash = "#schedule";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+
+  const reentered = runtime.document.getElementById("schedule-list").querySelector("article");
+  assert.equal(reentered.querySelectorAll("textarea")[0].value, "server text");
+  assert.equal(runtime.document.getElementById("schedule-notice").hidden, true);
+});
+
+test("admin runtime reconciles a stale schedule card without losing another dirty form", async () => {
+  const calls = [];
+  let firstCaption = "server one";
+  const secondCaption = "server two";
+  const posts = () => [
+    {
+      id: "post-one", media_id: "media-1", status: "queued", schedule_mode: "cadence",
+      scheduled_at: "2030-01-01T01:02:03Z", caption: firstCaption, revision: 4,
+      updated_at: "2030-01-01T00:00:04Z", media_kind: "video",
+    },
+    {
+      id: "post-two", media_id: "media-2", status: "queued", schedule_mode: "cadence",
+      scheduled_at: "2030-01-02T01:02:03Z", caption: secondCaption, revision: 8,
+      updated_at: "2030-01-02T00:00:08Z", media_kind: "video",
+    },
+  ];
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (pathName, options) => {
+      calls.push({ pathName, options });
+      if (pathName === "/api/v1/posts?limit=50") return jsonResponse({ items: posts(), next_cursor: null });
+      if (pathName === "/api/v1/posts/post-one" && options.method === "PATCH") {
+        firstCaption = "fresh server one";
+        return jsonResponse({ error: { message: "stale" } }, 409);
+      }
+      return jsonResponse({ counts: {}, attention: {} });
+    },
+  });
+  await settle();
+  runtime.window.location.hash = "#schedule";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+
+  const list = runtime.document.getElementById("schedule-list");
+  const cards = list.querySelectorAll("article");
+  cards[0].querySelectorAll("textarea")[0].value = "local one";
+  cards[0].querySelectorAll("textarea")[0].dispatchEvent({ type: "input" });
+  cards[1].querySelectorAll("textarea")[0].value = "local two";
+  cards[1].querySelectorAll("textarea")[0].dispatchEvent({ type: "input" });
+  buttonWithText(cards[0], "Save text").dispatchEvent({ type: "click" });
+  await settle();
+
+  const reconciled = list.querySelectorAll("article");
+  assert.equal(reconciled[0].querySelectorAll("textarea")[0].value, "fresh server one");
+  assert.equal(reconciled[1].querySelectorAll("textarea")[0].value, "local two");
+  assert.equal(runtime.document.getElementById("schedule-notice").hidden, false);
+  assert.equal(calls.filter(({ pathName }) => pathName === "/api/v1/posts?limit=50").length, 2);
 });
