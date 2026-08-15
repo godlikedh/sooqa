@@ -193,8 +193,14 @@ instant that the later materializer will keep outside cadence/window rules.
 The Inbox validates action/time combinations before insertion and includes all
 source, metadata, and intent fields in the existing `input_key` request hash.
 The intent is carried through duplicate review, force-save, retries, and
-terminal ingest states. This slice only records the request: it does not
-insert a `posts` row or a publication job.
+terminal ingest states. When storage becomes ready, Inbox atomically enqueues
+one typed `materialize_publication` job for every non-save ingest. The worker's
+database-only materializer locks the completed ingest, ready media, and
+captured channel snapshot, then creates at most one post through the same
+Publisher intent path. Save-only ingests create neither a post nor this job.
+Repeat conflicts become bounded evidence on a draft; a revision-fenced decision
+then approves once, keeps the exact requested instant, queues normally, or
+cancels while retaining the media.
 
 When storage is durably ready, the storage transition, linked-ingest
 completion, `local_work_path = NULL`, and cleanup enqueue commit together. A
@@ -264,13 +270,14 @@ state transition.
 Channels hold only target identity, enablement, timezone, window, and interval.
 Posts hold the intended message and the latest send result. A scheduled post
 is a query over `posts.state = 'queued'`; normal scheduling assigns
-`cadence_slot_at` and enqueues one fixed-dedupe `publish_post` job referencing
-the post ID. Publication mutations lock the channel first and then the
-affected post/job rows in a stable order. `posts.revision` is copied into the
-job payload, so a stale claim cannot send after an edit or publish-now
-operation. All post/job changes commit without Telegram I/O; exact future
-scheduling and other web-admin editing commands are added by later bounded
-slices without restoring the removed Telegram reorder/swap surface.
+`cadence_slot_at`, while exact/manual scheduling stores the requested future
+`scheduled_at` with `cadence_slot_at = NULL` and permits collisions. Both paths
+enqueue one fixed-dedupe `publish_post` job referencing the post ID.
+Publication mutations lock the channel first and then the affected post/job
+rows in a stable order. `posts.revision` is copied into the job payload, so a
+stale claim cannot send after an edit or publish-now operation. All post/job
+changes commit without Telegram I/O; exact scheduling changes only the
+selected post and never restores the removed Telegram reorder/swap surface.
 Send generation and token fence retries, while `unknown` preserves an
 ambiguous Telegram outcome for explicit reconciliation. `publish now` changes
 only the job due time and leaves the cadence slot intact.

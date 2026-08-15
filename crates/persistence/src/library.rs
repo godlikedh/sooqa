@@ -1110,12 +1110,29 @@ async fn complete_linked_ingests_for_storage(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     media_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE ingests SET state = 'completed', error_code = NULL, error_message = NULL, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
+    let updated = sqlx::query_as::<_, (Uuid, String)>(
+        "UPDATE ingests SET state = 'completed', error_code = NULL, error_message = NULL, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown'))) RETURNING id, requested_action",
     )
     .bind(media_id)
-    .execute(&mut **transaction)
+    .fetch_all(&mut **transaction)
     .await?;
+    for (ingest_id, requested_action) in updated {
+        if requested_action == "save" {
+            continue;
+        }
+        let job = NewJob::materialize_publication(ingest_id)
+            .dedupe_key(format!("ingest:{ingest_id}:materialize_publication:v1"));
+        sqlx::query(
+            "INSERT INTO queue.jobs (kind, payload, state, run_at, max_attempts, dedupe_key) VALUES ($1, $2, 'queued', COALESCE($3, now()), $4, $5) ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING",
+        )
+        .bind(job.job_type().as_str())
+        .bind(job.payload_json())
+        .bind(job.run_at_value())
+        .bind(job.max_attempts_value())
+        .bind(job.dedupe_key_value())
+        .execute(&mut **transaction)
+        .await?;
+    }
     Ok(())
 }
 
