@@ -528,6 +528,9 @@ impl PublisherRepository {
         if state != PostState::Draft {
             return Err(PublisherRepositoryError::PostDecisionNotAllowed { id, state });
         }
+        if current.repeat_evidence.is_none() {
+            return Err(PublisherRepositoryError::PostDecisionNotAllowed { id, state });
+        }
         check_expected_revision(&current, expected_revision)?;
         let action =
             PublicationAction::try_from(current.requested_action.as_str()).map_err(|_| {
@@ -647,7 +650,7 @@ impl PublisherRepository {
         let now = OffsetDateTime::now_utc();
         let revision = next_revision(current.revision)?;
         let row = sqlx::query_as::<_, PostRow>(
-            "UPDATE posts SET schedule_request_key = $2, schedule_request_hash = $3, state = 'queued', scheduled_at = $4, revision = $5, error_class = NULL, error_message = NULL, updated_at = now() WHERE id = $1 AND state IN ('draft', 'queued', 'failed') RETURNING *",
+            "UPDATE posts SET schedule_request_key = $2, schedule_request_hash = $3, state = 'queued', scheduled_at = $4, cadence_slot_at = NULL, revision = $5, error_class = NULL, error_message = NULL, updated_at = now() WHERE id = $1 AND state IN ('draft', 'queued', 'failed') RETURNING *",
         )
         .bind(id)
         .bind(&operation_key)
