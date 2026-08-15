@@ -600,13 +600,6 @@ test("admin runtime keeps schedule forms editable across refresh and fences ever
         updatedAt = `2026-01-01T00:00:0${revision}Z`;
         return jsonResponse(item());
       }
-      if (pathName === "/api/v1/posts/post-1/schedule") {
-        scheduledAt = "2030-02-02T02:03:04Z";
-        scheduleMode = "cadence";
-        revision += 1;
-        updatedAt = `2026-01-01T00:00:0${revision}Z`;
-        return jsonResponse(item());
-      }
       if (pathName === "/api/v1/posts/post-1/publish") {
         scheduledAt = "2030-03-03T03:04:05Z";
         scheduleMode = "explicit";
@@ -668,12 +661,6 @@ test("admin runtime keeps schedule forms editable across refresh and fences ever
   assert.equal(exactBody.publish_at, new Date(timeInput.value).toISOString());
   assert.match(list.textContent, /Exact time/);
 
-  const cadenceCard = list.querySelector("article");
-  buttonWithText(cadenceCard, "Queue normally").dispatchEvent({ type: "click" });
-  await settle();
-  assert.match(list.textContent, /Cadence/);
-  assert.match(list.textContent, /2030/);
-  assert.equal(list.querySelector("article").querySelectorAll("input")[0].value, "");
   const pastCard = list.querySelector("article");
   pastCard.querySelectorAll("input")[0].value = "2000-01-01T00:00";
   buttonWithText(pastCard, "Set exact time").dispatchEvent({ type: "click" });
@@ -684,7 +671,7 @@ test("admin runtime keeps schedule forms editable across refresh and fences ever
   buttonWithText(pastCard, "Post now").dispatchEvent({ type: "click" });
   await settle();
   const publish = calls.find(({ pathName }) => pathName.endsWith("/publish"));
-  assert.deepEqual(JSON.parse(publish.options.body), { expected_revision: 7 });
+  assert.deepEqual(JSON.parse(publish.options.body), { expected_revision: 6 });
   assert.equal(publish.options.headers.get("Idempotency-Key").startsWith("admin-ui:"), true);
 
   const removeCard = list.querySelector("article");

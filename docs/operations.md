@@ -78,14 +78,13 @@ Schedule loads `GET /api/v1/posts?limit=50` in scheduled-time/UUID order and
 does not request publication history. Cadence rows are marked separately from
 explicit-time rows. Draft, queued, and failed cards may patch only the public
 caption, cancel the post, request immediate publication, or call
-`/schedule-exact` with a future browser-local instant. It can also call
-`/schedule` without `publish_at` to return an exact-time row to normal cadence.
-Exact scheduling writes only the selected post, allows collisions, bypasses
-cadence/window rules, and leaves other posts untouched. Sending and unknown
-rows remain visible but read-only. Each mutation includes the current post
-revision; a conflict clears the stale item and reloads it while preserving
-other dirty cards, and a first-page refresh leaves each actively edited form
-in place. Leaving Schedule discards unsaved forms.
+`/schedule-exact` with a future browser-local instant. Exact scheduling writes
+only the selected post, allows collisions, bypasses cadence/window rules, and
+leaves other posts untouched. Sending and unknown rows remain visible but
+read-only. Each mutation includes the current post revision; a conflict clears
+the stale item and reloads it while preserving other dirty cards, and a
+first-page refresh leaves each actively edited form in place. Leaving Schedule
+discards unsaved forms.
 
 The server emits the admin HTML, CSS, and JavaScript from the binary, so no
 Node process, frontend service, CDN, or asset volume is required. Keep `/admin`

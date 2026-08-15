@@ -796,14 +796,6 @@
           }));
           showToast("Public post text cleared.");
         }, "button button-small button-secondary"),
-        actionButton("Queue normally", async () => {
-          await scheduleMutation(item, () => api(`/api/v1/posts/${encodeURIComponent(item.id)}/schedule`, {
-            method: "POST",
-            headers: scheduleIdempotencyHeaders(),
-            body: JSON.stringify({ expected_revision: item.revision }),
-          }));
-          showToast("Post returned to the normal cadence.");
-        }, "button button-small button-secondary"),
         actionButton("Set exact time", async () => {
           const publishAt = localFutureTimeToIso(timeInput.value);
           await scheduleMutation(item, () => api(`/api/v1/posts/${encodeURIComponent(item.id)}/schedule-exact`, {
