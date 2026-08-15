@@ -15,6 +15,10 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 async fn stored_media(database: &Database) -> Uuid {
+    let digest_seed = Uuid::new_v4();
+    let mut digest = Vec::with_capacity(32);
+    digest.extend_from_slice(digest_seed.as_bytes());
+    digest.extend_from_slice(digest_seed.as_bytes());
     let media = database
         .library()
         .resolve_media(MediaIngest {
@@ -30,7 +34,7 @@ async fn stored_media(database: &Database) -> Uuid {
                 duration_ms: Some(1),
                 bit_rate: None,
                 file_size_bytes: Some(1),
-                sha256: Some(vec![Uuid::new_v4().as_bytes()[0]; 32]),
+                sha256: Some(digest),
                 local_work_path: None,
                 preview: None,
             },

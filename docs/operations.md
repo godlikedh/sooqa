@@ -315,14 +315,19 @@ Install `userscripts/sooqa-2ch-save.user.js` in Tampermonkey. Its stable
 `main` branch, while the script's incremented `@version` lets Tampermonkey
 detect later releases.
 It is matched only to `https://2ch.su/*`, `https://2ch.org/*`, and
-`https://2ch.life/*`, discovers direct `.mp4`/`.webm` links and media nodes, and
-observes dynamically added posts. The first run asks for the local token and
+`https://2ch.life/*`, discovers direct `.mp4`/`.webm` links and media nodes
+inside real `.post` attachment areas, and observes dynamically added posts.
+Arbitrary page-level media and 2ch's generated fullscreen viewer are ignored.
+The first run asks for the local token and
 stores it in Tampermonkey's private storage. It never receives or stores the
 backend token. Each media preview gets `Post now`, `Post now…`, `Queue`,
 `Queue…`, `Save`, and `Save…` actions. Detailed actions collect only their
 documented metadata: internal tags/description, optional public post text, and
 the required browser-local exact time for `Queue…`; exact time is converted to
-an RFC3339 instant before submission.
+an RFC3339 instant before submission. Their modal layout is userscript-owned so
+board CSS cannot make the form unusable; if native modal opening or focus fails,
+the existing prompt fallback is used. Cancel, Escape, and submission are
+one-shot exits that restore the action buttons.
 Native `figure.post__image` filename/preview pairs are treated as one
 attachment, so galleries retain their existing preview structure while rows
 are added around each item.
