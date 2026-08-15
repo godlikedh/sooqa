@@ -23,8 +23,10 @@ const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
 const DEFAULT_FFPROBE_PATH: &str = "ffprobe";
 const DEFAULT_YTDLP_PATH: &str = "yt-dlp";
 const DEFAULT_YTDLP_FORMAT: &str = "bestvideo*+bestaudio/best";
+const DEFAULT_YTDLP_POT_PROVIDER_URL: &str = "http://127.0.0.1:4416";
 const MAX_YTDLP_ALLOWED_HOSTS: usize = 32;
 const MAX_YTDLP_ALLOWED_HOST_LENGTH: usize = 253;
+const MAX_YTDLP_POT_PROVIDER_URL_LENGTH: usize = 256;
 const DEFAULT_MEDIA_WORK_ROOT: &str = "/var/lib/sooqa/work";
 const DEFAULT_MEDIA_PROCESSING_TIMEOUT_SECONDS: u64 = 3_600;
 const MAX_MEDIA_PROCESSING_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
@@ -242,6 +244,7 @@ pub struct MediaConfig {
     pub ytdlp_path: PathBuf,
     pub ytdlp_format: String,
     pub ytdlp_allowed_hosts: Vec<String>,
+    pub ytdlp_pot_provider_url: String,
     pub processing_timeout_seconds: u64,
     pub source_download_max_bytes: u64,
     pub normalized_storage_max_bytes: u64,
@@ -399,6 +402,12 @@ impl AppConfig {
                     "media.ytdlp_allowed_hosts",
                     raw.media.ytdlp_allowed_hosts,
                 )?,
+                ytdlp_pot_provider_url: parse_ytdlp_pot_provider_url(
+                    "media.ytdlp_pot_provider_url",
+                    raw.media
+                        .ytdlp_pot_provider_url
+                        .unwrap_or_else(|| DEFAULT_YTDLP_POT_PROVIDER_URL.to_owned()),
+                )?,
                 processing_timeout_seconds: raw
                     .media
                     .processing_timeout_seconds
@@ -467,7 +476,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.ytdlp_allowed_hosts={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} companion.listen_address={} companion.request_body_limit_bytes={} companion.request_timeout_seconds={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.ytdlp_allowed_hosts={} media.ytdlp_pot_provider_url={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} companion.listen_address={} companion.request_body_limit_bytes={} companion.request_timeout_seconds={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -481,6 +490,7 @@ impl AppConfig {
             self.media.ytdlp_path.display(),
             self.media.ytdlp_format,
             self.media.ytdlp_allowed_hosts.join(","),
+            self.media.ytdlp_pot_provider_url,
             self.media.processing_timeout_seconds,
             self.media.source_download_max_bytes,
             self.media.normalized_storage_max_bytes,
@@ -544,6 +554,10 @@ impl AppConfig {
             };
             self.media.ytdlp_allowed_hosts =
                 parse_ytdlp_allowed_hosts("SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS", values)?;
+        }
+        if let Some(value) = optional_env_string("SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL")? {
+            self.media.ytdlp_pot_provider_url =
+                parse_ytdlp_pot_provider_url("SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL", value)?;
         }
         if let Some(value) = optional_env_string("SOOQA_MEDIA_PROCESSING_TIMEOUT_SECONDS")? {
             self.media.processing_timeout_seconds =
@@ -808,6 +822,10 @@ impl AppConfig {
             "media.ytdlp_allowed_hosts",
             self.media.ytdlp_allowed_hosts.clone(),
         )?;
+        parse_ytdlp_pot_provider_url(
+            "media.ytdlp_pot_provider_url",
+            self.media.ytdlp_pot_provider_url.clone(),
+        )?;
         if self.telegram.storage_chat_id.is_some_and(|id| id >= 0) {
             return Err(ConfigError::InvalidValue {
                 name: "telegram.storage_chat_id".to_owned(),
@@ -914,6 +932,7 @@ struct RawMediaConfig {
     ytdlp_path: Option<String>,
     ytdlp_format: Option<String>,
     ytdlp_allowed_hosts: Vec<String>,
+    ytdlp_pot_provider_url: Option<String>,
     processing_timeout_seconds: Option<u64>,
     source_download_max_bytes: Option<u64>,
     normalized_storage_max_bytes: Option<u64>,
@@ -1062,6 +1081,27 @@ fn parse_ytdlp_allowed_hosts(name: &str, values: Vec<String>) -> Result<Vec<Stri
     Ok(normalized)
 }
 
+fn parse_ytdlp_pot_provider_url(name: &str, value: String) -> Result<String, ConfigError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() || value.len() > MAX_YTDLP_POT_PROVIDER_URL_LENGTH {
+        return Err(ConfigError::InvalidValue {
+            name: name.to_owned(),
+            reason: "must be a bounded HTTP(S) provider origin",
+        });
+    }
+    let parsed = url::Url::parse(&value).map_err(|_| ConfigError::InvalidValue {
+        name: name.to_owned(),
+        reason: "must be a valid HTTP(S) provider URL",
+    })?;
+    if !is_safe_ytdlp_pot_provider_url(&parsed) {
+        return Err(ConfigError::InvalidValue {
+            name: name.to_owned(),
+            reason: "must be an HTTP(S) provider origin without credentials, path, query, or fragment; HTTP hosts must be private",
+        });
+    }
+    Ok(value)
+}
+
 fn parse_admin_user_ids(name: &str, value: &str) -> Result<Vec<i64>, ConfigError> {
     value
         .split(',')
@@ -1089,6 +1129,41 @@ fn is_safe_telegram_api_base_url(url: &url::Url) -> bool {
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
+    {
+        return false;
+    }
+    if url.scheme() == "https" {
+        return true;
+    }
+
+    let Some(host) = url.host_str() else { return false };
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            !address.is_unspecified()
+                && (address.is_loopback() || address.is_private() || address.is_link_local())
+        }
+        Ok(IpAddr::V6(address)) => {
+            !address.is_unspecified()
+                && (address.is_loopback()
+                    || address.is_unique_local()
+                    || address.is_unicast_link_local())
+        }
+        Err(_) => {
+            host.eq_ignore_ascii_case("localhost")
+                || !host.contains('.')
+                || host.ends_with(".local")
+        }
+    }
+}
+
+fn is_safe_ytdlp_pot_provider_url(url: &url::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
     {
         return false;
     }
@@ -1366,6 +1441,7 @@ mod tests {
         assert_eq!(config.media.ytdlp_path, PathBuf::from("yt-dlp"));
         assert_eq!(config.media.ytdlp_format, "bestvideo*+bestaudio/best");
         assert!(config.media.ytdlp_allowed_hosts.is_empty());
+        assert_eq!(config.media.ytdlp_pot_provider_url, DEFAULT_YTDLP_POT_PROVIDER_URL);
         assert_eq!(config.media.processing_timeout_seconds, 7200);
     }
 
@@ -1429,6 +1505,40 @@ mod tests {
         let error = parse_ytdlp_allowed_hosts("media.ytdlp_allowed_hosts", values)
             .expect_err("too many host entries must fail");
         assert!(error.to_string().contains("at most 32"));
+    }
+
+    #[test]
+    fn ytdlp_pot_provider_url_is_private_and_bounded() {
+        let config = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media]\nytdlp_pot_provider_url = \"http://pot-provider:4416\"\n",
+        )
+        .expect("TOML should parse");
+        assert_eq!(config.media.ytdlp_pot_provider_url, "http://pot-provider:4416");
+        assert!(config.summary().contains("media.ytdlp_pot_provider_url=http://pot-provider:4416"));
+
+        for value in [
+            "http://user:password@pot-provider:4416",
+            "http://pot-provider:4416/ping",
+            "http://pot-provider:4416?token=secret",
+            "http://provider.example:4416",
+        ] {
+            let contents = format!("[media]\nytdlp_pot_provider_url = \"{value}\"\n");
+            assert!(
+                AppConfig::from_toml_str(AppRole::Worker, None, &contents).is_err(),
+                "unsafe provider URL should fail: {value:?}"
+            );
+        }
+
+        let oversized = format!(
+            "[media]\nytdlp_pot_provider_url = \"https://{}\"\n",
+            "p".repeat(MAX_YTDLP_POT_PROVIDER_URL_LENGTH)
+        );
+        assert!(
+            AppConfig::from_toml_str(AppRole::Worker, None, &oversized).is_err(),
+            "oversized provider URL should fail"
+        );
     }
 
     #[test]

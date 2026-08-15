@@ -389,5 +389,7 @@ submitted URL remains provenance while the inspected canonical URL is
 revalidated against the same scheme, credential, port, and host rules before
 download. A specific media-byte 403 gets one fresh high-quality attempt and
 one combined progressive fallback; private, account-required, removed, and
-other extractor outcomes remain terminal. Workspaces are derived from UUIDs
-and are cleaned only in known paths.
+other extractor outcomes remain terminal. Enabled yt-dlp also requires the
+pinned bgutil plugin, a private PO-token provider health/version check, and
+explicitly disabled config, cookie, browser, netrc, and remote-component
+inputs. Workspaces are derived from UUIDs and are cleaned only in known paths.

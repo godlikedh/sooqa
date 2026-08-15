@@ -43,6 +43,27 @@ services:
       retries: 20
       start_period: 10s
 
+  pot-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider@sha256:1aaa43a0ca72dfca6a6d2129a0fb4a23465c25adb1b043f8aff829a20825646b
+    restart: unless-stopped
+    init: true
+    expose:
+      - "4416"
+    mem_limit: 512m
+    cpus: 0.50
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4416/ping', { redirect: 'error' }).then(response => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
   server:
     image: sooqa:home
     build:
@@ -63,6 +84,7 @@ services:
       SOOQA_TELEGRAM_STORAGE_CHAT_ID: ${SOOQA_TELEGRAM_STORAGE_CHAT_ID:?set SOOQA_TELEGRAM_STORAGE_CHAT_ID in deploy/home/.env}
       SOOQA_MEDIA_WORK_ROOT: /var/lib/sooqa/work
       SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS: ${SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS-youtube.com,youtu.be}
+      SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL: ${SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL:-http://pot-provider:4416}
       SOOQA_MEDIA_PROCESSING_TIMEOUT_SECONDS: ${SOOQA_MEDIA_PROCESSING_TIMEOUT_SECONDS:-3600}
       SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES: ${SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES:-8589934592}
       SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES: ${SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES:-1900000000}
