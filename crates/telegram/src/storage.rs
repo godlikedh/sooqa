@@ -722,10 +722,9 @@ mod tests {
         Media {
             id: Uuid::from_u128(1),
             kind: MediaKind::Video,
-            status: sooqa_library::MediaStatus::Active,
             title: None,
             description: None,
-            notes: None,
+            tags: Vec::new(),
             mime_type: Some("video/mp4".to_owned()),
             container: Some("mp4".to_owned()),
             video_codec: None,
@@ -740,7 +739,6 @@ mod tests {
             storage_state: MediaStorageState::Pending,
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),
-            archived_at: None,
         }
     }
 

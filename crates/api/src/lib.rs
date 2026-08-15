@@ -413,16 +413,9 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
         LibraryRepositoryError::OptimisticConflict(_) => {
             ApiError::conflict("media_changed", "The media item changed since it was read", headers)
         }
-        LibraryRepositoryError::EmptyUpdate => ApiError::bad_request(
-            "empty_update",
-            "The request must contain at least one editable field",
-            headers,
-        ),
-        LibraryRepositoryError::TagNotAttached => ApiError::not_found(
-            "tag_not_attached",
-            "The tag is not attached to the media item",
-            headers,
-        ),
+        LibraryRepositoryError::InvalidTag(_) => {
+            ApiError::bad_request("invalid_tag", "The tag is invalid", headers)
+        }
         LibraryRepositoryError::InvalidLimit { .. } => {
             ApiError::bad_request("invalid_limit", "The limit must be between 1 and 50", headers)
         }

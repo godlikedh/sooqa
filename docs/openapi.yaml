@@ -11,8 +11,6 @@ servers:
 tags:
   - name: health
     description: Process liveness.
-  - name: admin
-    description: Bounded single-admin operational views.
   - name: ingest
     description: Durable media ingestion requests.
   - name: media
@@ -22,24 +20,6 @@ tags:
   - name: posts
     description: Intended posts and publication scheduling.
 paths:
-  /api/v1/dashboard:
-    get:
-      tags: [admin]
-      operationId: getDashboard
-      summary: Read bounded dashboard counts and attention cards
-      security:
-        - bearerAuth: []
-      parameters:
-        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
-      responses:
-        '200':
-          description: Current bounded operational dashboard state.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/DashboardResponse' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '500': { $ref: '#/components/responses/InternalError' }
   /health/live:
     get:
       tags: [health]
@@ -56,24 +36,6 @@ paths:
         '400':
           description: The health request was malformed.
   /api/v1/ingests:
-    get:
-      tags: [admin]
-      operationId: listIngests
-      summary: List bounded newest-first ingest cards
-      security:
-        - bearerAuth: []
-      parameters:
-        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 50 } }
-        - { name: cursor, in: query, schema: { type: string } }
-      responses:
-        '200':
-          description: A cursor-paginated operational ingest page.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/IngestPage' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '500': { $ref: '#/components/responses/InternalError' }
     post:
       tags: [ingest]
       operationId: createIngest
@@ -186,25 +148,16 @@ paths:
     get:
       tags: [media]
       operationId: searchMedia
-      summary: List or exactly look up normalized media
+      summary: Search normalized media
       description: >-
         With no q parameter this returns newest-first bounded catalogue pages.
-        q accepts only a media UUID, ingest UUID, normalized HTTP(S) source URL, or
-        private HTTPS Telegram storage link. The three official 2ch mirror hosts
-        resolve to one source identity while stored provenance is retained. q
-        cannot be combined with tags, kind, or status catalogue filters.
+        q accepts a media or ingest UUID, a normalized HTTP(S) source URL, or a
+        private HTTPS Telegram storage link. Official 2ch mirror hosts resolve
+        to one source identity while stored provenance is retained.
       security:
         - bearerAuth: []
       parameters:
         - { name: q, in: query, description: "Exact media UUID, ingest UUID, source URL, or Telegram storage link.", schema: { type: string } }
-        - { name: tags, in: query, description: Comma-separated normalized tags., schema: { type: string } }
-        - { name: kind, in: query, schema: { $ref: '#/components/schemas/MediaKind' } }
-        - name: status
-          in: query
-          schema:
-            allOf:
-              - $ref: '#/components/schemas/MediaStatus'
-            default: active
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 50 } }
         - { name: cursor, in: query, schema: { type: string } }
       responses:
@@ -258,72 +211,11 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/media/{id}/archive:
-    post:
-      tags: [media]
-      operationId: archiveMedia
-      summary: Archive media
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/MediaId'
-      responses:
-        '200':
-          description: Archived media row.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Media' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/media/{id}/tags:
-    post:
-      tags: [media]
-      operationId: addMediaTag
-      summary: Add a normalized tag
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/MediaId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/TagRequest' }
-      responses:
-        '200':
-          description: The attached tag.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Tag' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '413': { $ref: '#/components/responses/PayloadTooLarge' }
-        '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/media/{id}/tags/{tag}:
-    delete:
-      tags: [media]
-      operationId: removeMediaTag
-      summary: Remove a normalized tag
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/MediaId'
-        - { name: tag, in: path, required: true, schema: { type: string } }
-      responses:
-        '204': { description: Tag removed. }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/channels:
     get:
       tags: [channels]
       operationId: listChannels
       summary: List configured target channels
-      description: Includes disabled channels so the settings client can re-enable them.
       security:
         - bearerAuth: []
       responses:
@@ -374,95 +266,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
-    patch:
-      tags: [channels]
-      operationId: updateChannel
-      summary: Update the single target channel settings
-      description: >-
-        Updates only the selected channel with an updated_at optimistic fence.
-        Enabling a second channel is rejected as an ambiguous publication
-        target.
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/ChannelId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/ChannelUpdateRequest' }
-      responses:
-        '200':
-          description: Updated channel settings.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Channel' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '413': { $ref: '#/components/responses/PayloadTooLarge' }
-        '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/media/{id}/publication-intent:
-    post:
-      tags: [media]
-      operationId: createMediaPublicationIntent
-      summary: Queue or publish ready media
-      description: >-
-        Creates the one intended post for a ready media item. A recent or
-        queued publication of the same media returns a draft with bounded
-        repeat evidence for a later decision.
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/MediaId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/PublicationIntentRequest' }
-      responses:
-        '200':
-          description: The intent was replayed.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Post' }
-        '201':
-          description: The publication intent was materialized.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Post' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '413': { $ref: '#/components/responses/PayloadTooLarge' }
-        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/posts:
-    get:
-      tags: [posts]
-      operationId: listPosts
-      summary: List bounded unpublished schedule work
-      description: >-
-        Orders draft, queued, sending, failed, and unknown posts by
-        scheduled_at then stable ID. Published and cancelled history is hidden
-        unless include_history is true.
-      security:
-        - bearerAuth: []
-      parameters:
-        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 50, default: 50 } }
-        - { name: cursor, in: query, schema: { type: string } }
-        - { name: include_history, in: query, schema: { type: boolean, default: false } }
-      responses:
-        '200':
-          description: A bounded schedule page.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/PostPage' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '500': { $ref: '#/components/responses/InternalError' }
     post:
       tags: [posts]
       operationId: createPost
@@ -553,67 +357,11 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/posts/{id}/schedule-exact:
-    post:
-      tags: [posts]
-      operationId: schedulePostExact
-      summary: Set one post to an explicit future instant
-      description: >-
-        Schedules only the selected post at the requested future instant. It
-        permits exact-time collisions and does not validate or move unrelated
-        cadence slots.
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/PostId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/ExactScheduleRequest' }
-      responses:
-        '202':
-          description: Post scheduled at the exact instant.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Post' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/posts/{id}/decision:
-    post:
-      tags: [posts]
-      operationId: decidePostPublication
-      summary: Resolve a repeat-publication decision
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/PostId'
-        - $ref: '#/components/parameters/IdempotencyKey'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/PublicationDecisionRequest' }
-      responses:
-        '200':
-          description: The decision was applied or replayed.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Post' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
-        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/posts/{id}/publish:
     post:
       tags: [posts]
       operationId: publishPostNow
-      summary: Request immediate publication for a post
+      summary: Queue a post for immediate publication
       security:
         - bearerAuth: []
       parameters:
@@ -623,10 +371,85 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/PostMutationRequest' }
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
       responses:
         '202':
-          description: Post accepted for immediate publication.
+          description: Post queued for immediate publication.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/posts/{id}/earlier:
+    post:
+      tags: [posts]
+      operationId: movePostEarlier
+      summary: Swap a queued post with its adjacent earlier post
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
+      responses:
+        '200':
+          description: Current post after the swap or boundary no-op.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/posts/{id}/later:
+    post:
+      tags: [posts]
+      operationId: movePostLater
+      summary: Swap a queued post with its adjacent later post
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
+      responses:
+        '200':
+          description: Current post after the swap or boundary no-op.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Post' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/posts/{id}/slot:
+    post:
+      tags: [posts]
+      operationId: setPostSlot
+      summary: Move a queued post to a valid cadence slot
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetSlotRequest' }
+      responses:
+        '200':
+          description: Current post after moving or swapping the slot.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Post' }
@@ -648,7 +471,7 @@ paths:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/PostMutationRequest' }
+            schema: { $ref: '#/components/schemas/QueueMutationRequest' }
       responses:
         '200':
           description: Cancelled post.
@@ -803,28 +626,6 @@ components:
           required: [self]
           properties:
             self: { type: string }
-    IngestPage:
-      type: object
-      required: [items]
-      properties:
-        items: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/IngestListItem' } }
-        next_cursor: { type: string, nullable: true }
-    IngestListItem:
-      type: object
-      required: [id, requested_action, status, created_at, updated_at]
-      properties:
-        id: { type: string, format: uuid }
-        source_url: { type: string, nullable: true }
-        page_url: { type: string, nullable: true }
-        requested_action: { type: string, enum: [save, queue, post_now] }
-        status: { $ref: '#/components/schemas/IngestStatus' }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-        completed_at: { type: string, format: date-time, nullable: true }
-        media_id: { type: string, format: uuid, nullable: true }
-        storage_url: { type: string, format: uri, nullable: true }
-        error_code: { type: string, nullable: true }
-        error_message: { type: string, nullable: true, maxLength: 512 }
     IngestResponse:
       allOf:
         - $ref: '#/components/schemas/IngestAcceptedResponse'
@@ -888,93 +689,18 @@ components:
         score_bps: { type: integer, minimum: 0, maximum: 10000 }
         shared_token_count: { type: integer, format: int64, minimum: 0 }
         token_overlap_bps: { type: integer, format: int64, minimum: 0, maximum: 10000 }
-    DashboardResponse:
-      type: object
-      required: [counts, attention]
-      properties:
-        counts: { $ref: '#/components/schemas/DashboardCounts' }
-        attention: { $ref: '#/components/schemas/DashboardAttention' }
-    DashboardCounts:
-      type: object
-      required: [ready_media, future_queued_posts, active_ingests, technical_jobs_queued, technical_jobs_running, technical_duplicate_decisions, publication_repeat_decisions, caption_sync_failures]
-      properties:
-        ready_media: { type: integer, format: int64, minimum: 0 }
-        future_queued_posts: { type: integer, format: int64, minimum: 0 }
-        active_ingests: { type: integer, format: int64, minimum: 0 }
-        technical_jobs_queued: { type: integer, format: int64, minimum: 0 }
-        technical_jobs_running: { type: integer, format: int64, minimum: 0 }
-        technical_duplicate_decisions: { type: integer, format: int64, minimum: 0 }
-        publication_repeat_decisions: { type: integer, format: int64, minimum: 0 }
-        caption_sync_failures: { type: integer, format: int64, minimum: 0 }
-    DashboardAttention:
-      type: object
-      required: [technical_duplicates, publication_repeats, caption_sync_failures]
-      properties:
-        technical_duplicates:
-          type: array
-          maxItems: 50
-          items: { $ref: '#/components/schemas/TechnicalDuplicateAttention' }
-        publication_repeats:
-          type: array
-          maxItems: 50
-          items: { $ref: '#/components/schemas/PublicationRepeatAttention' }
-        caption_sync_failures:
-          type: array
-          maxItems: 50
-          items: { $ref: '#/components/schemas/CaptionSyncFailureAttention' }
-    TechnicalDuplicateAttention:
-      type: object
-      required: [ingest_id, candidates]
-      properties:
-        ingest_id: { type: string, format: uuid }
-        source_url: { type: string, nullable: true }
-        candidates:
-          type: array
-          maxItems: 3
-          items: { $ref: '#/components/schemas/TechnicalDuplicateCandidate' }
-    TechnicalDuplicateCandidate:
-      type: object
-      required: [media_id, classification, score_bps, storage_state]
-      properties:
-        media_id: { type: string, format: uuid }
-        classification: { type: string, enum: [strong_duplicate, partial_match] }
-        score_bps: { type: integer, minimum: 0, maximum: 10000 }
-        storage_state: { type: string }
-        storage_url: { type: string, format: uri, nullable: true }
-    PublicationRepeatAttention:
-      type: object
-      required: [post_id, media_id, requested_action, status, revision]
-      properties:
-        post_id: { type: string, format: uuid }
-        media_id: { type: string, format: uuid }
-        requested_action: { type: string, enum: [queue, post_now] }
-        requested_publish_at: { type: string, format: date-time, nullable: true }
-        caption: { type: string, nullable: true }
-        status: { type: string, enum: [draft, queued, sending, published, unknown, failed, cancelled] }
-        repeat_evidence: { $ref: '#/components/schemas/RepeatEvidence' }
-        revision: { type: integer, format: int64, minimum: 0 }
-    CaptionSyncFailureAttention:
-      type: object
-      required: [media_id]
-      properties:
-        media_id: { type: string, format: uuid }
-        error_message: { type: string, nullable: true, maxLength: 512 }
     MediaKind:
       type: string
       enum: [video, image, animation, audio]
-    MediaStatus:
-      type: string
-      enum: [active, archived, deleted]
     Media:
       type: object
-      required: [id, kind, status, tags, created_at, updated_at]
+      required: [id, kind, tags, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         kind: { $ref: '#/components/schemas/MediaKind' }
-        status: { $ref: '#/components/schemas/MediaStatus' }
         title: { type: string, nullable: true }
         description: { type: string, nullable: true }
-        notes: { type: string, nullable: true }
+        tags: { type: array, items: { type: string, minLength: 1, maxLength: 100 } }
         storage_state: { type: string, enum: [pending_storage, ready, storage_unknown, missing], nullable: true }
         storage_url: { type: string, format: uri, nullable: true }
         source_url: { type: string, nullable: true }
@@ -990,10 +716,8 @@ components:
         bit_rate: { type: integer, format: int64, nullable: true }
         file_size_bytes: { type: integer, format: int64, nullable: true }
         sha256: { type: string, nullable: true }
-        tags: { type: array, items: { $ref: '#/components/schemas/Tag' } }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
-        archived_at: { type: string, format: date-time, nullable: true }
     MediaPage:
       type: object
       required: [items]
@@ -1002,25 +726,12 @@ components:
         next_cursor: { type: string, nullable: true }
     MediaUpdateRequest:
       type: object
+      required: [tags, description, expected_updated_at]
       additionalProperties: false
       properties:
-        title: { type: string, nullable: true }
+        tags: { type: array, items: { type: string, minLength: 1, maxLength: 100 } }
         description: { type: string, nullable: true }
-        notes: { type: string, nullable: true }
-        expected_updated_at: { type: string, format: date-time, nullable: true }
-    TagRequest:
-      type: object
-      required: [tag]
-      additionalProperties: false
-      properties:
-        tag: { type: string, minLength: 1 }
-    Tag:
-      type: object
-      required: [normalized_name, display_name, created_at]
-      properties:
-        normalized_name: { type: string }
-        display_name: { type: string }
-        created_at: { type: string, format: date-time }
+        expected_updated_at: { type: string, format: date-time }
     ChannelCreateRequest:
       type: object
       required: [name, telegram_chat_id]
@@ -1034,21 +745,6 @@ components:
         interval_minutes: { type: integer, minimum: 1, default: 30 }
         default_parse_mode: { type: string, enum: [HTML, MarkdownV2], nullable: true }
         default_disable_notification: { type: boolean, default: false }
-    ChannelUpdateRequest:
-      type: object
-      additionalProperties: false
-      required: [expected_updated_at]
-      properties:
-        name: { type: string, minLength: 1, maxLength: 128 }
-        telegram_chat_id: { type: integer, format: int64, description: Negative Telegram chat ID. }
-        is_enabled: { type: boolean }
-        time_zone: { type: string }
-        window_start: { type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$' }
-        window_end: { type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$' }
-        interval_minutes: { type: integer, minimum: 1 }
-        default_parse_mode: { type: string, enum: [HTML, MarkdownV2], nullable: true }
-        default_disable_notification: { type: boolean }
-        expected_updated_at: { type: string, format: date-time }
     Channel:
       type: object
       required: [id, name, telegram_chat_id, is_enabled, time_zone, window_start, window_end, interval_minutes, default_disable_notification, created_at, updated_at]
@@ -1079,32 +775,6 @@ components:
         channel_id: { type: string, format: uuid }
         caption: { type: string, nullable: true, maxLength: 1024 }
         parse_mode: { type: string, enum: [HTML, MarkdownV2], nullable: true }
-    PublicationIntentRequest:
-      type: object
-      required: [requested_action]
-      additionalProperties: false
-      properties:
-        requested_action: { type: string, enum: [queue, post_now] }
-        requested_publish_at:
-          type: string
-          format: date-time
-          nullable: true
-          description: Future exact instant for queue; omit for normal cadence or post_now.
-        requested_post_caption: { type: string, nullable: true, maxLength: 1024 }
-    PublicationDecisionRequest:
-      type: object
-      required: [decision, expected_revision]
-      additionalProperties: false
-      properties:
-        decision: { type: string, enum: [post_now_anyway, queue_anyway, keep_exact_time, cancel] }
-        expected_revision: { type: integer, format: int64, minimum: 0 }
-    ExactScheduleRequest:
-      type: object
-      required: [publish_at, expected_revision]
-      additionalProperties: false
-      properties:
-        publish_at: { type: string, format: date-time }
-        expected_revision: { type: integer, format: int64, minimum: 0 }
     PostUpdateRequest:
       type: object
       required: [expected_revision]
@@ -1117,55 +787,20 @@ components:
         expected_revision: { type: integer, format: int64, minimum: 0 }
     Post:
       type: object
-      required: [id, media_id, channel_id, origin_ingest_id, requested_action, requested_publish_at, repeat_evidence, disable_notification, status, scheduled_at, revision, created_at, updated_at]
+      required: [id, media_id, channel_id, disable_notification, status, scheduled_at, revision, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         media_id: { type: string, format: uuid }
         channel_id: { type: string, format: uuid }
-        origin_ingest_id: { type: string, format: uuid, nullable: true }
-        requested_action: { type: string, enum: [queue, post_now] }
-        requested_publish_at: { type: string, format: date-time, nullable: true }
-        repeat_evidence:
-          type: object
-          allOf:
-            - $ref: '#/components/schemas/RepeatEvidence'
-          nullable: true
         caption: { type: string, nullable: true }
         parse_mode: { type: string, nullable: true }
         disable_notification: { type: boolean }
         status: { type: string, enum: [draft, queued, sending, published, unknown, failed, cancelled] }
         scheduled_at: { type: string, format: date-time }
         cadence_slot_at: { type: string, format: date-time, nullable: true }
-        schedule_mode: { type: string, enum: [cadence, explicit] }
-        channel_name: { type: string, nullable: true }
-        media_kind: { type: string, nullable: true, enum: [video, image, animation, audio] }
-        source_url: { type: string, format: uri, nullable: true }
-        storage_url: { type: string, format: uri, nullable: true }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         revision: { type: integer, format: int64, minimum: 0 }
-    PostPage:
-      type: object
-      required: [items]
-      properties:
-        items: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/Post' } }
-        next_cursor: { type: string, nullable: true }
-    RepeatEvidence:
-      type: object
-      required: [conflicts]
-      properties:
-        conflicts:
-          type: array
-          maxItems: 8
-          items: { $ref: '#/components/schemas/RepeatConflict' }
-    RepeatConflict:
-      type: object
-      required: [post_id, state, at, target_message_link]
-      properties:
-        post_id: { type: string, format: uuid }
-        state: { type: string, enum: [draft, queued, sending, published, unknown, failed, cancelled] }
-        at: { type: string, format: date-time }
-        target_message_link: { type: string, nullable: true }
     ScheduleRequest:
       type: object
       required: [expected_revision]
@@ -1173,9 +808,16 @@ components:
       properties:
         publish_at: { type: string, format: date-time, nullable: true }
         expected_revision: { type: integer, format: int64, minimum: 0 }
-    PostMutationRequest:
+    QueueMutationRequest:
       type: object
       required: [expected_revision]
       additionalProperties: false
       properties:
+        expected_revision: { type: integer, format: int64, minimum: 0 }
+    SetSlotRequest:
+      type: object
+      required: [slot, expected_revision]
+      additionalProperties: false
+      properties:
+        slot: { type: string, format: date-time }
         expected_revision: { type: integer, format: int64, minimum: 0 }

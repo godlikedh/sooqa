@@ -183,6 +183,10 @@ There is no generic idempotency table and no permanent Telegram update-receipt
 table. Repeated creates may return the existing resource; updates should be
 naturally idempotent setters where possible.
 
+The administrator media list is a bounded cursor-ordered view. A media metadata
+edit replaces the complete normalized tag set and description under the media
+row's `updated_at` revision fence.
+
 Issue #44 adds the versioned `video_sequence_v1` media foundation and its
 pre-storage identity gate. Video exact SHA reuse, bounded token shortlisting,
 aligned duplicate evidence, durable `duplicate_pending`, and the authorized

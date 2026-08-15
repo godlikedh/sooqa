@@ -7,11 +7,11 @@ use sooqa_jobs::NewJob;
 use sooqa_library::{
     CaptionSyncFailure, MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, Media,
     MediaCursor, MediaDetails, MediaIngest, MediaKind, MediaLookup, MediaMetadata, MediaPage,
-    MediaSearchQuery, MediaSource, MediaSourceInput, MediaStatus, MediaStorageState, MediaSummary,
-    MediaUpdate, NewTag, SourceKind, StorageCaptionMetadata, StorageReceipt,
-    StorageUploadAttachment, StorageUploadInfo, StorageUploadReservation,
-    StorageUploadReservationRequest, StorageUploadStore, Tag, VideoDuplicateClassification,
-    VideoDuplicateEvidence, VideoDuplicateMatch, VideoIdentityOutcome,
+    MediaSearchQuery, MediaSource, MediaSourceInput, MediaStorageState, MediaSummary, MediaUpdate,
+    SourceKind, StorageCaptionMetadata, StorageReceipt, StorageUploadAttachment, StorageUploadInfo,
+    StorageUploadReservation, StorageUploadReservationRequest, StorageUploadStore,
+    TagValidationError, VideoDuplicateClassification, VideoDuplicateEvidence, VideoDuplicateMatch,
+    VideoIdentityOutcome, normalize_tag,
 };
 use sooqa_media::{
     SequenceAlignmentConfig, SequenceClassification, VideoSequenceFingerprint,
@@ -133,16 +133,14 @@ impl LibraryRepository {
     ) -> Result<Option<MediaDetails>, LibraryRepositoryError> {
         let Some(row) = self.load(id).await? else { return Ok(None) };
         let media = row.clone().into_media()?;
-        let tags = row.tags.iter().map(|tag| tag_from_name(tag, row.updated_at)).collect();
         let source = source_from_row(&row)?;
         Ok(Some(MediaDetails {
+            media,
+            source,
             storage_url: storage_message_url(
                 row.telegram_storage_chat_id,
                 row.telegram_storage_message_id,
             ),
-            media,
-            tags,
-            source,
         }))
     }
 
@@ -153,28 +151,16 @@ impl LibraryRepository {
         if !(1..=50).contains(&query.limit) {
             return Err(LibraryRepositoryError::InvalidLimit { value: query.limit });
         }
-        let text = query.text.filter(|value| !value.trim().is_empty());
-        let kind = query.kind.map(|value| value.as_str().to_owned());
-        let status = query.status.map(|value| value.as_str().to_owned());
-        let tags = (!query.tags.is_empty()).then_some(query.tags);
         let rows = sqlx::query_as::<_, MediaRow>(
             r#"
             SELECT * FROM media
-            WHERE ($1::text IS NULL OR kind = $1)
-              AND ($2::text IS NULL OR title ILIKE '%' || $2 || '%' OR description ILIKE '%' || $2 || '%')
-              AND ($3::text[] IS NULL OR tags @> $3)
-              AND ($4::timestamptz IS NULL OR (updated_at, id) < ($4, $5))
-              AND ($6::text IS NULL OR ($6 = 'active' AND source_metadata->>'archived' IS DISTINCT FROM 'true') OR ($6 = 'archived' AND source_metadata->>'archived' = 'true'))
+            WHERE ($1::timestamptz IS NULL OR (updated_at, id) < ($1, $2))
             ORDER BY updated_at DESC, id DESC
-            LIMIT $7
+            LIMIT $3
             "#,
         )
-        .bind(kind)
-        .bind(text)
-        .bind(tags)
         .bind(query.cursor.as_ref().map(|cursor| cursor.updated_at))
         .bind(query.cursor.as_ref().map(|cursor| cursor.id))
-        .bind(status)
         .bind(i64::from(query.limit) + 1)
         .fetch_all(&self.pool)
         .await?;
@@ -263,9 +249,6 @@ impl LibraryRepository {
         u64::try_from(count).map_err(|_| LibraryRepositoryError::InvalidCount)
     }
 
-    /// #82 stores caption-sync state in the media aggregate metadata. Until
-    /// that slice writes the field this bounded aggregate naturally returns
-    /// zero, without introducing a preview/sync table in #81.
     pub async fn count_caption_sync_failures(&self) -> Result<u64, LibraryRepositoryError> {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM media WHERE source_metadata->>'caption_sync_state' = 'failed'",
@@ -308,86 +291,34 @@ impl LibraryRepository {
         id: Uuid,
         update: MediaUpdate,
     ) -> Result<Media, LibraryRepositoryError> {
-        if update.title.is_none() && update.description.is_none() && update.notes.is_none() {
-            return Err(LibraryRepositoryError::EmptyUpdate);
-        }
-        let current = self.load(id).await?.ok_or(LibraryRepositoryError::ResourceMissing(id))?;
-        if update.expected_updated_at.is_some_and(|expected| expected != current.updated_at) {
+        let mut transaction = self.pool.begin().await?;
+        let current = sqlx::query_as::<_, MediaRow>("SELECT * FROM media WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
+        if current.updated_at != update.expected_updated_at {
             return Err(LibraryRepositoryError::OptimisticConflict(id));
         }
-        let title = update.title.unwrap_or(current.title.clone());
-        let description = update.description.unwrap_or(current.description.clone());
-        let notes = update.notes.unwrap_or_else(|| {
-            current.source_metadata.get("notes").and_then(Value::as_str).map(str::to_owned)
-        });
-        let metadata = with_notes(current.source_metadata, notes);
+        let tags = normalize_tags(update.tags)?;
         let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET title = $2, description = $3, source_metadata = $4, updated_at = now() WHERE id = $1 RETURNING *",
+            "UPDATE media SET description = $2, tags = $3, updated_at = now() WHERE id = $1 RETURNING *",
         )
         .bind(id)
-        .bind(title)
-        .bind(description)
-        .bind(metadata)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
-        row.into_media()
-    }
-
-    pub async fn archive_media(&self, id: Uuid) -> Result<Media, LibraryRepositoryError> {
-        let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET source_metadata = source_metadata || jsonb_build_object('archived', true), updated_at = now() WHERE id = $1 RETURNING *",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
-        row.into_media()
-    }
-
-    pub async fn add_tag(&self, id: Uuid, tag: NewTag) -> Result<Tag, LibraryRepositoryError> {
-        let row = sqlx::query_as::<_, MediaRow>(
-            "UPDATE media SET tags = array_append(array_remove(tags, $2), $2), updated_at = now() WHERE id = $1 RETURNING *",
-        )
-        .bind(id)
-        .bind(&tag.normalized_name)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(LibraryRepositoryError::ResourceMissing(id))?;
-        Ok(tag_from_name(&tag.normalized_name, row.updated_at))
-    }
-
-    pub async fn remove_tag(&self, id: Uuid, tag: &str) -> Result<(), LibraryRepositoryError> {
-        let updated = sqlx::query(
-            "UPDATE media SET tags = array_remove(tags, $2), updated_at = now() WHERE id = $1 AND $2 = ANY(tags)",
-        )
-        .bind(id)
-        .bind(tag)
-        .execute(&self.pool)
+        .bind(update.description)
+        .bind(tags)
+        .fetch_one(&mut *transaction)
         .await?;
-        if updated.rows_affected() != 0 {
-            return Ok(());
-        }
-        let exists =
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM media WHERE id = $1)")
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await?;
-        if !exists {
-            return Err(LibraryRepositoryError::ResourceMissing(id));
-        }
-        Err(LibraryRepositoryError::TagNotAttached)
-    }
-
-    pub async fn list_tags(&self, id: Uuid) -> Result<Vec<Tag>, LibraryRepositoryError> {
-        let row = self.load(id).await?.ok_or(LibraryRepositoryError::ResourceMissing(id))?;
-        Ok(row.tags.iter().map(|tag| tag_from_name(tag, row.updated_at)).collect())
+        transaction.commit().await?;
+        row.into_media()
     }
 
     pub async fn resolve_media(
         &self,
         ingest: MediaIngest,
     ) -> Result<MediaResolutionResult, LibraryRepositoryError> {
+        let mut ingest = ingest;
+        ingest.tags = normalize_tags(ingest.tags)?;
         validate_media_ingest(&ingest)?;
         let sha256 =
             ingest.metadata.sha256.as_deref().ok_or(LibraryRepositoryError::MissingSha256)?;
@@ -487,6 +418,7 @@ impl LibraryRepository {
         if ingest.metadata.kind != MediaKind::Video {
             return Err(LibraryRepositoryError::InvalidVideoIdentityKind);
         }
+        let tags = normalize_tags(ingest.tags.clone())?;
         config
             .validate()
             .map_err(|error| LibraryRepositoryError::InvalidAlignment(error.to_string()))?;
@@ -514,7 +446,7 @@ impl LibraryRepository {
         .fetch_optional(&mut **transaction)
         .await?
         {
-            let merged_tags = merge_tags(&row.tags, &ingest.tags);
+            let merged_tags = merge_tags(&row.tags, &tags);
             sqlx::query(
                 "UPDATE media SET tags = $2, title = COALESCE(title, $3), description = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE description END, source_url = COALESCE(source_url, $5), source_metadata = $6, updated_at = now() WHERE id = $1",
             )
@@ -610,7 +542,7 @@ impl LibraryRepository {
         .bind(&search_tokens)
         .bind(&ingest.media.title)
         .bind(&ingest.media.description)
-        .bind(&ingest.tags)
+        .bind(&tags)
         .bind(ingest.source.normalized_url.clone().or(ingest.source.original_url.clone()))
         .bind(&source_value)
         .bind(&ingest.metadata.mime_type)
@@ -918,12 +850,9 @@ impl LibraryRepository {
 
     fn summary_from_row(&self, row: MediaRow) -> Result<MediaSummary, LibraryRepositoryError> {
         let media = row.clone().into_media()?;
-        let tags = row.tags.iter().map(|tag| tag_from_name(tag, row.updated_at)).collect();
         let source = source_from_row(&row)?;
         Ok(MediaSummary {
             media,
-            tags,
-            source_count: u64::from(source.is_some()),
             source_url: row.source_url,
             source_original_url: source.as_ref().and_then(|value| value.original_url.clone()),
             source_metadata: source.map(|source| source.metadata),
@@ -1234,29 +1163,12 @@ async fn complete_linked_ingests_for_storage(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     media_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    let updated = sqlx::query_as::<_, (Uuid, String)>(
-        "UPDATE ingests SET state = 'completed', error_code = NULL, error_message = NULL, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown'))) RETURNING id, requested_action",
+    sqlx::query(
+        "UPDATE ingests SET state = 'completed', error_code = NULL, error_message = NULL, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
     )
     .bind(media_id)
-    .fetch_all(&mut **transaction)
+    .execute(&mut **transaction)
     .await?;
-    for (ingest_id, requested_action) in updated {
-        if requested_action == "save" {
-            continue;
-        }
-        let job = NewJob::materialize_publication(ingest_id)
-            .dedupe_key(format!("ingest:{ingest_id}:materialize_publication:v1"));
-        sqlx::query(
-            "INSERT INTO queue.jobs (kind, payload, state, run_at, max_attempts, dedupe_key) VALUES ($1, $2, 'queued', COALESCE($3, now()), $4, $5) ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING",
-        )
-        .bind(job.job_type().as_str())
-        .bind(job.payload_json())
-        .bind(job.run_at_value())
-        .bind(job.max_attempts_value())
-        .bind(job.dedupe_key_value())
-        .execute(&mut **transaction)
-        .await?;
-    }
     Ok(())
 }
 
@@ -1266,14 +1178,9 @@ impl MediaRow {
             id: self.id,
             kind: MediaKind::try_from(self.kind.as_str())
                 .map_err(LibraryRepositoryError::UnknownMediaKind)?,
-            status: if self.source_metadata.get("archived").and_then(Value::as_bool) == Some(true) {
-                MediaStatus::Archived
-            } else {
-                MediaStatus::Active
-            },
             title: self.title,
             description: self.description,
-            notes: self.source_metadata.get("notes").and_then(Value::as_str).map(str::to_owned),
+            tags: self.tags,
             mime_type: self.mime_type,
             container: self.container,
             video_codec: self.video_codec,
@@ -1289,9 +1196,6 @@ impl MediaRow {
                 .map_err(LibraryRepositoryError::UnknownStorageState)?,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            archived_at: (self.source_metadata.get("archived").and_then(Value::as_bool)
-                == Some(true))
-            .then_some(self.updated_at),
         })
     }
 
@@ -1380,7 +1284,15 @@ fn source_from_row(row: &MediaRow) -> Result<Option<MediaSource>, LibraryReposit
                     .ok()
             },
         ),
-        retrieved_at: row.updated_at,
+        retrieved_at: row
+            .source_metadata
+            .get("retrieved_at")
+            .and_then(Value::as_str)
+            .and_then(|value| {
+                time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .unwrap_or(row.created_at),
         metadata: row
             .source_metadata
             .get("metadata")
@@ -1409,10 +1321,16 @@ fn source_to_value(source: &MediaSourceInput) -> Value {
         "author_name": source.author_name,
         "title": source.title,
         "description": source.description,
-        "published_at": source.published_at.map(|value| value.to_string()),
-        "retrieved_at": OffsetDateTime::now_utc().to_string(),
+        "published_at": source.published_at.map(format_rfc3339),
+        "retrieved_at": format_rfc3339(OffsetDateTime::now_utc()),
         "metadata": source.metadata,
     })
+}
+
+fn format_rfc3339(value: OffsetDateTime) -> String {
+    value
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("RFC 3339 formatting for an OffsetDateTime cannot fail")
 }
 
 fn merge_missing_source_metadata(existing: &Value, incoming: &Value) -> Value {
@@ -1453,25 +1371,15 @@ fn merge_tags(existing: &[String], incoming: &[String]) -> Vec<String> {
     tags
 }
 
-fn tag_from_name(name: &str, created_at: OffsetDateTime) -> Tag {
-    Tag { normalized_name: name.to_owned(), display_name: name.to_owned(), created_at }
-}
-
-fn with_notes(mut metadata: Value, notes: Option<String>) -> Value {
-    if !metadata.is_object() {
-        metadata = json!({ "metadata": metadata });
-    }
-    if let Some(object) = metadata.as_object_mut() {
-        match notes {
-            Some(notes) => {
-                object.insert("notes".to_owned(), Value::String(notes));
-            }
-            None => {
-                object.remove("notes");
-            }
+fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, LibraryRepositoryError> {
+    let mut normalized = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let tag = normalize_tag(tag)?;
+        if !normalized.iter().any(|current| current == &tag) {
+            normalized.push(tag);
         }
     }
-    metadata
+    Ok(normalized)
 }
 
 fn validate_media_ingest(ingest: &MediaIngest) -> Result<(), LibraryRepositoryError> {
@@ -1480,6 +1388,9 @@ fn validate_media_ingest(ingest: &MediaIngest) -> Result<(), LibraryRepositoryEr
     };
     if sha256.len() != 32 {
         return Err(LibraryRepositoryError::InvalidSha256Length { actual: sha256.len() });
+    }
+    for tag in &ingest.tags {
+        normalize_tag(tag)?;
     }
     Ok(())
 }
@@ -1529,13 +1440,11 @@ pub enum LibraryRepositoryError {
     DuplicateEvidenceTooLarge { max: usize },
     #[error("media {0} was not found")]
     ResourceMissing(Uuid),
-    #[error("media update must change at least one field")]
-    EmptyUpdate,
     #[error("media {0} was modified by another request")]
     OptimisticConflict(Uuid),
-    #[error("tag is not attached")]
-    TagNotAttached,
-    #[error("media search limit must be between 1 and 100, got {value}")]
+    #[error("invalid media tag: {0}")]
+    InvalidTag(#[from] TagValidationError),
+    #[error("media search limit must be between 1 and 50, got {value}")]
     InvalidLimit { value: u32 },
     #[error("database count was negative")]
     InvalidCount,
