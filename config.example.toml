@@ -16,6 +16,8 @@ ytdlp_format = "bestvideo*+bestaudio/best"
 # Empty means direct-only. Page-like URLs are sent to yt-dlp only when their
 # initial hostname is explicitly listed here; subdomains are included.
 # ytdlp_allowed_hosts = ["youtube.com", "youtu.be"]
+# The home Compose deployment overrides this with http://pot-provider:4416.
+# ytdlp_pot_provider_url = "http://127.0.0.1:4416"
 # Total deadline for one ffmpeg normalization or video-frame extraction.
 processing_timeout_seconds = 3600
 # Maximum bytes staged from a URL before normalization. This may exceed 2 GB
