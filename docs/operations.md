@@ -45,8 +45,14 @@ storage link; it is not full-text search.
 Channel settings are editable through the revision-fenced
 `PATCH /api/v1/channels/{id}` endpoint. Reload after a `channel_changed` or
 `channel_configuration_ambiguous` conflict. Do not place API or Telegram
-secrets in channel rows or query strings. Caption-sync failure cards appear
-when the later #82 worker writes the bounded media metadata marker.
+secrets in channel rows or query strings. Media responses include optional
+bounded preview metadata; fetch bytes through the authenticated
+`GET /api/v1/media/{id}/preview` route. A missing preview is expected for
+audio, older rows, and animations whose decoder could not safely produce one.
+The route returns a private-cache ETag and never exposes a workspace path.
+Caption-sync failures appear from the media row's bounded sync marker and can
+be requeued with the authenticated
+`POST /api/v1/media/{id}/caption-sync/retry` command.
 
 ## Telegram and media
 
@@ -118,6 +124,23 @@ needed for probing and normalization. Source downloads and Telegram uploads
 are streamed or path-based; no file-sized byte buffer is used.
 Polling, downloads, and storage uploads use separate HTTP timeout policies so a
 long upload cannot inherit the long-poll or download-stall deadline.
+
+Preview bytes are separate from canonical storage output. The worker validates
+preview MIME, dimensions, encoded size, and SHA-256 before the media row is
+committed. Video preview production reuses the best frame already decoded by
+the sequence extractor; animation preview production makes only one bounded
+first-frame decode attempt. No preview path triggers a second full video
+decode, an ffmpeg process per sample, an original-media retention rule, or an
+automatic backfill.
+
+After a storage message exists, the revision-fenced media metadata command
+replaces the complete description and tag set in one transaction and enqueues
+a durable `sync_storage_caption` job after the database commit. The job edits
+the existing storage message and uses both the media caption generation and a
+claim token as fences. Retries are bounded and restore a pending claim before
+re-running; an expired final lease records a failure for the current
+generation. A late old-generation completion schedules a current-generation
+reapply so the final Telegram caption cannot remain stale.
 
 Publisher scheduling is controlled only by PostgreSQL `posts.scheduled_at`,
 `posts.cadence_slot_at`, and `queue.jobs.run_at`. Normal queueing assigns the

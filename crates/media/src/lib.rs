@@ -44,13 +44,17 @@ pub use ffprobe::{
 };
 pub use fingerprint::{
     DEFAULT_MAX_FRAME_SEQUENCE_BYTES, FingerprintVersion, FrameDecodeLimits, FrameExtractionError,
-    FrameExtractor, VIDEO_SEQUENCE_V1,
+    FrameExtractor, VIDEO_SEQUENCE_V1, VideoSequenceExtraction,
 };
 pub use hashing::{FileDigest, HashError, sha256_file};
 pub(crate) use hashing::{sha256_bytes, sha256_file_sync};
 pub use image_normalize::{
-    CanonicalImageFormat, CanonicalImageProfile, ImageNormalizationError, ImageNormalizationPlan,
-    ImageNormalizationResult, ImageNormalizer, ImageProfileError,
+    BOUNDED_PREVIEW_MAX_BYTES, BOUNDED_PREVIEW_MAX_HEIGHT, BOUNDED_PREVIEW_MAX_WIDTH,
+    BoundedImagePreview, CanonicalImageFormat, CanonicalImageProfile, ImageNormalizationError,
+    ImageNormalizationPlan, ImageNormalizationResult, ImageNormalizer, ImageProfileError,
+    PreviewEncodingError, PreviewFrameDecodeError, PreviewValidationError,
+    decode_first_preview_frame, encode_bounded_preview, validate_bounded_preview,
+    validate_bounded_preview_for_mime,
 };
 pub use normalize::{
     AudioCodec, CanonicalContainer, CanonicalVideoProfile, NormalizationError, NormalizationMode,

@@ -51,6 +51,71 @@ pub enum MediaStorageState {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptionSyncState {
+    NotRequired,
+    Pending,
+    Syncing,
+    Synced,
+    Failed,
+}
+
+impl CaptionSyncState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Pending => "pending",
+            Self::Syncing => "syncing",
+            Self::Synced => "synced",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl TryFrom<&str> for CaptionSyncState {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "not_required" => Ok(Self::NotRequired),
+            "pending" => Ok(Self::Pending),
+            "syncing" => Ok(Self::Syncing),
+            "synced" => Ok(Self::Synced),
+            "failed" => Ok(Self::Failed),
+            unknown => Err(unknown.to_owned()),
+        }
+    }
+}
+
+pub const MAX_MEDIA_PREVIEW_BYTES: usize = 128 * 1024;
+pub const MAX_MEDIA_PREVIEW_WIDTH: u32 = 320;
+pub const MAX_MEDIA_PREVIEW_HEIGHT: u32 = 320;
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MediaPreviewMetadata {
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub size_bytes: u32,
+    pub sha256: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MediaPreviewInput {
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub sha256: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MediaPreviewData {
+    pub metadata: MediaPreviewMetadata,
+    pub bytes: Vec<u8>,
+}
+
 impl MediaStorageState {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -132,6 +197,10 @@ pub struct Media {
     pub sha256: Option<Vec<u8>>,
     pub local_work_path: Option<String>,
     pub storage_state: MediaStorageState,
+    pub preview: Option<MediaPreviewMetadata>,
+    pub caption_sync_generation: i32,
+    pub caption_sync_state: CaptionSyncState,
+    pub caption_sync_error: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
@@ -163,6 +232,7 @@ pub struct MediaMetadata {
     pub file_size_bytes: Option<u64>,
     pub sha256: Option<Vec<u8>>,
     pub local_work_path: Option<String>,
+    pub preview: Option<MediaPreviewInput>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -269,6 +339,16 @@ pub struct MediaUpdate {
     pub expected_updated_at: OffsetDateTime,
 }
 
+const MAX_TAG_LENGTH: usize = 100;
+
+#[derive(Debug, Clone, Eq, PartialEq, Error)]
+pub enum TagValidationError {
+    #[error("tag must not be empty")]
+    Empty,
+    #[error("tag must be at most {max} characters")]
+    TooLong { max: usize },
+}
+
 pub fn normalize_tag(value: impl AsRef<str>) -> Result<String, TagValidationError> {
     let value = value.as_ref().trim().to_lowercase();
     if value.is_empty() {
@@ -278,16 +358,6 @@ pub fn normalize_tag(value: impl AsRef<str>) -> Result<String, TagValidationErro
         return Err(TagValidationError::TooLong { max: MAX_TAG_LENGTH });
     }
     Ok(value)
-}
-
-const MAX_TAG_LENGTH: usize = 100;
-
-#[derive(Debug, Clone, Eq, PartialEq, Error)]
-pub enum TagValidationError {
-    #[error("tag must not be empty")]
-    Empty,
-    #[error("tag must be at most {max} characters")]
-    TooLong { max: usize },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -384,11 +454,30 @@ pub struct StorageCaptionMetadata {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CaptionSyncClaim {
+    pub media_id: Uuid,
+    pub generation: i32,
+    pub claim_token: Uuid,
+    pub storage_chat_id: i64,
+    pub storage_message_id: i64,
+    pub metadata: StorageCaptionMetadata,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CaptionSyncCompletion {
+    Applied,
+    Stale,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StorageUploadAttachment {
     pub storage_chat_id: i64,
     pub storage_message_id: i64,
     pub telegram_file_id: Option<String>,
     pub telegram_file_unique_id: Option<String>,
+    /// Present for a newly uploaded Telegram object. Reconciliation attaches
+    /// an already-existing object and therefore has no caption snapshot.
+    pub caption_metadata: Option<StorageCaptionMetadata>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -399,7 +488,7 @@ pub struct StorageUploadReservationRequest {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum StorageUploadReservation {
-    Reserved { media_id: Uuid, owner_token: Uuid },
+    Reserved { media_id: Uuid, owner_token: Uuid, caption_metadata: StorageCaptionMetadata },
     Reused(StorageReceipt),
     InProgress { retry_at: Option<OffsetDateTime> },
     ReconciliationRequired,
@@ -472,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn tags_trim_and_normalize_to_bounded_strings() {
+    fn tags_trim_and_normalize_without_merging_display_text() {
         assert_eq!(normalize_tag("  Rust 🦀  ").unwrap(), "rust 🦀");
     }
 

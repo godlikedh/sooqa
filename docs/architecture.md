@@ -350,9 +350,16 @@ read models with stable timestamp-plus-UUID cursors and a maximum page size of
 error logs. Dashboard counts are aggregate SQL reads, while attention cards
 carry only bounded duplicate, repeat-decision, and caption-sync evidence.
 Media `q` lookups are exact identifiers/URLs rather than semantic search. The
-channel settings patch locks and validates the complete candidate, uses
-`updated_at` for stale-write rejection, and serializes enablement so at most
-one active publication target can be configured.
+media row may also carry one validated preview (at most 320 by 320 and 128 KiB)
+and a generation-fenced storage-caption sync state. The authenticated preview
+route serves private-cache JPEG/PNG bytes without exposing workspace paths;
+audio and unsupported/older rows simply have no preview. The channel settings
+patch locks and validates the complete candidate, uses `updated_at` for
+stale-write rejection, and serializes enablement so at most one active
+publication target can be configured. Media metadata editing uses one
+revision-fenced command for the complete tags plus internal description; the
+caption-sync claim token prevents a recovered old worker from overwriting a
+newer same-generation attempt.
 
 ## Security and filesystem rules
 

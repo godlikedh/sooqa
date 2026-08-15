@@ -693,6 +693,7 @@ fn video_media_ingest(sha256: Vec<u8>, source: &str) -> MediaIngest {
             file_size_bytes: Some(100),
             sha256: Some(sha256),
             local_work_path: Some("/tmp/sooqa-worker-test.mp4".to_owned()),
+            preview: None,
         },
         source: MediaSourceInput {
             ingest_id: None,

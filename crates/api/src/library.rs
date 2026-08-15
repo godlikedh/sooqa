@@ -1,8 +1,10 @@
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Json as JsonExtractor, Path, Query, State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode},
-    routing::get,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::Response,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,6 +22,8 @@ pub(crate) fn routes() -> Router<ApiState> {
     Router::new()
         .route("/api/v1/media", get(search_media))
         .route("/api/v1/media/{id}", get(get_media).patch(update_media))
+        .route("/api/v1/media/{id}/preview", get(get_preview))
+        .route("/api/v1/media/{id}/caption-sync/retry", post(retry_caption_sync))
 }
 
 async fn search_media(
@@ -57,6 +61,71 @@ async fn get_media(
     Path(id): Path<Uuid>,
 ) -> Result<Json<MediaResponse>, ApiError> {
     authorize(&state.api_token, &headers).await?;
+    let media = state
+        .library
+        .find_media_details(id)
+        .await
+        .map_err(|error| map_library_error(error, &headers))?
+        .ok_or_else(|| {
+            ApiError::not_found("media_not_found", "The media item was not found", &headers)
+        })?;
+    Ok(Json(MediaResponse::from_details(&media)))
+}
+
+async fn get_preview(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    authorize(&state.api_token, &headers).await?;
+    let preview = state
+        .library
+        .find_media_preview(id)
+        .await
+        .map_err(|error| map_library_error(error, &headers))?
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "preview_not_available",
+                "The media item has no bounded preview",
+                &headers,
+            )
+        })?;
+    let etag = format!("\"{}\"", hex_digest(&preview.metadata.sha256));
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == etag)
+    {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, "private, max-age=3600")
+            .body(Body::empty())
+            .map_err(|_| ApiError::internal(&headers));
+    }
+    let content_type = HeaderValue::try_from(preview.metadata.mime_type.as_str())
+        .map_err(|_| ApiError::internal(&headers))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, preview.bytes.len())
+        .header(header::CACHE_CONTROL, "private, max-age=3600")
+        .header(header::ETAG, etag)
+        .body(Body::from(preview.bytes))
+        .map_err(|_| ApiError::internal(&headers))
+}
+
+async fn retry_caption_sync(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<MediaResponse>, ApiError> {
+    authorize(&state.api_token, &headers).await?;
+    state
+        .library
+        .retry_caption_sync(id)
+        .await
+        .map_err(|error| map_library_error(error, &headers))?;
     let media = state
         .library
         .find_media_details(id)
@@ -339,6 +408,8 @@ struct MediaResponse {
     tags: Vec<String>,
     storage_state: String,
     storage_url: Option<String>,
+    preview: Option<MediaPreviewResponse>,
+    caption_sync: CaptionSyncResponse,
     source_url: Option<String>,
     source_original_url: Option<String>,
     source_metadata: Option<Value>,
@@ -358,33 +429,50 @@ struct MediaResponse {
     updated_at: OffsetDateTime,
 }
 
+#[derive(Debug, Serialize)]
+struct MediaPreviewResponse {
+    url: String,
+    mime_type: String,
+    width: u32,
+    height: u32,
+    size_bytes: u32,
+    etag: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CaptionSyncResponse {
+    generation: i32,
+    state: sooqa_library::CaptionSyncState,
+    error: Option<String>,
+}
+
 impl MediaResponse {
     fn from_summary(summary: &MediaSummary) -> Self {
         Self::from_media(
             &summary.media,
-            summary.storage_url.clone(),
             summary.source_url.clone(),
             summary.source_original_url.clone(),
             summary.source_metadata.clone(),
+            summary.storage_url.clone(),
         )
     }
 
     fn from_details(details: &MediaDetails) -> Self {
         Self::from_media(
             &details.media,
-            details.storage_url.clone(),
             details.source.as_ref().and_then(|source| source.normalized_url.clone()),
             details.source.as_ref().and_then(|source| source.original_url.clone()),
             details.source.as_ref().map(|source| source.metadata.clone()),
+            details.storage_url.clone(),
         )
     }
 
     fn from_media(
         media: &sooqa_library::Media,
-        storage_url: Option<String>,
         source_url: Option<String>,
         source_original_url: Option<String>,
         source_metadata: Option<Value>,
+        storage_url: Option<String>,
     ) -> Self {
         Self {
             id: media.id,
@@ -394,6 +482,19 @@ impl MediaResponse {
             tags: media.tags.clone(),
             storage_state: media.storage_state.as_str().to_owned(),
             storage_url,
+            preview: media.preview.as_ref().map(|preview| MediaPreviewResponse {
+                url: format!("/api/v1/media/{}/preview", media.id),
+                mime_type: preview.mime_type.clone(),
+                width: preview.width,
+                height: preview.height,
+                size_bytes: preview.size_bytes,
+                etag: format!("\"{}\"", hex_digest(&preview.sha256)),
+            }),
+            caption_sync: CaptionSyncResponse {
+                generation: media.caption_sync_generation,
+                state: media.caption_sync_state,
+                error: media.caption_sync_error.clone(),
+            },
             source_url,
             source_original_url,
             source_metadata,
@@ -458,20 +559,34 @@ mod tests {
     }
 
     #[test]
-    fn media_update_requires_complete_metadata_and_accepts_null_description() {
-        let request = serde_json::from_str::<UpdateMediaRequest>(
-            r#"{"tags":[],"description":null,"expected_updated_at":"1970-01-01T00:00:42Z"}"#,
-        )
-        .expect("complete media update should deserialize");
-        assert_eq!(request.description.into_present(), Ok(None));
-        assert!(
-            serde_json::from_str::<UpdateMediaRequest>(
-                r#"{"tags":[],"expected_updated_at":"1970-01-01T00:00:42Z"}"#
-            )
-            .expect("missing nullable fields are represented for handler validation")
-            .description
-            .into_present()
-            .is_err()
+    fn exact_media_lookup_accepts_uuid_without_catalogue_filters() {
+        let mut params =
+            SearchParams { q: Some(Uuid::from_u128(7).to_string()), ..SearchParams::default() };
+        assert_eq!(take_lookup_input(&mut params), Some(Uuid::from_u128(7).to_string()));
+    }
+
+    #[test]
+    fn media_lookup_parses_private_telegram_storage_links() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            parse_media_lookup("https://t.me/c/3971341583/57", &headers).unwrap(),
+            MediaLookup::StorageMessage { chat_id: -1003971341583, message_id: 57 }
         );
+    }
+
+    #[test]
+    fn media_lookup_accepts_http_source_urls() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            parse_media_lookup("http://example.test/video?id=7&utm_source=test", &headers).unwrap(),
+            MediaLookup::SourceUrls(vec!["http://example.test/video?id=7".to_owned()])
+        );
+    }
+
+    #[test]
+    fn media_lookup_rejects_non_exact_telegram_storage_paths() {
+        let headers = HeaderMap::new();
+        assert!(parse_media_lookup("https://user@t.me/c/3971341583/57", &headers).is_err());
+        assert!(parse_media_lookup("https://t.me/c/3971341583/57?preview=1", &headers).is_err());
     }
 }

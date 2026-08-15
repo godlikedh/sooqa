@@ -19,7 +19,7 @@ use sooqa_worker::{
     compute_fingerprint_handler, download_source_handler, finalize_ingest_handler,
     inspect_source_handler, materialize_publication_handler, media_processing_components,
     normalize_asset_handler, probe_asset_handler_with_telegram_source, publish_post_handler,
-    upload_storage_asset_handler,
+    sync_storage_caption_handler, upload_storage_asset_handler,
 };
 
 #[tokio::main]
@@ -207,7 +207,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     );
     handlers.register(JobType::ComputeFingerprint, move |job| fingerprint_handler(job));
     tracing::info!("video fingerprint handler enabled");
-    let finalize_handler = finalize_ingest_handler(database.inbox(), database.library());
+    let finalize_handler = finalize_ingest_handler(
+        database.inbox(),
+        database.library(),
+        config.media.work_root.clone(),
+    );
     handlers.register(JobType::FinalizeIngest, move |job| finalize_handler(job));
     tracing::info!("ingest finalization handler enabled");
     let materialize_handler = materialize_publication_handler(database.publisher());
@@ -225,12 +229,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
     match (telegram_api, config.telegram.storage_chat_id) {
         (Some(api), Some(storage_chat_id)) => {
+            let caption_api = api.clone();
             let provider = StorageUploadProvider::new(api, database.library(), storage_chat_id)?
                 .with_max_storage_bytes(config.media.normalized_storage_max_bytes)
                 .with_work_root(config.media.work_root.clone());
             provider.verify_storage_chat().await?;
             let storage_handler = upload_storage_asset_handler(database.inbox(), provider);
             handlers.register(JobType::UploadStorageAsset, move |job| storage_handler(job));
+            let caption_handler = sync_storage_caption_handler(database.library(), caption_api);
+            handlers.register(JobType::SyncStorageCaption, move |job| caption_handler(job));
             tracing::info!(storage_chat_id, "Telegram storage upload job handler enabled");
         }
         (None, Some(_)) => {

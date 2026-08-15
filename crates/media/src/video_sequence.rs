@@ -178,6 +178,8 @@ pub struct VideoSequenceBuilder {
     expected_samples: usize,
     samples: Vec<VideoSequenceSample>,
     previous_luma: Option<Vec<u8>>,
+    best_image: Option<DynamicImage>,
+    best_information_bps: Option<u16>,
 }
 
 impl VideoSequenceBuilder {
@@ -200,6 +202,8 @@ impl VideoSequenceBuilder {
             expected_samples,
             samples: Vec::with_capacity(expected_samples),
             previous_luma: None,
+            best_image: None,
+            best_information_bps: None,
         })
     }
 
@@ -209,6 +213,13 @@ impl VideoSequenceBuilder {
         }
         let normalized = normalize_image(image);
         let sample = sample_features(&normalized, self.previous_luma.as_deref());
+        if self
+            .best_information_bps
+            .is_none_or(|best_information_bps| sample.information_bps > best_information_bps)
+        {
+            self.best_information_bps = Some(sample.information_bps);
+            self.best_image = Some(image.clone());
+        }
         self.previous_luma = Some(normalized.luma);
         self.samples.push(sample);
         Ok(())
@@ -223,10 +234,19 @@ impl VideoSequenceBuilder {
     }
 
     pub fn finish(self) -> Result<VideoSequenceFingerprint, VideoSequenceError> {
+        self.finish_with_best_image().map(|(fingerprint, _)| fingerprint)
+    }
+
+    pub fn finish_with_best_image(
+        mut self,
+    ) -> Result<(VideoSequenceFingerprint, Option<DynamicImage>), VideoSequenceError> {
         if self.samples.len() != self.expected_samples {
             return Err(VideoSequenceError::InvalidTimestampGrid);
         }
-        VideoSequenceFingerprint::new(self.duration_ms, self.interval_ms, self.samples)
+        let best_image = self.best_image.take();
+        let fingerprint =
+            VideoSequenceFingerprint::new(self.duration_ms, self.interval_ms, self.samples)?;
+        Ok((fingerprint, best_image))
     }
 }
 
@@ -630,6 +650,21 @@ mod tests {
         }
         assert_eq!(builder.len(), 2);
         assert_eq!(builder.finish().expect("incremental fingerprint should build"), expected);
+    }
+
+    #[test]
+    fn incremental_builder_retains_only_the_highest_information_frame() {
+        let flat = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(32, 32, Rgb([80, 80, 80])));
+        let detailed = DynamicImage::ImageRgb8(ImageBuffer::from_fn(32, 32, |x, y| {
+            let value = ((x * 37 + y * 71) % 256) as u8;
+            Rgb([value, 255 - value, value / 2])
+        }));
+        let mut builder = VideoSequenceBuilder::new(1_000, 500).unwrap();
+        builder.push_image(&flat).unwrap();
+        builder.push_image(&detailed).unwrap();
+        let (fingerprint, best) = builder.finish_with_best_image().unwrap();
+        assert_eq!(fingerprint.samples.len(), 2);
+        assert_eq!(best.unwrap().to_rgb8(), detailed.to_rgb8());
     }
 
     #[test]

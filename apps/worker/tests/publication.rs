@@ -151,6 +151,7 @@ async fn stored_media(database: &Database) -> Uuid {
                 file_size_bytes: Some(1),
                 sha256: Some(sha256.to_vec()),
                 local_work_path: None,
+                preview: None,
             },
             source: MediaSourceInput {
                 ingest_id: None,

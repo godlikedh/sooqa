@@ -67,9 +67,27 @@ Channel settings are read and patched through `/api/v1/channels/{id}` with
 validated time windows, IANA time zones, an optimistic `updated_at` fence, and
 a conflict when enabling a second target would make publication ambiguous.
 These routes never return raw job payloads, lease tokens, secrets, or complete
-error logs. Caption-sync failure cards read the bounded media marker reserved
-for the follow-up preview/sync slice in issue #82; that slice owns producing
-and clearing the marker.
+error logs. Caption-sync failure cards read the bounded failure state stored on
+the media row.
+
+Media responses expose optional bounded preview metadata and an authenticated
+`GET /api/v1/media/{id}/preview` endpoint. Previews are at most 320 by 320 and
+128 KiB, are validated before persistence, and are kept on the existing media
+row. Video previews use the highest-information frame already decoded by the
+`video_sequence_v1` extraction; static images use the existing image thumbnail
+boundary; animations make one safe representative-frame attempt; audio has no
+bitmap preview. Existing media rows are not downloaded or backfilled.
+
+Telegram storage captions contain only the bounded internal description,
+normalized tags, and source URL. One revision-fenced metadata command replaces
+the complete tag set and description atomically, advances a generation, marks
+sync pending, and enqueues durable fenced work; there are no separate
+one-tag mutation routes. The worker edits the existing storage message after
+commit and records only a matching generation/claim's result. Public post
+text, IDs, hashes, workflow state, and schedule data never enter storage
+captions. The authenticated
+`POST /api/v1/media/{id}/caption-sync/retry` command creates a new generation
+for a failed sync.
 
 Large-media capture uses Telegram's official local Bot API server when the home
 deployment is cut over manually. URL/link source downloads, Telegram-source
@@ -108,8 +126,9 @@ tables are:
   current error/timestamps;
 - `media`: one normalized stored media item with canonical SHA-256, compact
   versioned fingerprint data and video search tokens, searchable text/tags,
-  common media properties, source metadata, Telegram storage identifiers, and
-  storage ambiguity state;
+  common media properties, one optional bounded preview, generation-fenced
+  storage-caption sync state, source metadata, Telegram storage identifiers,
+  and storage ambiguity state;
 - `channels`: one target Telegram channel with enablement, IANA time zone,
   posting window, and cadence interval;
 - `posts`: one intended Telegram post and its eventual result, including
@@ -155,7 +174,9 @@ references the `posts` row, and one post row becomes the durable publication
 record after success. Telegram calls, HTTP downloads, ffmpeg, and ffprobe run
 outside database transactions. External effects use state plus generation or
 fencing tokens, and ambiguous effects are retained for explicit reconciliation
-instead of being blindly retried. A retryable no-effect publication updates
+instead of being blindly retried. Storage-caption edits commit their generation
+and durable job before calling Telegram; stale completions are fenced and
+schedule a current-generation reapply. A retryable no-effect publication updates
 the running job payload and post revision atomically; on its final attempt the
 post becomes failed before the job becomes terminal. Publication copies the
 ready Telegram storage

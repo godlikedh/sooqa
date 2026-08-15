@@ -54,6 +54,14 @@ while source budgets remain independent so a large input can still normalize
 successfully. The worker and storage provider both enforce the canonical-output
 ceiling before an upload effect.
 
+Media previews are private derived bytes on the existing media row. The API
+requires the normal bearer authorization, serves only validated JPEG/PNG data
+at a fixed 320-by-320 and 128 KiB maximum, uses `Cache-Control: private`, and
+does not expose the source or workspace path. Preview generation never retains
+the original input or downloads older media for backfill. Storage captions are
+bounded to internal description, normalized tags, and source URL; public post
+text, identifiers, hashes, workflow data, and schedules are excluded.
+
 Workspaces reject separators and parent-directory components in file names.
 Temporary files are published only after validation, and cleanup is limited to
 known workspace paths. PostgreSQL constraints enforce digest length, media

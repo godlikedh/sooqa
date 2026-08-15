@@ -172,6 +172,7 @@ impl JobRepository {
                 .settle_publication_lease(lease, run_at, error_class, error_message, false)
                 .await;
         }
+        let mut transaction = self.pool.begin().await?;
         let row = sqlx::query_as::<_, JobRow>(
             r#"
             UPDATE queue.jobs
@@ -195,9 +196,38 @@ impl JobRepository {
         .bind(run_at)
         .bind(error_class)
         .bind(error_message)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await?
         .ok_or(JobRepositoryError::LeaseLost)?;
+        if row.kind == JobType::SyncStorageCaption.as_str() {
+            let media_id = row
+                .payload
+                .get("media_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok());
+            let generation = row.payload.get("generation").and_then(serde_json::Value::as_i64);
+            if let (Some(media_id), Some(generation)) = (media_id, generation) {
+                if row.state == "queued" {
+                    sqlx::query(
+                        "UPDATE media SET caption_sync_state = 'pending', caption_sync_error = NULL, caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2 AND caption_sync_state = 'syncing'",
+                    )
+                    .bind(media_id)
+                    .bind(generation)
+                    .execute(&mut *transaction)
+                    .await?;
+                } else if row.state == "failed" {
+                    sqlx::query(
+                        "UPDATE media SET caption_sync_state = 'failed', caption_sync_error = left($3, 512), caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2 AND caption_sync_state = 'syncing'",
+                    )
+                    .bind(media_id)
+                    .bind(generation)
+                    .bind(error_message)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+            }
+        }
+        transaction.commit().await?;
         row.into_job()
     }
 
@@ -304,6 +334,23 @@ impl JobRepository {
         .fetch_all(&mut *transaction)
         .await?;
         for job in &recovered {
+            if job.kind == JobType::SyncStorageCaption.as_str() && job.state == "queued" {
+                let media_id = job
+                    .payload
+                    .get("media_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| Uuid::parse_str(value).ok());
+                let generation = job.payload.get("generation").and_then(serde_json::Value::as_i64);
+                if let (Some(media_id), Some(generation)) = (media_id, generation) {
+                    sqlx::query(
+                        "UPDATE media SET caption_sync_state = 'pending', caption_sync_error = NULL, caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2 AND caption_sync_state = 'syncing'",
+                    )
+                    .bind(media_id)
+                    .bind(generation)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+            }
             if job.state == "failed" && job.attempt_count >= job.max_attempts {
                 reconcile_exhausted_job(&mut transaction, job).await?;
             }
@@ -750,6 +797,25 @@ async fn reconcile_exhausted_job(
                 .await?;
             }
         }
+        return Ok(());
+    }
+    if job_type == JobType::SyncStorageCaption {
+        let Some(media_id) = job
+            .payload
+            .get("media_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+        else {
+            return Ok(());
+        };
+        let generation = job.payload.get("generation").and_then(serde_json::Value::as_i64);
+        sqlx::query(
+        "UPDATE media SET caption_sync_state = 'failed', caption_sync_error = 'caption sync job lease expired after the final attempt', caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_state = 'syncing' AND ($2::bigint IS NULL OR caption_sync_generation = $2)",
+        )
+        .bind(media_id)
+        .bind(generation)
+        .execute(&mut **transaction)
+        .await?;
         return Ok(());
     }
     if job_type != JobType::UploadStorageAsset {

@@ -25,6 +25,10 @@ const DEFAULT_JPEG_QUALITY: u8 = 85;
 const DEFAULT_MAX_INPUT_PIXELS: u64 = 100_000_000;
 const DEFAULT_MAX_INPUT_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_MAX_WORKING_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ANIMATION_PREVIEW_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
+pub const BOUNDED_PREVIEW_MAX_BYTES: usize = 128 * 1024;
+pub const BOUNDED_PREVIEW_MAX_WIDTH: u32 = 320;
+pub const BOUNDED_PREVIEW_MAX_HEIGHT: u32 = 320;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalImageProfile {
@@ -140,6 +144,7 @@ pub struct ImageNormalizationResult {
     pub canonical_path: PathBuf,
     pub thumbnail_path: PathBuf,
     pub format: CanonicalImageFormat,
+    pub thumbnail_format: CanonicalImageFormat,
     pub has_transparency: bool,
     pub width: u32,
     pub height: u32,
@@ -206,6 +211,7 @@ impl ImageNormalizer {
             canonical_path: encoded.canonical_path,
             thumbnail_path: encoded.thumbnail_path,
             format: encoded.format,
+            thumbnail_format: encoded.thumbnail_format,
             has_transparency: encoded.has_transparency,
             width: encoded.width,
             height: encoded.height,
@@ -215,6 +221,192 @@ impl ImageNormalizer {
             thumbnail_digest,
         })
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BoundedImagePreview {
+    pub bytes: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub digest: FileDigest,
+}
+
+#[derive(Debug, Error)]
+pub enum PreviewEncodingError {
+    #[error("preview image dimensions must be greater than zero")]
+    InvalidDimensions,
+    #[error("preview JPEG exceeds the {max}-byte limit after bounded encoding: {size} bytes")]
+    TooLarge { size: usize, max: usize },
+    #[error("could not encode preview JPEG: {0}")]
+    Encode(#[source] image::ImageError),
+    #[error("encoded preview failed validation: {0}")]
+    InvalidEncoded(String),
+}
+
+/// Encodes one already-decoded image into the fixed, private preview format.
+/// The caller owns the decode budget; this function only resizes and encodes
+/// the supplied sample and never reads the source media again.
+pub fn encode_bounded_preview(
+    image: &DynamicImage,
+) -> Result<BoundedImagePreview, PreviewEncodingError> {
+    if image.width() == 0 || image.height() == 0 {
+        return Err(PreviewEncodingError::InvalidDimensions);
+    }
+    let mut preview = fit_image(image, BOUNDED_PREVIEW_MAX_WIDTH, BOUNDED_PREVIEW_MAX_HEIGHT);
+    let mut largest_candidate = 0;
+    loop {
+        let rgb = preview.to_rgb8();
+        for quality in (5..=85).rev().step_by(5).chain(std::iter::once(1)) {
+            let mut encoded = Cursor::new(Vec::new());
+            JpegEncoder::new_with_quality(&mut encoded, quality)
+                .encode_image(&DynamicImage::ImageRgb8(rgb.clone()))
+                .map_err(PreviewEncodingError::Encode)?;
+            let candidate = encoded.into_inner();
+            largest_candidate = largest_candidate.max(candidate.len());
+            if candidate.len() <= BOUNDED_PREVIEW_MAX_BYTES {
+                let (width, height) = validate_bounded_preview(&candidate)
+                    .map_err(|error| PreviewEncodingError::InvalidEncoded(error.to_string()))?;
+                return Ok(BoundedImagePreview {
+                    digest: sha256_bytes(&candidate),
+                    bytes: candidate,
+                    width,
+                    height,
+                });
+            }
+        }
+
+        if preview.width() == 1 && preview.height() == 1 {
+            return Err(PreviewEncodingError::TooLarge {
+                size: largest_candidate.max(BOUNDED_PREVIEW_MAX_BYTES + 1),
+                max: BOUNDED_PREVIEW_MAX_BYTES,
+            });
+        }
+        let next_width = preview.width().saturating_mul(3).saturating_div(4).max(1);
+        let next_height = preview.height().saturating_mul(3).saturating_div(4).max(1);
+        preview = preview.thumbnail(next_width, next_height);
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum PreviewValidationError {
+    #[error("preview is empty")]
+    Empty,
+    #[error("preview exceeds the {max}-byte limit")]
+    TooLarge { max: usize },
+    #[error("preview is not a valid bounded image: {0}")]
+    Decode(#[source] image::ImageError),
+    #[error("preview MIME type {actual:?} does not match the declared {expected:?}")]
+    MimeMismatch { expected: String, actual: String },
+    #[error("preview dimensions {width}x{height} exceed {max_width}x{max_height}")]
+    Dimensions { width: u32, height: u32, max_width: u32, max_height: u32 },
+}
+
+pub fn validate_bounded_preview(bytes: &[u8]) -> Result<(u32, u32), PreviewValidationError> {
+    validate_bounded_preview_for_mime(bytes, None)
+}
+
+pub fn validate_bounded_preview_for_mime(
+    bytes: &[u8],
+    expected_mime_type: Option<&str>,
+) -> Result<(u32, u32), PreviewValidationError> {
+    if bytes.is_empty() {
+        return Err(PreviewValidationError::Empty);
+    }
+    if bytes.len() > BOUNDED_PREVIEW_MAX_BYTES {
+        return Err(PreviewValidationError::TooLarge { max: BOUNDED_PREVIEW_MAX_BYTES });
+    }
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| PreviewValidationError::Decode(image::ImageError::IoError(error)))?;
+    if let Some(expected_mime_type) = expected_mime_type {
+        let actual_mime_type = match reader.format() {
+            Some(ImageFormat::Jpeg) => "image/jpeg",
+            Some(ImageFormat::Png) => "image/png",
+            Some(_) | None => "unknown",
+        };
+        if actual_mime_type != expected_mime_type {
+            return Err(PreviewValidationError::MimeMismatch {
+                expected: expected_mime_type.to_owned(),
+                actual: actual_mime_type.to_owned(),
+            });
+        }
+    }
+    let mut limits = Limits::default();
+    limits.max_alloc =
+        Some(BOUNDED_PREVIEW_MAX_WIDTH as u64 * BOUNDED_PREVIEW_MAX_HEIGHT as u64 * 4);
+    reader.limits(limits);
+    let image = reader.decode().map_err(PreviewValidationError::Decode)?;
+    if image.width() == 0
+        || image.height() == 0
+        || image.width() > BOUNDED_PREVIEW_MAX_WIDTH
+        || image.height() > BOUNDED_PREVIEW_MAX_HEIGHT
+    {
+        return Err(PreviewValidationError::Dimensions {
+            width: image.width(),
+            height: image.height(),
+            max_width: BOUNDED_PREVIEW_MAX_WIDTH,
+            max_height: BOUNDED_PREVIEW_MAX_HEIGHT,
+        });
+    }
+    Ok((image.width(), image.height()))
+}
+
+#[derive(Debug, Error)]
+pub enum PreviewFrameDecodeError {
+    #[error("preview frame input is unavailable at {path}: {source}")]
+    Input { path: PathBuf, source: io::Error },
+    #[error("preview frame input is not a regular file: {path}")]
+    NotFile { path: PathBuf },
+    #[error("preview frame input exceeds the {max}-byte limit: {path}")]
+    TooLarge { path: PathBuf, max: u64 },
+    #[error("preview frame input format is unsupported: {format}")]
+    UnsupportedFormat { format: String },
+    #[error("preview frame could not be decoded at {path}: {source}")]
+    Decode { path: PathBuf, source: image::ImageError },
+    #[error("preview frame decode task failed: {0}")]
+    TaskJoin(#[source] tokio::task::JoinError),
+}
+
+/// Decodes only the first frame of an image-capable animation. Unsupported
+/// or over-budget animations can remain without a bitmap preview.
+pub async fn decode_first_preview_frame(
+    path: impl Into<PathBuf>,
+) -> Result<DynamicImage, PreviewFrameDecodeError> {
+    let path = path.into();
+    tokio::task::spawn_blocking(move || decode_first_preview_frame_sync(&path))
+        .await
+        .map_err(PreviewFrameDecodeError::TaskJoin)?
+}
+
+fn decode_first_preview_frame_sync(path: &Path) -> Result<DynamicImage, PreviewFrameDecodeError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| PreviewFrameDecodeError::Input { path: path.to_owned(), source })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(PreviewFrameDecodeError::NotFile { path: path.to_owned() });
+    }
+    if metadata.len() > MAX_ANIMATION_PREVIEW_SOURCE_BYTES {
+        return Err(PreviewFrameDecodeError::TooLarge {
+            path: path.to_owned(),
+            max: MAX_ANIMATION_PREVIEW_SOURCE_BYTES,
+        });
+    }
+    let reader = ImageReader::open(path)
+        .map_err(|source| PreviewFrameDecodeError::Input { path: path.to_owned(), source })?
+        .with_guessed_format()
+        .map_err(|source| PreviewFrameDecodeError::Input { path: path.to_owned(), source })?;
+    let format = reader.format().ok_or_else(|| PreviewFrameDecodeError::UnsupportedFormat {
+        format: "unknown".to_owned(),
+    })?;
+    if !matches!(format, ImageFormat::Gif | ImageFormat::Jpeg | ImageFormat::Png) {
+        return Err(PreviewFrameDecodeError::UnsupportedFormat { format: format!("{format:?}") });
+    }
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(100_000_000 * 4);
+    let mut reader = reader;
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|source| PreviewFrameDecodeError::Decode { path: path.to_owned(), source })
 }
 
 async fn cleanup_outputs(encoded: &EncodedImage) {
@@ -280,6 +472,8 @@ pub enum ImageNormalizationError {
     Output { path: PathBuf, source: io::Error },
     #[error("could not encode image output {path}: {source}")]
     Encode { path: PathBuf, source: image::ImageError },
+    #[error("could not encode bounded preview output {path}: {source}")]
+    PreviewEncode { path: PathBuf, source: PreviewEncodingError },
     #[error("image normalization task failed: {0}")]
     TaskJoin(#[source] tokio::task::JoinError),
     #[error("could not hash normalized image: {0}")]
@@ -293,6 +487,7 @@ struct EncodedImage {
     canonical_path: PathBuf,
     thumbnail_path: PathBuf,
     format: CanonicalImageFormat,
+    thumbnail_format: CanonicalImageFormat,
     has_transparency: bool,
     width: u32,
     height: u32,
@@ -327,7 +522,8 @@ fn encode_image(
     let thumbnail =
         fit_image(&canonical, profile.thumbnail_max_width, profile.thumbnail_max_height);
     let canonical_path = with_extension(&plan.canonical_base_path, format.extension());
-    let thumbnail_path = with_extension(&plan.thumbnail_base_path, format.extension());
+    let thumbnail_format = CanonicalImageFormat::Jpeg;
+    let thumbnail_path = with_extension(&plan.thumbnail_base_path, thumbnail_format.extension());
     if canonical_path == plan.input_path {
         return Err(ImageNormalizationError::OutputPathCollision { path: canonical_path });
     }
@@ -342,14 +538,8 @@ fn encode_image(
         profile.max_width,
         profile.max_height,
     )?;
-    let thumbnail_output = match ensure_output(
-        &thumbnail_path,
-        &thumbnail,
-        format,
-        profile,
-        profile.thumbnail_max_width,
-        profile.thumbnail_max_height,
-    ) {
+    let thumbnail_output = match ensure_bounded_preview_output(&thumbnail_path, &thumbnail, profile)
+    {
         Ok(output) => output,
         Err(error) => {
             if canonical_output.created {
@@ -363,6 +553,7 @@ fn encode_image(
         canonical_path,
         thumbnail_path,
         format,
+        thumbnail_format,
         has_transparency,
         width: canonical_output.width,
         height: canonical_output.height,
@@ -399,6 +590,45 @@ fn ensure_output(
                 max_width,
                 max_height,
                 &expected_digest,
+            )? {
+                Ok(EnsuredOutput { width, height, created: false })
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_bounded_preview_output(
+    path: &Path,
+    image: &DynamicImage,
+    profile: CanonicalImageProfile,
+) -> Result<EnsuredOutput, ImageNormalizationError> {
+    let preview = encode_bounded_preview(image).map_err(|source| {
+        ImageNormalizationError::PreviewEncode { path: path.to_owned(), source }
+    })?;
+    if let Some((width, height)) = existing_output_dimensions(
+        path,
+        CanonicalImageFormat::Jpeg,
+        profile,
+        BOUNDED_PREVIEW_MAX_WIDTH,
+        BOUNDED_PREVIEW_MAX_HEIGHT,
+        &preview.digest,
+    )? {
+        return Ok(EnsuredOutput { width, height, created: false });
+    }
+
+    match write_image(path, &preview.bytes) {
+        Ok(()) => Ok(EnsuredOutput { width: preview.width, height: preview.height, created: true }),
+        Err(error @ ImageNormalizationError::OutputExists { .. }) => {
+            if let Some((width, height)) = existing_output_dimensions(
+                path,
+                CanonicalImageFormat::Jpeg,
+                profile,
+                BOUNDED_PREVIEW_MAX_WIDTH,
+                BOUNDED_PREVIEW_MAX_HEIGHT,
+                &preview.digest,
             )? {
                 Ok(EnsuredOutput { width, height, created: false })
             } else {
@@ -784,6 +1014,32 @@ mod tests {
         workspace.cleanup().await.expect("workspace should be removed");
     }
 
+    #[test]
+    fn bounded_preview_has_fixed_dimensions_and_encoded_bytes() {
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_fn(2_000, 1_000, |x, y| {
+            let value = ((x.wrapping_mul(31) + y.wrapping_mul(17)) % 256) as u8;
+            Rgb([value, value.wrapping_mul(3), 255 - value])
+        }));
+        let preview = encode_bounded_preview(&image).expect("preview should encode");
+        assert!(preview.bytes.len() <= BOUNDED_PREVIEW_MAX_BYTES);
+        assert!(preview.width <= BOUNDED_PREVIEW_MAX_WIDTH);
+        assert!(preview.height <= BOUNDED_PREVIEW_MAX_HEIGHT);
+        assert!(matches!(
+            validate_bounded_preview(&preview.bytes),
+            Ok((width, height)) if (width, height) == (preview.width, preview.height)
+        ));
+    }
+
+    #[test]
+    fn bounded_preview_rejects_a_declared_mime_mismatch() {
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(16, 16, Rgb([1, 2, 3])));
+        let preview = encode_bounded_preview(&image).expect("preview should encode");
+        assert!(matches!(
+            validate_bounded_preview_for_mime(&preview.bytes, Some("image/png")),
+            Err(PreviewValidationError::MimeMismatch { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn transparent_images_remain_png_and_keep_alpha() {
         let workspace = MediaWorkspace::create(temp_path("transparent-workspace"), Uuid::new_v4())
@@ -821,6 +1077,47 @@ mod tests {
             .to_rgba8();
         assert_eq!(decoded.get_pixel(0, 0).0[3], 100);
 
+        workspace.cleanup().await.expect("workspace should be removed");
+    }
+
+    #[tokio::test]
+    async fn high_entropy_transparent_thumbnails_stay_within_the_preview_ceiling() {
+        let workspace =
+            MediaWorkspace::create(temp_path("bounded-transparent-workspace"), Uuid::new_v4())
+                .await
+                .expect("workspace should be created");
+        let input =
+            workspace.path(WorkspaceArea::Source, "input.png").expect("input path should be valid");
+        let image = ImageBuffer::from_fn(320, 320, |x, y| {
+            let red = x.wrapping_mul(37).wrapping_add(y.wrapping_mul(17)) as u8;
+            let green = x.wrapping_mul(13).wrapping_add(y.wrapping_mul(53)) as u8;
+            let blue = x.wrapping_mul(71).wrapping_add(y.wrapping_mul(29)) as u8;
+            let alpha = if (x + y) % 7 == 0 { 96 } else { u8::MAX };
+            Rgba([red, green, blue, alpha])
+        });
+        DynamicImage::ImageRgba8(image)
+            .save_with_format(&input, ImageFormat::Png)
+            .expect("test image should be written");
+        let normalizer = ImageNormalizer::new(CanonicalImageProfile::default())
+            .expect("profile should be valid");
+
+        let result = normalizer
+            .execute(
+                &normalizer
+                    .plan(&workspace, "input.png", "canonical", "thumbnail")
+                    .expect("normalization plan should be valid"),
+            )
+            .await
+            .expect("image should normalize");
+        let thumbnail = std::fs::read(&result.thumbnail_path).expect("thumbnail should exist");
+
+        assert_eq!(result.format, CanonicalImageFormat::Png);
+        assert_eq!(result.thumbnail_format, CanonicalImageFormat::Jpeg);
+        assert!(thumbnail.len() <= BOUNDED_PREVIEW_MAX_BYTES);
+        assert!(matches!(
+            validate_bounded_preview_for_mime(&thumbnail, Some("image/jpeg")),
+            Ok((width, height)) if (width, height) == (result.thumbnail_width, result.thumbnail_height)
+        ));
         workspace.cleanup().await.expect("workspace should be removed");
     }
 
