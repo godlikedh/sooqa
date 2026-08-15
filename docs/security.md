@@ -16,6 +16,16 @@ source URLs, the allowlisted 2ch mirror identity, or HTTPS private Telegram
 storage links. The API canonicalizes lookup input without changing stored
 source provenance, and generated storage links remain behind authentication.
 
+The `/admin` page is embedded in the server binary and uses only same-origin
+local assets. Its restrictive CSP permits scripts, styles, and API connections
+only from the server origin; it disables objects, framing, base-URI changes,
+and form actions. The browser keeps the bearer token only in `sessionStorage`
+and the lock action clears that value and the in-memory copy. Backend titles,
+captions, source URLs, tags, and errors are rendered as text or validated
+HTTP(S) links rather than injected HTML. This is a trusted-home-LAN MVP
+boundary, not a claim that the bearer-token UI is suitable for internet
+exposure.
+
 The Windows companion is a loopback-only fixed proxy. It accepts only
 `POST /v1/submit`, requires a separate local bearer token, caps JSON bodies, and
 forwards only the backend ingest route with a bounded timeout and a stable

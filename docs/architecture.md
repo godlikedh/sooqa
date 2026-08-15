@@ -361,6 +361,15 @@ revision-fenced command for the complete tags plus internal description; the
 caption-sync claim token prevents a recovered old worker from overwriting a
 newer same-generation attempt.
 
+The server process also merges an `admin_router` that serves the static
+`/admin` shell and its local assets with `include_str!`; no frontend runtime or
+separate service is part of the deployment. The page stores the configured
+bearer token only in browser `sessionStorage`, calls same-origin API routes,
+and uses a restrictive asset CSP. It renders backend strings through DOM text
+nodes and uses the existing API/repository fences for duplicate, publication,
+and channel decisions. Media and Schedule navigation are intentionally left
+to their later slices.
+
 ## Security and filesystem rules
 
 The API compares the configured bearer secret; no token administration data is

@@ -83,7 +83,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             database.library(),
             database.publisher(),
         ),
-    );
+    )
+    .merge(sooqa_server::admin_router());
 
     tracing::info!(role = %config.role, "sooqa server started");
     let server = sooqa_server::serve(listener, app, sooqa_runtime::shutdown_signal());

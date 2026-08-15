@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Sooqa Admin</title>
+  <link rel="stylesheet" href="/admin/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#dashboard" data-page-link="dashboard">sooqa <span>admin</span></a>
+    <nav class="nav" aria-label="Primary navigation">
+      <a href="#dashboard" data-page-link="dashboard">Dashboard</a>
+      <a href="#ingests" data-page-link="ingests">Ingests</a>
+      <a href="#media" data-page-link="media">Media</a>
+      <a href="#schedule" data-page-link="schedule">Schedule</a>
+      <a href="#settings" data-page-link="settings">Settings</a>
+    </nav>
+    <div class="session-actions">
+      <span id="session-status" class="session-status">Locked</span>
+      <button id="lock-button" class="button button-quiet" type="button" hidden>Forget token</button>
+    </div>
+  </header>
+
+  <main class="main-shell">
+    <section id="token-gate" class="token-gate" aria-labelledby="token-title">
+      <div class="token-card">
+        <p class="eyebrow">Trusted home network</p>
+        <h1 id="token-title">Open the private control room</h1>
+        <p class="muted">Enter the configured API token. It stays in this browser session only and is sent in same-origin bearer headers.</p>
+        <form id="token-form" class="stack-form">
+          <label for="api-token">API token</label>
+          <input id="api-token" name="api-token" type="password" autocomplete="off" spellcheck="false" required>
+          <button class="button button-primary" type="submit">Unlock admin</button>
+        </form>
+        <p id="token-error" class="form-error" role="alert" hidden></p>
+      </div>
+    </section>
+
+    <div id="admin-shell" hidden>
+      <section id="dashboard-page" class="page" data-page="dashboard" aria-labelledby="dashboard-title">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Operational overview</p>
+            <h1 id="dashboard-title">Dashboard</h1>
+            <p class="muted">Bounded live totals and the decisions that need an owner.</p>
+          </div>
+          <button id="dashboard-refresh" class="button button-secondary" type="button">Refresh</button>
+        </div>
+        <div id="dashboard-counts" class="metric-grid" aria-live="polite"><p class="loading-state">Loading dashboard…</p></div>
+        <div class="attention-grid">
+          <section class="panel" aria-labelledby="duplicates-title">
+            <div class="panel-heading"><h2 id="duplicates-title">Technical duplicates</h2><span id="duplicate-count" class="badge">0</span></div>
+            <div id="duplicate-list" class="card-list"><p class="loading-state">Loading decisions…</p></div>
+          </section>
+          <section class="panel" aria-labelledby="repeats-title">
+            <div class="panel-heading"><h2 id="repeats-title">Publication repeats</h2><span id="repeat-count" class="badge">0</span></div>
+            <div id="repeat-list" class="card-list"><p class="loading-state">Loading decisions…</p></div>
+          </section>
+          <section class="panel" aria-labelledby="caption-failures-title">
+            <div class="panel-heading"><h2 id="caption-failures-title">Caption sync failures</h2><span id="caption-failure-count" class="badge">0</span></div>
+            <div id="caption-failure-list" class="card-list"><p class="loading-state">Loading failures…</p></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="ingests-page" class="page" data-page="ingests" aria-labelledby="ingests-title" hidden>
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Read-only operations</p>
+            <h1 id="ingests-title">Ingests</h1>
+            <p class="muted">Newest first. Only the visible first page is refreshed.</p>
+          </div>
+          <button id="ingests-refresh" class="button button-secondary" type="button">Refresh</button>
+        </div>
+        <section class="panel">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>ID</th><th>Source</th><th>Action</th><th>State</th><th>Timing</th><th>Result</th><th>Error</th></tr></thead>
+              <tbody id="ingest-rows"><tr><td colspan="7" class="empty-state">Loading ingests…</td></tr></tbody>
+            </table>
+          </div>
+          <div class="pager"><button id="ingests-next" class="button button-secondary" type="button" hidden>Next page</button></div>
+        </section>
+      </section>
+
+      <section id="media-page" class="page placeholder-page" data-page="media" aria-labelledby="media-title" hidden>
+        <p class="eyebrow">Catalogue</p>
+        <h1 id="media-title">Media</h1>
+        <p class="muted">The bounded media catalogue is the next admin slice. Caption failures below link here so the workflow stays visible.</p>
+      </section>
+
+      <section id="schedule-page" class="page placeholder-page" data-page="schedule" aria-labelledby="schedule-title" hidden>
+        <p class="eyebrow">Publication</p>
+        <h1 id="schedule-title">Schedule</h1>
+        <p class="muted">The future schedule editor is the next admin slice. Publication decisions remain on the Dashboard until then.</p>
+      </section>
+
+      <section id="settings-page" class="page" data-page="settings" aria-labelledby="settings-title" hidden>
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">One target channel</p>
+            <h1 id="settings-title">Settings</h1>
+            <p class="muted">PostgreSQL is authoritative. A stale save is rejected and the form is refreshed.</p>
+          </div>
+          <button id="settings-refresh" class="button button-secondary" type="button">Refresh</button>
+        </div>
+        <section class="panel settings-panel">
+          <div id="settings-warning" class="notice" hidden></div>
+          <form id="settings-form" class="settings-form">
+            <input id="channel-id" type="hidden">
+            <input id="channel-updated-at" type="hidden">
+            <div class="form-grid">
+              <div class="field field-wide"><label for="channel-name">Display name</label><input id="channel-name" type="text" maxlength="128" required></div>
+              <div class="field"><label for="channel-chat-id">Telegram chat ID</label><input id="channel-chat-id" type="number" step="1" required></div>
+              <div class="field"><label for="channel-time-zone">IANA time zone</label><input id="channel-time-zone" type="text" required placeholder="Europe/Moscow"></div>
+              <div class="field"><label for="channel-window-start">Window start</label><input id="channel-window-start" type="time" required></div>
+              <div class="field"><label for="channel-window-end">Window end</label><input id="channel-window-end" type="time" required></div>
+              <div class="field"><label for="channel-interval">Cadence interval (minutes)</label><input id="channel-interval" type="number" min="1" step="1" required></div>
+              <div class="field"><label for="channel-parse-mode">Default parse mode</label><select id="channel-parse-mode"><option value="">Plain text</option><option value="HTML">HTML</option><option value="MarkdownV2">MarkdownV2</option></select></div>
+              <label class="check-field"><input id="channel-enabled" type="checkbox"><span>Enabled publication target</span></label>
+              <label class="check-field"><input id="channel-disable-notification" type="checkbox"><span>Disable Telegram notifications by default</span></label>
+            </div>
+            <div class="form-actions"><button id="settings-save" class="button button-primary" type="submit">Save settings</button><span id="settings-mode" class="muted">Loading…</span></div>
+          </form>
+        </section>
+      </section>
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </main>
+  <script src="/admin/assets/app.js" defer></script>
+</body>
+</html>
