@@ -145,6 +145,7 @@
   function lock() {
     stopIngestAutoRefresh();
     invalidateMediaPreviews();
+    discardScheduleEdits();
     state.token = "";
     try {
       writeToken("");
@@ -696,6 +697,12 @@
     }
   }
 
+  function discardScheduleEdits() {
+    state.scheduleEditing.clear();
+    const notice = $("schedule-notice");
+    if (notice) notice.hidden = true;
+  }
+
   function scheduleRevisionBody(item) {
     return {
       expected_revision: item.revision,
@@ -740,7 +747,7 @@
     const timing = node("p", "schedule-timing");
     timing.append(
       node("strong", "", `${scheduleModeLabel(item.schedule_mode)}: `),
-      node("span", "", formatDate(item.requested_publish_at || item.scheduled_at)),
+      node("span", "", formatDate(item.scheduled_at)),
     );
     main.append(timing);
 
@@ -758,7 +765,7 @@
       const timeLabel = node("label", "", "Exact future local time");
       const timeInput = document.createElement("input");
       timeInput.type = "datetime-local";
-      timeInput.value = scheduleLocalInput(item.requested_publish_at);
+      timeInput.value = item.schedule_mode === "explicit" ? scheduleLocalInput(item.scheduled_at) : "";
       timeInput.min = localDateTimeValue(new Date(Date.now() + 60_000));
       timeInput.addEventListener("input", () => markScheduleEditing(item.id));
       timeLabel.append(timeInput);
@@ -788,6 +795,14 @@
             body: JSON.stringify({ ...scheduleRevisionBody(item), caption: null }),
           }));
           showToast("Public post text cleared.");
+        }, "button button-small button-secondary"),
+        actionButton("Queue normally", async () => {
+          await scheduleMutation(item, () => api(`/api/v1/posts/${encodeURIComponent(item.id)}/schedule`, {
+            method: "POST",
+            headers: scheduleIdempotencyHeaders(),
+            body: JSON.stringify({ expected_revision: item.revision }),
+          }));
+          showToast("Post returned to the normal cadence.");
         }, "button button-small button-secondary"),
         actionButton("Set exact time", async () => {
           const publishAt = localFutureTimeToIso(timeInput.value);
@@ -830,21 +845,33 @@
     const list = $("schedule-list");
     state.scheduleItems = items;
     state.scheduleCursor = data.next_cursor || null;
-    if (state.scheduleEditing.size && [...list.children].some((child) => child.dataset.postId)) {
-      const notice = $("schedule-notice");
-      notice.textContent = "Schedule refreshed without replacing an active form. Save its edits or leave the page to reload it.";
-      notice.hidden = false;
-      $("schedule-next").hidden = !state.scheduleCursor;
-      return;
-    }
+    const existingCards = new Map(
+      [...list.children]
+        .filter((child) => child.dataset.postId)
+        .map((child) => [child.dataset.postId, child]),
+    );
     clear(list);
     if (!items.length) {
       list.append(node("p", "empty-state", "No unpublished schedule work."));
     } else {
-      for (const item of items) list.append(renderScheduleCard(item));
+      for (const item of items) {
+        const existingCard = existingCards.get(item.id);
+        if (existingCard && state.scheduleEditing.has(item.id)) {
+          list.append(existingCard);
+        } else {
+          state.scheduleEditing.delete(item.id);
+          list.append(renderScheduleCard(item));
+        }
+      }
     }
+    for (const postId of state.scheduleEditing) {
+      if (!items.some((item) => item.id === postId)) state.scheduleEditing.delete(postId);
+    }
+    const notice = $("schedule-notice");
+    const preservedEdit = items.some((item) => state.scheduleEditing.has(item.id));
+    notice.textContent = "Schedule refreshed without replacing active forms. Save their edits or leave the page to reload them.";
+    notice.hidden = !preservedEdit;
     $("schedule-next").hidden = !state.scheduleCursor;
-    $("schedule-notice").hidden = true;
   }
 
   async function loadSchedule(cursor) {
@@ -1007,7 +1034,9 @@
     stopIngestAutoRefresh();
     if (state.page === "media") invalidateMediaPreviews();
     const requested = window.location.hash.slice(1);
-    state.page = PAGE_NAMES.has(requested) ? requested : "dashboard";
+    const nextPage = PAGE_NAMES.has(requested) ? requested : "dashboard";
+    if (state.page === "schedule" && nextPage !== "schedule") discardScheduleEdits();
+    state.page = nextPage;
     for (const page of document.querySelectorAll("[data-page]")) page.hidden = page.dataset.page !== state.page;
     for (const navigation of document.querySelectorAll("[data-page-link]")) navigation.classList.toggle("active", navigation.dataset.pageLink === state.page);
     if (!state.token) {
@@ -1086,6 +1115,7 @@
   window.addEventListener("pagehide", () => {
     stopIngestAutoRefresh();
     invalidateMediaPreviews();
+    discardScheduleEdits();
   });
 
   setAuthView(Boolean(state.token));
