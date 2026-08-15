@@ -108,6 +108,9 @@ pub struct DownloadedSource {
     pub path: PathBuf,
     pub bytes: u64,
     pub mime_type: Option<String>,
+    /// The yt-dlp format selected for this download, when an adapter can
+    /// report it. This is bounded configuration metadata, not source data.
+    pub selected_format: Option<String>,
 }
 
 #[async_trait]
@@ -198,13 +201,7 @@ impl SourceDownloader for SourceDownloaderRouter {
             "direct_http" => self.direct_http.download(inspection, destination, limits).await,
             "yt_dlp" => match &self.ytdlp {
                 Some(ytdlp) => {
-                    if !is_allowed_ytdlp_source(&inspection.source_url, &self.ytdlp_allowed_hosts)?
-                    {
-                        return Err(DownloadError::terminal(
-                            "source_host_not_allowed",
-                            "page URL host is not enabled for yt-dlp",
-                        ));
-                    }
+                    validate_ytdlp_inspection(inspection, &self.ytdlp_allowed_hosts)?;
                     ytdlp.download(inspection, destination, limits).await
                 }
                 None => Err(DownloadError::terminal(
@@ -218,6 +215,26 @@ impl SourceDownloader for SourceDownloaderRouter {
             )),
         }
     }
+}
+
+fn validate_ytdlp_inspection(
+    inspection: &SourceInspection,
+    allowed_hosts: &[String],
+) -> Result<(), DownloadError> {
+    if !is_allowed_ytdlp_source(&inspection.source_url, allowed_hosts)?
+        || inspection
+            .resolved_url
+            .as_deref()
+            .map(|url| is_allowed_ytdlp_source(url, allowed_hosts))
+            .transpose()?
+            .is_some_and(|allowed| !allowed)
+    {
+        return Err(DownloadError::terminal(
+            "source_host_not_allowed",
+            "page URL host is not enabled for yt-dlp",
+        ));
+    }
+    Ok(())
 }
 
 impl SourceDownloaderRouter {
@@ -357,6 +374,7 @@ mod tests {
                 path: destination.to_owned(),
                 bytes: 1,
                 mime_type: Some("video/mp4".to_owned()),
+                selected_format: None,
             })
         }
     }
@@ -493,6 +511,33 @@ mod tests {
 
         let mut selected = inspection("yt_dlp", SourceMediaKind::Video);
         selected.source_url = source.source_url;
+        assert!(matches!(
+            router
+                .download(&selected, Path::new("source.bin"), &DownloadLimits::default())
+                .await,
+            Err(DownloadError::Terminal { class, .. }) if class == "source_host_not_allowed"
+        ));
+        assert_eq!(ytdlp_downloads.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn router_rejects_an_inspected_canonical_host_outside_the_allowlist() {
+        let ytdlp_downloads = Arc::new(AtomicUsize::new(0));
+        let router = SourceDownloaderRouter::new(
+            Arc::new(StubDownloader {
+                inspection: Ok(inspection("direct_http", SourceMediaKind::Unknown)),
+                downloads: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(StubDownloader {
+                inspection: Ok(inspection("yt_dlp", SourceMediaKind::Video)),
+                downloads: Arc::clone(&ytdlp_downloads),
+            }),
+            vec!["youtube.com".to_owned()],
+        );
+        let mut selected = inspection("yt_dlp", SourceMediaKind::Video);
+        selected.source_url = "https://youtube.com/watch?v=abc".to_owned();
+        selected.resolved_url = Some("https://attacker.example/watch?v=abc".to_owned());
+
         assert!(matches!(
             router
                 .download(&selected, Path::new("source.bin"), &DownloadLimits::default())

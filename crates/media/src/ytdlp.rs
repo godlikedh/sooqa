@@ -20,6 +20,8 @@ use crate::{
 const DEFAULT_DENO_PATH: &str = "deno";
 const MIN_SUPPORTED_DENO_VERSION: (u32, u32, u32) = (2, 3, 0);
 const YTDLP_ATTEMPT_MAX_BYTES_MULTIPLIER: u64 = 3;
+pub const YTDLP_PROGRESSIVE_FALLBACK_FORMAT: &str =
+    "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]";
 pub const DEFAULT_YTDLP_METADATA_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const RUNTIME_FIXTURE: &[u8] = br#"{
   "id": "sooqa-runtime-fixture",
@@ -318,73 +320,16 @@ impl YtDlpDownloader {
     }
 }
 
-#[async_trait]
-impl SourceDownloader for YtDlpDownloader {
-    async fn inspect(&self, source: &SourceInput) -> Result<SourceInspection, DownloadError> {
-        validate_limits(&self.inspection_limits, self.inspection_limits.timeout)?;
-        let source_url = validate_source_url(&source.source_url)?;
-        let mut args = vec![
-            "--dump-single-json".to_owned(),
-            "--skip-download".to_owned(),
-            "--no-playlist".to_owned(),
-            "--no-warnings".to_owned(),
-            "--no-progress".to_owned(),
-        ];
-        args.extend(self.security_args());
-        args.extend([
-            "--format".to_owned(),
-            self.config.format_selection.clone(),
-            "--".to_owned(),
-            source_url.clone(),
-        ]);
-        let output = self
-            .run_with_output_limit(
-                args,
-                self.inspection_limits.timeout,
-                &source_url,
-                self.config.metadata_max_output_bytes,
-            )
-            .await?;
-        let metadata = parse_metadata(&output.stdout, &source_url)?;
-        if metadata.filesize_bytes.is_some_and(|bytes| bytes > self.inspection_limits.max_bytes) {
-            return Err(DownloadError::terminal(
-                "source_too_large",
-                "yt-dlp metadata exceeds the configured byte limit",
-            ));
-        }
-
-        let content_length_bytes = metadata.filesize_bytes;
-        let mime_type = metadata.mime_type.clone();
-        let title = metadata.title.clone();
-        let media_kind = metadata.media_kind();
-        let resolved_url = metadata.webpage_url.clone().or_else(|| Some(source_url.clone()));
-        let metadata = serde_json::to_value(&metadata).map_err(|error| {
-            DownloadError::terminal(
-                "ytdlp_metadata",
-                format!("could not serialize metadata: {error}"),
-            )
-        })?;
-
-        Ok(SourceInspection {
-            adapter: "yt_dlp".to_owned(),
-            source_url: source.source_url.clone(),
-            resolved_url,
-            media_kind,
-            mime_type,
-            content_length_bytes,
-            title,
-            metadata,
-        })
-    }
-
-    async fn download(
+impl YtDlpDownloader {
+    async fn download_with_format(
         &self,
         inspection: &SourceInspection,
         destination: &Path,
         limits: &DownloadLimits,
+        source_url: &str,
+        attempt_max_bytes: u64,
+        format_selection: &str,
     ) -> Result<DownloadedSource, DownloadError> {
-        validate_limits(limits, limits.timeout)?;
-        let source_url = validate_source_url(&inspection.source_url)?;
         let attempt_path = destination.with_file_name(format!(".sooqa-ytdlp-{}", Uuid::new_v4()));
         let attempt = TempDirectory::reserve(attempt_path).await.map_err(|source| {
             DownloadError::terminal(
@@ -392,13 +337,6 @@ impl SourceDownloader for YtDlpDownloader {
                 format!("could not reserve yt-dlp attempt directory: {source}"),
             )
         })?;
-        let attempt_max_bytes =
-            limits.max_bytes.checked_mul(YTDLP_ATTEMPT_MAX_BYTES_MULTIPLIER).ok_or_else(|| {
-                DownloadError::terminal(
-                    "invalid_download_limits",
-                    "yt-dlp aggregate attempt byte limit overflowed",
-                )
-            })?;
 
         let mut args = vec![
             "--no-playlist".to_owned(),
@@ -417,16 +355,14 @@ impl SourceDownloader for YtDlpDownloader {
             "--max-filesize".to_owned(),
             limits.max_bytes.to_string(),
             "--format".to_owned(),
-            self.config.format_selection.clone(),
+            format_selection.to_owned(),
             "--output".to_owned(),
             "final.%(ext)s".to_owned(),
             "--".to_owned(),
-            source_url.clone(),
+            source_url.to_owned(),
         ]);
-        let result = self
-            .run_sequence(args, limits.timeout, &source_url, attempt.path(), attempt_max_bytes)
-            .await;
-        result?;
+        self.run_sequence(args, limits.timeout, source_url, attempt.path(), attempt_max_bytes)
+            .await?;
 
         let final_path = single_regular_file(attempt.path()).await.map_err(|source| {
             DownloadError::terminal(
@@ -470,7 +406,150 @@ impl SourceDownloader for YtDlpDownloader {
             path: destination.to_owned(),
             bytes,
             mime_type: inspection.mime_type.clone(),
+            selected_format: Some(format_selection.to_owned()),
         })
+    }
+}
+
+#[async_trait]
+impl SourceDownloader for YtDlpDownloader {
+    async fn inspect(&self, source: &SourceInput) -> Result<SourceInspection, DownloadError> {
+        validate_limits(&self.inspection_limits, self.inspection_limits.timeout)?;
+        let source_url = validate_source_url(&source.source_url)?;
+        let mut args = vec![
+            "--dump-single-json".to_owned(),
+            "--skip-download".to_owned(),
+            "--no-playlist".to_owned(),
+            "--no-warnings".to_owned(),
+            "--no-progress".to_owned(),
+        ];
+        args.extend(self.security_args());
+        args.extend([
+            "--format".to_owned(),
+            self.config.format_selection.clone(),
+            "--".to_owned(),
+            source_url.clone(),
+        ]);
+        let output = self
+            .run_with_output_limit(
+                args,
+                self.inspection_limits.timeout,
+                &source_url,
+                self.config.metadata_max_output_bytes,
+            )
+            .await?;
+        let metadata = parse_metadata(&output.stdout, &source_url)?;
+        if metadata.filesize_bytes.is_some_and(|bytes| bytes > self.inspection_limits.max_bytes) {
+            return Err(DownloadError::terminal(
+                "source_too_large",
+                "yt-dlp metadata exceeds the configured byte limit",
+            ));
+        }
+
+        let content_length_bytes = metadata.filesize_bytes;
+        let mime_type = metadata.mime_type.clone();
+        let title = metadata.title.clone();
+        let media_kind = metadata.media_kind();
+        let resolved_url = metadata
+            .webpage_url
+            .as_deref()
+            .map(validate_source_url)
+            .transpose()?
+            .or_else(|| Some(source_url.clone()));
+        let metadata = serde_json::to_value(&metadata).map_err(|error| {
+            DownloadError::terminal(
+                "ytdlp_metadata",
+                format!("could not serialize metadata: {error}"),
+            )
+        })?;
+
+        Ok(SourceInspection {
+            adapter: "yt_dlp".to_owned(),
+            source_url: source.source_url.clone(),
+            resolved_url,
+            media_kind,
+            mime_type,
+            content_length_bytes,
+            title,
+            metadata,
+        })
+    }
+
+    async fn download(
+        &self,
+        inspection: &SourceInspection,
+        destination: &Path,
+        limits: &DownloadLimits,
+    ) -> Result<DownloadedSource, DownloadError> {
+        validate_limits(limits, limits.timeout)?;
+        let source_url = inspection.resolved_url.as_deref().unwrap_or(&inspection.source_url);
+        let source_url = validate_source_url(source_url)?;
+        let attempt_max_bytes =
+            limits.max_bytes.checked_mul(YTDLP_ATTEMPT_MAX_BYTES_MULTIPLIER).ok_or_else(|| {
+                DownloadError::terminal(
+                    "invalid_download_limits",
+                    "yt-dlp aggregate attempt byte limit overflowed",
+                )
+            })?;
+
+        let high_quality_format = self.config.format_selection.clone();
+        let first_attempt = self
+            .download_with_format(
+                inspection,
+                destination,
+                limits,
+                &source_url,
+                attempt_max_bytes,
+                &high_quality_format,
+            )
+            .await;
+        match first_attempt {
+            Ok(downloaded) => return Ok(downloaded),
+            Err(error) if is_media_data_forbidden(&error) => {}
+            Err(error) => return Err(error),
+        }
+
+        // A second process gets fresh extractor/plugin state. Only the
+        // specific media-byte 403 is eligible for this bounded recovery path;
+        // private, removed, account-required, and other extractor outcomes
+        // remain terminal.
+        let second_attempt = self
+            .download_with_format(
+                inspection,
+                destination,
+                limits,
+                &source_url,
+                attempt_max_bytes,
+                &high_quality_format,
+            )
+            .await;
+        match second_attempt {
+            Ok(downloaded) => Ok(downloaded),
+            Err(error) if is_media_data_forbidden(&error) => self
+                .download_with_format(
+                    inspection,
+                    destination,
+                    limits,
+                    &source_url,
+                    attempt_max_bytes,
+                    YTDLP_PROGRESSIVE_FALLBACK_FORMAT,
+                )
+                .await
+                .map_err(|fallback_error| {
+                    if is_media_data_forbidden(&fallback_error) {
+                        DownloadError::retryable(
+                            "ytdlp_media_forbidden",
+                            format!(
+                                "high-quality and progressive yt-dlp attempts were rejected: {}",
+                                fallback_error
+                            ),
+                        )
+                    } else {
+                        fallback_error
+                    }
+                }),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -663,11 +742,23 @@ fn map_process_failure(output: &ExternalCommandOutput, source_url: &str) -> Down
     } else {
         format!("yt-dlp exited unsuccessfully with status {:?}: {stderr}", output.exit_code)
     };
-    if is_transient_failure(&stderr) {
+    if is_media_data_forbidden_message(&stderr) {
+        DownloadError::retryable("ytdlp_media_forbidden", message)
+    } else if is_transient_failure(&stderr) {
         DownloadError::retryable("ytdlp_upstream", message)
     } else {
         DownloadError::terminal("ytdlp_process", message)
     }
+}
+
+fn is_media_data_forbidden(error: &DownloadError) -> bool {
+    matches!(error, DownloadError::Retryable { class, .. } if class == "ytdlp_media_forbidden")
+}
+
+fn is_media_data_forbidden_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("unable to download video data")
+        && (message.contains("http error 403") || message.contains("http 403"))
 }
 
 fn is_transient_failure(message: &str) -> bool {
@@ -820,7 +911,7 @@ mod tests {
         let downloader = YtDlpDownloader::with_limits(config, limits);
         let source = SourceInput {
             ingest_request_id: uuid::Uuid::new_v4(),
-            source_url: "https://example.test/watch?v=abc&title=hello%20world".to_owned(),
+            source_url: "https://example.test/watch?v=abc&list=playlist&index=2".to_owned(),
             page_url: None,
         };
 
@@ -830,6 +921,7 @@ mod tests {
         assert_eq!(inspection.mime_type.as_deref(), Some("video/mp4"));
         assert_eq!(inspection.content_length_bytes, Some(17));
         assert_eq!(inspection.title.as_deref(), Some("Example"));
+        assert_eq!(inspection.resolved_url.as_deref(), Some("https://example.test/watch?v=abc"));
         assert_eq!(inspection.metadata["duration_ms"], 3500);
 
         let inspect_args =
@@ -850,7 +942,7 @@ mod tests {
         assert!(
             inspect_args
                 .lines()
-                .any(|line| line == "https://example.test/watch?v=abc&title=hello%20world")
+                .any(|line| line == "https://example.test/watch?v=abc&list=playlist&index=2")
         );
 
         let destination = root.join("source.webm");
@@ -877,11 +969,7 @@ mod tests {
             .nth(1)
             .expect("download output argument should be logged");
         assert_eq!(output_argument, "final.%(ext)s");
-        assert!(
-            download_args
-                .lines()
-                .any(|line| line == "https://example.test/watch?v=abc&title=hello%20world")
-        );
+        assert!(download_args.lines().any(|line| line == "https://example.test/watch?v=abc"));
 
         let replayed = downloader
             .download(&inspection, &destination, &limits)
@@ -894,6 +982,178 @@ mod tests {
         );
 
         tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
+    }
+
+    #[tokio::test]
+    async fn download_uses_the_inspected_canonical_url_for_shorts() {
+        let root =
+            std::env::temp_dir().join(format!("sooqa-ytdlp-shorts-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.expect("test root should be created");
+        let executable = root.join("fake-yt-dlp.sh");
+        let args_log = root.join("args.log");
+        let script = format!(
+            "#!/bin/sh\nset -eu\nlog={args_log:?}\n: > \"$log\"\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$log\"; done\nprintf 'short-media' > final.mp4\n",
+            args_log = args_log.display()
+        );
+        tokio::fs::write(&executable, script).await.expect("fake executable should be written");
+        let mut permissions = tokio::fs::metadata(&executable)
+            .await
+            .expect("fake executable metadata should be available")
+            .permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&executable, permissions)
+            .await
+            .expect("fake executable should be executable");
+
+        let downloader = YtDlpDownloader::new(
+            YtDlpConfig::new(&executable, "bestvideo*+bestaudio/best")
+                .expect("format selection should be valid"),
+        );
+        let inspection = SourceInspection {
+            adapter: "yt_dlp".to_owned(),
+            source_url: "https://www.youtube.com/shorts/short-id".to_owned(),
+            resolved_url: Some("https://www.youtube.com/watch?v=short-id".to_owned()),
+            media_kind: SourceMediaKind::Video,
+            mime_type: Some("video/mp4".to_owned()),
+            content_length_bytes: None,
+            title: None,
+            metadata: serde_json::json!({}),
+        };
+        let destination = root.join("source.mp4");
+
+        let downloaded = downloader
+            .download(&inspection, &destination, &DownloadLimits::default())
+            .await
+            .expect("canonical Shorts URL should download");
+        assert_eq!(downloaded.selected_format.as_deref(), Some("bestvideo*+bestaudio/best"));
+        let args = tokio::fs::read_to_string(&args_log).await.expect("arguments should be logged");
+        assert!(args.lines().any(|line| line == "https://www.youtube.com/watch?v=short-id"));
+        assert!(!args.lines().any(|line| line == "https://www.youtube.com/shorts/short-id"));
+
+        tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
+    }
+
+    #[tokio::test]
+    async fn media_data_403_refreshes_high_quality_extraction_before_success() {
+        let root =
+            std::env::temp_dir().join(format!("sooqa-ytdlp-refresh-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.expect("test root should be created");
+        let executable = root.join("fake-yt-dlp.sh");
+        let count_file = root.join("attempts");
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncount=0\nif [ -f {count_file:?} ]; then count=$(cat {count_file:?}); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > {count_file:?}\nif [ \"$count\" -eq 1 ]; then printf '%s\\n' 'ERROR: unable to download video data: HTTP Error 403: Forbidden' >&2; exit 1; fi\nprintf 'fresh-media' > final.mp4\n",
+            count_file = count_file.display()
+        );
+        tokio::fs::write(&executable, script).await.expect("fake executable should be written");
+        let mut permissions = tokio::fs::metadata(&executable)
+            .await
+            .expect("fake executable metadata should be available")
+            .permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&executable, permissions)
+            .await
+            .expect("fake executable should be executable");
+
+        let downloader = YtDlpDownloader::new(
+            YtDlpConfig::new(&executable, "bestvideo*+bestaudio/best")
+                .expect("format selection should be valid"),
+        );
+        let inspection = SourceInspection {
+            adapter: "yt_dlp".to_owned(),
+            source_url: "https://www.youtube.com/watch?v=refresh".to_owned(),
+            resolved_url: Some("https://www.youtube.com/watch?v=refresh".to_owned()),
+            media_kind: SourceMediaKind::Video,
+            mime_type: Some("video/mp4".to_owned()),
+            content_length_bytes: None,
+            title: None,
+            metadata: serde_json::json!({}),
+        };
+        let destination = root.join("source.mp4");
+
+        let downloaded = downloader
+            .download(&inspection, &destination, &DownloadLimits::default())
+            .await
+            .expect("a fresh high-quality extraction should recover");
+        assert_eq!(downloaded.selected_format.as_deref(), Some("bestvideo*+bestaudio/best"));
+        assert_eq!(tokio::fs::read_to_string(&count_file).await.unwrap(), "2");
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"fresh-media");
+
+        tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
+    }
+
+    #[tokio::test]
+    async fn repeated_media_data_403_uses_one_clean_progressive_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("sooqa-ytdlp-fallback-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.expect("test root should be created");
+        let executable = root.join("fake-yt-dlp.sh");
+        let formats_log = root.join("formats.log");
+        let script = format!(
+            "#!/bin/sh\nset -eu\nformat=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--format' ]; then shift; format=$1; fi\n  shift\ndone\nprintf '%s\\n' \"$format\" >> {formats_log:?}\nif [ \"$format\" = 'bestvideo*+bestaudio/best' ]; then printf '%s\\n' 'ERROR: unable to download video data: HTTP Error 403: Forbidden' >&2; exit 1; fi\nprintf 'progressive-media' > final.mp4\n",
+            formats_log = formats_log.display()
+        );
+        tokio::fs::write(&executable, script).await.expect("fake executable should be written");
+        let mut permissions = tokio::fs::metadata(&executable)
+            .await
+            .expect("fake executable metadata should be available")
+            .permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&executable, permissions)
+            .await
+            .expect("fake executable should be executable");
+
+        let high_quality = "bestvideo*+bestaudio/best";
+        let downloader = YtDlpDownloader::new(
+            YtDlpConfig::new(&executable, high_quality).expect("format selection should be valid"),
+        );
+        let inspection = SourceInspection {
+            adapter: "yt_dlp".to_owned(),
+            source_url: "https://www.youtube.com/watch?v=fallback".to_owned(),
+            resolved_url: Some("https://www.youtube.com/watch?v=fallback".to_owned()),
+            media_kind: SourceMediaKind::Video,
+            mime_type: Some("video/mp4".to_owned()),
+            content_length_bytes: None,
+            title: None,
+            metadata: serde_json::json!({}),
+        };
+        let destination = root.join("source.mp4");
+
+        let downloaded = downloader
+            .download(&inspection, &destination, &DownloadLimits::default())
+            .await
+            .expect("progressive fallback should succeed");
+        assert_eq!(downloaded.selected_format.as_deref(), Some(YTDLP_PROGRESSIVE_FALLBACK_FORMAT));
+        let formats = tokio::fs::read_to_string(&formats_log).await.unwrap();
+        assert_eq!(
+            formats.lines().collect::<Vec<_>>(),
+            [high_quality, high_quality, YTDLP_PROGRESSIVE_FALLBACK_FORMAT]
+        );
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"progressive-media");
+
+        tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
+    }
+
+    #[test]
+    fn private_and_account_required_outcomes_are_not_media_data_retries() {
+        for stderr in [
+            "ERROR: [youtube] Private video. Sign in to watch this video.",
+            "ERROR: [youtube] Sign in to confirm your age.",
+            "ERROR: [youtube] This video is unavailable.",
+        ] {
+            let error = map_process_failure(
+                &ExternalCommandOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    stdout: Vec::new(),
+                    stderr: stderr.as_bytes().to_vec(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+                "https://www.youtube.com/watch?v=terminal",
+            );
+            assert_eq!(error.class(), "ytdlp_process");
+            assert!(!error.is_retryable());
+        }
     }
 
     #[tokio::test]

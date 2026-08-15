@@ -145,12 +145,19 @@ CDN media URLs. The supported home path is public regular videos and Shorts;
 private, members-only, age-restricted, geo-bypassed, and cookie-authenticated
 media are intentionally outside this setup.
 
-Current limitation: inspection records yt-dlp's resolved media URL, but the
-download attempt still starts from the originally submitted page URL, and an
-HTTP 403 is terminal rather than trying a bounded fallback/provider path.
-[Issue #102](https://github.com/godlikedh/sooqa/issues/102) tracks reliable
-YouTube/Shorts download handling; treat these page sources as best-effort until
-that issue is closed.
+The submitted URL remains the ingest provenance. After inspection, the worker
+uses the validated canonical `resolved_url` for yt-dlp execution and checks its
+scheme, credentials, port, and host against the same allowlist before starting
+the child. The configured high-quality format is attempted first. If a fresh
+attempt reports the specific media-byte `HTTP Error 403`, the worker starts one
+more high-quality attempt with fresh extractor state; if that also receives the
+same error, it makes one clean attempt with the bounded combined progressive
+selection `best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]`.
+The winning selection is recorded as `input_json.download.selected_format`.
+Private, removed, account-required, and other extractor failures stay
+terminal, while a failed progressive attempt returns to the existing bounded
+job retry policy. Every attempt has its own directory and failed or partial
+files are removed before another attempt.
 
 The home image downloads the official standalone `yt-dlp` distribution, which
 contains the bundled `yt-dlp-ejs` component, and a pinned Deno runtime. The
