@@ -82,13 +82,9 @@ this baseline.
   storage uploads, and publication use separate bounded calls. Telegram file
   acceptance is metadata-only; source bytes are reconstructed by the worker
   from the durable file ID. Publication receives only a ready storage receipt
-  and never receives a local media path. Queue prompts retain the ForceReply
-  message ID and post revision; callbacks validate the current queue projection
-  through the Publisher adapter before sending a prompt. Queue rendering
-  carries post state so draft/failed rows do not expose queued-only slot moves.
-  Queue cards use a per-chat pacing hook and bounded RetryAfter retries; a
-  partial view is cleaned up and its update claim is completed before reporting
-  the rendering failure.
+  and never receives a local media path. The Telegram adapter remains focused
+  on capture, duplicate decisions, and sending; bounded web-admin slices own
+  publication editing.
 - `sooqa-persistence` owns migrations and short database transactions.
 - `sooqa-api` owns HTTP routing, one configured bearer secret, limits, and
   stable request-ID errors.
@@ -267,13 +263,14 @@ state transition.
 
 Channels hold only target identity, enablement, timezone, window, and interval.
 Posts hold the intended message and the latest send result. A scheduled post
-is a query over `posts.state = 'queued'`; scheduling assigns `cadence_slot_at`
-and enqueues one fixed-dedupe `publish_post` job referencing the post ID. Queue
-mutations lock the channel first and then the affected post/job rows in a
-stable order. `posts.revision` is copied into the job payload, so a stale
-claim cannot send after an edit, swap, move, or publish-now operation. Adjacent
-move and occupied-slot operations swap exactly two slots; empty-slot moves do
-not compact unrelated posts. All post/job changes commit without Telegram I/O.
+is a query over `posts.state = 'queued'`; normal scheduling assigns
+`cadence_slot_at` and enqueues one fixed-dedupe `publish_post` job referencing
+the post ID. Publication mutations lock the channel first and then the
+affected post/job rows in a stable order. `posts.revision` is copied into the
+job payload, so a stale claim cannot send after an edit or publish-now
+operation. All post/job changes commit without Telegram I/O; exact future
+scheduling and other web-admin editing commands are added by later bounded
+slices without restoring the removed Telegram reorder/swap surface.
 Send generation and token fence retries, while `unknown` preserves an
 ambiguous Telegram outcome for explicit reconciliation. `publish now` changes
 only the job due time and leaves the cadence slot intact.
@@ -328,15 +325,10 @@ sequenceDiagram
     end
 ```
 
-The configured administrator can inspect and mutate the same durable queue in
-the private Telegram DM with `/queue`. The Telegram adapter owns only bounded
-message-ID and ForceReply state; it does not create a UI table or issue SQL.
-Count callbacks load at most 125 posts, render one text card per post, and
-link directly to the existing storage message. Every mutating callback carries
-the post revision and delegates to `PublisherService`, so stale cards produce
-`Queue changed; run /queue again.` without changing PostgreSQL state. A
-partial render is deleted best-effort and reported, while a second `/queue`
-cleans the previous view before replacing it.
+The Telegram adapter does not expose the superseded queue presentation or
+its reorder/swap callbacks. It remains responsible for capture, duplicate
+decisions, and publication transport; bounded web-admin slices own durable
+publication inspection and editing through the API.
 
 ## Security and filesystem rules
 

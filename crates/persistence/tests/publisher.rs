@@ -6,7 +6,7 @@ use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
 use sooqa_persistence::{Database, PublishLease, PublisherRepositoryError};
-use sooqa_publisher::{NewChannel, NewPost, PostSchedule, PostState, PostUpdate, QueueDirection};
+use sooqa_publisher::{NewChannel, NewPost, PostSchedule, PostState, PostUpdate};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -79,83 +79,6 @@ async fn publish_job_snapshot(
     .fetch_one(database.pool())
     .await
     .unwrap()
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires PostgreSQL"]
-async fn queue_projection_preserves_every_mutable_post_state(pool: sqlx::PgPool) {
-    let database = Database::from_pool(pool);
-    let channel = database
-        .publisher()
-        .create_channel(
-            NewChannel::try_new(format!("projection-{}", Uuid::new_v4()), -1000000000010).unwrap(),
-        )
-        .await
-        .unwrap();
-    let media_id = stored_media(&database).await;
-    let database_ref = &database;
-    let create = |suffix: &str| {
-        let suffix = suffix.to_owned();
-        async move {
-            database_ref
-                .publisher()
-                .create_post_idempotent(
-                    NewPost {
-                        media_id,
-                        channel_id: channel.id,
-                        caption: Some(suffix.to_owned()),
-                        parse_mode: None,
-                        disable_notification: false,
-                    },
-                    format!("projection-{suffix}-{}", Uuid::new_v4()),
-                    suffix.as_bytes(),
-                )
-                .await
-                .unwrap()
-                .post
-        }
-    };
-    let draft = create("draft").await;
-    let queued = create("queued").await;
-    let failed = create("failed").await;
-    let sending = create("sending").await;
-    let requested_at = OffsetDateTime::now_utc();
-    let queued = database
-        .publisher()
-        .schedule_post(PostSchedule::try_new(queued.id, requested_at, "queued-key", 0).unwrap())
-        .await
-        .unwrap();
-    let failed = database
-        .publisher()
-        .schedule_post(PostSchedule::try_new(failed.id, requested_at, "failed-key", 0).unwrap())
-        .await
-        .unwrap();
-    let sending = database
-        .publisher()
-        .schedule_post(PostSchedule::try_new(sending.id, requested_at, "sending-key", 0).unwrap())
-        .await
-        .unwrap();
-    sqlx::query("UPDATE posts SET state = 'failed' WHERE id = $1")
-        .bind(failed.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    sqlx::query(
-        "UPDATE posts SET state = 'sending', send_token = gen_random_uuid(), send_started_at = now() WHERE id = $1",
-    )
-        .bind(sending.id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-
-    let projected = database.publisher().list_queue_posts(10).await.unwrap();
-    let mut states = projected.iter().map(|post| post.state).collect::<Vec<_>>();
-    states.sort_by_key(|state| state.as_str());
-    assert_eq!(states, vec![PostState::Draft, PostState::Failed, PostState::Queued]);
-    assert!(projected.iter().any(|post| post.id == draft.id && post.state == PostState::Draft));
-    assert!(projected.iter().any(|post| post.id == queued.id && post.state == PostState::Queued));
-    assert!(projected.iter().any(|post| post.id == failed.id && post.state == PostState::Failed));
-    assert!(!projected.iter().any(|post| post.id == sending.id));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -285,9 +208,7 @@ async fn post_schedule_uses_one_row_and_channel_cadence(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fences(
-    pool: sqlx::PgPool,
-) {
+async fn post_mutations_preserve_revision_fences(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let mut new_channel =
         NewChannel::try_new(format!("test-{}", Uuid::new_v4()), -1000000000001).unwrap();
@@ -384,26 +305,6 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
     let second_slot = queued[1].cadence_slot_at.unwrap();
     let third_slot = queued[2].cadence_slot_at.unwrap();
     assert!(first_slot < second_slot && second_slot < third_slot);
-    let moved = database
-        .publisher()
-        .move_adjacent(queued[1].id, QueueDirection::Earlier, queued[1].revision)
-        .await
-        .unwrap();
-    assert_eq!(moved.cadence_slot_at, Some(first_slot));
-    assert_eq!(
-        database.publisher().find_post(queued[0].id).await.unwrap().unwrap().cadence_slot_at,
-        Some(second_slot)
-    );
-    assert_eq!(moved.revision, 2);
-
-    let swapped =
-        database.publisher().set_slot(queued[2].id, second_slot, queued[2].revision).await.unwrap();
-    assert_eq!(swapped.cadence_slot_at, Some(second_slot));
-    assert_eq!(
-        database.publisher().find_post(queued[0].id).await.unwrap().unwrap().cadence_slot_at,
-        Some(third_slot)
-    );
-
     let sending_before = database.publisher().find_post(queued[0].id).await.unwrap().unwrap();
     let sending_job = claim_publish_job(&database, sending_before.id).await;
     let sending_attempt = sending_job.lease().unwrap();
@@ -414,23 +315,10 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
         .unwrap();
     let target_before = database.publisher().find_post(queued[2].id).await.unwrap().unwrap();
     let sending_job_before = publish_job_snapshot(&database, sending.post.id).await;
-    let target_job_before = publish_job_snapshot(&database, target_before.id).await;
-    let blocked = database
-        .publisher()
-        .set_slot(queued[2].id, sending.post.cadence_slot_at.unwrap(), target_before.revision)
-        .await;
-    assert!(matches!(
-        blocked,
-        Err(PublisherRepositoryError::PostNotEditable { state: PostState::Sending, .. })
-    ));
-    let target_after = database.publisher().find_post(queued[2].id).await.unwrap().unwrap();
-    assert_eq!(target_after.cadence_slot_at, target_before.cadence_slot_at);
-    assert_eq!(target_after.revision, target_before.revision);
     let sending_after = database.publisher().find_post(sending.post.id).await.unwrap().unwrap();
     assert_eq!(sending_after.state, PostState::Sending);
     assert_eq!(sending_after.revision, sending.post.revision);
     assert_eq!(publish_job_snapshot(&database, sending.post.id).await, sending_job_before);
-    assert_eq!(publish_job_snapshot(&database, target_before.id).await, target_job_before);
 
     let edited = database
         .publisher()
@@ -441,13 +329,13 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
                 parse_mode: None,
                 disable_notification: None,
                 expected_updated_at: None,
-                expected_revision: swapped.revision,
+                expected_revision: target_before.revision,
             },
         )
         .await
         .unwrap();
     assert_eq!(edited.caption.as_deref(), Some("edited"));
-    assert_eq!(edited.revision, swapped.revision + 1);
+    assert_eq!(edited.revision, target_before.revision + 1);
     let job_payload: serde_json::Value =
         sqlx::query_scalar("SELECT payload FROM queue.jobs WHERE dedupe_key = $1")
             .bind(format!("post:{}:publish:v1", queued[2].id))
@@ -455,6 +343,7 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
             .await
             .unwrap();
     assert_eq!(job_payload["expected_revision"], edited.revision);
+    assert_eq!(publish_job_snapshot(&database, sending.post.id).await, sending_job_before);
 
     let now = database
         .publisher()
@@ -471,7 +360,8 @@ async fn queue_mutations_swap_move_edit_cancel_and_publish_now_with_revision_fen
     assert_eq!(replay.revision, now.revision);
     assert_eq!(replay.cadence_slot_at, now.cadence_slot_at);
 
-    let cancelled = database.publisher().cancel_post(queued[1].id, moved.revision).await.unwrap();
+    let cancelled =
+        database.publisher().cancel_post(queued[1].id, queued[1].revision).await.unwrap();
     assert_eq!(cancelled.state, PostState::Cancelled);
     assert!(cancelled.cadence_slot_at.is_none());
     assert_eq!(

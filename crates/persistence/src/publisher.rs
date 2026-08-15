@@ -5,10 +5,9 @@ use sooqa_jobs::JobAttempt;
 use sooqa_publisher::{
     Channel, ChannelValidationError, NewChannel, NewPost, Post, PostSchedule, PostState,
     PostUpdate, PublishClaim, PublishRetry, PublishedMessage, PublisherValidationError,
-    QueueDirection, QueuePost, validate_caption,
+    validate_caption,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
-use std::collections::HashMap;
 use thiserror::Error;
 use time::{OffsetDateTime, Time};
 use uuid::Uuid;
@@ -71,24 +70,6 @@ struct PostRow {
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
     revision: i64,
-}
-
-#[derive(Debug, Clone, FromRow)]
-struct QueuePostRow {
-    id: Uuid,
-    revision: i64,
-    state: String,
-    scheduled_at: OffsetDateTime,
-    cadence_slot_at: Option<OffsetDateTime>,
-    time_zone: String,
-    caption: Option<String>,
-    media_kind: String,
-    title: Option<String>,
-    description: Option<String>,
-    tags: Vec<String>,
-    source_url: Option<String>,
-    storage_chat_id: Option<i64>,
-    storage_message_id: Option<i64>,
 }
 
 impl PublisherRepository {
@@ -187,105 +168,6 @@ impl PublisherRepository {
             .await?
             .map(PostRow::into_post)
             .transpose()
-    }
-
-    pub async fn count_queue_posts(&self) -> Result<i64, PublisherRepositoryError> {
-        Ok(sqlx::query_scalar(
-            "SELECT count(*) FROM posts WHERE state IN ('draft', 'queued', 'failed')",
-        )
-        .fetch_one(&self.pool)
-        .await?)
-    }
-
-    pub async fn list_queue_posts(
-        &self,
-        limit: u32,
-    ) -> Result<Vec<QueuePost>, PublisherRepositoryError> {
-        let rows = sqlx::query_as::<_, QueuePostRow>(
-            "SELECT posts.id, posts.revision, posts.state, posts.scheduled_at, posts.cadence_slot_at, channels.time_zone, posts.caption, media.kind AS media_kind, media.title, media.description, media.tags, media.source_url, media.telegram_storage_chat_id AS storage_chat_id, media.telegram_storage_message_id AS storage_message_id FROM posts JOIN channels ON channels.id = posts.channel_id JOIN media ON media.id = posts.media_id WHERE posts.state IN ('draft', 'queued', 'failed') ORDER BY COALESCE(posts.cadence_slot_at, posts.scheduled_at), posts.id LIMIT $1",
-        )
-        .bind(i64::from(limit))
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(QueuePostRow::into_queue_post).collect())
-    }
-
-    pub async fn queue_post(
-        &self,
-        id: Uuid,
-        _revision: i64,
-    ) -> Result<QueuePost, PublisherRepositoryError> {
-        self.find_queue_post(id).await
-    }
-
-    pub async fn find_queue_post(&self, id: Uuid) -> Result<QueuePost, PublisherRepositoryError> {
-        Ok(sqlx::query_as::<_, QueuePostRow>(
-            "SELECT posts.id, posts.revision, posts.state, posts.scheduled_at, posts.cadence_slot_at, channels.time_zone, posts.caption, media.kind AS media_kind, media.title, media.description, media.tags, media.source_url, media.telegram_storage_chat_id AS storage_chat_id, media.telegram_storage_message_id AS storage_message_id FROM posts JOIN channels ON channels.id = posts.channel_id JOIN media ON media.id = posts.media_id WHERE posts.id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(PublisherRepositoryError::PostMissing(id))?
-        .into_queue_post())
-    }
-
-    pub async fn move_queue_post(
-        &self,
-        id: Uuid,
-        direction: QueueDirection,
-        revision: i64,
-    ) -> Result<QueuePost, PublisherRepositoryError> {
-        self.move_adjacent(id, direction, revision).await?;
-        self.queue_post(id, revision).await
-    }
-
-    pub async fn set_queue_post_slot(
-        &self,
-        id: Uuid,
-        slot: OffsetDateTime,
-        revision: i64,
-    ) -> Result<QueuePost, PublisherRepositoryError> {
-        self.set_slot(id, slot, revision).await?;
-        self.queue_post(id, revision).await
-    }
-
-    pub async fn update_queue_caption(
-        &self,
-        id: Uuid,
-        revision: i64,
-        caption: Option<String>,
-    ) -> Result<QueuePost, PublisherRepositoryError> {
-        self.update_post(
-            id,
-            PostUpdate {
-                caption: Some(caption),
-                parse_mode: None,
-                disable_notification: None,
-                expected_updated_at: None,
-                expected_revision: revision,
-            },
-        )
-        .await?;
-        self.queue_post(id, revision).await
-    }
-
-    pub async fn publish_queue_post(
-        &self,
-        id: Uuid,
-        revision: i64,
-    ) -> Result<QueuePost, PublisherRepositoryError> {
-        let request_key = format!("telegram:queue:now:{id}:{revision}");
-        self.publish_now(id, request_key, revision).await?;
-        self.queue_post(id, revision).await
-    }
-
-    pub async fn cancel_queue_post(
-        &self,
-        id: Uuid,
-        revision: i64,
-    ) -> Result<QueuePost, PublisherRepositoryError> {
-        self.cancel_post(id, revision).await?;
-        self.queue_post(id, revision).await
     }
 
     pub async fn update_post(
@@ -443,134 +325,6 @@ impl PublisherRepository {
         } else {
             update_publish_job(&mut transaction, id, now, row.revision).await?;
         }
-        transaction.commit().await?;
-        row.into_post()
-    }
-
-    pub async fn move_adjacent(
-        &self,
-        id: Uuid,
-        direction: QueueDirection,
-        expected_revision: i64,
-    ) -> Result<Post, PublisherRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let channel_id = post_channel_id(&mut transaction, id).await?;
-        let _channel = lock_channel(&mut transaction, channel_id).await?;
-        let current_snapshot = lock_post(&mut transaction, id).await?;
-        let current_state = current_snapshot.post_state()?;
-        if current_state != PostState::Queued {
-            return Err(PublisherRepositoryError::PostNotEditable { id, state: current_state });
-        }
-        check_expected_revision(&current_snapshot, expected_revision)?;
-        let adjacent_id = adjacent_post_id(&mut transaction, &current_snapshot, direction).await?;
-        let Some(adjacent_id) = adjacent_id else {
-            transaction.commit().await?;
-            return current_snapshot.into_post();
-        };
-        let mut rows = lock_posts(&mut transaction, &[id, adjacent_id]).await?;
-        let current = rows.remove(&id).ok_or(PublisherRepositoryError::PostMissing(id))?;
-        let adjacent =
-            rows.remove(&adjacent_id).ok_or(PublisherRepositoryError::PostMissing(adjacent_id))?;
-        if adjacent.post_state()? != PostState::Queued {
-            return Err(PublisherRepositoryError::PostNotEditable {
-                id: adjacent.id,
-                state: adjacent.post_state()?,
-            });
-        }
-        let current_slot =
-            current.cadence_slot_at.ok_or(PublisherRepositoryError::PostNotScheduled(id))?;
-        let adjacent_slot = adjacent
-            .cadence_slot_at
-            .ok_or(PublisherRepositoryError::PostNotScheduled(adjacent.id))?;
-        let current_revision = next_revision(current.revision)?;
-        let adjacent_revision = next_revision(adjacent.revision)?;
-        let current_row =
-            update_post_slot(&mut transaction, &current, adjacent_slot, current_revision).await?;
-        let adjacent_row =
-            update_post_slot(&mut transaction, &adjacent, current_slot, adjacent_revision).await?;
-        update_publish_job(&mut transaction, current.id, adjacent_slot, current_row.revision)
-            .await?;
-        update_publish_job(&mut transaction, adjacent.id, current_slot, adjacent_row.revision)
-            .await?;
-        transaction.commit().await?;
-        current_row.into_post()
-    }
-
-    pub async fn set_slot(
-        &self,
-        id: Uuid,
-        slot: OffsetDateTime,
-        expected_revision: i64,
-    ) -> Result<Post, PublisherRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
-        let channel_id = post_channel_id(&mut transaction, id).await?;
-        let channel = lock_channel(&mut transaction, channel_id).await?;
-        let current_snapshot = lock_post(&mut transaction, id).await?;
-        let current_state = current_snapshot.post_state()?;
-        if current_state != PostState::Queued {
-            return Err(PublisherRepositoryError::PostNotEditable { id, state: current_state });
-        }
-        check_expected_revision(&current_snapshot, expected_revision)?;
-        validate_slot(slot, &channel)?;
-        let occupied = sqlx::query_as::<_, OccupiedSlotRow>(
-            "SELECT id, state FROM posts WHERE channel_id = $1 AND state IN ('queued', 'sending') AND cadence_slot_at = $2 AND id <> $3 FOR UPDATE",
-        )
-        .bind(channel.id)
-        .bind(slot)
-        .bind(id)
-        .fetch_optional(&mut *transaction)
-        .await?;
-        if current_snapshot.cadence_slot_at == Some(slot) {
-            transaction.commit().await?;
-            return current_snapshot.into_post();
-        }
-        if let Some(occupied) = occupied {
-            let occupied_id = occupied.id;
-            if occupied.state == PostState::Sending.as_str() {
-                return Err(PublisherRepositoryError::PostNotEditable {
-                    id: occupied_id,
-                    state: PostState::Sending,
-                });
-            }
-            let mut rows = lock_posts(&mut transaction, &[id, occupied_id]).await?;
-            let current = rows.remove(&id).ok_or(PublisherRepositoryError::PostMissing(id))?;
-            let occupied = rows
-                .remove(&occupied_id)
-                .ok_or(PublisherRepositoryError::PostMissing(occupied_id))?;
-            let current_slot = current
-                .cadence_slot_at
-                .ok_or(PublisherRepositoryError::PostNotScheduled(current.id))?;
-            occupied
-                .cadence_slot_at
-                .ok_or(PublisherRepositoryError::PostNotScheduled(occupied.id))?;
-            let current_row = update_post_slot(
-                &mut transaction,
-                &current,
-                slot,
-                next_revision(current.revision)?,
-            )
-            .await?;
-            let occupied_row = update_post_slot(
-                &mut transaction,
-                &occupied,
-                current_slot,
-                next_revision(occupied.revision)?,
-            )
-            .await?;
-            update_publish_job(&mut transaction, id, slot, current_row.revision).await?;
-            update_publish_job(&mut transaction, occupied_id, current_slot, occupied_row.revision)
-                .await?;
-            transaction.commit().await?;
-            return current_row.into_post();
-        }
-        let row = update_post_slot(
-            &mut transaction,
-            &current_snapshot,
-            slot,
-            next_revision(current_snapshot.revision)?,
-        )
-        .await?;
-        update_publish_job(&mut transaction, id, slot, row.revision).await?;
         transaction.commit().await?;
         row.into_post()
     }
@@ -826,67 +580,6 @@ async fn lock_post(
         .ok_or(PublisherRepositoryError::PostMissing(id))
 }
 
-async fn lock_posts(
-    transaction: &mut Transaction<'_, Postgres>,
-    ids: &[Uuid],
-) -> Result<HashMap<Uuid, PostRow>, PublisherRepositoryError> {
-    let mut ids = ids.to_vec();
-    ids.sort_unstable();
-    ids.dedup();
-    let rows = sqlx::query_as::<_, PostRow>(
-        "SELECT * FROM posts WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
-    )
-    .bind(&ids)
-    .fetch_all(&mut **transaction)
-    .await?;
-    let rows = rows.into_iter().map(|row| (row.id, row)).collect::<HashMap<_, _>>();
-    if rows.len() != ids.len() {
-        let missing = ids.into_iter().find(|id| !rows.contains_key(id)).unwrap_or_default();
-        return Err(PublisherRepositoryError::PostMissing(missing));
-    }
-    Ok(rows)
-}
-
-async fn adjacent_post_id(
-    transaction: &mut Transaction<'_, Postgres>,
-    current: &PostRow,
-    direction: QueueDirection,
-) -> Result<Option<Uuid>, PublisherRepositoryError> {
-    let (comparison, ordering) = match direction {
-        QueueDirection::Earlier => ("<", "DESC"),
-        QueueDirection::Later => (">", "ASC"),
-    };
-    let query = format!(
-        "SELECT id FROM posts WHERE channel_id = $1 AND state = 'queued' AND cadence_slot_at IS NOT NULL AND cadence_slot_at {comparison} $2 AND id <> $3 ORDER BY cadence_slot_at {ordering}, id {ordering} LIMIT 1"
-    );
-    Ok(sqlx::query_scalar::<_, Uuid>(&query)
-        .bind(current.channel_id)
-        .bind(current.cadence_slot_at)
-        .bind(current.id)
-        .fetch_optional(&mut **transaction)
-        .await?)
-}
-
-async fn update_post_slot(
-    transaction: &mut Transaction<'_, Postgres>,
-    current: &PostRow,
-    slot: OffsetDateTime,
-    revision: i64,
-) -> Result<PostRow, PublisherRepositoryError> {
-    sqlx::query_as::<_, PostRow>(
-        "UPDATE posts SET scheduled_at = $2, cadence_slot_at = $2, revision = $3, updated_at = now() WHERE id = $1 AND state = 'queued' RETURNING *",
-    )
-    .bind(current.id)
-    .bind(slot)
-    .bind(revision)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(PublisherRepositoryError::PostNotEditable {
-        id: current.id,
-        state: current.post_state()?,
-    })
-}
-
 async fn validate_media_and_channel(
     pool: &PgPool,
     media_id: Uuid,
@@ -1044,12 +737,6 @@ struct PublishJobAttemptRow {
     max_attempts: i32,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct OccupiedSlotRow {
-    id: Uuid,
-    state: String,
-}
-
 async fn lock_publish_job(
     transaction: &mut Transaction<'_, Postgres>,
     post_id: Uuid,
@@ -1110,37 +797,6 @@ fn check_expected_revision(
 
 fn next_revision(current: i64) -> Result<i64, PublisherRepositoryError> {
     current.checked_add(1).ok_or(PublisherRepositoryError::RevisionOverflow)
-}
-
-fn validate_slot(
-    slot: OffsetDateTime,
-    channel: &ChannelRow,
-) -> Result<(), PublisherRepositoryError> {
-    if slot < OffsetDateTime::now_utc() {
-        return Err(PublisherRepositoryError::CadenceSlotInPast);
-    }
-    let timezone: Tz = channel
-        .time_zone
-        .parse()
-        .map_err(|_| PublisherRepositoryError::InvalidTimeZone(channel.time_zone.clone()))?;
-    let local = to_chrono(slot)?.with_timezone(&timezone);
-    let start = to_chrono_time(channel.window_start);
-    let end = to_chrono_time(channel.window_end);
-    if local.time() < start || local.time() >= end {
-        return Err(PublisherRepositoryError::InvalidCadenceSlot);
-    }
-    let elapsed =
-        local.naive_local().signed_duration_since(NaiveDateTime::new(local.date_naive(), start));
-    let interval_nanos = i64::from(channel.interval_minutes)
-        .checked_mul(60)
-        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
-        .ok_or(PublisherRepositoryError::InvalidCadenceSlot)?;
-    let elapsed_nanos =
-        elapsed.num_nanoseconds().ok_or(PublisherRepositoryError::InvalidCadenceSlot)?;
-    if elapsed_nanos < 0 || elapsed_nanos % interval_nanos != 0 {
-        return Err(PublisherRepositoryError::InvalidCadenceSlot);
-    }
-    Ok(())
 }
 
 async fn next_free_slot(
@@ -1278,28 +934,6 @@ impl PostRow {
     }
 }
 
-impl QueuePostRow {
-    fn into_queue_post(self) -> QueuePost {
-        QueuePost {
-            id: self.id,
-            revision: self.revision,
-            state: PostState::try_from(self.state.as_str())
-                .expect("posts.state is constrained by the database schema"),
-            scheduled_at: self.scheduled_at,
-            cadence_slot_at: self.cadence_slot_at,
-            time_zone: self.time_zone,
-            caption: self.caption,
-            media_kind: self.media_kind,
-            title: self.title,
-            description: self.description,
-            tags: self.tags,
-            source_url: self.source_url,
-            storage_chat_id: self.storage_chat_id,
-            storage_message_id: self.storage_message_id,
-        }
-    }
-}
-
 /// Return enough enabled channels to distinguish the valid single-target
 /// configuration from both missing and ambiguous configuration. The row locks
 /// keep a selected channel enabled until the caller commits its snapshot.
@@ -1368,8 +1002,6 @@ pub enum PublisherRepositoryError {
     PostNotEditable { id: Uuid, state: PostState },
     #[error("post {id} cannot be scheduled in state {state:?}")]
     PostCannotBeScheduled { id: Uuid, state: PostState },
-    #[error("post {0} has no cadence slot")]
-    PostNotScheduled(Uuid),
     #[error("post {id} is not claimable in state {state:?}")]
     PostNotClaimable { id: Uuid, state: PostState },
     #[error("post request key conflicts with another post: {0}")]
@@ -1439,15 +1071,6 @@ mod tests {
     fn timestamp(value: &str) -> OffsetDateTime {
         OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
             .expect("valid test timestamp")
-    }
-
-    #[test]
-    fn validate_slot_rejects_fractional_cadence_offsets() {
-        let channel = channel("UTC", 8, 22);
-        assert!(matches!(
-            validate_slot(timestamp("2030-01-01T08:00:00.500Z"), &channel),
-            Err(PublisherRepositoryError::InvalidCadenceSlot)
-        ));
     }
 
     #[test]
