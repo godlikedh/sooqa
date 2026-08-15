@@ -44,6 +44,9 @@ test("admin client keeps the token in session storage and renders backend text s
   assert.match(script, /schedule-exact/);
   assert.match(script, /scheduleEditing/);
   assert.match(script, /posts\?limit=50/);
+  assert.match(script, /function copyableId/);
+  assert.match(script, /navigator\.clipboard/);
+  assert.match(script, /execCommand\("copy"\)/);
   assert.match(html, /<th>ID<\/th>/);
   assert.match(html, /colspan="7"/);
 });
@@ -52,6 +55,7 @@ test("admin visual system is dark, local, and keyboard-focused", () => {
   assert.match(styles, /color-scheme: dark/);
   assert.match(styles, /background: var\(--bg\)/);
   assert.match(styles, /:focus-visible/);
+  assert.match(styles, /copyable-id-button/);
   assert.doesNotMatch(styles, /https?:\/\//);
 });
 
@@ -66,9 +70,11 @@ class FakeNode {
     this.dataset = {};
     this.listeners = new Map();
     this.className = "";
+    this.style = {};
     this._text = "";
     this.hidden = false;
     this.disabled = false;
+    this.selected = false;
     this.value = "";
     this.checked = false;
     this.href = "";
@@ -142,6 +148,10 @@ class FakeNode {
   }
 
   focus() {}
+
+  select() {
+    this.selected = true;
+  }
 
   showModal() {
     this.open = true;
@@ -265,8 +275,9 @@ function binaryResponse(mimeType = "image/jpeg", status = 200) {
   };
 }
 
-function createAdminRuntime({ token = "", handler }) {
+function createAdminRuntime({ token = "", handler, clipboard, execCommand = () => false }) {
   const document = makeAdminDocument();
+  document.execCommand = execCommand;
   const storage = new Map(token ? [["sooqa.admin.api_token", token]] : []);
   const objectUrls = new Set();
   let objectUrlNumber = 0;
@@ -281,6 +292,7 @@ function createAdminRuntime({ token = "", handler }) {
       setItem: (key, value) => storage.set(key, String(value)),
       removeItem: (key) => storage.delete(key),
     },
+    navigator: clipboard ? { clipboard } : {},
     URL: {
       createObjectURL: () => {
         const value = `blob:test-${++objectUrlNumber}`;
@@ -334,6 +346,14 @@ async function settle() {
 
 function buttonWithText(element, text) {
   return element.querySelectorAll("button").find((button) => button.textContent === text);
+}
+
+function copyButton(element) {
+  return element.querySelectorAll("button").find((button) => button.className.includes("copyable-id-button"));
+}
+
+function copyButtons(element) {
+  return element.querySelectorAll("button").filter((button) => button.className.includes("copyable-id-button"));
 }
 
 test("admin runtime handles token lifecycle, safe rendering, and both decisions", async () => {
@@ -784,4 +804,159 @@ test("admin runtime reconciles a stale schedule card without losing another dirt
   assert.equal(reconciled[1].querySelectorAll("textarea")[0].value, "local two");
   assert.equal(runtime.document.getElementById("schedule-notice").hidden, false);
   assert.equal(calls.filter(({ pathName }) => pathName === "/api/v1/posts?limit=50").length, 2);
+});
+
+test("admin runtime copies full IDs from Dashboard, Ingests, Media, and Schedule", async () => {
+  const ids = {
+    ingest: "11111111-1111-4111-8111-111111111111",
+    media: "22222222-2222-4222-8222-222222222222",
+    post: "33333333-3333-4333-8333-333333333333",
+  };
+  const copied = [];
+  const media = {
+    id: ids.media, kind: "video", title: "A clip", description: null,
+    storage_state: "ready", storage_url: "https://t.me/c/1/2", source_url: "https://example.test/clip.webm",
+    tags: [], caption_sync: { state: "synced" }, file_size_bytes: 100, duration_ms: 1_000,
+    updated_at: "2026-01-01T00:00:00Z",
+  };
+  const post = {
+    id: ids.post, media_id: ids.media, status: "queued", schedule_mode: "cadence",
+    scheduled_at: "2030-01-01T01:02:03Z", caption: "queued", media_kind: "video",
+    source_url: "https://example.test/clip.webm", storage_url: "https://t.me/c/1/2",
+    revision: 1, updated_at: "2026-01-01T00:00:00Z",
+  };
+  const dashboard = {
+    counts: {},
+    attention: {
+      technical_duplicates: [{
+        ingest_id: ids.ingest, source_url: "https://example.test/incoming",
+        candidates: [{ media_id: ids.media, classification: "strong_match", score_bps: 9900, storage_url: "https://t.me/c/1/2" }],
+      }],
+      publication_repeats: [{
+        post_id: ids.post, media_id: ids.media, requested_action: "post_now", status: "draft", revision: 1,
+        repeat_evidence: { conflicts: [{ post_id: ids.post, state: "published", at: "2026-01-01T00:00:00Z", target_message_link: "https://t.me/c/1/3" }] },
+      }],
+      caption_sync_failures: [{ media_id: ids.media, error_message: "sync failed" }],
+    },
+  };
+  const runtime = createAdminRuntime({
+    token: "secret",
+    clipboard: { writeText: async (value) => { copied.push(value); } },
+    handler: async (pathName) => {
+      if (pathName === "/api/v1/ingests?limit=50") return jsonResponse({ items: [{
+        id: ids.ingest, media_id: ids.media, source_url: "https://example.test/incoming",
+        requested_action: "save", status: "completed", created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:01:00Z", completed_at: "2026-01-01T00:01:00Z",
+      }], next_cursor: null });
+      if (pathName.startsWith("/api/v1/media?")) return jsonResponse({ items: [media], next_cursor: null });
+      if (pathName === "/api/v1/posts?limit=50") return jsonResponse({ items: [post], next_cursor: null });
+      if (pathName === "/api/v1/dashboard?limit=20") return jsonResponse(dashboard);
+      return jsonResponse({ counts: {}, attention: {} });
+    },
+  });
+  await settle();
+
+  const duplicate = runtime.document.getElementById("duplicate-list");
+  const duplicateButtons = copyButtons(duplicate);
+  assert.equal(duplicateButtons.length, 2);
+  assert.equal(duplicateButtons[0].textContent, "11111111…111111");
+  assert.equal(duplicateButtons[0].attributes.get("aria-label"), "Copy full ingest ID");
+  duplicateButtons[0].dispatchEvent({ type: "keydown", key: "Enter" });
+  await settle();
+  duplicateButtons[1].dispatchEvent({ type: "keydown", key: " " });
+  await settle();
+  assert.deepEqual(copied.slice(0, 2), [ids.ingest, ids.media]);
+  assert.equal(duplicateButtons[0].disabled, false);
+  assert.equal(duplicate.querySelectorAll("a").some((anchor) => anchor.textContent === "Telegram"), true);
+
+  const repeats = runtime.document.getElementById("repeat-list");
+  const repeatButtons = copyButtons(repeats);
+  assert.equal(repeatButtons.length, 2);
+  repeatButtons[0].dispatchEvent({ type: "click" });
+  await settle();
+  repeatButtons[1].dispatchEvent({ type: "click" });
+  await settle();
+  assert.deepEqual(copied.slice(2, 4), [ids.media, ids.post]);
+  assert.equal(repeats.querySelectorAll("a").some((anchor) => anchor.textContent === "Open post"), true);
+
+  runtime.window.location.hash = "#ingests";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+  const ingestRow = runtime.document.getElementById("ingest-rows").querySelector("tr");
+  const ingestButtons = copyButtons(ingestRow);
+  assert.equal(ingestButtons.length, 2);
+  ingestButtons[0].dispatchEvent({ type: "click" });
+  ingestButtons[1].dispatchEvent({ type: "click" });
+  await settle();
+  assert.deepEqual(copied.slice(4, 6), [ids.ingest, ids.media]);
+
+  runtime.window.location.hash = "#media";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+  const mediaCard = runtime.document.getElementById("media-grid").querySelector("article");
+  const mediaButton = copyButton(mediaCard);
+  assert.equal(mediaButton.attributes.get("aria-label"), "Copy full media ID");
+  mediaButton.dispatchEvent({ type: "click" });
+  await settle();
+  assert.equal(copied[6], ids.media);
+  assert.equal(mediaCard.querySelectorAll("a").some((anchor) => anchor.textContent === "Open in Telegram"), true);
+
+  runtime.window.location.hash = "#schedule";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+  const scheduleCard = runtime.document.getElementById("schedule-list").querySelector("article");
+  const scheduleButtons = copyButtons(scheduleCard);
+  assert.equal(scheduleButtons.length, 2);
+  scheduleButtons[0].dispatchEvent({ type: "keydown", key: " " });
+  scheduleButtons[1].dispatchEvent({ type: "keydown", key: "Enter" });
+  await settle();
+  assert.deepEqual(copied.slice(7, 9), [ids.media, ids.post]);
+  assert.equal(scheduleCard.querySelectorAll("a").some((anchor) => anchor.textContent === "Open in Telegram"), true);
+});
+
+test("admin runtime uses the selection fallback and exposes a failed copy", async () => {
+  const fullId = "44444444-4444-4444-8444-444444444444";
+  const dashboard = {
+    counts: {},
+    attention: {
+      technical_duplicates: [{ ingest_id: fullId, source_url: "https://example.test/incoming", candidates: [] }],
+      publication_repeats: [],
+      caption_sync_failures: [],
+    },
+  };
+  const fallbackCopies = [];
+  const runtime = createAdminRuntime({
+    token: "secret",
+    execCommand: (command) => {
+      const source = runtime.document.body.lastChild;
+      fallbackCopies.push({ command, value: source.value, selected: source.selected });
+      return true;
+    },
+    handler: async () => jsonResponse(dashboard),
+  });
+  await settle();
+
+  const fallbackButton = copyButton(runtime.document.getElementById("duplicate-list"));
+  fallbackButton.dispatchEvent({ type: "keydown", key: " " });
+  await settle();
+  assert.deepEqual(fallbackCopies, [{ command: "copy", value: fullId, selected: true }]);
+  assert.equal(fallbackButton.textContent, "Copied");
+  assert.match(runtime.document.getElementById("toast").textContent, /Copied full ingest ID/);
+
+  const failureRuntime = createAdminRuntime({
+    token: "secret",
+    execCommand: () => false,
+    handler: async () => jsonResponse(dashboard),
+  });
+  await settle();
+  const failureButton = copyButton(failureRuntime.document.getElementById("duplicate-list"));
+  failureButton.dispatchEvent({ type: "click" });
+  await settle();
+  const revealed = failureButton.parentElement.querySelector("input");
+  assert.equal(revealed.value, fullId);
+  assert.equal(revealed.hidden, false);
+  assert.equal(revealed.selected, true);
+  assert.equal(failureButton.disabled, false);
+  assert.match(failureRuntime.document.getElementById("toast").textContent, /selected for manual copy/);
+  assert.equal(failureRuntime.document.getElementById("toast").className.includes("error"), true);
 });

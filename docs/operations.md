@@ -92,6 +92,15 @@ the stale item and reloads it while preserving other dirty cards, and a
 first-page refresh leaves each actively edited form in place. Leaving Schedule
 discards unsaved forms.
 
+Compact UUID labels in Dashboard attention cards, Ingests, Media, and Schedule
+are copy controls rather than navigation links. Click one, or focus it and
+press Enter or Space, to copy the exact backend UUID while keeping the short
+label. The control uses `navigator.clipboard` when available and otherwise
+tries a temporary selected field with `document.execCommand("copy")`, which
+also supports the trusted-LAN HTTP setup. If copying still fails, the full
+UUID is revealed and selected for manual copying, with a visible error
+message. Source, Telegram, and in-app navigation links remain separate.
+
 The server emits the admin HTML, CSS, and JavaScript from the binary, so no
 Node process, frontend service, CDN, or asset volume is required. Keep `/admin`
 behind the same trusted-LAN boundary as the bearer API; the page's CSP and

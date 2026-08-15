@@ -108,6 +108,115 @@
     return text.length > 18 ? `${text.slice(0, 8)}…${text.slice(-6)}` : text;
   }
 
+  function selectText(element) {
+    element.focus();
+    if (typeof element.select === "function") {
+      element.select();
+    } else if (typeof element.setSelectionRange === "function") {
+      element.setSelectionRange(0, element.value.length);
+    }
+  }
+
+  function copyWithSelection(value) {
+    const source = document.createElement("textarea");
+    source.value = value;
+    source.readOnly = true;
+    source.setAttribute("aria-hidden", "true");
+    source.style.position = "fixed";
+    source.style.opacity = "0";
+    source.style.pointerEvents = "none";
+    document.body.append(source);
+    selectText(source);
+    let copied = false;
+    try {
+      copied = typeof document.execCommand === "function" && document.execCommand("copy");
+    } catch (_error) {
+      copied = false;
+    }
+    document.body.removeChild(source);
+    return Boolean(copied);
+  }
+
+  async function copyText(value) {
+    const clipboard = window.navigator && window.navigator.clipboard;
+    if (clipboard && typeof clipboard.writeText === "function") {
+      try {
+        await clipboard.writeText(value);
+        return true;
+      } catch (_error) {
+        // A denied or unavailable Clipboard API can still work through selection.
+      }
+    }
+    return copyWithSelection(value);
+  }
+
+  function copyableId(label, value) {
+    const fullValue = value ? String(value) : "";
+    if (!fullValue) return node("span", "muted", "—");
+
+    const kind = String(label || "item").toLowerCase();
+    const shortValue = formatId(fullValue);
+    const copyLabel = `Copy full ${kind} ID`;
+    const control = node("span", "copyable-id-control");
+    const button = node("button", "copyable-id-button mono", shortValue);
+    button.type = "button";
+    button.title = copyLabel;
+    button.setAttribute("aria-label", copyLabel);
+    control.append(button);
+
+    let fallback = null;
+    let feedbackTimer = null;
+    const ensureFallback = () => {
+      if (fallback) return fallback;
+      fallback = node("input", "copyable-id-fallback mono");
+      fallback.type = "text";
+      fallback.value = fullValue;
+      fallback.readOnly = true;
+      fallback.setAttribute("aria-label", `Full ${kind} ID`);
+      control.append(fallback);
+      return fallback;
+    };
+    const restoreButton = () => {
+      button.textContent = shortValue;
+      button.classList.toggle("copied", false);
+      button.setAttribute("aria-label", copyLabel);
+    };
+    const showCopied = () => {
+      if (fallback) fallback.hidden = true;
+      button.textContent = "Copied";
+      button.classList.toggle("copied", true);
+      button.setAttribute("aria-label", `${kind} ID copied`);
+      window.clearTimeout(feedbackTimer);
+      feedbackTimer = window.setTimeout(restoreButton, 1800);
+      showToast(`Copied full ${kind} ID.`);
+    };
+    const showCopyFailure = () => {
+      const visibleFallback = ensureFallback();
+      visibleFallback.hidden = false;
+      selectText(visibleFallback);
+      showToast(`Could not copy the full ${kind} ID. The full value is selected for manual copy.`, true);
+    };
+    const performCopy = async () => {
+      if (await copyText(fullValue)) showCopied();
+      else showCopyFailure();
+    };
+
+    button.addEventListener("click", () => { void performCopy(); });
+    button.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        void performCopy();
+      }
+    });
+    return control;
+  }
+
+  function idReference(label, value) {
+    const reference = node("span", "id-reference");
+    reference.append(node("span", "id-reference-label", `${label} `), copyableId(label, value));
+    return reference;
+  }
+
   function formatBytes(value) {
     if (!Number.isFinite(Number(value)) || Number(value) < 0) return "—";
     const bytes = Number(value);
@@ -240,13 +349,16 @@
       const source = node("p");
       source.append(node("strong", "", "Incoming source"), node("br"));
       source.append(link(item.source_url, item.source_url || "No source URL"));
-      card.append(source, node("p", "meta", `Ingest ${formatId(item.ingest_id)}`));
+      const ingest = node("p", "meta");
+      ingest.append(idReference("Ingest", item.ingest_id));
+      card.append(source, ingest);
       for (const candidate of item.candidates || []) {
         const row = node("div", "candidate-row");
         const label = node("div", "candidate-label");
         label.append(
           node("strong", "", `${candidate.classification || "Candidate"} · ${candidate.score_bps ?? 0} bps`),
-          candidate.storage_url ? link(candidate.storage_url, `Media ${formatId(candidate.media_id)}`) : node("span", "muted", `Media ${formatId(candidate.media_id)}`),
+          idReference("Media", candidate.media_id),
+          candidate.storage_url ? link(candidate.storage_url, "Telegram") : node("span", "muted", "Telegram unavailable"),
         );
         row.append(label, actionButton("Same — use this", async () => {
           await api(`/api/v1/ingests/${encodeURIComponent(item.ingest_id)}/accept-duplicate`, {
@@ -279,9 +391,11 @@
     }
     for (const item of items) {
       const card = node("article", "decision-card");
+      const media = node("p", "meta");
+      media.append(idReference("Media", item.media_id), node("span", "", ` · revision ${item.revision}`));
       card.append(
         node("p", "", `${item.requested_action || "Publication"} · ${item.status || "unknown"}`),
-        node("p", "meta", `Media ${formatId(item.media_id)} · revision ${item.revision}`),
+        media,
       );
       if (item.caption) card.append(node("p", "muted", item.caption));
       if (item.requested_publish_at) card.append(node("p", "meta", `Requested ${formatDate(item.requested_publish_at)}`));
@@ -290,12 +404,8 @@
         const conflictList = node("ul", "conflict-list");
         for (const conflict of conflicts) {
           const detail = node("li");
-          detail.append(
-            node("span", "state", `${conflict.state || "unknown"} · ${formatDate(conflict.at)}`),
-            conflict.target_message_link
-              ? link(conflict.target_message_link, `Post ${formatId(conflict.post_id)}`)
-              : node("span", "muted", `Post ${formatId(conflict.post_id)}`),
-          );
+          detail.append(node("span", "state", `${conflict.state || "unknown"} · ${formatDate(conflict.at)}`), idReference("Post", conflict.post_id));
+          if (conflict.target_message_link) detail.append(link(conflict.target_message_link, "Open post"));
           conflictList.append(detail);
         }
         card.append(conflictList);
@@ -333,7 +443,7 @@
     for (const item of items) {
       const card = node("article", "decision-card");
       const target = node("p");
-      target.append(mediaNavigationLink(item.media_id, `Media ${formatId(item.media_id)} · open Media / Retry`));
+      target.append(idReference("Media", item.media_id), node("span", "muted", " · "), mediaNavigationLink(item.media_id, "Open Media / Retry"));
       card.append(target, node("p", "meta", item.error_message || "Telegram storage caption sync failed."));
       container.append(card);
     }
@@ -377,9 +487,7 @@
     }
     for (const item of items) {
       const row = document.createElement("tr");
-      const id = node("span", "mono", formatId(item.id));
-      id.title = item.id || "";
-      appendIngestCell(row, id);
+      appendIngestCell(row, idReference("Ingest", item.id));
       const source = item.source_url ? link(item.source_url, item.source_url) : node("span", "muted", "No source URL");
       appendIngestCell(row, source);
       appendIngestCell(row, item.requested_action);
@@ -394,7 +502,7 @@
       );
       appendIngestCell(row, timing);
       const result = node("span");
-      if (item.media_id) result.append(node("span", "muted", `Media ${formatId(item.media_id)}`));
+      if (item.media_id) result.append(idReference("Media", item.media_id));
       if (item.storage_url) result.append(result.firstChild ? node("span", "muted", " · ") : document.createTextNode(""), link(item.storage_url, "Telegram"));
       appendIngestCell(row, result);
       appendIngestCell(row, [item.error_code, item.error_message].filter(Boolean).join(": "));
@@ -555,7 +663,7 @@
     visual.append(placeholder);
     if (media.preview?.url) {
       const image = node("img");
-      image.alt = `Bounded preview for media ${formatId(media.id)}`;
+      image.alt = `Bounded preview for ${media.kind || "media"}`;
       image.loading = "lazy";
       image.decoding = "async";
       image.hidden = true;
@@ -569,9 +677,7 @@
     heading.append(node("h2", "", title), node("span", "media-kind", media.kind || "MEDIA"));
     main.append(heading);
     const meta = node("div", "media-meta");
-    const id = node("span", "mono", formatId(media.id));
-    id.title = media.id || "";
-    meta.append(id, node("span", "meta", media.storage_state || "unknown"));
+    meta.append(idReference("Media", media.id), node("span", "meta", media.storage_state || "unknown"));
     if (media.file_size_bytes !== null && media.file_size_bytes !== undefined) meta.append(node("span", "meta", formatBytes(media.file_size_bytes)));
     if (media.duration_ms !== null && media.duration_ms !== undefined) meta.append(node("span", "meta", formatMediaDuration(media.duration_ms)));
     main.append(meta);
@@ -722,16 +828,15 @@
 
     const main = node("div", "schedule-main");
     const heading = node("div", "schedule-heading");
-    heading.append(
-      node("h2", "", `${item.media_kind || "Media"} · ${formatId(item.media_id)}`),
-      node("span", "schedule-mode", scheduleModeLabel(item.schedule_mode)),
-    );
+    const title = node("h2");
+    title.append(node("span", "", `${item.media_kind || "Media"} · `), idReference("Media", item.media_id));
+    heading.append(title, node("span", "schedule-mode", scheduleModeLabel(item.schedule_mode)));
     main.append(heading);
 
     const statusRow = node("div", "schedule-status-row");
     const status = node("span", "state schedule-state", item.status || "unknown");
     status.dataset.state = item.status || "unknown";
-    statusRow.append(status, node("span", "meta", `Post ${formatId(item.id)}`));
+    statusRow.append(status, idReference("Post", item.id));
     if (item.channel_name) statusRow.append(node("span", "meta", item.channel_name));
     main.append(statusRow);
 
@@ -891,7 +996,9 @@
     const dialog = $("publication-dialog");
     const exact = action === "queue_exact";
     $("publication-dialog-title").textContent = exact ? "Queue at an exact time" : "Post now with public text";
-    $("publication-dialog-context").textContent = `Media ${formatId(media.id)} · internal description and tags stay separate.`;
+    const context = $("publication-dialog-context");
+    clear(context);
+    context.append(idReference("Media", media.id), node("span", "", " · internal description and tags stay separate."));
     $("publication-caption").value = "";
     $("publication-time").value = "";
     $("publication-time").min = localDateTimeValue(new Date(Date.now() + 60_000));
