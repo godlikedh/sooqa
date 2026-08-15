@@ -160,6 +160,9 @@ worker checks `/ping` for provider version `1.3.1` before enabling page jobs; a
 missing provider or version mismatch fails startup with a provider-specific
 diagnostic. Standalone deployments can set
 `SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL` to another validated provider origin.
+yt-dlp retains its normal supported-client selection; the pinned provider is
+made available through its extractor argument rather than forcing one client
+for every YouTube page.
 
 The submitted URL remains the ingest provenance. After inspection, the worker
 uses the validated canonical `resolved_url` for yt-dlp execution and checks its
