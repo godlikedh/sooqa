@@ -1,5 +1,7 @@
 # sooqa 2ch userscript
 
+Current userscript version: `0.2.1`.
+
 Install [`sooqa-2ch-save.user.js`](https://raw.githubusercontent.com/godlikedh/sooqa/main/userscripts/sooqa-2ch-save.user.js)
 in Tampermonkey on these supported HTTPS domains:
 
@@ -11,10 +13,11 @@ The script adds one vertically attached action row per direct `.mp4` or `.webm`
 attachment, including attachments added after the page initially loads. Each
 row has `Post now`, `Post now…`, `Queue`, `Queue…`, `Save`, and `Save…` in a
 3x2 action grid. Existing previews and native link/play/download behavior stay
-in place; on native `figure.post__image` markup the filename link and preview
-are treated as one attachment, including multi-item galleries. The script does
-not resize or replace media and does not scrape other domains or page-like
-links.
+in place; discovery is limited to actual `.post` attachment areas. On native
+`figure.post__image` markup the filename link and preview are treated as one
+attachment, including multi-item galleries. The script ignores arbitrary
+page-level media and 2ch's generated fullscreen viewer, does not resize or
+replace media, and does not scrape other domains or page-like links.
 
 The script sends only to `http://127.0.0.1:47831/v1/submit` with the local
 companion token read from Tampermonkey storage. It contains no backend API or
@@ -24,7 +27,10 @@ the script prompts on first use.
 Plain actions send no metadata. `Save…` asks for tags and an internal
 description; `Post now…` adds public post text; and `Queue…` additionally asks
 for a required browser-local date/time, which is sent as an RFC3339 instant.
-Blank optional text is omitted, and textarea line breaks are preserved.
+Detailed actions use a userscript-owned modal layout with an existing prompt
+fallback if the browser cannot open or focus the native dialog. Cancel, Escape,
+and submission always restore the action buttons. Blank optional text is
+omitted, and textarea line breaks are preserved.
 `Queue` uses the normal cadence. The request is synchronous from the browser's
 perspective: `Accepted request` means the companion/backend accepted an ingest
 request, not that the media has finished downloading or appeared in Telegram
