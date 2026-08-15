@@ -1070,6 +1070,7 @@ mod tests {
         };
         let inspection =
             downloader.inspect(&source).await.expect("Shorts inspection should succeed");
+        assert_eq!(inspection.source_url, source.source_url);
         assert_eq!(
             inspection.resolved_url.as_deref(),
             Some("https://www.youtube.com/watch?v=short-id")
