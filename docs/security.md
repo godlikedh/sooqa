@@ -3,7 +3,10 @@
 sooqa is a single-admin self-hosted service. Keep the server, database, media
 work root, API secret, and Telegram credentials on a trusted host.
 
-HTTP routes require the configured bearer secret. Authorization is configuration
+Every `/api/v1` route requires the configured bearer secret. `/health/live`
+and the static `/admin` HTML, JavaScript, and CSS are intentionally public to
+the listening network; the admin page cannot read or mutate application data
+until it supplies the bearer token to the API. Authorization is configuration
 based; PostgreSQL stores no administrator or device-token records. Request
 bodies and timeouts are bounded, and stable errors expose a request ID without
 secrets.
@@ -25,6 +28,11 @@ captions, source URLs, tags, and errors are rendered as text or validated
 HTTP(S) links rather than injected HTML. This is a trusted-home-LAN MVP
 boundary, not a claim that the bearer-token UI is suitable for internet
 exposure.
+
+The home deployment serves plain HTTP. A bearer token sent over a network is
+not encrypted, so bind the port only to the trusted host/LAN described in
+the [operations guide](operations.md), or put an authenticated TLS reverse
+proxy in front of it. Do not expose the server port directly to the internet.
 
 Media previews are requested with the bearer header from same-origin API paths;
 the token is never placed in a preview URL or `<img>` request. The browser

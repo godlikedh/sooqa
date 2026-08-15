@@ -1,11 +1,11 @@
 # sooqa product authority
 
-This document is the active product authority for the architecture reset
-recorded in [ADR 0009](adr/0009-five-table-persistence-reset.md) and GitHub
-issue #43. It supersedes the old persistence model and the historical roadmap
-when they conflict. The checked-out code and `docs/architecture.md` describe
-the shipped consolidated model; this document remains the product authority
-for behavior and scope.
+This document is the active product authority for the consolidated architecture
+established by [ADR 0009](adr/0009-five-table-persistence-reset.md) and GitHub
+issue #43. It supersedes the discarded persistence model and the historical
+roadmap when they conflict. The checked-out code and `docs/architecture.md`
+describe the shipped model; this document remains the product authority for
+behavior and scope.
 
 ## Product
 
@@ -20,13 +20,19 @@ The first release is intentionally narrow:
 - one administrator and one self-hosted installation;
 - PostgreSQL as the source of truth;
 - direct HTTP media, explicitly allowlisted public YouTube/Shorts pages through
-  yt-dlp, plus the already-supported Telegram ingest paths;
+  yt-dlp subject to the current limitations in the
+  [operations guide](operations.md), plus the already-supported Telegram ingest
+  paths;
 - durable download, probe, normalization, fingerprint, identity-gate, and
   storage workflow;
-- searchable stored media with captions/descriptions and normalized tags;
+- a bounded stored-media catalogue with exact UUID/source/storage-link lookup
+  plus editable internal descriptions and normalized tags;
 - immediate publication or a simple per-channel cadence queue.
 
-Publisher mutations are durable PostgreSQL operations: normal cadence enqueue
+Publisher mutations are durable PostgreSQL operations. A publication intent
+requires a decision when the same media is already queued/sending or was
+published during the 14 days before the intended send instant; older history
+does not block or prompt. Normal cadence enqueue
 assigns the next valid channel-local slot, exact/manual scheduling sets only
 the selected post to one future instant, and exact posts may share an instant
 without moving unrelated cadence slots. Each queued post has one fixed-dedupe
@@ -269,7 +275,7 @@ claim to be safe for internet exposure.
 
 ## Explicit non-goals
 
-This reset does not add:
+The current single-admin MVP does not add:
 
 - compatibility with old databases, API snapshots, repository interfaces, or
   local data;
@@ -277,10 +283,11 @@ This reset does not add:
 - multiple administrators, users, tenants, storage providers, albums, media
   variants, derivative assets, or a generalized content taxonomy;
 - Grafana/Prometheus deployment;
-- Telegram publication functionality beyond behavior already present at the
-  selected implementation base.
+- semantic or full-text media search.
 
-Existing local databases may be discarded explicitly by the owner. No tool or
-test may reset a Docker volume automatically. The implementation must provide
-documented, explicit reset instructions and must verify the new model from an
-empty database.
+Only databases from the discarded pre-reset model were allowed to be recreated
+when adopting ADR 0009. A current five-table installation is durable operator
+data and must be preserved through forward-only migrations and backups. No
+tool or test may reset a Docker volume automatically; the explicit legacy-reset
+procedure remains owner-run and documented in the
+[operations guide](operations.md).

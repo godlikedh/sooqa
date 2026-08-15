@@ -4,52 +4,42 @@ All notable changes to sooqa will be documented here.
 
 ## [Unreleased]
 
+No changes yet.
+
+## [0.2.0] - 2026-08-15
+
 ### Added
 
-- Reworked the 2ch userscript into per-media six-action rows with typed
-  post-now/queue/save dialogs, exact browser-local queue times, retry-safe
-  action IDs, and bounded informational accepted history across mirrors.
-- Extended the loopback companion to validate and forward the typed capture
-  intent, public post text, and exact queue time, with version-tagged Windows
-  release assets and checksums.
-- Composed static JPEG/PNG image normalization into the durable ingest path,
-  including typed canonical/thumbnail metadata, image content kinds, and
-  idempotent thumbnail library persistence without a schema change.
-- Composed the durable `normalize_asset` worker with the canonical ffmpeg
-  profile, shared workspace publication, output validation, SHA-256 metadata,
-  lease-fenced retry handling, and an idempotent `finalize_ingest` handoff.
-- Composed `finalize_ingest` with exact-dedup/library persistence so successful
-  video normalization creates or reuses canonical content, asset, and source
-  rows before the ingest becomes completed.
-- Made successful `probe_asset` completion advance the ingest to
-  `normalizing` and enqueue the existing `normalize_asset` job atomically.
-- Composed the durable `download_source` worker handler with the existing
-  ingest/job schema, shared workspace, typed download metadata, and idempotent
-  `probe_asset` handoff; fenced completion and failure to the current job
-  lease attempt.
-- Composed production URL source inspection with the SSRF-hardened direct HTTP
-  adapter; kept yt-dlp available behind its media boundary pending subprocess
-  egress isolation.
-- Bootstrapped the Rust 2024 workspace and application/crate layout.
-- Added formatting, linting, testing, and GitHub CI foundations.
-- Added typed TOML/environment configuration, redacted summaries, structured
-  tracing, and graceful shutdown scaffolding.
-- Added the server liveness endpoint, request IDs, limits, build metadata, and
-  a Dockerfile skeleton.
-- Added the PostgreSQL Compose service, SQLx connection layer, initial schema
-  migration, and migration integration test harness.
-- Added typed durable job values and a PostgreSQL repository with atomic
-  claiming, leases, retries, attempt history, and stale-lease recovery.
-- Added the bounded worker loop, worker identity, handler registry, graceful
-  shutdown, structured job logs, and in-process worker metrics.
-- Added the first Telegram adapter with configurable long polling, private
-  administrator authorization, `/start`, `/help`, and `/status`, plus durable
-  update-id deduplication receipts.
-- Added private Telegram URL ingest through `/add` or a single bare URL,
-  durable Inbox request acknowledgements, and versioned status callback data.
-- Added the Telegram storage provider with canonical hash verification,
-  idempotent upload intents, Telegram file reference persistence, active-object
-  reuse, and storage-chat startup diagnostics.
-- Added direct Telegram photo/video/document ingest with Bot API downloads,
-  cloud download-limit detection, preserved source metadata, shared workspace
-  handoff, and typed ffprobe job consumption.
+- Five-table PostgreSQL persistence for durable ingests, media, channels,
+  posts, and leased jobs, with forward migrations and fenced recovery.
+- Direct HTTP, allowlisted yt-dlp, and Telegram media capture with durable
+  download, probe, normalization, fingerprint, deduplication, storage, and
+  cleanup stages.
+- Canonical video/image normalization, exact SHA reuse, bounded aligned video
+  fingerprints, duplicate decisions, previews, editable metadata, and fenced
+  Telegram storage-caption synchronization.
+- Durable publication intent materialization, cadence and exact scheduling,
+  14-day repeat decisions, revision-fenced post editing, and fenced Telegram
+  copy/send behavior.
+- Bounded bearer-authenticated admin APIs and an embedded dark web admin for
+  dashboard decisions, ingest status, media metadata, channel settings, and
+  unpublished schedule management.
+- A loopback Windows companion and 2ch userscript with six capture actions,
+  retry-safe action IDs, cross-mirror accepted history, and versioned release
+  artifacts with SHA-256 checksums.
+- A pinned home Compose topology with PostgreSQL, the official local Telegram
+  Bot API server, large-media streaming, yt-dlp, Deno, and shared workspaces.
+
+### Security
+
+- Added SSRF-resistant direct downloads, an explicit yt-dlp host allowlist,
+  bounded subprocesses and workspaces, separate local/backend companion
+  secrets, and a same-origin admin CSP.
+- Telegram long polling uses a process-local duplicate-delivery gate; durable
+  business effects are idempotent through ingest/job/media/post keys rather
+  than a Telegram receipt table.
+
+### Known limitations
+
+- Public YouTube/Shorts extraction is best-effort while issue #102 tracks
+  resolved-download URL handling and bounded recovery from HTTP 403 responses.

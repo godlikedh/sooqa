@@ -9,22 +9,22 @@ transactions.
 
 The repository currently provides:
 
-- an OpenAPI-described HTTP Inbox API for creating and reading ingest requests;
-    - one configured bearer secret for the single-admin API;
-    - PostgreSQL-backed `ingests`, one-row `media`, `channels`, `posts`, and
-      durable `queue.jobs` with leases and stale-lease recovery;
+- an OpenAPI-described, bearer-authenticated HTTP API plus a bounded dark web
+  admin for ingests, media, publication decisions, channels, and schedules;
+- PostgreSQL-backed `ingests`, one-row `media`, `channels`, `posts`, and
+  durable `queue.jobs` with leases and stale-lease recovery;
 - direct HTTP and yt-dlp media adapters, ffprobe inspection, ffmpeg
   normalization, image normalization, exact hashing, and the bounded
   pre-storage video identity gate;
-    - a Telegram long-polling adapter for admin URL/media submission and a
-      media-row storage state machine;
+- a Telegram long-polling adapter for admin URL/media submission and a
+  media-row storage state machine;
 - an explicit storage-intent reconciliation CLI for ambiguous Telegram
-    uploads.
-    - Publisher channel/post persistence with cadence slots and fenced sends.
+  uploads, plus Publisher channel/post persistence with cadence slots,
+  revision fences, and fenced Telegram sends;
 - a minimal loopback companion at `POST /v1/submit` and a reviewed 2ch
   Tampermonkey script for direct MP4/WebM attachments;
-    - Windows PR artifacts and version-tagged GitHub Releases provide a
-      standalone x86_64 companion executable plus SHA-256 checksum.
+- version-tagged GitHub Releases with a standalone Windows x86_64 companion
+  executable and SHA-256 checksum.
 
 The composed worker registers `inspect_source` with the SSRF-hardened direct
 HTTP/allowlisted yt-dlp adapters, `download_source` into the shared media
@@ -41,8 +41,10 @@ the bounded `video_sequence_v1` identity decision before creating a
 `pending_storage` media row. Strong perceptual matches become durable
 `duplicate_pending` ingests and can be overridden through the authorized
 force-save route. Images, animations, and audio use exact SHA only. Storage
-upload and publication remain separate durable stages; Telegram publication
-itself is not enabled yet.
+upload and publication are separate durable stages. For non-save capture
+intents, the worker materializes a post after storage is ready and publishes it
+by copying the stored Telegram message, with a safe stored-file-ID fallback for
+explicit copy-unavailable responses.
 
 Active documentation is the authority for current behavior:
 

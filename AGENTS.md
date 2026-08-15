@@ -3,16 +3,16 @@
 ## Mission
 
 Build sooqa, the self-hosted Telegram media pipeline described in
-`docs/product.md`, through small, reviewable increments. The five-table
-persistence reset in issue #43 and ADR 0009 is the active target architecture;
+`docs/product.md`, through small, reviewable increments. The five-table model
+established by issue #43 and ADR 0009 is the current persistence architecture;
 the former product specification is retained as
 `docs/reference/PROJECT_SPEC.md` for historical roadmap context only.
 
 ## Before coding
 
 1. Read `docs/product.md`, README.md, the relevant active document in `docs/`,
-   and relevant ADRs. During the issue #43 reset, `docs/product.md` and
-   ADR 0009 are authoritative over legacy code and stale active prose.
+   and relevant ADRs. `docs/product.md` and ADR 0009 are authoritative over
+   the discarded pre-reset model and stale active prose.
    Consult `docs/reference/PROJECT_SPEC.md` only for historical product and
    roadmap context.
 2. Inspect the current branch and working tree.
@@ -30,9 +30,9 @@ the former product specification is retained as
 - Keep the single-admin MVP simple without making future boundaries impossible.
 - Treat code and tests as the final authority when active documentation and
   historical roadmap text differ.
-- The issue #43 reset has no compatibility requirement: do not add data-copy
-  SQL, compatibility views, old-name aliases, dual writes, or fallback
-  readers for the discarded schema.
+- Do not add data-copy SQL, compatibility views, old-name aliases, dual writes,
+  or fallback readers for the discarded pre-reset schema. Preserve current
+  five-table installations through forward-only migrations.
 - Never reset or delete a local Docker volume automatically. Destructive
   database reset commands must be documented for the owner to run explicitly.
 

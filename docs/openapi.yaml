@@ -464,8 +464,13 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/PostCreateRequest' }
       responses:
+        '200':
+          description: Idempotent replay returned the existing post.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Post' }
         '201':
-          description: Post created or replayed.
+          description: Post created.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Post' }

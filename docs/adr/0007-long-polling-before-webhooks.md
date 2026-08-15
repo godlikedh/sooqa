@@ -15,12 +15,15 @@ command flow and would make local operation harder to verify.
 
 Use Telegram long polling for the initial adapter. The server constructs the
 polling client with a configurable Bot API base URL and timeout, deletes an
-existing webhook before polling, and persists each Telegram update ID in
-PostgreSQL before handling it. Receipt claims use a lease token, complete only
-after a response succeeds, and are released on a failed response. The polling
-loop advances its Telegram offset only after the handler succeeds; failed
-handlers retain the offset and retry with a short backoff. Teloxide remains
-behind the project-owned `sooqa-telegram` boundary.
+existing webhook before polling, and claims each Telegram update ID in a
+process-local lease-aware store before handling it. The store suppresses
+concurrent delivery only for the lifetime of that server process; it is not a
+PostgreSQL receipt ledger. The polling loop advances its Telegram offset only
+after the handler succeeds; failed handlers retain the offset and retry with a
+short backoff. Durable business effects use their owning aggregate's keys,
+especially the Telegram-derived `ingests.input_key`, so a replay after restart
+does not create a second ingest. Teloxide remains behind the project-owned
+`sooqa-telegram` boundary.
 
 The runtime makes five handler attempts. If an update still fails, it returns
 an error without advancing the offset so a process supervisor can restart the
@@ -31,20 +34,21 @@ bounded attempts so a supervisor can restart or alert on the condition.
 
 The adapter does not expose a public webhook route in H1. A future webhook
 implementation must preserve the same normalized update boundary and durable
-deduplication semantics, and must add deployment-specific authentication and
-replay behavior before replacing polling.
+business-effect idempotency, and must add deployment-specific authentication
+and replay behavior before replacing polling.
 
 ## Consequences
 
 - Local and private-network deployments need only outbound access to the Bot
   API.
-- Restarted polling does not answer a completed update twice, while abandoned
-  claims can be reclaimed after five minutes.
+- One running server suppresses duplicate concurrent handling, while abandoned
+  in-process claims can be reclaimed after five minutes.
+- A restart may redeliver an update; durable ingest keys prevent duplicate
+  ingest work, but purely conversational replies are not stored as receipts.
 - A failed response can be retried, with the usual Telegram ambiguity if the
   network fails after Telegram accepted the request.
 - The adapter owns a small polling loop instead of delegating handler errors to
   a dispatcher that would log them and continue past the update.
-- Receipt rows are durable operational data and need retention/cleanup policy
-  in a later operations slice.
+- There is no Telegram receipt table or receipt-retention task.
 - Long polling is not the final answer for every deployment; webhooks remain a
   future option when public ingress and deployment diagnostics are ready.
