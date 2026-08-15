@@ -9,12 +9,11 @@ use sooqa_inbox::{
     TelegramSubmissionInput,
 };
 use sooqa_library::StorageUploadAttachment;
-use sooqa_persistence::{DuplicateCandidate, InboxRepository, PublisherRepository};
-use sooqa_publisher::{QueueDirection, QueuePost};
+use sooqa_persistence::{DuplicateCandidate, InboxRepository};
 use sooqa_telegram::{
     DuplicateCandidateCard, DuplicateCandidateStorage, DuplicateDecisionResult,
     DuplicatePendingCard, IngestAccepted, IngestService, MediaIngestCommand, MemoryUpdateStore,
-    PublisherService, TelegramRuntime, UrlIngestCommand,
+    TelegramRuntime, UrlIngestCommand,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -100,7 +99,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
             config.telegram.storage_chat_id,
             DatabaseIngestService { repository: database.inbox() },
         )?
-        .with_publisher(DatabasePublisherService { repository: database.publisher() })
         .with_upload_timeout(std::time::Duration::from_secs(
             config.telegram.upload_timeout_seconds,
         ))?
@@ -200,87 +198,6 @@ fn parse_i32(name: &str, value: &str) -> Result<i32, Box<dyn Error>> {
 #[derive(Clone)]
 struct DatabaseIngestService {
     repository: InboxRepository,
-}
-
-#[derive(Clone)]
-struct DatabasePublisherService {
-    repository: PublisherRepository,
-}
-
-#[async_trait::async_trait]
-impl PublisherService for DatabasePublisherService {
-    type Error = sooqa_persistence::PublisherRepositoryError;
-
-    async fn queue_count(&self) -> Result<usize, Self::Error> {
-        let count = self.repository.count_queue_posts().await?;
-        Ok(usize::try_from(count).unwrap_or(usize::MAX))
-    }
-
-    async fn list_queue(&self, limit: usize) -> Result<Vec<QueuePost>, Self::Error> {
-        self.repository.list_queue_posts(u32::try_from(limit).unwrap_or(u32::MAX)).await
-    }
-
-    async fn get_queue_post(&self, post_id: Uuid) -> Result<QueuePost, Self::Error> {
-        self.repository.find_queue_post(post_id).await
-    }
-
-    async fn move_queue_post(
-        &self,
-        post_id: Uuid,
-        direction: QueueDirection,
-        expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error> {
-        self.repository.move_queue_post(post_id, direction, expected_revision).await
-    }
-
-    async fn set_queue_post_slot(
-        &self,
-        post_id: Uuid,
-        slot: time::OffsetDateTime,
-        expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error> {
-        self.repository.set_queue_post_slot(post_id, slot, expected_revision).await
-    }
-
-    async fn update_queue_caption(
-        &self,
-        post_id: Uuid,
-        caption: Option<String>,
-        expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error> {
-        self.repository.update_queue_caption(post_id, expected_revision, caption).await
-    }
-
-    async fn publish_queue_post(
-        &self,
-        post_id: Uuid,
-        expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error> {
-        self.repository.publish_queue_post(post_id, expected_revision).await
-    }
-
-    async fn cancel_queue_post(
-        &self,
-        post_id: Uuid,
-        expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error> {
-        self.repository.cancel_queue_post(post_id, expected_revision).await
-    }
-
-    fn is_conflict(error: &Self::Error) -> bool {
-        matches!(
-            error,
-            sooqa_persistence::PublisherRepositoryError::PostMissing(_)
-                | sooqa_persistence::PublisherRepositoryError::OptimisticConflict(_)
-                | sooqa_persistence::PublisherRepositoryError::PostNotEditable { .. }
-                | sooqa_persistence::PublisherRepositoryError::PostCannotBeScheduled { .. }
-                | sooqa_persistence::PublisherRepositoryError::PostNotScheduled(_)
-                | sooqa_persistence::PublisherRepositoryError::PostNotClaimable { .. }
-                | sooqa_persistence::PublisherRepositoryError::StalePublicationJob { .. }
-                | sooqa_persistence::PublisherRepositoryError::PublishJobRunning(_)
-                | sooqa_persistence::PublisherRepositoryError::PublishJobUnavailable { .. }
-        )
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
