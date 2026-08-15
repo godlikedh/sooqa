@@ -70,6 +70,8 @@ single-admin deployment's explicit trust boundary. The home Compose PO-token
 provider is private-network-only, has no host-published port, and is checked
 for the pinned `1.3.1` version at worker startup. Each yt-dlp attempt gets a
 unique job-owned directory with a relative output and explicit home/temp paths;
+yt-dlp keeps its normal supported-client selection; the pinned PO-token
+provider is supplied to that selection without globally forcing an mweb client.
 the worker monitors the aggregate directory while the child is running, not
 only the final file, and removes the complete directory on success, failure,
 timeout, or cancellation. The aggregate budget is three times the final source

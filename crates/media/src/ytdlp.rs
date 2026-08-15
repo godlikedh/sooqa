@@ -396,8 +396,6 @@ impl YtDlpDownloader {
             "--js-runtimes".to_owned(),
             format!("deno:{}", self.config.deno_path.display()),
             "--extractor-args".to_owned(),
-            "youtube:player-client=mweb".to_owned(),
-            "--extractor-args".to_owned(),
             format!("youtubepot-bgutilhttp:base_url={}", self.config.pot_provider_url),
         ]
     }
@@ -1018,6 +1016,19 @@ mod tests {
         assert_eq!(calls[1].args()[0], "eval");
     }
 
+    #[test]
+    fn provider_argument_does_not_force_youtube_client_selection() {
+        let downloader = YtDlpDownloader::new(
+            YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
+        );
+        let args = downloader.security_args();
+
+        assert!(args.iter().any(|argument| {
+            argument == "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"
+        }));
+        assert!(!args.iter().any(|argument| argument == "youtube:player-client=mweb"));
+    }
+
     #[tokio::test]
     async fn runtime_probe_rejects_a_missing_pinned_plugin() {
         let runner = Arc::new(RuntimeProbeRunner {
@@ -1217,7 +1228,6 @@ mod tests {
             "--js-runtimes",
             "deno:deno",
             "--extractor-args",
-            "youtube:player-client=mweb",
             "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
         ] {
             assert!(
@@ -1225,6 +1235,7 @@ mod tests {
                 "missing argument: {argument}"
             );
         }
+        assert!(!inspect_args.lines().any(|line| line == "youtube:player-client=mweb"));
         assert!(
             inspect_args
                 .lines()
