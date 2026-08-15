@@ -342,6 +342,7 @@ impl YtDlpDownloader {
         let ping_url = pot_provider_ping_url(&self.config.pot_provider_url)?;
         let client = reqwest::Client::builder()
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .build()
             .map_err(|error| format!("could not build PO-token provider client: {error}"))?;
@@ -373,11 +374,11 @@ impl YtDlpDownloader {
         }
         let payload: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("PO-token provider returned invalid health JSON: {error}"))?;
-        let version = payload.get("version").and_then(serde_json::Value::as_str);
-        if version != Some(YTDLP_POT_PROVIDER_VERSION) {
+        if payload.get("version").and_then(serde_json::Value::as_str)
+            != Some(YTDLP_POT_PROVIDER_VERSION)
+        {
             return Err(format!(
-                "PO-token provider version mismatch: expected {YTDLP_POT_PROVIDER_VERSION}, got {}",
-                version.unwrap_or("<missing>")
+                "PO-token provider version mismatch: expected {YTDLP_POT_PROVIDER_VERSION}"
             ));
         }
         Ok(())
@@ -1037,10 +1038,19 @@ mod tests {
     }
 
     async fn provider_fixture(status: &str, body: &str) -> (String, tokio::task::JoinHandle<()>) {
+        provider_fixture_with_headers(status, "", body).await
+    }
+
+    async fn provider_fixture_with_headers(
+        status: &str,
+        headers: &str,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener =
             TcpListener::bind("127.0.0.1:0").await.expect("provider fixture should bind");
         let address = listener.local_addr().expect("provider fixture address should be known");
         let status = status.to_owned();
+        let headers = headers.to_owned();
         let body = body.to_owned();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("provider request should arrive");
@@ -1049,8 +1059,8 @@ mod tests {
                 stream.read(&mut request).await.expect("provider request should be readable");
             assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /ping"));
             let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}",
+                body.len(),
             );
             stream
                 .write_all(response.as_bytes())
@@ -1074,6 +1084,47 @@ mod tests {
             .verify_pot_provider(Duration::from_secs(1))
             .await
             .expect("pinned provider fixture should pass");
+        server.await.expect("provider fixture should finish");
+    }
+
+    #[tokio::test]
+    async fn provider_preflight_rejects_redirects() {
+        let (provider_url, server) = provider_fixture_with_headers(
+            "302 Found",
+            "Location: http://example.invalid/ping\r\n",
+            r#"{"server_uptime":1.0,"version":"1.3.1"}"#,
+        )
+        .await;
+        let downloader = YtDlpDownloader::new(
+            YtDlpConfig::new("yt-dlp", "best")
+                .expect("format selection should be valid")
+                .with_pot_provider_url(provider_url),
+        );
+
+        let error = downloader
+            .verify_pot_provider(Duration::from_secs(1))
+            .await
+            .expect_err("provider redirects should fail preflight");
+        assert!(error.contains("PO-token provider returned HTTP 302"));
+        server.await.expect("provider fixture should finish");
+    }
+
+    #[tokio::test]
+    async fn provider_preflight_does_not_echo_untrusted_version_text() {
+        let (provider_url, server) =
+            provider_fixture("200 OK", r#"{"version":"unexpected-secret-text"}"#).await;
+        let downloader = YtDlpDownloader::new(
+            YtDlpConfig::new("yt-dlp", "best")
+                .expect("format selection should be valid")
+                .with_pot_provider_url(provider_url),
+        );
+
+        let error = downloader
+            .verify_pot_provider(Duration::from_secs(1))
+            .await
+            .expect_err("wrong provider version should fail preflight");
+        assert!(error.contains("PO-token provider version mismatch"));
+        assert!(!error.contains("unexpected-secret-text"));
         server.await.expect("provider fixture should finish");
     }
 

@@ -75,8 +75,6 @@ services:
         condition: service_healthy
       telegram-bot-api:
         condition: service_healthy
-      pot-provider:
-        condition: service_healthy
     environment: &sooqa-environment
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in deploy/home/.env}
       SOOQA_API_TOKEN: ${SOOQA_API_TOKEN:?set SOOQA_API_TOKEN in deploy/home/.env}
@@ -106,8 +104,6 @@ services:
       postgres:
         condition: service_healthy
       telegram-bot-api:
-        condition: service_healthy
-      pot-provider:
         condition: service_healthy
     environment: *sooqa-environment
     volumes:

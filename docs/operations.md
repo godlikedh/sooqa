@@ -152,9 +152,13 @@ media are intentionally outside this setup.
 The home Compose deployment starts `brainicism/bgutil-ytdlp-pot-provider` as a
 private, health-checked service with no published host port and configures the
 worker with `http://pot-provider:4416`. The image is pinned by its multi-
-architecture digest. The worker checks `/ping` for provider version `1.3.1`
-before enabling page jobs; a missing provider or version mismatch fails startup
-with a provider-specific diagnostic. Standalone deployments can set
+architecture digest. The server and worker do not use a Compose health
+dependency on this service: direct-only deployments remain usable when
+`SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS` is empty, while the worker's restart policy
+retries its fail-closed provider preflight when page support is enabled. The
+worker checks `/ping` for provider version `1.3.1` before enabling page jobs; a
+missing provider or version mismatch fails startup with a provider-specific
+diagnostic. Standalone deployments can set
 `SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL` to another validated provider origin.
 
 The submitted URL remains the ingest provenance. After inspection, the worker
@@ -186,8 +190,9 @@ the aggregate attempt directory with a three-times-final-size budget to allow
 video/audio merging, while the final published file remains bounded by
 `SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES`; a successful attempt must contain
 exactly one regular media file. To update any pinned dependency, change its
-version, asset names if needed, and every matching checksum together; build the
-home image and
+version, asset names if needed, and every matching checksum together; the
+Dockerfile also rejects a bgutil version/checksum override unless the Docker
+and Rust runtime pins are updated together. Build the home image and
 verify the startup diagnostics before doing an owner smoke test. CI uses fake
 executables and does not contact YouTube.
 
