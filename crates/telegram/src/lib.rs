@@ -1627,9 +1627,21 @@ mod tests {
         );
         assert_eq!(
             service
-                .acknowledge_callback(IncomingCallback {
-                    update_id: 13,
-                    callback_id: "stale-duplicate-card".to_owned(),
+                .handle_update(Update {
+                    id: teloxide::types::UpdateId(13),
+                    kind: UpdateKind::CallbackQuery(
+                        serde_json::from_value(serde_json::json!({
+                            "id": "stale-duplicate-card",
+                            "from": {
+                                "id": 456,
+                                "is_bot": false,
+                                "first_name": "Former reviewer"
+                            },
+                            "chat_instance": "stale-card",
+                            "data": "v1:duplicate_use:stale:payload"
+                        }))
+                        .expect("callback fixture should deserialize"),
+                    ),
                 })
                 .await
                 .unwrap(),
