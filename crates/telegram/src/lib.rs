@@ -13,17 +13,14 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
 use sooqa_library::MediaKind;
-use sooqa_publisher::{PostState, QueueDirection, QueuePost};
 use teloxide::{
     Bot,
     payloads::{GetUpdatesSetters, SendMessageSetters},
     prelude::{Request, Requester},
     types::{
         CallbackQueryId, ChatId, FileId, InlineKeyboardButton, InlineKeyboardMarkup, Message,
-        MessageId, ReplyMarkup, Update, UpdateKind,
+        Update, UpdateKind,
     },
 };
 use thiserror::Error as ThisError;
@@ -43,11 +40,10 @@ pub use storage::{
 };
 
 pub const START_RESPONSE: &str = "sooqa is ready. You are authorized.";
-pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorization\n/help — show this help\n/add <url> — queue a URL\n/status — show service status\n/duplicates — review pending duplicate candidates\n/queue — inspect the publication queue";
+pub const HELP_RESPONSE: &str = "Available commands:\n/start — show authorization\n/help — show this help\n/add <url> — queue a URL\n/status — show service status\n/duplicates — review pending duplicate candidates";
 pub const STATUS_RESPONSE: &str = "sooqa is online.";
 pub const UNAUTHORIZED_RESPONSE: &str = "This bot is restricted to its configured administrator.";
 pub const ADD_USAGE_RESPONSE: &str = "Send one http(s) URL after /add, or send a bare URL.";
-pub const QUEUE_MAX_POSTS: usize = 125;
 pub const DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_TELEGRAM_UPLOAD_TIMEOUT_SECONDS: u64 = 3_600;
 const TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
@@ -56,10 +52,6 @@ const TELEGRAM_MEDIA_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const TELEGRAM_MEDIA_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const TELEGRAM_MAX_UPLOAD_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const RESPONSE_RATE_LIMIT: Duration = Duration::from_secs(1);
-const QUEUE_CARD_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_QUEUE_CARD_RETRIES: usize = 3;
-const MAX_QUEUE_RETRY_AFTER: Duration = Duration::from_secs(30);
-const QUEUE_PROMPT_TTL: Duration = Duration::from_secs(10 * 60);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_HANDLER_ATTEMPTS: usize = 5;
 const MAX_POLLING_ATTEMPTS: usize = 5;
@@ -130,7 +122,6 @@ pub enum Command {
     Add,
     Status,
     Duplicates,
-    Queue,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -205,66 +196,6 @@ pub struct DuplicateDecisionResult {
     pub media_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum QueuePromptKind {
-    Caption,
-    Slot,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueuePrompt {
-    pub post_id: Uuid,
-    pub expected_revision: i64,
-    pub kind: QueuePromptKind,
-    pub prompt_message_id: i64,
-}
-
-#[async_trait]
-pub trait PublisherService: Clone + Send + Sync + 'static {
-    type Error: Error + Send + Sync + 'static;
-
-    async fn queue_count(&self) -> Result<usize, Self::Error>;
-
-    async fn list_queue(&self, limit: usize) -> Result<Vec<QueuePost>, Self::Error>;
-
-    async fn get_queue_post(&self, post_id: Uuid) -> Result<QueuePost, Self::Error>;
-
-    async fn move_queue_post(
-        &self,
-        post_id: Uuid,
-        direction: QueueDirection,
-        expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error>;
-
-    async fn set_queue_post_slot(
-        &self,
-        post_id: Uuid,
-        slot: OffsetDateTime,
-        expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error>;
-
-    async fn update_queue_caption(
-        &self,
-        post_id: Uuid,
-        caption: Option<String>,
-        expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error>;
-
-    async fn publish_queue_post(
-        &self,
-        post_id: Uuid,
-        expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error>;
-
-    async fn cancel_queue_post(
-        &self,
-        post_id: Uuid,
-        expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error>;
-
-    fn is_conflict(error: &Self::Error) -> bool;
-}
-
 #[async_trait]
 pub trait IngestService: Clone + Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
@@ -329,70 +260,6 @@ impl IngestService for () {
     }
 }
 
-#[async_trait]
-impl PublisherService for () {
-    type Error = IngestUnavailable;
-
-    async fn queue_count(&self) -> Result<usize, Self::Error> {
-        Err(IngestUnavailable)
-    }
-
-    async fn list_queue(&self, _limit: usize) -> Result<Vec<QueuePost>, Self::Error> {
-        Err(IngestUnavailable)
-    }
-
-    async fn get_queue_post(&self, _post_id: Uuid) -> Result<QueuePost, Self::Error> {
-        Err(IngestUnavailable)
-    }
-
-    async fn move_queue_post(
-        &self,
-        _post_id: Uuid,
-        _direction: QueueDirection,
-        _expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error> {
-        Err(IngestUnavailable)
-    }
-
-    async fn set_queue_post_slot(
-        &self,
-        _post_id: Uuid,
-        _slot: OffsetDateTime,
-        _expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error> {
-        Err(IngestUnavailable)
-    }
-
-    async fn update_queue_caption(
-        &self,
-        _post_id: Uuid,
-        _caption: Option<String>,
-        _expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error> {
-        Err(IngestUnavailable)
-    }
-
-    async fn publish_queue_post(
-        &self,
-        _post_id: Uuid,
-        _expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error> {
-        Err(IngestUnavailable)
-    }
-
-    async fn cancel_queue_post(
-        &self,
-        _post_id: Uuid,
-        _expected_revision: i64,
-    ) -> Result<QueuePost, Self::Error> {
-        Err(IngestUnavailable)
-    }
-
-    fn is_conflict(_error: &Self::Error) -> bool {
-        false
-    }
-}
-
 #[derive(Debug, ThisError)]
 pub enum TelegramError {
     #[error("Telegram API request failed: {0}")]
@@ -413,8 +280,6 @@ pub enum TelegramError {
     UpdateInProgress(i64),
     #[error("Telegram URL ingest failed: {0}")]
     Ingest(#[source] Box<dyn Error + Send + Sync>),
-    #[error("Telegram publisher operation failed: {0}")]
-    Publisher(#[source] Box<dyn Error + Send + Sync>),
 }
 
 #[derive(Debug, ThisError)]
@@ -448,40 +313,11 @@ pub trait TelegramApi: Clone + Send + Sync + 'static {
         keyboard: Vec<Vec<InlineButton>>,
     ) -> Result<(), Self::Error>;
 
-    async fn send_inline_keyboard_with_id(
-        &self,
-        chat_id: i64,
-        text: &str,
-        keyboard: Vec<Vec<InlineButton>>,
-    ) -> Result<i64, Self::Error> {
-        self.send_inline_keyboard(chat_id, text, keyboard).await?;
-        Ok(0)
-    }
-
-    async fn send_force_reply(&self, chat_id: i64, text: &str) -> Result<i64, Self::Error> {
-        self.send_text(chat_id, text).await?;
-        Ok(0)
-    }
-
-    async fn delete_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    /// Wait for the next queue card slot. Production Telegram calls pace this
-    /// per chat; test adapters can override it with a no-op clock.
-    async fn wait_for_queue_card(&self, _chat_id: i64) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
     async fn answer_callback_query(&self, callback_id: &str) -> Result<(), Self::Error>;
 
     async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), Self::Error>;
 
     fn is_retryable_error(error: &Self::Error) -> bool;
-
-    fn retry_after(_error: &Self::Error) -> Option<Duration> {
-        None
-    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -593,30 +429,13 @@ impl UpdateStore for MemoryUpdateStore {
 }
 
 #[derive(Clone)]
-pub struct TelegramService<A, S, I = (), P = ()> {
+pub struct TelegramService<A, S, I = ()> {
     api: A,
     update_store: S,
     ingest_service: Option<I>,
-    publisher_service: Option<P>,
     admin_user_ids: Arc<BTreeSet<i64>>,
     response_limiter: Arc<Mutex<HashMap<RateLimitKey, Instant>>>,
     source_download_max_bytes: u64,
-    views: Arc<Mutex<HashMap<i64, QueueViewState>>>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct QueueViewState {
-    message_ids: Vec<i64>,
-    prompt_message_id: Option<i64>,
-    prompt: Option<QueuePrompt>,
-    prompt_expires_at: Option<Instant>,
-}
-
-enum QueueMutation {
-    Move { post_id: Uuid, expected_revision: i64, direction: QueueDirection },
-    Caption { post_id: Uuid, expected_revision: i64, caption: Option<String> },
-    Publish { post_id: Uuid, expected_revision: i64 },
-    Cancel { post_id: Uuid, expected_revision: i64 },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -635,16 +454,14 @@ where
             api,
             update_store,
             ingest_service: None,
-            publisher_service: None,
             admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
             response_limiter: Arc::new(Mutex::new(HashMap::new())),
             source_download_max_bytes: DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
-            views: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
-impl<A, S, I> TelegramService<A, S, I, ()>
+impl<A, S, I> TelegramService<A, S, I>
 where
     A: TelegramApi,
     S: UpdateStore,
@@ -660,44 +477,18 @@ where
             api,
             update_store,
             ingest_service: Some(ingest_service),
-            publisher_service: None,
             admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
             response_limiter: Arc::new(Mutex::new(HashMap::new())),
             source_download_max_bytes: DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
-            views: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
-impl<A, S, I> TelegramService<A, S, I, ()>
+impl<A, S, I> TelegramService<A, S, I>
 where
     A: TelegramApi,
     S: UpdateStore,
     I: IngestService,
-{
-    pub fn with_publisher<P>(self, publisher_service: P) -> TelegramService<A, S, I, P>
-    where
-        P: PublisherService,
-    {
-        TelegramService {
-            api: self.api,
-            update_store: self.update_store,
-            ingest_service: self.ingest_service,
-            publisher_service: Some(publisher_service),
-            admin_user_ids: self.admin_user_ids,
-            response_limiter: self.response_limiter,
-            source_download_max_bytes: self.source_download_max_bytes,
-            views: self.views,
-        }
-    }
-}
-
-impl<A, S, I, P> TelegramService<A, S, I, P>
-where
-    A: TelegramApi,
-    S: UpdateStore,
-    I: IngestService,
-    P: PublisherService,
 {
     pub fn with_source_download_max_bytes(mut self, max_bytes: u64) -> Self {
         self.source_download_max_bytes = max_bytes;
@@ -739,17 +530,6 @@ where
             )
             .await?;
             return Ok(HandleOutcome::Unauthorized);
-        }
-        if self.expire_queue_prompt(message.chat_id) {
-            self.clear_queue_view(message.chat_id).await;
-        }
-        if message.media.is_none()
-            && let Some(text) = message.text.as_deref()
-            && (is_cancel_command(text)
-                || (parse_command(text).is_none()
-                    && self.queue_prompt_matches(message.chat_id, message.reply_to_message_id)))
-        {
-            return self.handle_queue_prompt(message, claim).await;
         }
         if let Some(media) = message.media.clone() {
             return self.handle_media_message(message, claim, media).await;
@@ -802,9 +582,6 @@ where
                 if command == Command::Duplicates {
                     return self.handle_duplicate_command(message, claim).await;
                 }
-                if command == Command::Queue {
-                    return self.handle_queue_command(message, claim).await;
-                }
                 if !self.allow_response(message.user_id, message.chat_id) {
                     self.complete(claim).await?;
                     return Ok(HandleOutcome::RateLimited);
@@ -815,7 +592,6 @@ where
                     Command::Status => STATUS_RESPONSE,
                     Command::Add => ADD_USAGE_RESPONSE,
                     Command::Duplicates => unreachable!("duplicate command is handled above"),
-                    Command::Queue => unreachable!("queue command is handled above"),
                 };
                 self.send_and_complete(
                     claim,
@@ -960,535 +736,6 @@ where
         Ok(HandleOutcome::Responded(Command::Duplicates))
     }
 
-    async fn handle_queue_command(
-        &self,
-        message: IncomingMessage,
-        claim: UpdateClaim,
-    ) -> Result<HandleOutcome, TelegramError> {
-        let rate_limit_key = RateLimitKey { user_id: message.user_id, chat_id: message.chat_id };
-        if !self.allow_response(message.user_id, message.chat_id) {
-            self.complete(claim).await?;
-            return Ok(HandleOutcome::RateLimited);
-        }
-        self.clear_queue_view(message.chat_id).await;
-        let Some(publisher) = self.publisher_service.as_ref() else {
-            self.clear_response(rate_limit_key);
-            self.release(claim).await?;
-            return Err(TelegramError::Publisher(Box::new(IngestUnavailable)));
-        };
-        let total = match publisher.queue_count().await {
-            Ok(total) => total,
-            Err(error) => {
-                self.clear_response(rate_limit_key);
-                self.release(claim).await?;
-                return Err(TelegramError::Publisher(Box::new(error)));
-            }
-        };
-        if total == 0 {
-            self.send_and_complete(claim, message.chat_id, "Queue is empty.", rate_limit_key)
-                .await?;
-            return Ok(HandleOutcome::Responded(Command::Queue));
-        }
-        let (text, keyboard) = render_queue_count(total);
-        match self.send_queue_card(message.chat_id, &text, keyboard).await {
-            Ok(message_id) => {
-                self.store_queue_count_message(message.chat_id, message_id);
-                self.complete(claim).await?;
-                Ok(HandleOutcome::Responded(Command::Queue))
-            }
-            Err(error) => {
-                self.clear_response(rate_limit_key);
-                self.release(claim).await?;
-                Err(error)
-            }
-        }
-    }
-
-    async fn send_queue_card(
-        &self,
-        chat_id: i64,
-        text: &str,
-        keyboard: Vec<Vec<InlineButton>>,
-    ) -> Result<i64, TelegramError> {
-        for attempt in 0..=MAX_QUEUE_CARD_RETRIES {
-            self.api
-                .wait_for_queue_card(chat_id)
-                .await
-                .map_err(|error| TelegramError::Api(Box::new(error)))?;
-            match self.api.send_inline_keyboard_with_id(chat_id, text, keyboard.clone()).await {
-                Ok(message_id) => return Ok(message_id),
-                Err(error) => {
-                    if attempt < MAX_QUEUE_CARD_RETRIES
-                        && let Some(delay) = A::retry_after(&error)
-                    {
-                        tokio::time::sleep(delay.min(MAX_QUEUE_RETRY_AFTER)).await;
-                        continue;
-                    }
-                    return Err(TelegramError::Api(Box::new(error)));
-                }
-            }
-        }
-        unreachable!("the bounded queue card retry loop always returns")
-    }
-
-    async fn handle_queue_prompt(
-        &self,
-        message: IncomingMessage,
-        claim: UpdateClaim,
-    ) -> Result<HandleOutcome, TelegramError> {
-        let Some(prompt) = self.take_queue_prompt(message.chat_id) else {
-            if message.text.as_deref().is_some_and(is_cancel_command) {
-                self.clear_queue_view(message.chat_id).await;
-                self.send_and_complete(
-                    claim,
-                    message.chat_id,
-                    "No active queue prompt.",
-                    RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
-                )
-                .await?;
-                return Ok(HandleOutcome::Responded(Command::Queue));
-            }
-            self.complete(claim).await?;
-            return Ok(HandleOutcome::UnrecognizedIgnored);
-        };
-        let text = message.text.as_deref().unwrap_or_default().trim();
-        if is_cancel_command(text) {
-            self.clear_queue_view(message.chat_id).await;
-            self.send_and_complete(
-                claim,
-                message.chat_id,
-                "Queue prompt cancelled.",
-                RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
-            )
-            .await?;
-            return Ok(HandleOutcome::Responded(Command::Queue));
-        }
-        let Some(publisher) = self.publisher_service.as_ref() else {
-            self.release(claim).await?;
-            return Err(TelegramError::Publisher(Box::new(IngestUnavailable)));
-        };
-        let result = match prompt.kind {
-            QueuePromptKind::Caption => {
-                let caption = if text.is_empty() || text.eq_ignore_ascii_case("/clear") {
-                    None
-                } else {
-                    Some(text.to_owned())
-                };
-                publisher
-                    .update_queue_caption(prompt.post_id, caption, prompt.expected_revision)
-                    .await
-                    .map(|_| "✅ Post text updated.".to_owned())
-            }
-            QueuePromptKind::Slot => {
-                let slot =
-                    OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339);
-                match slot {
-                    Ok(slot) => publisher
-                        .set_queue_post_slot(prompt.post_id, slot, prompt.expected_revision)
-                        .await
-                        .map(|_| "✅ Queue slot updated.".to_owned()),
-                    Err(_) => {
-                        self.restore_queue_prompt(message.chat_id, prompt);
-                        self.send_and_complete(
-                            claim,
-                            message.chat_id,
-                            "⚠️ Send an RFC3339 slot, for example 2026-08-12T18:30:00Z, or /cancel.",
-                            RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
-                        )
-                        .await?;
-                        return Ok(HandleOutcome::Responded(Command::Queue));
-                    }
-                }
-            }
-        };
-        let response = match result {
-            Ok(response) => response,
-            Err(error) if P::is_conflict(&error) => "Queue changed; run /queue again.".to_owned(),
-            Err(error) => format!("⚠️ Queue operation failed: {error}"),
-        };
-        self.clear_queue_view(message.chat_id).await;
-        self.send_and_complete(
-            claim,
-            message.chat_id,
-            &response,
-            RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
-        )
-        .await?;
-        Ok(HandleOutcome::Responded(Command::Queue))
-    }
-
-    async fn handle_queue_callback(
-        &self,
-        chat_id: i64,
-        data: CallbackData,
-        claim: UpdateClaim,
-    ) -> Result<HandleOutcome, TelegramError> {
-        match data {
-            CallbackData::QueueCount { count } => {
-                self.handle_queue_count(chat_id, count, claim).await
-            }
-            CallbackData::QueueSetSlot { post_id, expected_revision } => {
-                self.begin_queue_prompt(
-                    chat_id,
-                    QueuePrompt {
-                        post_id,
-                        expected_revision,
-                        kind: QueuePromptKind::Slot,
-                        prompt_message_id: 0,
-                    },
-                    "Send an RFC3339 queue slot, for example 2026-08-12T18:30:00Z, or /cancel.",
-                    claim,
-                )
-                .await
-            }
-            CallbackData::QueueEditCaption { post_id, expected_revision } => {
-                self.begin_queue_prompt(
-                    chat_id,
-                    QueuePrompt {
-                        post_id,
-                        expected_revision,
-                        kind: QueuePromptKind::Caption,
-                        prompt_message_id: 0,
-                    },
-                    "Send new post text, /clear to remove it, or /cancel.",
-                    claim,
-                )
-                .await
-            }
-            CallbackData::QueueEarlier { post_id, expected_revision } => {
-                self.apply_queue_mutation(
-                    chat_id,
-                    claim,
-                    QueueMutation::Move {
-                        post_id,
-                        expected_revision,
-                        direction: QueueDirection::Earlier,
-                    },
-                )
-                .await
-            }
-            CallbackData::QueueLater { post_id, expected_revision } => {
-                self.apply_queue_mutation(
-                    chat_id,
-                    claim,
-                    QueueMutation::Move {
-                        post_id,
-                        expected_revision,
-                        direction: QueueDirection::Later,
-                    },
-                )
-                .await
-            }
-            CallbackData::QueueClearCaption { post_id, expected_revision } => {
-                self.apply_queue_mutation(
-                    chat_id,
-                    claim,
-                    QueueMutation::Caption { post_id, expected_revision, caption: None },
-                )
-                .await
-            }
-            CallbackData::QueuePublishNow { post_id, expected_revision } => {
-                self.apply_queue_mutation(
-                    chat_id,
-                    claim,
-                    QueueMutation::Publish { post_id, expected_revision },
-                )
-                .await
-            }
-            CallbackData::QueueCancel { post_id, expected_revision } => {
-                self.apply_queue_mutation(
-                    chat_id,
-                    claim,
-                    QueueMutation::Cancel { post_id, expected_revision },
-                )
-                .await
-            }
-            _ => unreachable!("non-queue callback routed to queue handler"),
-        }
-    }
-
-    async fn handle_queue_count(
-        &self,
-        chat_id: i64,
-        requested: usize,
-        claim: UpdateClaim,
-    ) -> Result<HandleOutcome, TelegramError> {
-        let Some(publisher) = self.publisher_service.as_ref() else {
-            self.release(claim).await?;
-            return Err(TelegramError::Publisher(Box::new(IngestUnavailable)));
-        };
-        let total = match publisher.queue_count().await {
-            Ok(total) => total,
-            Err(error) => {
-                self.release(claim).await?;
-                return Err(TelegramError::Publisher(Box::new(error)));
-            }
-        };
-        if total < requested {
-            self.clear_queue_view(chat_id).await;
-            self.send_queue_count_prompt(chat_id, total, claim).await?;
-            return Ok(HandleOutcome::CallbackHandled);
-        }
-        let posts = match publisher.list_queue(requested.min(QUEUE_MAX_POSTS)).await {
-            Ok(posts) => posts,
-            Err(error) => {
-                self.release(claim).await?;
-                return Err(TelegramError::Publisher(Box::new(error)));
-            }
-        };
-        if posts.len() != requested {
-            self.clear_queue_view(chat_id).await;
-            self.send_queue_count_prompt(chat_id, posts.len(), claim).await?;
-            return Ok(HandleOutcome::CallbackHandled);
-        }
-
-        self.clear_queue_view(chat_id).await;
-        for (index, post) in posts.iter().enumerate() {
-            let (text, keyboard) = render_queue_post(index + 1, post);
-            let message_id = match self.send_queue_card(chat_id, &text, keyboard).await {
-                Ok(message_id) => message_id,
-                Err(error) => {
-                    self.clear_queue_view(chat_id).await;
-                    let report_result = self
-                        .api
-                        .send_text(chat_id, "⚠️ Queue view could not be rendered completely.");
-                    self.complete(claim).await?;
-                    if let Err(report_error) = report_result.await {
-                        return Err(TelegramError::Api(Box::new(report_error)));
-                    }
-                    tracing::warn!(
-                        ?error,
-                        chat_id,
-                        "queue view rendering failed after partial send"
-                    );
-                    return Ok(HandleOutcome::CallbackHandled);
-                }
-            };
-            self.store_queue_message(chat_id, message_id);
-        }
-        self.complete(claim).await?;
-        Ok(HandleOutcome::CallbackHandled)
-    }
-
-    async fn send_queue_count_prompt(
-        &self,
-        chat_id: i64,
-        total: usize,
-        claim: UpdateClaim,
-    ) -> Result<(), TelegramError> {
-        if total == 0 {
-            self.send_and_complete(
-                claim,
-                chat_id,
-                "Queue is empty.",
-                RateLimitKey { user_id: Some(chat_id), chat_id },
-            )
-            .await?;
-            return Ok(());
-        }
-        let (text, keyboard) = render_queue_count(total);
-        match self.send_queue_card(chat_id, &text, keyboard).await {
-            Ok(message_id) => {
-                self.store_queue_count_message(chat_id, message_id);
-                self.complete(claim).await?;
-                Ok(())
-            }
-            Err(error) => {
-                self.release(claim).await?;
-                Err(error)
-            }
-        }
-    }
-
-    async fn begin_queue_prompt(
-        &self,
-        chat_id: i64,
-        mut prompt: QueuePrompt,
-        text: &str,
-        claim: UpdateClaim,
-    ) -> Result<HandleOutcome, TelegramError> {
-        let Some(publisher) = self.publisher_service.as_ref() else {
-            self.release(claim).await?;
-            return Err(TelegramError::Publisher(Box::new(IngestUnavailable)));
-        };
-        let post = match publisher.get_queue_post(prompt.post_id).await {
-            Ok(post) => post,
-            Err(error) if P::is_conflict(&error) => {
-                self.clear_queue_view(chat_id).await;
-                self.send_and_complete(
-                    claim,
-                    chat_id,
-                    "Queue changed; run /queue again.",
-                    RateLimitKey { user_id: Some(chat_id), chat_id },
-                )
-                .await?;
-                return Ok(HandleOutcome::CallbackHandled);
-            }
-            Err(error) => {
-                self.release(claim).await?;
-                return Err(TelegramError::Publisher(Box::new(error)));
-            }
-        };
-        let valid = post.revision == prompt.expected_revision
-            && post.state.is_queue_mutable()
-            && (prompt.kind != QueuePromptKind::Slot || post.state == PostState::Queued);
-        if !valid {
-            self.clear_queue_view(chat_id).await;
-            self.send_and_complete(
-                claim,
-                chat_id,
-                "Queue changed; run /queue again.",
-                RateLimitKey { user_id: Some(chat_id), chat_id },
-            )
-            .await?;
-            return Ok(HandleOutcome::CallbackHandled);
-        }
-        self.clear_queue_view(chat_id).await;
-        match self.api.send_force_reply(chat_id, text).await {
-            Ok(message_id) => {
-                prompt.prompt_message_id = message_id;
-                self.store_queue_prompt(chat_id, message_id, prompt);
-                self.complete(claim).await?;
-                Ok(HandleOutcome::CallbackHandled)
-            }
-            Err(error) => {
-                self.release(claim).await?;
-                Err(TelegramError::Api(Box::new(error)))
-            }
-        }
-    }
-
-    async fn apply_queue_mutation(
-        &self,
-        chat_id: i64,
-        claim: UpdateClaim,
-        mutation: QueueMutation,
-    ) -> Result<HandleOutcome, TelegramError> {
-        let Some(publisher) = self.publisher_service.as_ref() else {
-            self.release(claim).await?;
-            return Err(TelegramError::Publisher(Box::new(IngestUnavailable)));
-        };
-        let result = match mutation {
-            QueueMutation::Move { post_id, direction, expected_revision } => publisher
-                .move_queue_post(post_id, direction, expected_revision)
-                .await
-                .map(|_| match direction {
-                    QueueDirection::Earlier => "✅ Post moved earlier.".to_owned(),
-                    QueueDirection::Later => "✅ Post moved later.".to_owned(),
-                }),
-            QueueMutation::Caption { post_id, expected_revision, caption } => {
-                let cleared = caption.is_none();
-                publisher.update_queue_caption(post_id, caption, expected_revision).await.map(
-                    |_| {
-                        if cleared {
-                            "✅ Post text cleared.".to_owned()
-                        } else {
-                            "✅ Post text updated.".to_owned()
-                        }
-                    },
-                )
-            }
-            QueueMutation::Publish { post_id, expected_revision } => publisher
-                .publish_queue_post(post_id, expected_revision)
-                .await
-                .map(|_| "✅ Post queued for immediate publication.".to_owned()),
-            QueueMutation::Cancel { post_id, expected_revision } => publisher
-                .cancel_queue_post(post_id, expected_revision)
-                .await
-                .map(|_| "✅ Post removed from the queue.".to_owned()),
-        };
-        let response = match result {
-            Ok(response) => response,
-            Err(error) if P::is_conflict(&error) => "Queue changed; run /queue again.".to_owned(),
-            Err(error) => format!("⚠️ Queue operation failed: {error}"),
-        };
-        self.clear_queue_view(chat_id).await;
-        self.send_and_complete(
-            claim,
-            chat_id,
-            &response,
-            RateLimitKey { user_id: Some(chat_id), chat_id },
-        )
-        .await?;
-        Ok(HandleOutcome::CallbackHandled)
-    }
-
-    fn expire_queue_prompt(&self, chat_id: i64) -> bool {
-        let mut views = self.views.lock().expect("Telegram queue view lock is not poisoned");
-        let Some(view) = views.get_mut(&chat_id) else { return false };
-        if view.prompt_expires_at.is_some_and(|expires_at| expires_at <= Instant::now()) {
-            view.prompt = None;
-            view.prompt_expires_at = None;
-            return true;
-        }
-        false
-    }
-
-    fn queue_prompt_matches(&self, chat_id: i64, reply_to_message_id: Option<i64>) -> bool {
-        let views = self.views.lock().expect("Telegram queue view lock is not poisoned");
-        views
-            .get(&chat_id)
-            .and_then(|view| view.prompt.as_ref())
-            .is_some_and(|prompt| reply_to_message_id == Some(prompt.prompt_message_id))
-    }
-
-    fn take_queue_prompt(&self, chat_id: i64) -> Option<QueuePrompt> {
-        self.views
-            .lock()
-            .expect("Telegram queue view lock is not poisoned")
-            .get_mut(&chat_id)
-            .and_then(|view| view.prompt.take())
-    }
-
-    fn restore_queue_prompt(&self, chat_id: i64, prompt: QueuePrompt) {
-        let mut views = self.views.lock().expect("Telegram queue view lock is not poisoned");
-        let view = views.entry(chat_id).or_default();
-        view.prompt = Some(prompt);
-        view.prompt_expires_at = Some(Instant::now() + QUEUE_PROMPT_TTL);
-    }
-
-    fn store_queue_count_message(&self, chat_id: i64, message_id: i64) {
-        if message_id <= 0 {
-            return;
-        }
-        let mut views = self.views.lock().expect("Telegram queue view lock is not poisoned");
-        let view = views.entry(chat_id).or_default();
-        if view.message_ids.len() < QUEUE_MAX_POSTS + 1 {
-            view.message_ids.push(message_id);
-        }
-    }
-
-    fn store_queue_message(&self, chat_id: i64, message_id: i64) {
-        self.store_queue_count_message(chat_id, message_id);
-    }
-
-    fn store_queue_prompt(&self, chat_id: i64, message_id: i64, prompt: QueuePrompt) {
-        let mut views = self.views.lock().expect("Telegram queue view lock is not poisoned");
-        let view = views.entry(chat_id).or_default();
-        view.prompt_message_id = (message_id > 0).then_some(message_id);
-        view.prompt = Some(prompt);
-        view.prompt_expires_at = Some(Instant::now() + QUEUE_PROMPT_TTL);
-    }
-
-    async fn clear_queue_view(&self, chat_id: i64) {
-        let ids = self
-            .views
-            .lock()
-            .expect("Telegram queue view lock is not poisoned")
-            .remove(&chat_id)
-            .map(|view| {
-                view.message_ids
-                    .into_iter()
-                    .chain(view.prompt_message_id)
-                    .filter(|message_id| *message_id > 0)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for message_id in ids {
-            let _ = self.api.delete_message(chat_id, message_id).await;
-        }
-    }
-
     pub async fn handle_update(&self, update: Update) -> Result<HandleOutcome, TelegramError> {
         let update_id = i64::from(update.id.0);
         match update.kind {
@@ -1579,9 +826,6 @@ where
             self.complete(claim).await?;
             return Ok(HandleOutcome::CallbackHandled);
         };
-        if is_queue_callback(&data) {
-            return self.handle_queue_callback(chat_id, data, claim).await;
-        }
         let Some(ingest_service) = self.ingest_service.as_ref() else {
             self.release(claim).await?;
             return Err(TelegramError::Ingest(Box::new(IngestUnavailable)));
@@ -1607,7 +851,6 @@ where
                 self.complete(claim).await?;
                 return Ok(HandleOutcome::CallbackHandled);
             }
-            _ => unreachable!("queue callback was routed before ingest callbacks"),
         };
         if let Err(error) = self.api.send_text(chat_id, &response).await {
             self.release(claim).await?;
@@ -1813,17 +1056,8 @@ fn parse_command(text: &str) -> Option<Command> {
         "add" => Some(Command::Add),
         "status" => Some(Command::Status),
         "duplicates" => Some(Command::Duplicates),
-        "queue" => Some(Command::Queue),
         _ => None,
     }
-}
-
-fn is_cancel_command(text: &str) -> bool {
-    let Some(command) = text.split_whitespace().next().and_then(|value| value.strip_prefix('/'))
-    else {
-        return false;
-    };
-    command.split('@').next().is_some_and(|value| value.eq_ignore_ascii_case("cancel"))
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1886,14 +1120,6 @@ pub enum CallbackData {
     IngestStatus { request_id: Uuid },
     DuplicateUse { request_id: Uuid, media_id: Uuid },
     DuplicateForceSave { request_id: Uuid },
-    QueueCount { count: usize },
-    QueueEarlier { post_id: Uuid, expected_revision: i64 },
-    QueueLater { post_id: Uuid, expected_revision: i64 },
-    QueueSetSlot { post_id: Uuid, expected_revision: i64 },
-    QueueEditCaption { post_id: Uuid, expected_revision: i64 },
-    QueueClearCaption { post_id: Uuid, expected_revision: i64 },
-    QueuePublishNow { post_id: Uuid, expected_revision: i64 },
-    QueueCancel { post_id: Uuid, expected_revision: i64 },
 }
 
 impl CallbackData {
@@ -1905,28 +1131,6 @@ impl CallbackData {
             }
             Self::DuplicateForceSave { request_id } => {
                 format!("v1:duplicate_force_save:{}", encode_uuid(request_id))
-            }
-            Self::QueueCount { count } => format!("v1:q:n:{count}"),
-            Self::QueueEarlier { post_id, expected_revision } => {
-                format!("v1:q:e:{}:{expected_revision}", encode_uuid(post_id))
-            }
-            Self::QueueLater { post_id, expected_revision } => {
-                format!("v1:q:l:{}:{expected_revision}", encode_uuid(post_id))
-            }
-            Self::QueueSetSlot { post_id, expected_revision } => {
-                format!("v1:q:s:{}:{expected_revision}", encode_uuid(post_id))
-            }
-            Self::QueueEditCaption { post_id, expected_revision } => {
-                format!("v1:q:c:{}:{expected_revision}", encode_uuid(post_id))
-            }
-            Self::QueueClearCaption { post_id, expected_revision } => {
-                format!("v1:q:z:{}:{expected_revision}", encode_uuid(post_id))
-            }
-            Self::QueuePublishNow { post_id, expected_revision } => {
-                format!("v1:q:p:{}:{expected_revision}", encode_uuid(post_id))
-            }
-            Self::QueueCancel { post_id, expected_revision } => {
-                format!("v1:q:x:{}:{expected_revision}", encode_uuid(post_id))
             }
         }
     }
@@ -1958,34 +1162,6 @@ impl CallbackData {
                     return None;
                 }
                 Some(Self::DuplicateForceSave { request_id })
-            }
-            "q" => {
-                let action = parts.next()?;
-                match action {
-                    "n" => {
-                        let count = parts.next()?.parse().ok()?;
-                        (parts.next().is_none() && (1..=QUEUE_MAX_POSTS).contains(&count))
-                            .then_some(Self::QueueCount { count })
-                    }
-                    action @ ("e" | "l" | "s" | "c" | "z" | "p" | "x") => {
-                        let post_id = decode_uuid(parts.next()?)?;
-                        let expected_revision = parts.next()?.parse().ok()?;
-                        if parts.next().is_some() {
-                            return None;
-                        }
-                        Some(match action {
-                            "e" => Self::QueueEarlier { post_id, expected_revision },
-                            "l" => Self::QueueLater { post_id, expected_revision },
-                            "s" => Self::QueueSetSlot { post_id, expected_revision },
-                            "c" => Self::QueueEditCaption { post_id, expected_revision },
-                            "z" => Self::QueueClearCaption { post_id, expected_revision },
-                            "p" => Self::QueuePublishNow { post_id, expected_revision },
-                            "x" => Self::QueueCancel { post_id, expected_revision },
-                            _ => unreachable!("queue action is restricted above"),
-                        })
-                    }
-                    _ => None,
-                }
             }
             _ => None,
         }
@@ -2070,158 +1246,6 @@ fn format_duplicate_decision_response(prefix: &str, result: &DuplicateDecisionRe
     format!("{prefix}\nID: {}\nStatus: {}", result.request_id, result.status)
 }
 
-fn is_queue_callback(data: &CallbackData) -> bool {
-    matches!(
-        data,
-        CallbackData::QueueCount { .. }
-            | CallbackData::QueueEarlier { .. }
-            | CallbackData::QueueLater { .. }
-            | CallbackData::QueueSetSlot { .. }
-            | CallbackData::QueueEditCaption { .. }
-            | CallbackData::QueueClearCaption { .. }
-            | CallbackData::QueuePublishNow { .. }
-            | CallbackData::QueueCancel { .. }
-    )
-}
-
-fn render_queue_count(total: usize) -> (String, Vec<Vec<InlineButton>>) {
-    let selectable_total = total.min(QUEUE_MAX_POSTS);
-    let mut counts = Vec::new();
-    let mut scale = 1_usize;
-    while scale <= selectable_total {
-        for base in [1_usize, 2, 5] {
-            let value = base.saturating_mul(scale);
-            if value <= selectable_total {
-                counts.push(value);
-            }
-        }
-        scale = scale.saturating_mul(10);
-    }
-    if total <= QUEUE_MAX_POSTS && !counts.contains(&total) {
-        counts.push(total);
-    }
-    counts.sort_unstable();
-    counts.dedup();
-    let keyboard = counts
-        .into_iter()
-        .map(|count| {
-            vec![InlineButton::Callback {
-                text: if count == total { format!("All {count}") } else { count.to_string() },
-                data: CallbackData::QueueCount { count }.encode(),
-            }]
-        })
-        .collect();
-    (format!("Publication queue: {total} post(s). How many should I show?"), keyboard)
-}
-
-fn render_queue_post(index: usize, post: &QueuePost) -> (String, Vec<Vec<InlineButton>>) {
-    let slot = post
-        .cadence_slot_at
-        .map_or_else(|| "unscheduled".to_owned(), |slot| format_queue_slot(slot, &post.time_zone));
-    let title = post.title.as_deref().unwrap_or("—");
-    let description = post.description.as_deref().unwrap_or("—");
-    let tags = if post.tags.is_empty() { "—".to_owned() } else { post.tags.join(", ") };
-    let source_url = post.source_url.as_deref().unwrap_or("—");
-    let post_text = post.caption.as_deref().unwrap_or("—");
-    let text = format!(
-        "Post {index}\nState: {}\nScheduled: {slot}\nMedia: {}\nTitle: {}\nDescription: {}\nTags: {}\nSource: {}\nPost text: {}",
-        post.state.as_str(),
-        truncate_for_telegram(&post.media_kind, 80),
-        truncate_for_telegram(title, 240),
-        truncate_for_telegram(description, 480),
-        truncate_for_telegram(&tags, 240),
-        truncate_for_telegram(source_url, 320),
-        truncate_for_telegram(post_text, 1_024),
-    );
-    let mut keyboard = Vec::new();
-    if let Some(url) = post
-        .storage_chat_id
-        .zip(post.storage_message_id)
-        .and_then(|(chat_id, message_id)| storage_message_url(chat_id, message_id))
-    {
-        keyboard.push(vec![InlineButton::Url { text: "Open media".to_owned(), url }]);
-    }
-    if post.state == PostState::Queued && post.cadence_slot_at.is_some() {
-        keyboard.push(vec![
-            InlineButton::Callback {
-                text: "Earlier".to_owned(),
-                data: CallbackData::QueueEarlier {
-                    post_id: post.id,
-                    expected_revision: post.revision,
-                }
-                .encode(),
-            },
-            InlineButton::Callback {
-                text: "Later".to_owned(),
-                data: CallbackData::QueueLater {
-                    post_id: post.id,
-                    expected_revision: post.revision,
-                }
-                .encode(),
-            },
-        ]);
-    }
-    if post.state == PostState::Queued {
-        keyboard.push(vec![InlineButton::Callback {
-            text: "Set slot".to_owned(),
-            data: CallbackData::QueueSetSlot { post_id: post.id, expected_revision: post.revision }
-                .encode(),
-        }]);
-    }
-    let mut caption_actions = vec![InlineButton::Callback {
-        text: "Edit post text".to_owned(),
-        data: CallbackData::QueueEditCaption { post_id: post.id, expected_revision: post.revision }
-            .encode(),
-    }];
-    if post.caption.is_some() {
-        caption_actions.push(InlineButton::Callback {
-            text: "Clear text".to_owned(),
-            data: CallbackData::QueueClearCaption {
-                post_id: post.id,
-                expected_revision: post.revision,
-            }
-            .encode(),
-        });
-    }
-    keyboard.push(caption_actions);
-    keyboard.push(vec![
-        InlineButton::Callback {
-            text: "Post now".to_owned(),
-            data: CallbackData::QueuePublishNow {
-                post_id: post.id,
-                expected_revision: post.revision,
-            }
-            .encode(),
-        },
-        InlineButton::Callback {
-            text: "Remove from queue".to_owned(),
-            data: CallbackData::QueueCancel { post_id: post.id, expected_revision: post.revision }
-                .encode(),
-        },
-    ]);
-    (text, keyboard)
-}
-
-fn format_queue_slot(slot: OffsetDateTime, time_zone: &str) -> String {
-    let Some(utc) = DateTime::<Utc>::from_timestamp(slot.unix_timestamp(), slot.nanosecond())
-    else {
-        return format!("{slot} ({time_zone})");
-    };
-    let Ok(time_zone) = time_zone.parse::<Tz>() else {
-        return format!("{slot} ({time_zone})");
-    };
-    format!("{} ({})", utc.with_timezone(&time_zone).format("%Y-%m-%d %H:%M %Z"), time_zone)
-}
-
-fn storage_message_url(chat_id: i64, message_id: i64) -> Option<String> {
-    if chat_id >= 0 || message_id <= 0 {
-        return None;
-    }
-    let raw_id = chat_id.to_string();
-    let internal_id = raw_id.strip_prefix("-100").unwrap_or_else(|| raw_id.trim_start_matches('-'));
-    (!internal_id.is_empty()).then(|| format!("https://t.me/c/{internal_id}/{message_id}"))
-}
-
 #[derive(Clone)]
 pub struct TeloxideApi {
     control_bot: Bot,
@@ -2230,7 +1254,6 @@ pub struct TeloxideApi {
     cloud_download_limit_bytes: Option<u64>,
     cloud_upload_limit_bytes: Option<u64>,
     source_download_max_bytes: u64,
-    queue_card_next_send: Arc<Mutex<HashMap<i64, Instant>>>,
 }
 
 impl TeloxideApi {
@@ -2293,7 +1316,6 @@ impl TeloxideApi {
             cloud_download_limit_bytes: is_cloud.then_some(TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES),
             cloud_upload_limit_bytes: is_cloud.then_some(TELEGRAM_CLOUD_UPLOAD_LIMIT_BYTES),
             source_download_max_bytes: DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
-            queue_card_next_send: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -2411,28 +1433,6 @@ impl TelegramApi for TeloxideApi {
         }
     }
 
-    fn retry_after(error: &Self::Error) -> Option<Duration> {
-        match error {
-            TelegramApiError::Api(teloxide::RequestError::RetryAfter(seconds)) => {
-                Some(seconds.duration())
-            }
-            _ => None,
-        }
-    }
-
-    async fn wait_for_queue_card(&self, chat_id: i64) -> Result<(), Self::Error> {
-        let now = Instant::now();
-        let target = {
-            let mut next_send =
-                self.queue_card_next_send.lock().expect("queue pacing lock is not poisoned");
-            let target = next_send.get(&chat_id).copied().unwrap_or(now).max(now);
-            next_send.insert(chat_id, target + QUEUE_CARD_INTERVAL);
-            target
-        };
-        tokio::time::sleep(target.saturating_duration_since(now)).await;
-        Ok(())
-    }
-
     async fn send_text(&self, chat_id: i64, text: &str) -> Result<(), Self::Error> {
         self.bot()
             .send_message(ChatId(chat_id), text.to_owned())
@@ -2466,55 +1466,6 @@ impl TelegramApi for TeloxideApi {
         self.bot()
             .send_message(ChatId(chat_id), text.to_owned())
             .reply_markup(InlineKeyboardMarkup::new(keyboard))
-            .await
-            .map(|_| ())
-            .map_err(TelegramApiError::Api)
-    }
-
-    async fn send_inline_keyboard_with_id(
-        &self,
-        chat_id: i64,
-        text: &str,
-        keyboard: Vec<Vec<InlineButton>>,
-    ) -> Result<i64, Self::Error> {
-        let keyboard = keyboard
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|button| match button {
-                        InlineButton::Callback { text, data } => {
-                            InlineKeyboardButton::callback(text, data)
-                        }
-                        InlineButton::Url { text, url } => {
-                            let url = Url::parse(&url).expect("rendered Telegram URL is valid");
-                            InlineKeyboardButton::url(text, url)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        self.bot()
-            .send_message(ChatId(chat_id), text.to_owned())
-            .reply_markup(InlineKeyboardMarkup::new(keyboard))
-            .await
-            .map(|message| i64::from(message.id.0))
-            .map_err(TelegramApiError::Api)
-    }
-
-    async fn send_force_reply(&self, chat_id: i64, text: &str) -> Result<i64, Self::Error> {
-        self.bot()
-            .send_message(ChatId(chat_id), text.to_owned())
-            .reply_markup(ReplyMarkup::force_reply())
-            .await
-            .map(|message| i64::from(message.id.0))
-            .map_err(TelegramApiError::Api)
-    }
-
-    async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<(), Self::Error> {
-        let message_id = i32::try_from(message_id)
-            .map_err(|_| TelegramApiError::InvalidMessageId(message_id))?;
-        self.bot()
-            .delete_message(ChatId(chat_id), MessageId(message_id))
             .await
             .map(|_| ())
             .map_err(TelegramApiError::Api)
@@ -2644,14 +1595,14 @@ impl tokio::io::AsyncWrite for LimitedWriter<'_> {
     }
 }
 
-pub struct TelegramRuntime<S, I, P = ()> {
+pub struct TelegramRuntime<S, I> {
     api: TeloxideApi,
-    service: TelegramService<TeloxideApi, S, I, P>,
+    service: TelegramService<TeloxideApi, S, I>,
     poll_timeout: Duration,
     storage_chat_id: Option<i64>,
 }
 
-impl<S, I> TelegramRuntime<S, I, ()>
+impl<S, I> TelegramRuntime<S, I>
 where
     S: UpdateStore,
     I: IngestService,
@@ -2672,11 +1623,10 @@ where
     }
 }
 
-impl<S, I, P> TelegramRuntime<S, I, P>
+impl<S, I> TelegramRuntime<S, I>
 where
     S: UpdateStore,
     I: IngestService,
-    P: PublisherService,
 {
     pub fn with_upload_timeout(mut self, upload_timeout: Duration) -> Result<Self, TelegramError> {
         self.api = self.api.with_upload_timeout(upload_timeout)?;
@@ -2749,34 +1699,14 @@ where
     }
 }
 
-impl<S, I> TelegramRuntime<S, I, ()>
-where
-    S: UpdateStore,
-    I: IngestService,
-{
-    pub fn with_publisher<P>(self, publisher: P) -> TelegramRuntime<S, I, P>
-    where
-        P: PublisherService,
-    {
-        let TelegramRuntime { api, service, poll_timeout, storage_chat_id } = self;
-        TelegramRuntime {
-            api,
-            service: service.with_publisher(publisher),
-            poll_timeout,
-            storage_chat_id,
-        }
-    }
-}
-
-async fn handle_update_with_retries<A, S, I, P>(
-    service: &TelegramService<A, S, I, P>,
+async fn handle_update_with_retries<A, S, I>(
+    service: &TelegramService<A, S, I>,
     update: Update,
 ) -> Result<i32, TelegramError>
 where
     A: TelegramApi,
     S: UpdateStore,
     I: IngestService,
-    P: PublisherService,
 {
     for attempt in 1..=MAX_HANDLER_ATTEMPTS {
         match service.handle_update(update.clone()).await {
@@ -2827,29 +1757,14 @@ mod tests {
 
     type MockKeyboard = (i64, String, Vec<Vec<InlineButton>>);
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum QueueMutationCall {
-        Move { post_id: Uuid, direction: QueueDirection, expected_revision: i64 },
-        Slot { post_id: Uuid, slot: OffsetDateTime, expected_revision: i64 },
-        Caption { post_id: Uuid, caption: Option<String>, expected_revision: i64 },
-        Publish { post_id: Uuid, expected_revision: i64 },
-        Cancel { post_id: Uuid, expected_revision: i64 },
-    }
-
     #[derive(Clone, Default)]
     struct MockApi {
         messages: Arc<Mutex<Vec<(i64, String)>>>,
         keyboards: Arc<Mutex<Vec<MockKeyboard>>>,
-        force_replies: Arc<Mutex<Vec<(i64, String)>>>,
-        deleted_messages: Arc<Mutex<Vec<(i64, i64)>>>,
-        next_message_id: Arc<Mutex<i64>>,
         callback_answers: Arc<Mutex<Vec<String>>>,
         downloads: Arc<Mutex<Vec<String>>>,
         fail: Arc<Mutex<bool>>,
         failures_remaining: Arc<Mutex<u8>>,
-        queue_send_calls: Arc<Mutex<usize>>,
-        queue_failures_remaining: Arc<Mutex<u8>>,
-        queue_fail_from_call: Arc<Mutex<Option<usize>>>,
     }
 
     #[derive(Debug, ThisError)]
@@ -2881,59 +1796,11 @@ mod tests {
             text: &str,
             keyboard: Vec<Vec<InlineButton>>,
         ) -> Result<(), Self::Error> {
-            let mut queue_send_calls =
-                self.queue_send_calls.lock().expect("mock mutex should not be poisoned");
-            *queue_send_calls += 1;
-            let call_number = *queue_send_calls;
-            let mut queue_failures =
-                self.queue_failures_remaining.lock().expect("mock mutex should not be poisoned");
-            let fail_from_call =
-                *self.queue_fail_from_call.lock().expect("mock mutex should not be poisoned");
-            if *queue_failures > 0 || fail_from_call.is_some_and(|start| call_number >= start) {
-                if *queue_failures > 0 {
-                    *queue_failures -= 1;
-                }
-                return Err(MockError);
-            }
             self.keyboards.lock().expect("mock mutex should not be poisoned").push((
                 chat_id,
                 text.to_owned(),
                 keyboard,
             ));
-            Ok(())
-        }
-
-        async fn send_inline_keyboard_with_id(
-            &self,
-            chat_id: i64,
-            text: &str,
-            keyboard: Vec<Vec<InlineButton>>,
-        ) -> Result<i64, Self::Error> {
-            self.send_inline_keyboard(chat_id, text, keyboard).await?;
-            let mut next_message_id =
-                self.next_message_id.lock().expect("mock mutex should not be poisoned");
-            let message_id = *next_message_id;
-            *next_message_id += 1;
-            Ok(message_id)
-        }
-
-        async fn send_force_reply(&self, chat_id: i64, text: &str) -> Result<i64, Self::Error> {
-            self.force_replies
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .push((chat_id, text.to_owned()));
-            let mut next_message_id =
-                self.next_message_id.lock().expect("mock mutex should not be poisoned");
-            let message_id = *next_message_id;
-            *next_message_id += 1;
-            Ok(message_id)
-        }
-
-        async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<(), Self::Error> {
-            self.deleted_messages
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .push((chat_id, message_id));
             Ok(())
         }
 
@@ -2962,14 +1829,6 @@ mod tests {
 
         fn is_retryable_error(_error: &Self::Error) -> bool {
             false
-        }
-
-        async fn wait_for_queue_card(&self, _chat_id: i64) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn retry_after(_error: &Self::Error) -> Option<Duration> {
-            Some(Duration::ZERO)
         }
     }
 
@@ -3024,148 +1883,6 @@ mod tests {
         duplicate_accepts: Arc<Mutex<Vec<(Uuid, Uuid)>>>,
         force_saves: Arc<Mutex<Vec<Uuid>>>,
         fail: Arc<Mutex<bool>>,
-    }
-
-    #[derive(Debug, ThisError)]
-    enum MockPublisherError {
-        #[error("mock publisher failure")]
-        Failure,
-        #[error("mock publisher post is missing")]
-        Missing,
-        #[error("mock publisher conflict")]
-        Conflict,
-    }
-
-    #[derive(Clone, Default)]
-    struct MockPublisherService {
-        posts: Arc<Mutex<Vec<QueuePost>>>,
-        conflict: Arc<Mutex<bool>>,
-        operations: Arc<Mutex<Vec<QueueMutationCall>>>,
-    }
-
-    #[async_trait]
-    impl PublisherService for MockPublisherService {
-        type Error = MockPublisherError;
-
-        async fn queue_count(&self) -> Result<usize, Self::Error> {
-            Ok(self.posts.lock().expect("mock mutex should not be poisoned").len())
-        }
-
-        async fn list_queue(&self, limit: usize) -> Result<Vec<QueuePost>, Self::Error> {
-            Ok(self
-                .posts
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .iter()
-                .take(limit)
-                .cloned()
-                .collect())
-        }
-
-        async fn get_queue_post(&self, post_id: Uuid) -> Result<QueuePost, Self::Error> {
-            self.posts
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .iter()
-                .find(|post| post.id == post_id)
-                .cloned()
-                .ok_or(MockPublisherError::Missing)
-        }
-
-        async fn move_queue_post(
-            &self,
-            post_id: Uuid,
-            direction: QueueDirection,
-            expected_revision: i64,
-        ) -> Result<QueuePost, Self::Error> {
-            self.operations
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .push(QueueMutationCall::Move { post_id, direction, expected_revision });
-            self.mutate(post_id, expected_revision, |post| post.clone())
-        }
-
-        async fn set_queue_post_slot(
-            &self,
-            post_id: Uuid,
-            slot: OffsetDateTime,
-            expected_revision: i64,
-        ) -> Result<QueuePost, Self::Error> {
-            self.operations
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .push(QueueMutationCall::Slot { post_id, slot, expected_revision });
-            self.mutate(post_id, expected_revision, |post| {
-                post.cadence_slot_at = Some(slot);
-                post.clone()
-            })
-        }
-
-        async fn update_queue_caption(
-            &self,
-            post_id: Uuid,
-            caption: Option<String>,
-            expected_revision: i64,
-        ) -> Result<QueuePost, Self::Error> {
-            self.operations.lock().expect("mock mutex should not be poisoned").push(
-                QueueMutationCall::Caption { post_id, caption: caption.clone(), expected_revision },
-            );
-            self.mutate(post_id, expected_revision, |post| {
-                post.caption = caption;
-                post.clone()
-            })
-        }
-
-        async fn publish_queue_post(
-            &self,
-            post_id: Uuid,
-            expected_revision: i64,
-        ) -> Result<QueuePost, Self::Error> {
-            self.operations
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .push(QueueMutationCall::Publish { post_id, expected_revision });
-            self.mutate(post_id, expected_revision, |post| post.clone())
-        }
-
-        async fn cancel_queue_post(
-            &self,
-            post_id: Uuid,
-            expected_revision: i64,
-        ) -> Result<QueuePost, Self::Error> {
-            self.operations
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .push(QueueMutationCall::Cancel { post_id, expected_revision });
-            self.mutate(post_id, expected_revision, |post| post.clone())
-        }
-
-        fn is_conflict(error: &Self::Error) -> bool {
-            matches!(error, MockPublisherError::Conflict | MockPublisherError::Missing)
-        }
-    }
-
-    impl MockPublisherService {
-        fn mutate(
-            &self,
-            post_id: Uuid,
-            expected_revision: i64,
-            update: impl FnOnce(&mut QueuePost) -> QueuePost,
-        ) -> Result<QueuePost, MockPublisherError> {
-            if *self.conflict.lock().expect("mock mutex should not be poisoned") {
-                return Err(MockPublisherError::Conflict);
-            }
-            let mut posts = self.posts.lock().expect("mock mutex should not be poisoned");
-            let post = posts
-                .iter_mut()
-                .find(|post| post.id == post_id)
-                .ok_or(MockPublisherError::Failure)?;
-            if post.revision != expected_revision {
-                return Err(MockPublisherError::Conflict);
-            }
-            post.revision += 1;
-            Ok(update(post))
-        }
     }
 
     #[async_trait]
@@ -3279,614 +1996,6 @@ mod tests {
         }
     }
 
-    fn admin_message(update_id: i64, text: &str) -> IncomingMessage {
-        let mut message = message(update_id, Some(123), text);
-        message.chat_id = 123;
-        message
-    }
-
-    fn queue_post(id: u128, revision: i64) -> QueuePost {
-        QueuePost {
-            id: Uuid::from_u128(id),
-            revision,
-            state: PostState::Queued,
-            scheduled_at: OffsetDateTime::now_utc(),
-            cadence_slot_at: Some(OffsetDateTime::now_utc()),
-            time_zone: "Europe/Moscow".to_owned(),
-            caption: Some("post text".to_owned()),
-            media_kind: "video".to_owned(),
-            title: Some("title".to_owned()),
-            description: Some("description".to_owned()),
-            tags: vec!["tag".to_owned()],
-            source_url: Some("https://example.test/source".to_owned()),
-            storage_chat_id: Some(-100123),
-            storage_message_id: Some(456),
-        }
-    }
-
-    fn callback(update_id: i64, data: CallbackData) -> IncomingCallback {
-        IncomingCallback {
-            update_id,
-            callback_id: format!("callback-{update_id}"),
-            user_id: 123,
-            chat_id: Some(123),
-            is_private: true,
-            data: Some(data.encode()),
-        }
-    }
-
-    #[test]
-    fn queue_count_choices_match_the_bounded_scale() {
-        for (total, expected) in [
-            (1, vec!["All 1"]),
-            (3, vec!["1", "2", "All 3"]),
-            (10, vec!["1", "2", "5", "All 10"]),
-            (37, vec!["1", "2", "5", "10", "20", "All 37"]),
-            (125, vec!["1", "2", "5", "10", "20", "50", "100", "All 125"]),
-        ] {
-            let (_, keyboard) = render_queue_count(total);
-            let labels = keyboard
-                .iter()
-                .flat_map(|row| row.iter())
-                .map(|button| match button {
-                    InlineButton::Callback { text, .. } | InlineButton::Url { text, .. } => {
-                        text.as_str()
-                    }
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(labels, expected);
-        }
-    }
-
-    #[test]
-    fn queue_card_actions_match_the_projected_post_state() {
-        for state in [PostState::Draft, PostState::Queued, PostState::Failed] {
-            let mut post = queue_post(40, 0);
-            post.state = state;
-            let (_, keyboard) = render_queue_post(1, &post);
-            let callbacks = keyboard
-                .iter()
-                .flat_map(|row| row.iter())
-                .filter_map(|button| match button {
-                    InlineButton::Callback { data, .. } => CallbackData::parse(data),
-                    InlineButton::Url { .. } => None,
-                })
-                .collect::<Vec<_>>();
-            assert!(
-                callbacks
-                    .iter()
-                    .any(|callback| { matches!(callback, CallbackData::QueueEditCaption { .. }) })
-            );
-            assert!(
-                callbacks
-                    .iter()
-                    .any(|callback| { matches!(callback, CallbackData::QueuePublishNow { .. }) })
-            );
-            assert!(
-                callbacks
-                    .iter()
-                    .any(|callback| { matches!(callback, CallbackData::QueueCancel { .. }) })
-            );
-            if state == PostState::Queued {
-                assert!(
-                    callbacks
-                        .iter()
-                        .any(|callback| { matches!(callback, CallbackData::QueueSetSlot { .. }) })
-                );
-                assert!(
-                    callbacks
-                        .iter()
-                        .any(|callback| { matches!(callback, CallbackData::QueueEarlier { .. }) })
-                );
-                assert!(
-                    callbacks
-                        .iter()
-                        .any(|callback| { matches!(callback, CallbackData::QueueLater { .. }) })
-                );
-            } else {
-                assert!(
-                    !callbacks
-                        .iter()
-                        .any(|callback| { matches!(callback, CallbackData::QueueSetSlot { .. }) })
-                );
-                assert!(
-                    !callbacks
-                        .iter()
-                        .any(|callback| { matches!(callback, CallbackData::QueueEarlier { .. }) })
-                );
-                assert!(
-                    !callbacks
-                        .iter()
-                        .any(|callback| { matches!(callback, CallbackData::QueueLater { .. }) })
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn queue_callbacks_delegate_each_direct_mutation() {
-        let post_id = Uuid::from_u128(41);
-        let expected_revision = 9;
-        let cases = vec![
-            (
-                CallbackData::QueueEarlier { post_id, expected_revision },
-                QueueMutationCall::Move {
-                    post_id,
-                    direction: QueueDirection::Earlier,
-                    expected_revision,
-                },
-            ),
-            (
-                CallbackData::QueueLater { post_id, expected_revision },
-                QueueMutationCall::Move {
-                    post_id,
-                    direction: QueueDirection::Later,
-                    expected_revision,
-                },
-            ),
-            (
-                CallbackData::QueueClearCaption { post_id, expected_revision },
-                QueueMutationCall::Caption { post_id, caption: None, expected_revision },
-            ),
-            (
-                CallbackData::QueuePublishNow { post_id, expected_revision },
-                QueueMutationCall::Publish { post_id, expected_revision },
-            ),
-            (
-                CallbackData::QueueCancel { post_id, expected_revision },
-                QueueMutationCall::Cancel { post_id, expected_revision },
-            ),
-        ];
-
-        for (index, (data, expected_call)) in cases.into_iter().enumerate() {
-            let api = MockApi::default();
-            let publisher = MockPublisherService::default();
-            publisher.posts.lock().unwrap().push(queue_post(41, expected_revision));
-            let service = TelegramService::with_ingest(
-                api.clone(),
-                MockStore::default(),
-                [123],
-                MockIngestService::default(),
-            )
-            .with_publisher(publisher.clone());
-
-            assert_eq!(
-                service.handle_callback(callback(200 + index as i64, data)).await.unwrap(),
-                HandleOutcome::CallbackHandled
-            );
-            assert_eq!(publisher.operations.lock().unwrap().as_slice(), &[expected_call]);
-            assert_eq!(api.callback_answers.lock().unwrap().len(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn valid_queue_slot_reply_delegates_the_exact_slot_and_revision() {
-        let api = MockApi::default();
-        *api.next_message_id.lock().unwrap() = 1;
-        let publisher = MockPublisherService::default();
-        let post = queue_post(42, 12);
-        publisher.posts.lock().unwrap().push(post.clone());
-        let service = TelegramService::with_ingest(
-            api.clone(),
-            MockStore::default(),
-            [123],
-            MockIngestService::default(),
-        )
-        .with_publisher(publisher.clone());
-
-        assert_eq!(
-            service
-                .handle_callback(callback(
-                    210,
-                    CallbackData::QueueSetSlot {
-                        post_id: post.id,
-                        expected_revision: post.revision,
-                    },
-                ))
-                .await
-                .unwrap(),
-            HandleOutcome::CallbackHandled
-        );
-        let slot_text = "2026-08-12T18:30:00Z";
-        let slot = OffsetDateTime::parse(slot_text, &time::format_description::well_known::Rfc3339)
-            .unwrap();
-        let mut reply = admin_message(211, slot_text);
-        reply.reply_to_message_id = Some(1);
-        assert_eq!(
-            service.handle_message(reply).await.unwrap(),
-            HandleOutcome::Responded(Command::Queue)
-        );
-        assert_eq!(
-            publisher.operations.lock().unwrap().as_slice(),
-            &[QueueMutationCall::Slot { post_id: post.id, slot, expected_revision: post.revision }]
-        );
-        assert!(api.deleted_messages.lock().unwrap().contains(&(123, 1)));
-    }
-
-    #[tokio::test]
-    async fn queue_command_renders_count_and_bounded_post_cards() {
-        let api = MockApi::default();
-        *api.next_message_id.lock().unwrap() = 1;
-        let publisher = MockPublisherService::default();
-        publisher.posts.lock().unwrap().extend([queue_post(1, 0), queue_post(2, 4)]);
-        let service = TelegramService::with_ingest(
-            api.clone(),
-            MockStore::default(),
-            [123],
-            MockIngestService::default(),
-        )
-        .with_publisher(publisher);
-
-        assert_eq!(
-            service.handle_message(admin_message(100, "/queue")).await.unwrap(),
-            HandleOutcome::Responded(Command::Queue)
-        );
-        assert_eq!(api.keyboards.lock().unwrap().len(), 1);
-        assert!(api.keyboards.lock().unwrap()[0].2.iter().flatten().any(|button| {
-            matches!(button, InlineButton::Callback { data, .. } if CallbackData::parse(data) == Some(CallbackData::QueueCount { count: 2 }))
-        }));
-
-        assert_eq!(
-            service
-                .handle_callback(callback(101, CallbackData::QueueCount { count: 2 }))
-                .await
-                .unwrap(),
-            HandleOutcome::CallbackHandled
-        );
-        let keyboards = api.keyboards.lock().unwrap();
-        assert_eq!(keyboards.len(), 3);
-        assert!(keyboards[1].1.contains("Post text: post text"));
-        assert!(keyboards[1].2.iter().flatten().any(|button| {
-            matches!(button, InlineButton::Url { text, url } if text == "Open media" && url == "https://t.me/c/123/456")
-        }));
-        assert!(api.deleted_messages.lock().unwrap().contains(&(123, 1)));
-    }
-
-    #[tokio::test]
-    async fn queue_caption_prompt_is_bound_to_revision_and_clears_old_view() {
-        let api = MockApi::default();
-        *api.next_message_id.lock().unwrap() = 1;
-        let publisher = MockPublisherService::default();
-        let post = queue_post(3, 7);
-        publisher.posts.lock().unwrap().push(post.clone());
-        let service = TelegramService::with_ingest(
-            api.clone(),
-            MockStore::default(),
-            [123],
-            MockIngestService::default(),
-        )
-        .with_publisher(publisher.clone());
-
-        service.handle_message(admin_message(102, "/queue")).await.unwrap();
-        service
-            .handle_callback(callback(
-                103,
-                CallbackData::QueueEditCaption {
-                    post_id: post.id,
-                    expected_revision: post.revision,
-                },
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            api.force_replies.lock().unwrap().as_slice(),
-            &[(123, "Send new post text, /clear to remove it, or /cancel.".to_owned())]
-        );
-        let mut reply = admin_message(104, "updated text");
-        reply.reply_to_message_id = Some(2);
-        service.handle_message(reply).await.unwrap();
-        assert_eq!(
-            publisher.operations.lock().unwrap().as_slice(),
-            &[QueueMutationCall::Caption {
-                post_id: post.id,
-                caption: Some("updated text".to_owned()),
-                expected_revision: post.revision,
-            }]
-        );
-        assert!(api.deleted_messages.lock().unwrap().contains(&(123, 1)));
-        assert!(
-            api.messages
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, text)| { text == "✅ Post text updated." })
-        );
-    }
-
-    #[tokio::test]
-    async fn queue_prompt_only_consumes_a_reply_to_its_prompt_and_commands_keep_priority() {
-        let api = MockApi::default();
-        *api.next_message_id.lock().unwrap() = 1;
-        let publisher = MockPublisherService::default();
-        let post = queue_post(30, 7);
-        publisher.posts.lock().unwrap().push(post.clone());
-        let service = TelegramService::with_ingest(
-            api.clone(),
-            MockStore::default(),
-            [123],
-            MockIngestService::default(),
-        )
-        .with_publisher(publisher.clone());
-
-        service
-            .handle_callback(callback(
-                130,
-                CallbackData::QueueEditCaption {
-                    post_id: post.id,
-                    expected_revision: post.revision,
-                },
-            ))
-            .await
-            .unwrap();
-
-        let mut unrelated = admin_message(131, "ordinary text");
-        unrelated.reply_to_message_id = None;
-        assert_eq!(
-            service.handle_message(unrelated).await.unwrap(),
-            HandleOutcome::UnrecognizedIgnored
-        );
-        assert!(publisher.operations.lock().unwrap().is_empty());
-
-        let mut queue_command = admin_message(134, "/queue");
-        queue_command.reply_to_message_id = Some(1);
-        assert_eq!(
-            service.handle_message(queue_command).await.unwrap(),
-            HandleOutcome::Responded(Command::Queue)
-        );
-        assert!(api.deleted_messages.lock().unwrap().contains(&(123, 1)));
-        assert!(publisher.operations.lock().unwrap().is_empty());
-
-        service
-            .handle_callback(callback(
-                135,
-                CallbackData::QueueEditCaption {
-                    post_id: post.id,
-                    expected_revision: post.revision,
-                },
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            service.handle_message(admin_message(136, "/cancel")).await.unwrap(),
-            HandleOutcome::Responded(Command::Queue)
-        );
-        assert_eq!(api.force_replies.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn queue_prompt_expiry_cleans_the_prompt_without_mutating_the_post() {
-        let api = MockApi::default();
-        *api.next_message_id.lock().unwrap() = 1;
-        let publisher = MockPublisherService::default();
-        let post = queue_post(31, 2);
-        publisher.posts.lock().unwrap().push(post.clone());
-        let service = TelegramService::with_ingest(
-            api.clone(),
-            MockStore::default(),
-            [123],
-            MockIngestService::default(),
-        )
-        .with_publisher(publisher.clone());
-
-        service
-            .handle_callback(callback(
-                135,
-                CallbackData::QueueEditCaption {
-                    post_id: post.id,
-                    expected_revision: post.revision,
-                },
-            ))
-            .await
-            .unwrap();
-        service.views.lock().unwrap().get_mut(&123).unwrap().prompt_expires_at =
-            Some(Instant::now() - Duration::from_secs(1));
-
-        assert_eq!(
-            service.handle_message(admin_message(136, "expired text")).await.unwrap(),
-            HandleOutcome::UnrecognizedIgnored
-        );
-        assert!(publisher.operations.lock().unwrap().is_empty());
-        assert!(api.deleted_messages.lock().unwrap().contains(&(123, 1)));
-    }
-
-    #[tokio::test]
-    async fn stale_queue_prompt_is_rejected_before_sending_force_reply() {
-        let api = MockApi::default();
-        let publisher = MockPublisherService::default();
-        let post = queue_post(32, 8);
-        publisher.posts.lock().unwrap().push(post.clone());
-        let service = TelegramService::with_ingest(
-            api.clone(),
-            MockStore::default(),
-            [123],
-            MockIngestService::default(),
-        )
-        .with_publisher(publisher);
-
-        assert_eq!(
-            service
-                .handle_callback(callback(
-                    137,
-                    CallbackData::QueueEditCaption {
-                        post_id: post.id,
-                        expected_revision: post.revision - 1,
-                    },
-                ))
-                .await
-                .unwrap(),
-            HandleOutcome::CallbackHandled
-        );
-        assert!(api.force_replies.lock().unwrap().is_empty());
-        assert!(
-            api.messages
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, text)| { text == "Queue changed; run /queue again." })
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_queue_slot_prompt_is_rejected_before_mutating_the_post() {
-        let api = MockApi::default();
-        let publisher = MockPublisherService::default();
-        let post = queue_post(35, 8);
-        publisher.posts.lock().unwrap().push(post.clone());
-        let service = TelegramService::with_ingest(
-            api.clone(),
-            MockStore::default(),
-            [123],
-            MockIngestService::default(),
-        )
-        .with_publisher(publisher.clone());
-
-        assert_eq!(
-            service
-                .handle_callback(callback(
-                    139,
-                    CallbackData::QueueSetSlot {
-                        post_id: post.id,
-                        expected_revision: post.revision - 1,
-                    },
-                ))
-                .await
-                .unwrap(),
-            HandleOutcome::CallbackHandled
-        );
-        assert!(api.force_replies.lock().unwrap().is_empty());
-        assert!(publisher.operations.lock().unwrap().is_empty());
-        assert!(
-            api.messages
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, text)| { text == "Queue changed; run /queue again." })
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_queue_prompt_post_returns_stable_conflict_response() {
-        let api = MockApi::default();
-        let service = TelegramService::with_ingest(
-            api.clone(),
-            MockStore::default(),
-            [123],
-            MockIngestService::default(),
-        )
-        .with_publisher(MockPublisherService::default());
-
-        assert_eq!(
-            service
-                .handle_callback(callback(
-                    140,
-                    CallbackData::QueueEditCaption {
-                        post_id: Uuid::from_u128(36),
-                        expected_revision: 0,
-                    },
-                ))
-                .await
-                .unwrap(),
-            HandleOutcome::CallbackHandled
-        );
-        assert!(api.force_replies.lock().unwrap().is_empty());
-        assert!(
-            api.messages
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, text)| { text == "Queue changed; run /queue again." })
-        );
-    }
-
-    #[tokio::test]
-    async fn queue_cards_retry_retry_after_without_sleep_and_cleanup_partial_view() {
-        let api = MockApi::default();
-        *api.next_message_id.lock().unwrap() = 1;
-        let publisher = MockPublisherService::default();
-        let first = queue_post(33, 0);
-        let second = queue_post(34, 0);
-        publisher.posts.lock().unwrap().extend([first, second]);
-        let service = TelegramService::with_ingest(
-            api.clone(),
-            MockStore::default(),
-            [123],
-            MockIngestService::default(),
-        )
-        .with_publisher(publisher);
-        *api.queue_failures_remaining.lock().unwrap() = 1;
-
-        let result = tokio::time::timeout(
-            Duration::from_millis(250),
-            service.handle_callback(callback(138, CallbackData::QueueCount { count: 2 })),
-        )
-        .await
-        .expect("mock retry-after must not sleep")
-        .unwrap();
-        assert_eq!(result, HandleOutcome::CallbackHandled);
-        assert_eq!(api.keyboards.lock().unwrap().len(), 2);
-        assert_eq!(*api.queue_send_calls.lock().unwrap(), 3);
-
-        *api.queue_fail_from_call.lock().unwrap() = Some(5);
-        assert_eq!(
-            service
-                .handle_callback(callback(139, CallbackData::QueueCount { count: 2 }))
-                .await
-                .unwrap(),
-            HandleOutcome::CallbackHandled
-        );
-        assert!(
-            api.messages
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, text)| { text == "⚠️ Queue view could not be rendered completely." })
-        );
-        assert!(api.deleted_messages.lock().unwrap().contains(&(123, 3)));
-        assert_eq!(
-            service
-                .handle_callback(callback(139, CallbackData::QueueCount { count: 2 }))
-                .await
-                .unwrap(),
-            HandleOutcome::DuplicateIgnored
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_queue_callback_returns_stable_conflict_response() {
-        let api = MockApi::default();
-        *api.next_message_id.lock().unwrap() = 1;
-        let publisher = MockPublisherService::default();
-        let post = queue_post(4, 1);
-        publisher.posts.lock().unwrap().push(post.clone());
-        *publisher.conflict.lock().unwrap() = true;
-        let service = TelegramService::with_ingest(
-            api.clone(),
-            MockStore::default(),
-            [123],
-            MockIngestService::default(),
-        )
-        .with_publisher(publisher);
-
-        service.handle_message(admin_message(105, "/queue")).await.unwrap();
-        service
-            .handle_callback(callback(
-                106,
-                CallbackData::QueueClearCaption {
-                    post_id: post.id,
-                    expected_revision: post.revision,
-                },
-            ))
-            .await
-            .unwrap();
-        assert!(
-            api.messages
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, text)| { text == "Queue changed; run /queue again." })
-        );
-    }
-
     #[tokio::test]
     async fn authorized_commands_are_translated_and_deduplicated() {
         let api = MockApi::default();
@@ -3901,6 +2010,34 @@ mod tests {
             HandleOutcome::DuplicateIgnored
         );
         assert_eq!(api.messages.lock().unwrap().as_slice(), &[(42, STATUS_RESPONSE.to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn superseded_queue_commands_and_callbacks_have_no_publication_effect() {
+        let api = MockApi::default();
+        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+
+        assert_eq!(
+            service.handle_message(message(11, Some(123), "/queue")).await.unwrap(),
+            HandleOutcome::UnrecognizedIgnored
+        );
+        assert_eq!(
+            service
+                .handle_callback(IncomingCallback {
+                    update_id: 12,
+                    callback_id: "legacy-queue".to_owned(),
+                    user_id: 123,
+                    chat_id: Some(123),
+                    is_private: true,
+                    data: Some("v1:queue_publish:00000000-0000-0000-0000-000000000001".to_owned()),
+                })
+                .await
+                .unwrap(),
+            HandleOutcome::CallbackHandled
+        );
+        assert!(api.messages.lock().unwrap().is_empty());
+        assert!(api.keyboards.lock().unwrap().is_empty());
+        assert_eq!(api.callback_answers.lock().unwrap().as_slice(), &["legacy-queue"]);
     }
 
     #[tokio::test]
@@ -4939,7 +3076,7 @@ mod tests {
         assert_eq!(parse_command("hello /status"), None);
         assert_eq!(parse_command("/add"), Some(Command::Add));
         assert_eq!(parse_command("/duplicates"), Some(Command::Duplicates));
-        assert_eq!(parse_command("/queue"), Some(Command::Queue));
+        assert_eq!(parse_command("/queue"), None);
     }
 
     #[test]
@@ -5040,15 +3177,6 @@ mod tests {
         assert_eq!(CallbackData::parse(&encoded_duplicate), Some(duplicate));
         let force_save = CallbackData::DuplicateForceSave { request_id };
         assert_eq!(CallbackData::parse(&force_save.encode()), Some(force_save));
-
-        let queue = CallbackData::QueuePublishNow { post_id: request_id, expected_revision: 17 };
-        assert_eq!(CallbackData::parse(&queue.encode()), Some(queue));
-        assert!(queue.encode().len() <= 64);
-        assert_eq!(
-            CallbackData::parse("v1:q:n:0"),
-            None,
-            "zero-count queue callbacks must be rejected"
-        );
     }
 
     #[tokio::test]

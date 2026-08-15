@@ -444,7 +444,6 @@ fn map_publisher_error(error: PublisherRepositoryError, headers: &HeaderMap) -> 
         ),
         PublisherRepositoryError::PostNotEditable { .. }
         | PublisherRepositoryError::PostCannotBeScheduled { .. }
-        | PublisherRepositoryError::PostNotScheduled(_)
         | PublisherRepositoryError::PostNotClaimable { .. }
         | PublisherRepositoryError::StalePublicationJob { .. }
         | PublisherRepositoryError::PublishJobMissing(_)

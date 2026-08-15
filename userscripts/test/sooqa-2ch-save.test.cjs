@@ -144,9 +144,16 @@ class FakeElement {
     }
   }
 
-  focus() {}
+  focus() {
+    if (this.ownerDocument && this.ownerDocument.throwOnFocus) {
+      throw new Error("focus failed");
+    }
+  }
 
   showModal() {
+    if (this.ownerDocument && this.ownerDocument.throwOnShowModal) {
+      throw new Error("showModal failed");
+    }
     this.open = true;
   }
 
@@ -163,6 +170,8 @@ class FakeDocument extends FakeElement {
     this.title = "Fixture thread";
     this.body = new FakeElement("body", this);
     this.observers = [];
+    this.throwOnFocus = false;
+    this.throwOnShowModal = false;
   }
 
   createElement(tagName) {
@@ -180,13 +189,17 @@ class FakeDocument extends FakeElement {
 
 function createPost(document, mediaUrls) {
   const post = document.createElement("article");
+  post.className = "post";
   post.setAttribute("data-num", mediaUrls[0]);
+  const images = document.createElement("div");
+  images.className = "post__images";
   for (const mediaUrl of mediaUrls) {
     const link = document.createElement("a");
     link.href = mediaUrl;
     link.setAttribute("href", mediaUrl);
-    post.append(link);
+    images.append(link);
   }
+  post.append(images);
   return post;
 }
 
@@ -222,14 +235,20 @@ function createRealThread(document, threadNumber, mediaUrls) {
   const post = document.createElement("article");
   post.className = "post";
   post.setAttribute("data-num", threadNumber + "-post");
-  for (const mediaUrl of mediaUrls) post.append(createFigureAttachment(document, mediaUrl));
+  const images = document.createElement("div");
+  images.className = "post__images";
+  for (const mediaUrl of mediaUrls) images.append(createFigureAttachment(document, mediaUrl));
+  post.append(images);
   thread.append(post);
   return { thread, post };
 }
 
 function createDuplicateMediaPost(document, mediaUrl) {
   const post = document.createElement("article");
+  post.className = "post";
   post.setAttribute("data-num", mediaUrl);
+  const images = document.createElement("div");
+  images.className = "post__images";
   const link = document.createElement("a");
   link.href = mediaUrl;
   link.setAttribute("href", mediaUrl);
@@ -241,8 +260,26 @@ function createDuplicateMediaPost(document, mediaUrl) {
   source.setAttribute("src", mediaUrl);
   video.append(source);
   link.append(video);
-  post.append(link);
+  images.append(link);
+  post.append(images);
   return post;
+}
+
+function createViewer(document, mediaUrl) {
+  const viewer = document.createElement("div");
+  viewer.className = "mv";
+  const main = document.createElement("div");
+  main.className = "mv__main";
+  main.setAttribute("id", "js-mv-main");
+  const video = document.createElement("video");
+  video.className = "mv__player";
+  video.setAttribute("id", "js-mv-player");
+  video.src = mediaUrl;
+  video.setAttribute("src", mediaUrl);
+  const source = document.createElement("source");
+  source.src = mediaUrl;
+  source.setAttribute("src", mediaUrl);
+  return { viewer, main, video, source };
 }
 
 function createBrowser(url, requests, storage = new Map(), requestHandler = null) {
@@ -284,6 +321,10 @@ function actionButtons(post) {
 
 function actionButton(post, key) {
   return actionButtons(post).find((button) => button.dataset.sooqaAction === key);
+}
+
+function assertActionButtonsState(post, disabled) {
+  for (const button of actionButtons(post)) assert.equal(button.disabled, disabled);
 }
 
 function requestPayload(request) {
@@ -424,14 +465,22 @@ test("fixture keeps the supported page surface narrow", () => {
     path.join(__dirname, "fixtures", "2ch-real-attachments.html"),
     "utf8"
   );
+  const viewerFixture = fs.readFileSync(
+    path.join(__dirname, "fixtures", "2ch-viewer-regression.html"),
+    "utf8"
+  );
   for (const host of ["2ch.su", "2ch.org", "2ch.life"]) {
     const escapedHost = host.replace(".", "\\.");
     assert.match(fixture, new RegExp("https://" + escapedHost + "/.*clip\\.webm"));
     assert.match(fixture, new RegExp("https://" + escapedHost + "/.*clip\\.mp4"));
   }
   assert.match(realFixture, /figure class="post__image"/);
+  assert.match(realFixture, /class="post__images"/);
   assert.match(realFixture, /class="post__image-link"/);
   assert.match(realFixture, /figcaption>[\s\S]*clip\.webm/);
+  assert.match(viewerFixture, /class="mv"/);
+  assert.match(viewerFixture, /id="js-mv-main"/);
+  assert.match(viewerFixture, /class="mv__player"/);
   assert.doesNotMatch(fixture, /youtube|yt-dlp/i);
 });
 
@@ -495,6 +544,75 @@ test("real 2ch figures wrap the preview, not the filename link, across galleries
   }
 });
 
+test("native media viewer mutations stay untouched while new posts still decorate", () => {
+  const requests = [];
+  const browser = createBrowser("https://2ch.org/b/res/335710210.html", requests);
+  const initialUrls = Array.from({ length: 4 }, (_value, index) =>
+    "https://2ch.org/b/src/" + (index + 1) + "/initial.webm"
+  );
+  const initial = createRealThread(browser.document, "335710210", initialUrls);
+  browser.document.body.append(initial.thread);
+  userscript.boot(browser.root);
+  assert.equal(initial.post.querySelectorAll(".sooqa-attachment-row").length, 4);
+  const initialRow = initial.post.querySelector(".sooqa-attachment-row");
+  browser.document.notifyAdded(initialRow);
+  browser.document.notifyAdded(initialRow.querySelector(".sooqa-action-panel"));
+  assert.equal(initial.post.querySelectorAll(".sooqa-attachment-row").length, 4);
+
+  const pageVideo = browser.document.createElement("video");
+  pageVideo.src = "https://2ch.org/b/src/8/page-level.webm";
+  pageVideo.setAttribute("src", pageVideo.src);
+  browser.document.body.append(pageVideo);
+  assert.equal(browser.document.body.querySelectorAll(".sooqa-attachment-row").length, 4);
+
+  const viewer = createViewer(browser.document, "https://2ch.org/b/src/9/clip.webm");
+  browser.document.body.append(viewer.viewer);
+  viewer.viewer.append(viewer.main);
+  browser.document.notifyAdded(viewer.main);
+  viewer.main.append(viewer.video);
+  browser.document.notifyAdded(viewer.video);
+  viewer.video.append(viewer.source);
+  browser.document.notifyAdded(viewer.source);
+
+  const viewerChildren = viewer.viewer.children.slice();
+  const mainChildren = viewer.main.children.slice();
+  const videoChildren = viewer.video.children.slice();
+  assert.equal(viewer.viewer.querySelectorAll(".sooqa-attachment-row").length, 0);
+  assert.equal(viewer.viewer.querySelectorAll(".sooqa-action-panel").length, 0);
+  assert.equal(viewer.main.parentElement, viewer.viewer);
+  assert.equal(viewer.video.parentElement, viewer.main);
+  assert.equal(viewer.source.parentElement, viewer.video);
+
+  for (let index = 0; index < 3; index += 1) {
+    const update = createViewer(browser.document, "https://2ch.org/b/src/" + (10 + index) + "/clip.webm");
+    viewer.viewer.append(update.main);
+    browser.document.notifyAdded(update.main);
+    update.main.append(update.video);
+    browser.document.notifyAdded(update.video);
+    update.video.append(update.source);
+    browser.document.notifyAdded(update.source);
+    assert.equal(update.main.parentElement, viewer.viewer);
+    assert.equal(update.video.parentElement, update.main);
+    assert.equal(update.source.parentElement, update.video);
+    assert.equal(update.main.querySelectorAll(".sooqa-attachment-row").length, 0);
+    update.main.remove();
+  }
+
+  assert.deepEqual(viewer.viewer.children, viewerChildren);
+  assert.deepEqual(viewer.main.children, mainChildren);
+  assert.deepEqual(viewer.video.children, videoChildren);
+  assert.equal(viewer.viewer.querySelectorAll(".sooqa-attachment-row").length, 0);
+  assert.equal(viewer.viewer.querySelectorAll(".sooqa-action-panel").length, 0);
+
+  const dynamicUrls = Array.from({ length: 8 }, (_value, index) =>
+    "https://2ch.org/b/src/" + (20 + index) + "/dynamic.mp4"
+  );
+  const dynamic = createRealThread(browser.document, "335710211", dynamicUrls);
+  browser.document.body.append(dynamic.thread);
+  assert.equal(dynamic.post.querySelectorAll(".sooqa-attachment-row").length, 8);
+  assert.equal(dynamic.post.querySelectorAll(".sooqa-action-panel").length, 8);
+});
+
 test("the same link, video, and source attachment gets one row", () => {
   const requests = [];
   const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
@@ -534,6 +652,10 @@ test("Post now… asks for public text and Queue… adds an exact future time", 
 
   actionButton(post, "post_now_detailed").click();
   let dialog = browser.document.body.querySelector("dialog");
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 1);
+  assert.match(browser.document.body.querySelector("style").textContent, /sooqa-metadata-dialog/);
+  assert.match(browser.document.body.querySelector("style").textContent, /::backdrop/);
+  assertActionButtonsState(post, true);
   assert.equal(dialog.querySelectorAll("input").length, 1);
   assert.equal(dialog.querySelectorAll("textarea").length, 2);
   dialog.querySelector("input").value = "Cats";
@@ -541,12 +663,16 @@ test("Post now… asks for public text and Queue… adds an exact future time", 
   dialog.querySelectorAll("textarea")[1].value = "Public";
   dialog.querySelectorAll("button")[1].click();
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assertActionButtonsState(post, false);
   assert.equal(requestPayload(requests[0]).requested_action, "post_now");
   assert.equal(requestPayload(requests[0]).requested_post_caption, "Public");
   assert.equal("requested_publish_at" in requestPayload(requests[0]), false);
 
   actionButton(post, "queue_exact").click();
   dialog = browser.document.body.querySelector("dialog");
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 1);
+  assertActionButtonsState(post, true);
   assert.equal(dialog.querySelectorAll("input").length, 2);
   assert.equal(dialog.querySelectorAll("textarea").length, 2);
   dialog.querySelectorAll("input")[0].value = "Cats";
@@ -555,6 +681,8 @@ test("Post now… asks for public text and Queue… adds an exact future time", 
   dialog.querySelectorAll("input")[1].value = futureLocalDateTime();
   dialog.querySelectorAll("button")[1].click();
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assertActionButtonsState(post, false);
   const exact = requestPayload(requests[1]);
   assert.equal(exact.requested_action, "queue");
   assert.equal(exact.requested_post_caption, "Public");
@@ -569,17 +697,101 @@ test("Save… asks only for internal metadata", async () => {
   userscript.boot(browser.root);
   actionButton(post, "save_detailed").click();
   const dialog = browser.document.body.querySelector("dialog");
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 1);
+  assertActionButtonsState(post, true);
   assert.equal(dialog.querySelectorAll("input").length, 1);
   assert.equal(dialog.querySelectorAll("textarea").length, 1);
   dialog.querySelector("input").value = "cats";
   dialog.querySelector("textarea").value = "internal";
   dialog.querySelectorAll("button")[1].click();
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assertActionButtonsState(post, false);
   const payload = requestPayload(requests[0]);
   assert.equal(payload.requested_action, "save");
   assert.deepEqual(payload.tags, ["cats"]);
   assert.equal(payload.description, "internal");
   assert.equal("requested_post_caption" in payload, false);
+});
+
+test("detailed dialog cancel and Escape finish once and restore controls", async () => {
+  const requests = [];
+  const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+  const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+  browser.document.body.append(post);
+  userscript.boot(browser.root);
+  const saveDetailed = actionButton(post, "save_detailed");
+
+  saveDetailed.click();
+  let dialog = browser.document.body.querySelector("dialog");
+  let closeCalls = 0;
+  const close = dialog.close.bind(dialog);
+  const remove = dialog.remove.bind(dialog);
+  dialog.close = () => {
+    closeCalls += 1;
+    close();
+  };
+  dialog.remove = () => {
+    assert.equal(closeCalls, 1);
+    remove();
+  };
+  dialog.querySelector(".sooqa-cancel").click();
+  dialog.dispatchEvent({ type: "cancel" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeCalls, 1);
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assert.equal(requests.length, 0);
+  assertActionButtonsState(post, false);
+
+  saveDetailed.click();
+  dialog = browser.document.body.querySelector("dialog");
+  closeCalls = 0;
+  const escapeClose = dialog.close.bind(dialog);
+  const escapeRemove = dialog.remove.bind(dialog);
+  dialog.close = () => {
+    closeCalls += 1;
+    escapeClose();
+  };
+  dialog.remove = () => {
+    assert.equal(closeCalls, 1);
+    escapeRemove();
+  };
+  dialog.dispatchEvent({ type: "cancel" });
+  dialog.dispatchEvent({ type: "cancel" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeCalls, 1);
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assertActionButtonsState(post, false);
+
+  saveDetailed.click();
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 1);
+  browser.document.body.querySelector("dialog").querySelector(".sooqa-cancel").click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assertActionButtonsState(post, false);
+});
+
+test("detailed dialog open and focus failures fall back without dead buttons", async () => {
+  for (const failure of ["showModal", "focus"]) {
+    const requests = [];
+    const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+    browser.root.prompt = () => "cats|internal|Public fallback";
+    browser.document.throwOnShowModal = failure === "showModal";
+    browser.document.throwOnFocus = failure === "focus";
+    const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+    browser.document.body.append(post);
+    userscript.boot(browser.root);
+
+    actionButton(post, "post_now_detailed").click();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+    assertActionButtonsState(post, false);
+    assert.equal(requests.length, 1);
+    const payload = requestPayload(requests[0]);
+    assert.equal(payload.requested_action, "post_now");
+    assert.deepEqual(payload.tags, ["cats"]);
+    assert.equal(payload.description, "internal");
+    assert.equal(payload.requested_post_caption, "Public fallback");
+  }
 });
 
 test("buttons suppress in-flight duplicates, reuse timeout IDs, and reset after response", () => {
@@ -717,7 +929,7 @@ test("accepted history is mirror-canonical, thread-local, bounded, and clearable
 
 test("metadata contains no backend secrets, polling, or stale update metadata", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "sooqa-2ch-save.user.js"), "utf8");
-  assert.match(source, /@version\s+0\.2\.0/);
+  assert.match(source, /@version\s+0\.2\.1/);
   assert.match(source, /@updateURL\s+https:\/\/raw\.githubusercontent\.com\/godlikedh\/sooqa\/main/);
   assert.match(source, /@downloadURL\s+https:\/\/raw\.githubusercontent\.com\/godlikedh\/sooqa\/main/);
   assert.match(source, /GM_xmlhttpRequest/);
