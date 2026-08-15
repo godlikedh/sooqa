@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize, de::Deserializer};
 use sha2::{Digest, Sha256};
-use sooqa_library::{MediaStatus, MediaStorageState};
+use sooqa_library::MediaStorageState;
 use sooqa_publisher::{
     Channel, NewChannel, NewPost, Post, PostExactSchedule, PostSchedule, PostState, PostUpdate,
     PublicationAction, PublicationDecision, PublicationIntent,
@@ -130,7 +130,7 @@ async fn create_media_publication_intent(
         .ok_or_else(|| {
             ApiError::not_found("media_not_found", "The media item was not found", &headers)
         })?;
-    require_publishable(&media.status, media.storage_state, &headers)?;
+    require_publishable(media.storage_state, &headers)?;
     let request_key = format!("media:{id}:intent:{}", idempotency_key(&headers)?);
     let result = state
         .publisher
@@ -204,7 +204,7 @@ async fn create_post(
         .ok_or_else(|| {
             ApiError::not_found("media_not_found", "The media item was not found", &headers)
         })?;
-    require_publishable(&media.status, media.storage_state, &headers)?;
+    require_publishable(media.storage_state, &headers)?;
     let channel = state
         .publisher
         .find_channel(payload.channel_id)
@@ -394,11 +394,10 @@ async fn cancel_post(
 }
 
 fn require_publishable(
-    status: &MediaStatus,
     storage_state: MediaStorageState,
     headers: &HeaderMap,
 ) -> Result<(), ApiError> {
-    if *status != MediaStatus::Active || storage_state != MediaStorageState::Ready {
+    if storage_state != MediaStorageState::Ready {
         return Err(ApiError::conflict(
             "media_not_publishable",
             "The media item is not ready for publication",

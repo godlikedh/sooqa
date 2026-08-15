@@ -44,37 +44,6 @@ impl TryFrom<&str> for MediaKind {
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MediaStatus {
-    Active,
-    Archived,
-    Deleted,
-}
-
-impl MediaStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Archived => "archived",
-            Self::Deleted => "deleted",
-        }
-    }
-}
-
-impl TryFrom<&str> for MediaStatus {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "active" => Ok(Self::Active),
-            "archived" => Ok(Self::Archived),
-            "deleted" => Ok(Self::Deleted),
-            unknown => Err(unknown.to_owned()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum MediaStorageState {
     Pending,
     Ready,
@@ -148,10 +117,9 @@ impl TryFrom<&str> for SourceKind {
 pub struct Media {
     pub id: Uuid,
     pub kind: MediaKind,
-    pub status: MediaStatus,
     pub title: Option<String>,
     pub description: Option<String>,
-    pub notes: Option<String>,
+    pub tags: Vec<String>,
     pub mime_type: Option<String>,
     pub container: Option<String>,
     pub video_codec: Option<String>,
@@ -166,7 +134,6 @@ pub struct Media {
     pub storage_state: MediaStorageState,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
-    pub archived_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -174,12 +141,11 @@ pub struct NewMedia {
     pub kind: MediaKind,
     pub title: Option<String>,
     pub description: Option<String>,
-    pub notes: Option<String>,
 }
 
 impl NewMedia {
     pub fn new(kind: MediaKind) -> Self {
-        Self { kind, title: None, description: None, notes: None }
+        Self { kind, title: None, description: None }
     }
 }
 
@@ -248,15 +214,12 @@ pub struct MediaResolution {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MediaDetails {
     pub media: Media,
-    pub tags: Vec<Tag>,
     pub source: Option<MediaSource>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MediaSummary {
     pub media: Media,
-    pub tags: Vec<Tag>,
-    pub source_count: u64,
     pub source_url: Option<String>,
     pub source_metadata: Option<Value>,
 }
@@ -269,10 +232,6 @@ pub struct MediaCursor {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MediaSearchQuery {
-    pub text: Option<String>,
-    pub tags: Vec<String>,
-    pub kind: Option<MediaKind>,
-    pub status: Option<MediaStatus>,
     pub limit: u32,
     pub cursor: Option<MediaCursor>,
 }
@@ -285,36 +244,20 @@ pub struct MediaPage {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MediaUpdate {
-    pub title: Option<Option<String>>,
-    pub description: Option<Option<String>>,
-    pub notes: Option<Option<String>>,
-    pub expected_updated_at: Option<OffsetDateTime>,
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+    pub expected_updated_at: OffsetDateTime,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Tag {
-    pub normalized_name: String,
-    pub display_name: String,
-    pub created_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NewTag {
-    pub normalized_name: String,
-    pub display_name: String,
-}
-
-impl NewTag {
-    pub fn try_new(display_name: impl Into<String>) -> Result<Self, TagValidationError> {
-        let display_name = display_name.into().trim().to_owned();
-        if display_name.is_empty() {
-            return Err(TagValidationError::Empty);
-        }
-        if display_name.chars().count() > MAX_TAG_LENGTH {
-            return Err(TagValidationError::TooLong { max: MAX_TAG_LENGTH });
-        }
-        Ok(Self { normalized_name: display_name.to_lowercase(), display_name })
+pub fn normalize_tag(value: impl AsRef<str>) -> Result<String, TagValidationError> {
+    let value = value.as_ref().trim().to_lowercase();
+    if value.is_empty() {
+        return Err(TagValidationError::Empty);
     }
+    if value.chars().count() > MAX_TAG_LENGTH {
+        return Err(TagValidationError::TooLong { max: MAX_TAG_LENGTH });
+    }
+    Ok(value)
 }
 
 const MAX_TAG_LENGTH: usize = 100;
@@ -509,16 +452,14 @@ mod tests {
     }
 
     #[test]
-    fn tags_trim_and_normalize_without_merging_display_text() {
-        let tag = NewTag::try_new("  Rust 🦀  ").expect("tag should be valid");
-        assert_eq!(tag.display_name, "Rust 🦀");
-        assert_eq!(tag.normalized_name, "rust 🦀");
+    fn tags_trim_and_normalize_to_bounded_strings() {
+        assert_eq!(normalize_tag("  Rust 🦀  ").unwrap(), "rust 🦀");
     }
 
     #[test]
     fn empty_tags_are_rejected() {
         assert_eq!(
-            NewTag::try_new("   ").expect_err("empty tag must fail"),
+            normalize_tag("   ").expect_err("empty tag must fail"),
             TagValidationError::Empty
         );
     }

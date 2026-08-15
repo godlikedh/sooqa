@@ -19,7 +19,6 @@ fn media_ingest_with_sha(source: &str, sha256: Vec<u8>) -> MediaIngest {
             kind: MediaKind::Video,
             title: Some("workspace-test".to_owned()),
             description: None,
-            notes: None,
         },
         metadata: MediaMetadata {
             kind: MediaKind::Video,
