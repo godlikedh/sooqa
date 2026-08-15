@@ -265,6 +265,8 @@ function createAdminRuntime({ token = "", handler }) {
   const objectUrls = new Set();
   let objectUrlNumber = 0;
   const windowListeners = new Map();
+  const intervalListeners = new Map();
+  let nextIntervalId = 1;
   const window = {
     document,
     location: { origin: "http://sooqa.test", hash: "" },
@@ -285,6 +287,12 @@ function createAdminRuntime({ token = "", handler }) {
     addEventListener: (type, listener) => windowListeners.set(type, listener),
     clearTimeout: () => {},
     setTimeout: () => 0,
+    clearInterval: (id) => intervalListeners.delete(id),
+    setInterval: (listener) => {
+      const id = nextIntervalId++;
+      intervalListeners.set(id, listener);
+      return id;
+    },
   };
   const fetch = (pathName, options) => handler(pathName, options);
   vm.runInNewContext(script, {
@@ -303,6 +311,12 @@ function createAdminRuntime({ token = "", handler }) {
     objectUrls,
     dispatchWindow(type) {
       windowListeners.get(type)?.({ type });
+    },
+    tickIntervals() {
+      for (const listener of intervalListeners.values()) listener();
+    },
+    intervalCount() {
+      return intervalListeners.size;
     },
   };
 }
@@ -397,6 +411,7 @@ test("admin runtime paginates ingests and refreshes only the first page", async 
   await settle();
 
   assert.equal(paths.filter((pathName) => pathName === "/api/v1/ingests?limit=50").length, 1);
+  assert.equal(runtime.intervalCount(), 1);
   assert.match(runtime.document.getElementById("ingest-rows").textContent, /ingest-1/);
   assert.match(runtime.document.getElementById("ingest-rows").textContent, /bad_input: <error>/);
   const next = runtime.document.getElementById("ingests-next");
@@ -404,7 +419,16 @@ test("admin runtime paginates ingests and refreshes only the first page", async 
   next.dispatchEvent({ type: "click" });
   await settle();
   assert.equal(paths.at(-1), "/api/v1/ingests?limit=50&cursor=next%3Acursor");
+  assert.equal(runtime.intervalCount(), 0);
+  const beforeTick = paths.length;
+  runtime.tickIntervals();
+  await settle();
+  assert.equal(paths.length, beforeTick);
   runtime.document.getElementById("ingests-refresh").dispatchEvent({ type: "click" });
+  await settle();
+  assert.equal(paths.at(-1), "/api/v1/ingests?limit=50");
+  assert.equal(runtime.intervalCount(), 1);
+  runtime.tickIntervals();
   await settle();
   assert.equal(paths.at(-1), "/api/v1/ingests?limit=50");
 });

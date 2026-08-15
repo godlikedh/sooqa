@@ -413,11 +413,6 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
         LibraryRepositoryError::OptimisticConflict(_) => {
             ApiError::conflict("media_changed", "The media item changed since it was read", headers)
         }
-        LibraryRepositoryError::EmptyUpdate => ApiError::bad_request(
-            "empty_update",
-            "The request must contain at least one editable field",
-            headers,
-        ),
         LibraryRepositoryError::CaptionSyncUnavailable(_) => ApiError::conflict(
             "caption_sync_unavailable",
             "The media item has no ready Telegram storage message",
@@ -425,6 +420,9 @@ fn map_library_error(error: LibraryRepositoryError, headers: &HeaderMap) -> ApiE
         ),
         LibraryRepositoryError::InvalidLimit { .. } => {
             ApiError::bad_request("invalid_limit", "The limit must be between 1 and 50", headers)
+        }
+        LibraryRepositoryError::InvalidTag(_) => {
+            ApiError::bad_request("invalid_tag", "The media tag is invalid", headers)
         }
         error => {
             error!(error = %error, "library API repository operation failed");
