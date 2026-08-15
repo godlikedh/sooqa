@@ -255,10 +255,12 @@ Issue #44 adds the versioned `video_sequence_v1` media foundation and its
 pre-storage identity gate. Video exact SHA reuse, bounded token shortlisting,
 aligned duplicate evidence, durable `duplicate_pending`, and the authorized
 force-save route are shipped together. Issue #52 adds the first durable
-duplicate decision: `/api/v1/ingests/{id}/accept-duplicate` and the private
-admin bot's `/duplicates` cards for accepting an evidenced media item or
-choosing `Save anyway`. Images, animations, and audio retain exact-SHA-only
-behavior.
+duplicate decision: the bounded Dashboard technical-duplicate cards and the
+existing `/api/v1/ingests/{id}/accept-duplicate` and
+`/api/v1/ingests/{id}/force-save` commands accept an evidenced media item or
+choose `Save anyway`. Telegram remains a capture and publication transport;
+it no longer presents duplicate-review cards. Images, animations, and audio
+retain exact-SHA-only behavior.
 
 ## Single-admin security
 

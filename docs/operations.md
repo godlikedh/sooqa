@@ -228,12 +228,14 @@ The superseded Telegram queue presentation, earlier/later controls, and
 occupied-slot swaps are removed. Publication inspection and editing belong to
 the bounded web-admin slices and remain revision-fenced API operations.
 
-In the administrator's private bot chat, `/duplicates` lists up to three
-pending duplicate ingests at a time. Ready candidates link to their Telegram
-storage message; `Use this` reuses the existing media item, while `Save anyway`
-starts the normal force-save pipeline. A pending-storage candidate remains on
-the existing media upload lifecycle. The HTTP equivalent is documented in
-`docs/openapi.yaml`.
+The web Dashboard is the sole owner-facing duplicate-decision surface. Its
+technical-duplicate cards show the bounded persisted candidate evidence and
+storage links; `Same — use this` reuses the existing media item, while
+`Different — save as new` starts the normal force-save pipeline. A
+pending-storage candidate remains on the existing media upload lifecycle.
+The durable HTTP commands are documented in `docs/openapi.yaml`. Telegram
+duplicate cards and callbacks are retired; stale callback data is acknowledged
+and ignored.
 
 Video fingerprint extraction uses the `video_sequence_v1` grid without a
 per-sample subprocess or permanent frame cache. One FFmpeg process first

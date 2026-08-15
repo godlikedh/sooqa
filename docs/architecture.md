@@ -143,14 +143,12 @@ sequenceDiagram
 ```
 
 When the video identity gate records `duplicate_pending`, the administrator
-can inspect it with `/duplicates` in the configured private bot chat. The bot
-renders at most three persisted candidates per ingest: ready candidates have
-an `Open media` link and `Use this` action, pending candidates have a `Use
-this` action with a storing label, and every card has `Save anyway`. Each
-callback is checked against the configured administrator and private chat
-before the durable command runs. Telegram callback queries are acknowledged
-before repository work so a slow database operation does not leave the client
-spinner active.
+inspects it through the bounded technical-duplicate cards on the web Dashboard.
+The Dashboard shows the persisted candidate storage links and dispatches the
+existing revision/idempotent duplicate commands. Telegram remains a capture
+and publication transport; it does not render duplicate cards or dispatch
+duplicate decisions. Callback queries from superseded cards are acknowledged
+and ignored without parsing their payload or touching the repository.
 
 The HTTP equivalent is
 `POST /api/v1/ingests/{id}/accept-duplicate` with `{ "media_id": "..." }`.
@@ -342,10 +340,10 @@ sequenceDiagram
     end
 ```
 
-The Telegram adapter does not expose the superseded queue presentation or
-its reorder/swap callbacks. It remains responsible for capture, duplicate
-decisions, and publication transport; bounded web-admin slices own durable
-publication inspection and editing through the API.
+The Telegram adapter does not expose the superseded queue or duplicate-card
+presentations or their callbacks. It remains responsible for capture and
+publication transport; the bounded web-admin Dashboard owns duplicate
+inspection and durable decisions through the API.
 
 The bounded admin API is owned by `sooqa-api` and reads through the Inbox,
 Library, Jobs, and Publisher repositories. Repository queries return small
