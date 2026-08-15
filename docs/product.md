@@ -133,6 +133,14 @@ Schedule forms use the post revision fence, and a first-page refresh preserves
 each actively edited form instead of replacing it; leaving the page discards
 those unsaved forms.
 
+Compact UUID references in the Dashboard attention cards, Ingests, Media, and
+Schedule views are keyboard-operable copy controls. They keep the shortened
+label on screen while copying the exact backend UUID, and keep source,
+Telegram, and in-app navigation links separate from the copy action. The
+browser Clipboard API is preferred; the admin also tries the selection-based
+copy path for trusted-LAN HTTP sessions. If both paths fail, the full UUID is
+shown in a selectable field and the owner receives an explicit error message.
+
 Large-media capture uses Telegram's official local Bot API server when the home
 deployment is cut over manually. URL/link source downloads, Telegram-source
 downloads, and canonical normalized storage output have separate budgets. The
