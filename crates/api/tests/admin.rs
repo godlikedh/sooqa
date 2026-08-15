@@ -252,17 +252,28 @@ async fn admin_api_lists_ingests_media_schedule_dashboard_and_channel_settings(p
     assert_eq!(retried["caption_sync"]["state"], "pending");
     assert_eq!(retried["caption_sync"]["generation"], 1);
 
+    let (status, current_media) =
+        request(&app, Method::GET, &format!("/api/v1/media/{media_id}"), Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let expected_updated_at = current_media["updated_at"]
+        .as_str()
+        .expect("media response should include updated_at")
+        .to_owned();
+
     let (status, edited) = request(
         &app,
         Method::PATCH,
         &format!("/api/v1/media/{media_id}"),
-        json!({"description": "edited internally", "tags": ["Rust", "reviewed", "rust"]}),
+        json!({
+            "description": "edited internally",
+            "tags": ["Rust", "reviewed", "rust"],
+            "expected_updated_at": expected_updated_at,
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(edited["description"], "edited internally");
-    assert_eq!(edited["tags"][0]["normalized_name"], "rust");
-    assert_eq!(edited["tags"][1]["normalized_name"], "reviewed");
+    assert_eq!(edited["tags"], json!(["rust", "reviewed"]));
     assert_eq!(edited["caption_sync"]["generation"], 2);
     assert_eq!(edited["caption_sync"]["state"], "pending");
 
