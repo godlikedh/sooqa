@@ -65,7 +65,8 @@ erDiagram
 There are no compatibility tables, copy migrations, generic idempotency table,
 Telegram receipt table, or automatic volume reset. A local database created by
 the previous model must be explicitly recreated by the owner before applying
-this baseline.
+this baseline. That incompatibility applies only to the discarded pre-reset
+schema; current five-table data is retained by forward-only migrations.
 
 ## Boundaries
 
@@ -279,6 +280,9 @@ is a query over `posts.state = 'queued'`; normal scheduling assigns
 `cadence_slot_at`, while exact/manual scheduling stores the requested future
 `scheduled_at` with `cadence_slot_at = NULL` and permits collisions. Both paths
 enqueue one fixed-dedupe `publish_post` job referencing the post ID.
+Creating an intent requires an explicit decision when the same media is already
+queued/sending or was published in the 14 days before the intended send time;
+older published history is allowed silently.
 Publication mutations lock the channel first and then the affected post/job
 rows in a stable order. `posts.revision` is copied into the job payload, so a
 stale claim cannot send after an edit or publish-now operation. All post/job

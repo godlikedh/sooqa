@@ -1,10 +1,8 @@
 # Operations
 
-## Fresh database
+## Database initialization and preservation
 
-The five-table baseline is intentionally incompatible with the pre-reset local
-database. The owner must recreate a development database explicitly; sooqa
-does not drop volumes or schemas automatically. Then apply the clean migration:
+For a brand-new installation, create an empty database and apply all migrations:
 
 ```bash
 DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa \
@@ -13,6 +11,12 @@ DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/sooqa \
 
 The same `DATABASE_URL` is used by server and worker. PostgreSQL is the durable
 source of truth for ingests, media, channels, posts, and jobs.
+
+The five-table baseline is intentionally incompatible only with the discarded
+pre-reset schema. Once a database has the current five-table baseline, preserve
+it: take a backup before upgrades and apply forward migrations in place. sooqa
+does not drop schemas or volumes automatically. The explicit legacy-reset
+procedure later in this document is destructive and owner-run.
 
 ## Server and worker
 
@@ -54,9 +58,11 @@ Caption-sync failures appear from the media row's bounded sync marker and can
 be requeued with the authenticated
 `POST /api/v1/media/{id}/caption-sync/retry` command.
 
-Open `/admin` in the owner's Windows Chrome session for the embedded web
-client. Enter the configured API token when prompted; it is kept only in that
-browser session and can be removed with `Forget token`. The Dashboard loads
+Open `/admin` in the owner's Chrome session for the embedded web client. The
+tracked home Compose configuration binds it to Mac loopback by default; a
+Windows machine must first use the trusted-LAN procedure below. Enter the
+configured API token when prompted; it is kept only in that browser session
+and can be removed with `Forget token`. The Dashboard loads
 only the bounded dashboard response and invokes the existing duplicate and
 publication-decision commands. Ingests loads 50 rows at a time and its refresh
 button returns to the first page; it has no retry or job controls. Settings
@@ -138,6 +144,13 @@ an accepted provider page can still follow provider redirects and fetch its
 CDN media URLs. The supported home path is public regular videos and Shorts;
 private, members-only, age-restricted, geo-bypassed, and cookie-authenticated
 media are intentionally outside this setup.
+
+Current limitation: inspection records yt-dlp's resolved media URL, but the
+download attempt still starts from the originally submitted page URL, and an
+HTTP 403 is terminal rather than trying a bounded fallback/provider path.
+[Issue #102](https://github.com/godlikedh/sooqa/issues/102) tracks reliable
+YouTube/Shorts download handling; treat these page sources as best-effort until
+that issue is closed.
 
 The home image downloads the official standalone `yt-dlp` distribution, which
 contains the bundled `yt-dlp-ejs` component, and a pinned Deno runtime. The
@@ -400,6 +413,107 @@ docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml bui
 docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml run --rm server migrate
 docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml up -d
 ```
+
+### Trusted-LAN admin access
+
+The tracked Compose file publishes port 8080 as `127.0.0.1:8080`, so it is not
+reachable from Windows by default. On a trusted home LAN, replace only that
+host address in the `server.ports` entry with the Mac's fixed LAN address, for
+example:
+
+```yaml
+ports:
+  - "192.168.1.132:8080:8080"
+```
+
+Recreate only the server container after the edit:
+
+```bash
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml up -d --no-deps --force-recreate server
+```
+
+Then open `http://192.168.1.132:8080/admin` from Windows and use the configured
+`SOOQA_API_TOKEN`. Use the Mac's actual LAN address, allow TCP 8080 only on the
+trusted/private firewall profile, and do not use `0.0.0.0` on an untrusted
+network. This connection is plain HTTP: use a TLS reverse proxy before crossing
+an untrusted network or exposing the service remotely.
+
+### Backup, upgrade, restore, and rollback
+
+Before every home upgrade, create a private PostgreSQL custom-format backup.
+Use an explicit owner-only path and keep the file outside the repository:
+
+```bash
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml exec -T postgres \
+  pg_dump --username=sooqa --dbname=sooqa --format=custom \
+  > /Users/OWNER/Backups/sooqa-before-upgrade.dump
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml exec -T postgres \
+  pg_restore --list \
+  < /Users/OWNER/Backups/sooqa-before-upgrade.dump > /dev/null
+```
+
+An upgrade keeps all named volumes and applies forward migrations before the
+new server and worker start:
+
+```bash
+docker image tag sooqa:home sooqa:home-before-upgrade
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml build
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml stop server worker
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml run --rm server migrate
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml up -d
+curl --fail http://127.0.0.1:8080/health/live
+```
+
+Update the Git checkout to the intended reviewed commit before `build`; source
+control selection is deliberately separate from the deployment commands. Do
+not use `down --volumes` during an upgrade.
+
+To restore a backup, first confirm the exact archive path. The following block
+irreversibly replaces the current `sooqa` database, so stop application writers
+and take another backup if the current state might be needed:
+
+```bash
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml stop server worker
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml exec -T postgres \
+  dropdb --username=sooqa --force sooqa
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml exec -T postgres \
+  createdb --username=sooqa --owner=sooqa sooqa
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml exec -T postgres \
+  pg_restore --username=sooqa --dbname=sooqa --no-owner --no-privileges --exit-on-error \
+  < /Users/OWNER/Backups/sooqa-before-upgrade.dump
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml run --rm server migrate
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml up -d
+```
+
+For binary-only rollback when no migration was applied, run:
+
+```bash
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml stop server worker
+docker image tag sooqa:home-before-upgrade sooqa:home
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml up -d --no-build --force-recreate server worker
+```
+
+If the upgrade applied any migration, an old binary is not assumed compatible
+with the new schema. Stop server and worker, retag the old image, restore the
+matching pre-upgrade database backup without applying newer migrations, and
+only then recreate the old server and worker with `--no-build`.
+
+### Destructive legacy-schema reset
+
+Use this only to discard a database from before ADR 0009, never as a normal
+upgrade or test command. It deletes the home PostgreSQL and transient sooqa
+workspace volumes but deliberately retains the local Bot API volume:
+
+```bash
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml down
+docker volume rm sooqa-home_home-postgres-data sooqa-home_home-sooqa-work
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml up -d postgres telegram-bot-api
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml run --rm server migrate
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml up -d
+```
+
+This reset is irreversible unless a PostgreSQL backup exists. Never add it to
+application startup, CI, tests, or an unattended deployment script.
 
 The official `tdlib/telegram-bot-api` source is built at the commit pinned in
 `deploy/telegram-bot-api/Dockerfile`. The local server runs with `--local`,

@@ -124,8 +124,9 @@ features.
 
 ## Implementation status
 
-This ADR is the authority layer for the reset. The following implementation
-stack must replace the legacy migrations, Rust aggregates/repositories,
-applications, API contracts, tests, and active documentation in one coherent
-implementation PR. No old-schema compatibility path should be added while
-doing so.
+Implemented. Migration `0001_initial.sql` establishes exactly the five
+application tables above, and later forward migrations extend those same
+aggregates without restoring the discarded schema. The Rust boundaries, API,
+tests, and active documentation use this model. The no-compatibility decision
+continues to apply to pre-reset databases; current five-table installations
+must be migrated and backed up rather than discarded.
