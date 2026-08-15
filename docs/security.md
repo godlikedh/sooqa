@@ -26,6 +26,12 @@ HTTP(S) links rather than injected HTML. This is a trusted-home-LAN MVP
 boundary, not a claim that the bearer-token UI is suitable for internet
 exposure.
 
+Media previews are requested with the bearer header from same-origin API paths;
+the token is never placed in a preview URL or `<img>` request. The browser
+uses object URLs for returned bytes and revokes them when the catalogue is
+re-rendered or the page is left. Publication dialogs submit public post text
+and exact times as separate fields from internal catalogue metadata.
+
 The Windows companion is a loopback-only fixed proxy. It accepts only
 `POST /v1/submit`, requires a separate local bearer token, caps JSON bodies, and
 forwards only the backend ingest route with a bounded timeout and a stable

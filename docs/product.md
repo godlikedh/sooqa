@@ -106,8 +106,15 @@ failures. Duplicate and repeat cards invoke their existing revision/idempotent
 commands; cancellation leaves media intact. Ingests is a read-only, newest-first
 50-row cursor list and refreshes only its first page. Settings edits or creates
 the one target channel through the optimistic `updated_at` API fence, including
-the IANA time zone and cadence window. Media and Schedule navigation is reserved
-for their subsequent implementation slices.
+the IANA time zone and cadence window. Media is a bounded 50-row catalogue: its
+exact lookup accepts one media/ingest UUID, normalized source URL including any
+supported 2ch mirror, or private Telegram storage link. Each card keeps internal
+description/tags edits separate from public publication text, shows the durable
+caption-sync state and retry, and fetches a bounded preview through the
+authenticated API into a revocable browser object URL. Ready media offers plain
+Post now/Queue actions and ellipsis dialogs for optional public text and an
+exact future browser-local time; repeat drafts go back to Dashboard decisions.
+Schedule navigation remains reserved for its subsequent implementation slice.
 
 Large-media capture uses Telegram's official local Bot API server when the home
 deployment is cut over manually. URL/link source downloads, Telegram-source

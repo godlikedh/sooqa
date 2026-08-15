@@ -63,6 +63,17 @@ button returns to the first page; it has no retry or job controls. Settings
 loads disabled channels too, edits one selected target with its `updated_at`
 fence, and reloads after a stale or ambiguous configuration conflict.
 
+Media browsing is also bounded to 50 rows. Use the exact lookup field for one
+media UUID, ingest UUID, supported mirror-equivalent 2ch URL, or private
+Telegram storage link; it is not a semantic search box. Catalogue edits send
+the complete tag set and internal description with the media `updated_at` fence.
+The response changes the caption marker to `Syncing`; `Retry sync` calls the
+durable retry endpoint after a failure. Preview bytes are fetched through the
+authenticated API and held only in revocable browser object URLs. Ready cards'
+Post now/Queue actions create publication intents; ellipsis variants collect
+only public text and, for exact queueing, a future local browser time. A repeat
+draft is resolved from Dashboard rather than in the Media page.
+
 The server emits the admin HTML, CSS, and JavaScript from the binary, so no
 Node process, frontend service, CDN, or asset volume is required. Keep `/admin`
 behind the same trusted-LAN boundary as the bearer API; the page's CSP and

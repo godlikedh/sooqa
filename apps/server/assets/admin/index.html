@@ -85,10 +85,27 @@
         </section>
       </section>
 
-      <section id="media-page" class="page placeholder-page" data-page="media" aria-labelledby="media-title" hidden>
-        <p class="eyebrow">Catalogue</p>
-        <h1 id="media-title">Media</h1>
-        <p class="muted">The bounded media catalogue is the next admin slice. Caption failures below link here so the workflow stays visible.</p>
+      <section id="media-page" class="page" data-page="media" aria-labelledby="media-title" hidden>
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Catalogue</p>
+            <h1 id="media-title">Media</h1>
+            <p class="muted">Newest first. Search accepts one exact UUID, source URL, mirror-equivalent 2ch URL, or private Telegram storage link.</p>
+          </div>
+          <button id="media-refresh" class="button button-secondary" type="button">Refresh</button>
+        </div>
+        <form id="media-search-form" class="search-form">
+          <label for="media-search">Exact lookup</label>
+          <div class="search-controls">
+            <input id="media-search" type="search" autocomplete="off" spellcheck="false" placeholder="UUID, https://example.test/clip.webm, or https://t.me/c/…">
+            <button class="button button-primary" type="submit">Look up</button>
+            <button id="media-clear-search" class="button button-secondary" type="button">Clear</button>
+          </div>
+          <p class="muted">Catalogue browsing stays bounded at 50 rows; lookup is exact and never performs semantic search.</p>
+        </form>
+        <div id="media-status" class="notice" hidden></div>
+        <div id="media-grid" class="media-grid" aria-live="polite"><p class="loading-state">Loading media…</p></div>
+        <div class="pager"><button id="media-next" class="button button-secondary" type="button" hidden>Next page</button></div>
       </section>
 
       <section id="schedule-page" class="page placeholder-page" data-page="schedule" aria-labelledby="schedule-title" hidden>
@@ -129,6 +146,24 @@
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   </main>
+  <dialog id="publication-dialog" class="publication-dialog" aria-labelledby="publication-dialog-title">
+    <form id="publication-form">
+      <p class="eyebrow">New publication intent</p>
+      <h2 id="publication-dialog-title">Publish media</h2>
+      <p id="publication-dialog-context" class="muted"></p>
+      <label for="publication-caption">Public post text <span class="muted">(optional)</span></label>
+      <textarea id="publication-caption" rows="5" maxlength="1024" placeholder="Text sent to the target channel"></textarea>
+      <div id="publication-time-field" class="field" hidden>
+        <label for="publication-time">Exact local future time</label>
+        <input id="publication-time" type="datetime-local">
+      </div>
+      <p id="publication-error" class="form-error" role="alert" hidden></p>
+      <div class="form-actions">
+        <button id="publication-cancel" class="button button-secondary" type="button">Cancel</button>
+        <button id="publication-submit" class="button button-primary" type="submit">Save intent</button>
+      </div>
+    </form>
+  </dialog>
   <script src="/admin/assets/app.js" defer></script>
 </body>
 </html>
