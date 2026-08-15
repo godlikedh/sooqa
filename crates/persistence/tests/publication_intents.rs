@@ -286,7 +286,8 @@ async fn exact_publication_allows_collisions_and_ignores_cadence_rules(pool: sql
     let _channel = publication_channel(&database, -100123456789).await;
     let first_media = stored_media(&database).await;
     let second_media = stored_media(&database).await;
-    let requested_at = OffsetDateTime::now_utc() + Duration::hours(2);
+    let requested_at =
+        (OffsetDateTime::now_utc() + Duration::hours(2)).replace_nanosecond(0).unwrap();
     let repository = database.publisher();
     let first = repository
         .create_publication_intent(
@@ -495,7 +496,38 @@ async fn repeat_evaluation_uses_the_intended_send_instant_and_persists_evidence(
 #[ignore = "requires PostgreSQL"]
 async fn publication_decisions_are_revision_fenced_and_idempotent(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
-    let _channel = publication_channel(&database, -100123456789).await;
+    let channel = publication_channel(&database, -100123456789).await;
+    let ordinary_media = stored_media(&database).await;
+    let ordinary_draft = database
+        .publisher()
+        .create_post_idempotent(
+            NewPost {
+                media_id: ordinary_media,
+                channel_id: channel.id,
+                caption: None,
+                parse_mode: None,
+                disable_notification: false,
+            },
+            "ordinary-direct-draft".to_owned(),
+            b"ordinary-direct-draft",
+        )
+        .await
+        .unwrap()
+        .post;
+    assert_eq!(ordinary_draft.state, PostState::Draft);
+    assert!(ordinary_draft.repeat_evidence.is_none());
+    assert!(matches!(
+        database
+            .publisher()
+            .decide_post(
+                ordinary_draft.id,
+                PublicationDecision::Cancel,
+                "ordinary-direct-decision".to_owned(),
+                ordinary_draft.revision,
+            )
+            .await,
+        Err(PublisherRepositoryError::PostDecisionNotAllowed { .. })
+    ));
     let media = stored_media(&database).await;
     let seed = database
         .publisher()

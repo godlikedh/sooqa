@@ -586,12 +586,17 @@ impl TelegramStorageCaptionApi for TeloxideApi {
     ) -> Result<(), Self::Error> {
         let message_id = i32::try_from(request.storage_message_id)
             .map_err(|_| StorageCaptionApiError::InvalidMessageId(request.storage_message_id))?;
-        self.bot()
+        let result = self
+            .bot()
             .edit_message_caption(ChatId(request.storage_chat_id), MessageId(message_id))
             .caption(request.caption)
             .send()
-            .await
-            .map_err(StorageCaptionApiError::Api)?;
+            .await;
+        match result {
+            Ok(_) => {}
+            Err(error) if is_idempotent_caption_edit_error(&error) => {}
+            Err(error) => return Err(StorageCaptionApiError::Api(error)),
+        }
         Ok(())
     }
 
@@ -607,6 +612,10 @@ impl TelegramStorageCaptionApi for TeloxideApi {
             )
         )
     }
+}
+
+fn is_idempotent_caption_edit_error(error: &teloxide::RequestError) -> bool {
+    matches!(error, teloxide::RequestError::Api(teloxide::errors::ApiError::MessageNotModified))
 }
 
 #[cfg(test)]
@@ -789,10 +798,9 @@ mod tests {
         Media {
             id: Uuid::from_u128(1),
             kind: MediaKind::Video,
-            status: sooqa_library::MediaStatus::Active,
             title: None,
             description: None,
-            notes: None,
+            tags: Vec::new(),
             mime_type: Some("video/mp4".to_owned()),
             container: Some("mp4".to_owned()),
             video_codec: None,
@@ -811,7 +819,6 @@ mod tests {
             caption_sync_error: None,
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),
-            archived_at: None,
         }
     }
 
@@ -1082,6 +1089,15 @@ mod tests {
         assert!(!<TeloxideApi as TelegramStorageCaptionApi>::is_retryable_error(
             &invalid_message_id
         ));
+    }
+
+    #[test]
+    fn unchanged_storage_caption_is_an_idempotent_success() {
+        let unchanged = teloxide::RequestError::Api(teloxide::errors::ApiError::MessageNotModified);
+        let rejected = teloxide::RequestError::Api(teloxide::errors::ApiError::BotBlocked);
+
+        assert!(is_idempotent_caption_edit_error(&unchanged));
+        assert!(!is_idempotent_caption_edit_error(&rejected));
     }
 
     #[test]
