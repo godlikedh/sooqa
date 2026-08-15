@@ -929,7 +929,7 @@ test("accepted history is mirror-canonical, thread-local, bounded, and clearable
 
 test("metadata contains no backend secrets, polling, or stale update metadata", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "sooqa-2ch-save.user.js"), "utf8");
-  assert.match(source, /@version\s+0\.2\.0/);
+  assert.match(source, /@version\s+0\.2\.1/);
   assert.match(source, /@updateURL\s+https:\/\/raw\.githubusercontent\.com\/godlikedh\/sooqa\/main/);
   assert.match(source, /@downloadURL\s+https:\/\/raw\.githubusercontent\.com\/godlikedh\/sooqa\/main/);
   assert.match(source, /GM_xmlhttpRequest/);

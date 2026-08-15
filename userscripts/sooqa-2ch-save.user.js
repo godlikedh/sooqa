@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         sooqa: 2ch media actions
 // @namespace    sooqa
-// @version      0.2.0
+// @version      0.2.1
 // @description  Add save, queue, and post-now controls to direct 2ch media.
 // @match        https://2ch.su/*
 // @match        https://2ch.org/*

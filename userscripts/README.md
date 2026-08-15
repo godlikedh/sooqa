@@ -1,5 +1,7 @@
 # sooqa 2ch userscript
 
+Current userscript version: `0.2.1`.
+
 Install [`sooqa-2ch-save.user.js`](https://raw.githubusercontent.com/godlikedh/sooqa/main/userscripts/sooqa-2ch-save.user.js)
 in Tampermonkey on these supported HTTPS domains:
 
