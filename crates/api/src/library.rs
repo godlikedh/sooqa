@@ -9,8 +9,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sooqa_library::{
-    MediaCursor, MediaDetails, MediaKind, MediaLookup, MediaPage, MediaSearchQuery, MediaStatus,
-    MediaSummary, MediaUpdate, NewTag,
+    MediaCursor, MediaDetails, MediaKind, MediaLookup, MediaPage, MediaSearchQuery, MediaSummary,
+    MediaUpdate,
 };
 use time::OffsetDateTime;
 use url::Url;
@@ -24,7 +24,6 @@ pub(crate) fn routes() -> Router<ApiState> {
         .route("/api/v1/media/{id}", get(get_media).patch(update_media))
         .route("/api/v1/media/{id}/preview", get(get_preview))
         .route("/api/v1/media/{id}/caption-sync/retry", post(retry_caption_sync))
-        .route("/api/v1/media/{id}/archive", post(archive_media))
 }
 
 async fn search_media(
@@ -34,7 +33,7 @@ async fn search_media(
 ) -> Result<Json<MediaPageResponse>, ApiError> {
     authorize(&state.api_token, &headers).await?;
     let mut params = params;
-    let lookup_input = take_lookup_input(&mut params, &headers)?;
+    let lookup_input = take_lookup_input(&mut params);
     let query = params.into_domain(&headers)?;
     let page = if let Some(lookup_input) = lookup_input {
         state
@@ -52,37 +51,8 @@ async fn search_media(
     Ok(Json(MediaPageResponse::from_page(&page)))
 }
 
-fn take_lookup_input(
-    params: &mut SearchParams,
-    headers: &HeaderMap,
-) -> Result<Option<String>, ApiError> {
-    let lookup_input = params.q.take().filter(|value| !value.trim().is_empty());
-    let has_catalogue_filter = params
-        .tags
-        .as_ref()
-        .is_some_and(|value| value.split(',').any(|tag| !tag.trim().is_empty()))
-        || params.kind.is_some()
-        || params.status.is_some();
-    if lookup_input.is_some() && has_catalogue_filter {
-        return Err(ApiError::bad_request(
-            "lookup_filters_not_allowed",
-            "Exact media lookup cannot be combined with catalogue filters",
-            headers,
-        ));
-    }
-    Ok(lookup_input)
-}
-
-fn normalize_tags(values: Vec<String>, headers: &HeaderMap) -> Result<Vec<String>, ApiError> {
-    let mut normalized = Vec::with_capacity(values.len());
-    for value in values {
-        let tag = NewTag::try_new(value)
-            .map_err(|_| ApiError::bad_request("invalid_tag", "The tag is invalid", headers))?;
-        if !normalized.iter().any(|current| current == &tag.normalized_name) {
-            normalized.push(tag.normalized_name);
-        }
-    }
-    Ok(normalized)
+fn take_lookup_input(params: &mut SearchParams) -> Option<String> {
+    params.q.take().filter(|value| !value.trim().is_empty())
 }
 
 async fn get_media(
@@ -176,12 +146,16 @@ async fn update_media(
     authorize(&state.api_token, &headers).await?;
     let JsonExtractor(payload) =
         body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
-    let tags = payload.tags.map(|values| normalize_tags(values, &headers)).transpose()?;
+    let description = payload.description.into_present().map_err(|_| {
+        ApiError::bad_request(
+            "invalid_media_update",
+            "The request must contain tags, description, and expected_updated_at",
+            &headers,
+        )
+    })?;
     let update = MediaUpdate {
-        title: payload.title,
-        description: payload.description,
-        notes: payload.notes,
-        tags,
+        description,
+        tags: payload.tags,
         expected_updated_at: payload.expected_updated_at,
     };
     state
@@ -200,58 +174,16 @@ async fn update_media(
     Ok(Json(MediaResponse::from_details(&media)))
 }
 
-async fn archive_media(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> Result<Json<MediaResponse>, ApiError> {
-    authorize(&state.api_token, &headers).await?;
-    state.library.archive_media(id).await.map_err(|error| map_library_error(error, &headers))?;
-    let media = state
-        .library
-        .find_media_details(id)
-        .await
-        .map_err(|error| map_library_error(error, &headers))?
-        .ok_or_else(|| {
-            ApiError::not_found("media_not_found", "The media item was not found", &headers)
-        })?;
-    Ok(Json(MediaResponse::from_details(&media)))
-}
-
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchParams {
     q: Option<String>,
-    tags: Option<String>,
-    kind: Option<String>,
-    status: Option<String>,
     limit: Option<String>,
     cursor: Option<String>,
 }
 
 impl SearchParams {
     fn into_domain(self, headers: &HeaderMap) -> Result<MediaSearchQuery, ApiError> {
-        let text = self.q.and_then(|value| {
-            let value = value.trim().to_owned();
-            (!value.is_empty()).then_some(value)
-        });
-        let tags = self
-            .tags
-            .unwrap_or_default()
-            .split(',')
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| {
-                NewTag::try_new(value).map(|tag| tag.normalized_name).map_err(|_| {
-                    ApiError::bad_request("invalid_tag", "The tag filter is invalid", headers)
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let kind = self.kind.as_deref().map(MediaKind::try_from).transpose().map_err(|_| {
-            ApiError::bad_request("invalid_kind", "The kind filter is invalid", headers)
-        })?;
-        let status =
-            self.status.as_deref().map(MediaStatus::try_from).transpose().map_err(|_| {
-                ApiError::bad_request("invalid_status", "The status filter is invalid", headers)
-            })?;
         let limit = self
             .limit
             .as_deref()
@@ -275,14 +207,7 @@ impl SearchParams {
         let cursor = self.cursor.as_deref().map(decode_cursor).transpose().map_err(|_| {
             ApiError::bad_request("invalid_cursor", "The cursor is invalid", headers)
         })?;
-        Ok(MediaSearchQuery {
-            text,
-            tags,
-            kind,
-            status: status.or(Some(MediaStatus::Active)),
-            limit,
-            cursor,
-        })
+        Ok(MediaSearchQuery { limit, cursor })
     }
 }
 
@@ -424,18 +349,39 @@ fn decode_cursor(value: &str) -> Result<MediaCursor, ()> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateMediaRequest {
-    #[serde(default)]
-    title: Option<Option<String>>,
-    #[serde(default)]
-    description: Option<Option<String>>,
-    #[serde(default)]
-    notes: Option<Option<String>>,
-    #[serde(default)]
-    tags: Option<Vec<String>>,
-    #[serde(default)]
-    #[serde(with = "time::serde::rfc3339::option")]
-    expected_updated_at: Option<OffsetDateTime>,
+    tags: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_required_nullable")]
+    description: RequiredNullable<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    expected_updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Default)]
+enum RequiredNullable<T> {
+    #[default]
+    Missing,
+    Present(Option<T>),
+}
+
+impl<T> RequiredNullable<T> {
+    fn into_present(self) -> Result<Option<T>, ()> {
+        match self {
+            Self::Missing => Err(()),
+            Self::Present(value) => Ok(value),
+        }
+    }
+}
+
+fn deserialize_required_nullable<'de, D, T>(
+    deserializer: D,
+) -> Result<RequiredNullable<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(RequiredNullable::Present(Option::<T>::deserialize(deserializer)?))
 }
 
 #[derive(Debug, Serialize)]
@@ -457,10 +403,9 @@ impl MediaPageResponse {
 struct MediaResponse {
     id: Uuid,
     kind: MediaKind,
-    status: MediaStatus,
     title: Option<String>,
     description: Option<String>,
-    notes: Option<String>,
+    tags: Vec<String>,
     storage_state: String,
     storage_url: Option<String>,
     preview: Option<MediaPreviewResponse>,
@@ -478,13 +423,10 @@ struct MediaResponse {
     bit_rate: Option<u64>,
     file_size_bytes: Option<u64>,
     sha256: Option<String>,
-    tags: Vec<TagResponse>,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     updated_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339::option")]
-    archived_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Serialize)]
@@ -508,7 +450,6 @@ impl MediaResponse {
     fn from_summary(summary: &MediaSummary) -> Self {
         Self::from_media(
             &summary.media,
-            &summary.tags,
             summary.source_url.clone(),
             summary.source_original_url.clone(),
             summary.source_metadata.clone(),
@@ -519,7 +460,6 @@ impl MediaResponse {
     fn from_details(details: &MediaDetails) -> Self {
         Self::from_media(
             &details.media,
-            &details.tags,
             details.source.as_ref().and_then(|source| source.normalized_url.clone()),
             details.source.as_ref().and_then(|source| source.original_url.clone()),
             details.source.as_ref().map(|source| source.metadata.clone()),
@@ -529,7 +469,6 @@ impl MediaResponse {
 
     fn from_media(
         media: &sooqa_library::Media,
-        tags: &[sooqa_library::Tag],
         source_url: Option<String>,
         source_original_url: Option<String>,
         source_metadata: Option<Value>,
@@ -538,10 +477,9 @@ impl MediaResponse {
         Self {
             id: media.id,
             kind: media.kind,
-            status: media.status,
             title: media.title.clone(),
             description: media.description.clone(),
-            notes: media.notes.clone(),
+            tags: media.tags.clone(),
             storage_state: media.storage_state.as_str().to_owned(),
             storage_url,
             preview: media.preview.as_ref().map(|preview| MediaPreviewResponse {
@@ -570,34 +508,14 @@ impl MediaResponse {
             bit_rate: media.bit_rate,
             file_size_bytes: media.file_size_bytes,
             sha256: media.sha256.as_deref().map(hex_digest),
-            tags: tags.iter().map(TagResponse::from_tag).collect(),
             created_at: media.created_at,
             updated_at: media.updated_at,
-            archived_at: media.archived_at,
         }
     }
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-#[derive(Debug, Serialize)]
-struct TagResponse {
-    normalized_name: String,
-    display_name: String,
-    #[serde(with = "time::serde::rfc3339")]
-    created_at: OffsetDateTime,
-}
-
-impl TagResponse {
-    fn from_tag(tag: &sooqa_library::Tag) -> Self {
-        Self {
-            normalized_name: tag.normalized_name.clone(),
-            display_name: tag.display_name.clone(),
-            created_at: tag.created_at,
-        }
-    }
 }
 
 fn map_json_rejection(rejection: JsonRejection, headers: &HeaderMap) -> ApiError {
@@ -622,23 +540,13 @@ mod tests {
     }
 
     #[test]
-    fn search_defaults_to_active_media_and_normalizes_filters() {
+    fn search_defaults_to_bounded_cursor_list() {
         let headers = HeaderMap::new();
-        let query = SearchParams {
-            q: Some("  cat  ".to_owned()),
-            tags: Some(" Rust,  MEDIA ".to_owned()),
-            kind: Some("video".to_owned()),
-            status: None,
-            limit: None,
-            cursor: None,
-        }
-        .into_domain(&headers)
-        .expect("filters should be valid");
-        assert_eq!(query.text.as_deref(), Some("cat"));
-        assert_eq!(query.tags, ["rust", "media"]);
-        assert_eq!(query.kind, Some(MediaKind::Video));
-        assert_eq!(query.status, Some(MediaStatus::Active));
+        let query = SearchParams { q: None, limit: None, cursor: None }
+            .into_domain(&headers)
+            .expect("default query should be valid");
         assert_eq!(query.limit, 50);
+        assert!(query.cursor.is_none());
     }
 
     #[test]
@@ -651,16 +559,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_media_lookup_rejects_catalogue_filters() {
-        let headers = HeaderMap::new();
-        let mut params = SearchParams {
-            q: Some(Uuid::from_u128(7).to_string()),
-            kind: Some("video".to_owned()),
-            ..SearchParams::default()
-        };
-        let error = take_lookup_input(&mut params, &headers)
-            .expect_err("exact lookup and catalogue filters must not be combined");
-        assert_eq!(error.code, "lookup_filters_not_allowed");
+    fn exact_media_lookup_accepts_uuid_without_catalogue_filters() {
+        let mut params =
+            SearchParams { q: Some(Uuid::from_u128(7).to_string()), ..SearchParams::default() };
+        assert_eq!(take_lookup_input(&mut params), Some(Uuid::from_u128(7).to_string()));
     }
 
     #[test]

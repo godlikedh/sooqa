@@ -351,15 +351,18 @@ async fn post_mutations_preserve_revision_fences(pool: sqlx::PgPool) {
         .publish_now(queued[2].id, "publish-now-test".to_owned(), edited.revision)
         .await
         .unwrap();
-    assert_eq!(now.cadence_slot_at, edited.cadence_slot_at);
+    assert!(now.cadence_slot_at.is_none());
     assert!(now.scheduled_at <= OffsetDateTime::now_utc());
+    let now_job = publish_job_snapshot(&database, now.id).await;
+    assert_eq!(now_job.1, now.scheduled_at);
+    assert_eq!(now_job.2["expected_revision"], now.revision);
     let replay = database
         .publisher()
         .publish_now(queued[2].id, "publish-now-test".to_owned(), now.revision)
         .await
         .unwrap();
     assert_eq!(replay.revision, now.revision);
-    assert_eq!(replay.cadence_slot_at, now.cadence_slot_at);
+    assert!(replay.cadence_slot_at.is_none());
 
     let cancelled =
         database.publisher().cancel_post(queued[1].id, queued[1].revision).await.unwrap();
