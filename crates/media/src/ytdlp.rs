@@ -20,6 +20,7 @@ use crate::{
 const DEFAULT_DENO_PATH: &str = "deno";
 const MIN_SUPPORTED_DENO_VERSION: (u32, u32, u32) = (2, 3, 0);
 const YTDLP_ATTEMPT_MAX_BYTES_MULTIPLIER: u64 = 3;
+pub const MAX_YTDLP_FORMAT_SELECTION_BYTES: usize = 1024;
 pub const YTDLP_PROGRESSIVE_FALLBACK_FORMAT: &str =
     "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]";
 pub const DEFAULT_YTDLP_METADATA_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -98,6 +99,8 @@ pub fn is_supported_deno_version(version_line: &str) -> bool {
 pub enum YtDlpConfigError {
     #[error("yt-dlp format selection must not be empty")]
     EmptyFormatSelection,
+    #[error("yt-dlp format selection exceeds the {MAX_YTDLP_FORMAT_SELECTION_BYTES}-byte limit")]
+    FormatSelectionTooLong,
     #[error("yt-dlp format selection contains an unsafe control character or option prefix")]
     UnsafeFormatSelection,
 }
@@ -159,7 +162,7 @@ impl YtDlpDownloader {
             ));
         }
         if !output.success {
-            return Err(map_process_failure(&output, source_url));
+            return Err(map_inspection_failure(&output, source_url));
         }
         Ok(output)
     }
@@ -203,7 +206,7 @@ impl YtDlpDownloader {
             ));
         }
         if !output.success {
-            return Err(map_process_failure(&output, source_url));
+            return Err(map_download_failure(&output, source_url));
         }
         Ok(output)
     }
@@ -330,6 +333,8 @@ impl YtDlpDownloader {
         attempt_max_bytes: u64,
         format_selection: &str,
     ) -> Result<DownloadedSource, DownloadError> {
+        validate_format_selection(format_selection)
+            .map_err(|error| DownloadError::terminal("ytdlp_format", error.to_string()))?;
         let attempt_path = destination.with_file_name(format!(".sooqa-ytdlp-{}", Uuid::new_v4()));
         let attempt = TempDirectory::reserve(attempt_path).await.map_err(|source| {
             DownloadError::terminal(
@@ -670,6 +675,9 @@ fn validate_format_selection(value: &str) -> Result<(), YtDlpConfigError> {
     if value.trim().is_empty() {
         return Err(YtDlpConfigError::EmptyFormatSelection);
     }
+    if value.len() > MAX_YTDLP_FORMAT_SELECTION_BYTES {
+        return Err(YtDlpConfigError::FormatSelectionTooLong);
+    }
     if value.starts_with('-') || value.chars().any(char::is_control) {
         return Err(YtDlpConfigError::UnsafeFormatSelection);
     }
@@ -735,20 +743,32 @@ fn map_command_error(error: CommandError, output_limit_class: &str) -> DownloadE
     }
 }
 
-fn map_process_failure(output: &ExternalCommandOutput, source_url: &str) -> DownloadError {
+fn map_process_failure(
+    output: &ExternalCommandOutput,
+    source_url: &str,
+    allow_media_data_recovery: bool,
+) -> DownloadError {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().replace(source_url, "<source-url>");
     let message = if stderr.is_empty() {
         format!("yt-dlp exited unsuccessfully with status {:?}", output.exit_code)
     } else {
         format!("yt-dlp exited unsuccessfully with status {:?}: {stderr}", output.exit_code)
     };
-    if is_media_data_forbidden_message(&stderr) {
+    if allow_media_data_recovery && is_media_data_forbidden_message(&stderr) {
         DownloadError::retryable("ytdlp_media_forbidden", message)
     } else if is_transient_failure(&stderr) {
         DownloadError::retryable("ytdlp_upstream", message)
     } else {
         DownloadError::terminal("ytdlp_process", message)
     }
+}
+
+fn map_inspection_failure(output: &ExternalCommandOutput, source_url: &str) -> DownloadError {
+    map_process_failure(output, source_url, false)
+}
+
+fn map_download_failure(output: &ExternalCommandOutput, source_url: &str) -> DownloadError {
+    map_process_failure(output, source_url, true)
 }
 
 fn is_media_data_forbidden(error: &DownloadError) -> bool {
@@ -985,6 +1005,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inspection_media_data_403_remains_terminal() {
+        let root = std::env::temp_dir()
+            .join(format!("sooqa-ytdlp-inspection-403-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.expect("test root should be created");
+        let executable = root.join("fake-yt-dlp.sh");
+        let script = "#!/bin/sh\nset -eu\nprintf '%s\\n' 'ERROR: unable to download video data: HTTP Error 403: Forbidden' >&2\nexit 1\n";
+        tokio::fs::write(&executable, script).await.expect("fake executable should be written");
+        let mut permissions = tokio::fs::metadata(&executable)
+            .await
+            .expect("fake executable metadata should be available")
+            .permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&executable, permissions)
+            .await
+            .expect("fake executable should be executable");
+
+        let downloader = YtDlpDownloader::new(
+            YtDlpConfig::new(&executable, "best").expect("format selection should be valid"),
+        );
+        let error = downloader
+            .inspect(&SourceInput {
+                ingest_request_id: uuid::Uuid::new_v4(),
+                source_url: "https://www.youtube.com/watch?v=inspection-403".to_owned(),
+                page_url: None,
+            })
+            .await
+            .expect_err("inspection 403 should fail");
+        assert_eq!(error.class(), "ytdlp_process");
+        assert!(!error.is_retryable());
+
+        tokio::fs::remove_dir_all(root).await.expect("test root should be removed");
+    }
+
+    #[tokio::test]
     async fn download_uses_the_inspected_canonical_url_for_shorts() {
         let root =
             std::env::temp_dir().join(format!("sooqa-ytdlp-shorts-{}", uuid::Uuid::new_v4()));
@@ -992,7 +1046,7 @@ mod tests {
         let executable = root.join("fake-yt-dlp.sh");
         let args_log = root.join("args.log");
         let script = format!(
-            "#!/bin/sh\nset -eu\nlog={args_log:?}\n: > \"$log\"\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$log\"; done\nprintf 'short-media' > final.mp4\n",
+            "#!/bin/sh\nset -eu\nlog={args_log:?}\n: > \"$log\"\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"$log\"; done\nif [ \"$1\" = \"--dump-single-json\" ]; then printf '%s\\n' '{{\"id\":\"short-id\",\"title\":\"Short\",\"webpage_url\":\"https://www.youtube.com/watch?v=short-id\",\"extractor\":\"youtube\",\"ext\":\"mp4\",\"vcodec\":\"h264\",\"acodec\":\"aac\"}}'; else printf 'short-media' > final.mp4; fi\n",
             args_log = args_log.display()
         );
         tokio::fs::write(&executable, script).await.expect("fake executable should be written");
@@ -1009,16 +1063,17 @@ mod tests {
             YtDlpConfig::new(&executable, "bestvideo*+bestaudio/best")
                 .expect("format selection should be valid"),
         );
-        let inspection = SourceInspection {
-            adapter: "yt_dlp".to_owned(),
+        let source = SourceInput {
+            ingest_request_id: uuid::Uuid::new_v4(),
             source_url: "https://www.youtube.com/shorts/short-id".to_owned(),
-            resolved_url: Some("https://www.youtube.com/watch?v=short-id".to_owned()),
-            media_kind: SourceMediaKind::Video,
-            mime_type: Some("video/mp4".to_owned()),
-            content_length_bytes: None,
-            title: None,
-            metadata: serde_json::json!({}),
+            page_url: None,
         };
+        let inspection =
+            downloader.inspect(&source).await.expect("Shorts inspection should succeed");
+        assert_eq!(
+            inspection.resolved_url.as_deref(),
+            Some("https://www.youtube.com/watch?v=short-id")
+        );
         let destination = root.join("source.mp4");
 
         let downloaded = downloader
@@ -1140,7 +1195,7 @@ mod tests {
             "ERROR: [youtube] Sign in to confirm your age.",
             "ERROR: [youtube] This video is unavailable.",
         ] {
-            let error = map_process_failure(
+            let error = map_download_failure(
                 &ExternalCommandOutput {
                     success: false,
                     exit_code: Some(1),
@@ -1346,6 +1401,14 @@ exit 1
             YtDlpConfig::new(PathBuf::from("yt-dlp"), "   ")
                 .expect_err("empty format must be rejected"),
             YtDlpConfigError::EmptyFormatSelection
+        );
+        assert_eq!(
+            YtDlpConfig::new(
+                PathBuf::from("yt-dlp"),
+                "x".repeat(MAX_YTDLP_FORMAT_SELECTION_BYTES + 1)
+            )
+            .expect_err("an oversized format must be rejected"),
+            YtDlpConfigError::FormatSelectionTooLong
         );
     }
 
