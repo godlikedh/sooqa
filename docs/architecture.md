@@ -376,8 +376,10 @@ nodes and uses the existing API/repository fences for duplicate, publication,
 and channel decisions. Schedule uses the same bounded API boundary for
 chronological unpublished post read models, public-caption edits, exact future
 times, Post now, and cancellation; its revision-fenced commands never make
-the browser a scheduling authority. Sending and unknown rows are exposed as
-read-only because their external outcome is ambiguous. The Media slice uses
+the browser a scheduling authority. Schedule cards may display the same
+authenticated bounded still preview as Media, but never proxy or play source
+media. Sending and unknown rows are exposed as read-only because their
+external outcome is ambiguous. The Media slice uses
 the same API boundary for bounded
 50-row catalogue pages, exact lookup, complete metadata edits, caption-sync
 retry, authenticated preview bytes, and publication intents; it does not add a

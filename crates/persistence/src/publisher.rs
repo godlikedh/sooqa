@@ -5,7 +5,7 @@ use sooqa_jobs::JobAttempt;
 use sooqa_publisher::{
     Channel, ChannelUpdate, ChannelValidationError, MAX_REPEAT_EVIDENCE_BYTES,
     MAX_REPEAT_EVIDENCE_CONFLICTS, NewChannel, NewPost, Post, PostCursor, PostExactSchedule,
-    PostListItem, PostPage, PostSchedule, PostState, PostUpdate, PublicationAction,
+    PostListItem, PostPage, PostPreview, PostSchedule, PostState, PostUpdate, PublicationAction,
     PublicationDecision, PublicationIntent, PublishClaim, PublishRetry, PublishedMessage,
     PublisherValidationError, RepeatConflict, RepeatEvidence, validate_caption,
 };
@@ -69,6 +69,11 @@ struct PostListMetadataRow {
     source_url: Option<String>,
     telegram_storage_chat_id: Option<i64>,
     telegram_storage_message_id: Option<i64>,
+    preview_mime_type: Option<String>,
+    preview_width: Option<i32>,
+    preview_height: Option<i32>,
+    preview_size_bytes: Option<i32>,
+    preview_sha256: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -553,7 +558,10 @@ impl PublisherRepository {
         let row = sqlx::query_as::<_, PostListMetadataRow>(
             r#"
             SELECT c.name AS channel_name, m.kind AS media_kind, m.source_url,
-                   m.telegram_storage_chat_id, m.telegram_storage_message_id
+                   m.telegram_storage_chat_id, m.telegram_storage_message_id,
+                   m.preview_mime_type, m.preview_width, m.preview_height,
+                   octet_length(m.preview_bytes) AS preview_size_bytes,
+                   m.preview_sha256
             FROM posts AS p
             JOIN channels AS c ON c.id = p.channel_id
             JOIN media AS m ON m.id = p.media_id
@@ -564,6 +572,32 @@ impl PublisherRepository {
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else { return Ok(None) };
+        let preview = match (
+            row.preview_mime_type,
+            row.preview_width,
+            row.preview_height,
+            row.preview_size_bytes,
+            row.preview_sha256,
+        ) {
+            (None, None, None, None, None) => None,
+            (Some(mime_type), Some(width), Some(height), Some(size_bytes), Some(sha256))
+                if matches!(mime_type.as_str(), "image/jpeg" | "image/png")
+                    && (1..=320).contains(&width)
+                    && (1..=320).contains(&height)
+                    && (1..=131_072).contains(&size_bytes)
+                    && sha256.len() == 32 =>
+            {
+                Some(PostPreview {
+                    mime_type,
+                    width: u32::try_from(width).expect("preview width is positive and bounded"),
+                    height: u32::try_from(height).expect("preview height is positive and bounded"),
+                    size_bytes: u32::try_from(size_bytes)
+                        .expect("preview size is positive and bounded"),
+                    sha256,
+                })
+            }
+            _ => return Err(PublisherRepositoryError::InvalidPreviewMetadata(id)),
+        };
         Ok(Some(PostListItem {
             post,
             channel_name: row.channel_name,
@@ -573,6 +607,7 @@ impl PublisherRepository {
                 row.telegram_storage_chat_id,
                 row.telegram_storage_message_id,
             ),
+            preview,
         }))
     }
 
@@ -1871,6 +1906,8 @@ pub enum PublisherRepositoryError {
     PostMissing(Uuid),
     #[error("post list limit must be between 1 and 50, got {value}")]
     InvalidLimit { value: u32 },
+    #[error("media preview metadata for post {0} is invalid")]
+    InvalidPreviewMetadata(Uuid),
     #[error("database count was negative")]
     InvalidCount,
     #[error("post {id} is not editable in state {state:?}")]

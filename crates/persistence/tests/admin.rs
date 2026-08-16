@@ -195,6 +195,7 @@ async fn schedule_page_is_bounded_and_channel_updates_are_revision_fenced(pool: 
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].post.requested_publish_at, Some(exact));
     assert_eq!(page.items[0].storage_url.as_deref(), Some("https://t.me/c/3971341583/57"));
+    assert_eq!(page.items[0].preview, None);
 
     let updated = database
         .publisher()

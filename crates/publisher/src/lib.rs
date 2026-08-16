@@ -226,6 +226,16 @@ pub struct PostListItem {
     pub media_kind: String,
     pub source_url: Option<String>,
     pub storage_url: Option<String>,
+    pub preview: Option<PostPreview>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PostPreview {
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub size_bytes: u32,
+    pub sha256: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

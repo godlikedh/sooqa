@@ -701,6 +701,124 @@ test("admin runtime keeps schedule forms editable across refresh and fences ever
   assert.match(list.textContent, /No unpublished schedule work/);
 });
 
+test("admin runtime renders only advertised schedule previews and keeps failures usable", async () => {
+  const calls = [];
+  const posts = [
+    {
+      id: "post-preview", media_id: "media-preview", status: "queued", schedule_mode: "cadence",
+      scheduled_at: "2030-01-01T01:02:03Z", caption: "with preview", media_kind: "video",
+      preview: { url: "/api/v1/media/media-preview/preview", mime_type: "image/jpeg" },
+    },
+    {
+      id: "post-audio", media_id: "media-audio", status: "queued", schedule_mode: "explicit",
+      scheduled_at: "2030-01-02T01:02:03Z", caption: "audio", media_kind: "audio",
+    },
+    {
+      id: "post-failed", media_id: "media-failed", status: "unknown", schedule_mode: "explicit",
+      scheduled_at: "2030-01-03T01:02:03Z", caption: "still readable", media_kind: "image",
+      preview: { url: "/api/v1/media/media-failed/preview", mime_type: "image/png" },
+    },
+  ];
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (pathName, options) => {
+      calls.push({ pathName, options });
+      if (pathName === "/api/v1/posts?limit=50") return jsonResponse({ items: posts, next_cursor: null });
+      if (pathName === "/api/v1/media/media-preview/preview") return binaryResponse();
+      if (pathName === "/api/v1/media/media-failed/preview") return jsonResponse({ error: { message: "gone" } }, 404);
+      return jsonResponse({ counts: {}, attention: {} });
+    },
+  });
+  await settle();
+  runtime.window.location.hash = "#schedule";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+
+  const cards = runtime.document.getElementById("schedule-list").querySelectorAll("article");
+  assert.equal(cards.length, 3);
+  assert.equal(calls.filter(({ pathName }) => pathName.endsWith("/preview")).length, 2);
+  for (const call of calls.filter(({ pathName }) => pathName.endsWith("/preview"))) {
+    assert.equal(call.options.headers.get("Authorization"), "Bearer secret");
+    assert.doesNotMatch(call.pathName, /secret/);
+  }
+
+  const readyVisual = cards[0].children[0];
+  assert.equal(readyVisual.children[0].hidden, true);
+  assert.equal(readyVisual.children[1].hidden, false);
+  assert.equal(runtime.objectUrls.size, 1);
+
+  const audioVisual = cards[1].children[0];
+  assert.equal(audioVisual.children.length, 1);
+  assert.match(audioVisual.children[0].textContent, /Preview on Media/);
+
+  const failedVisual = cards[2].children[0];
+  assert.equal(failedVisual.children.length, 2);
+  assert.equal(failedVisual.children[1].hidden, true);
+  assert.equal(failedVisual.children[0].hidden, false);
+  assert.match(failedVisual.children[0].textContent, /Preview unavailable/);
+  assert.equal(cards[2].querySelectorAll("textarea").length, 0);
+
+  readyVisual.children[1].dispatchEvent({ type: "error" });
+  assert.equal(runtime.objectUrls.size, 0);
+  assert.equal(readyVisual.children[0].hidden, false);
+  assert.match(readyVisual.children[0].textContent, /Preview unavailable/);
+});
+
+test("admin runtime revokes replaced schedule previews while preserving a dirty card", async () => {
+  const calls = [];
+  const posts = [
+    {
+      id: "post-dirty-preview", media_id: "media-dirty", status: "queued", schedule_mode: "cadence",
+      scheduled_at: "2030-01-01T01:02:03Z", caption: "server text", media_kind: "video",
+      preview: { url: "/api/v1/media/media-dirty/preview", mime_type: "image/jpeg" },
+    },
+    {
+      id: "post-replaced-preview", media_id: "media-replaced", status: "queued", schedule_mode: "cadence",
+      scheduled_at: "2030-01-02T01:02:03Z", caption: "replace me", media_kind: "image",
+      preview: { url: "/api/v1/media/media-replaced/preview", mime_type: "image/jpeg" },
+    },
+  ];
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (pathName, options) => {
+      calls.push({ pathName, options });
+      if (pathName === "/api/v1/posts?limit=50") return jsonResponse({ items: posts, next_cursor: null });
+      if (pathName.endsWith("/media-dirty/preview")) return binaryResponse();
+      if (pathName.endsWith("/media-replaced/preview")) return binaryResponse();
+      return jsonResponse({ counts: {}, attention: {} });
+    },
+  });
+  await settle();
+  runtime.window.location.hash = "#schedule";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+
+  const list = runtime.document.getElementById("schedule-list");
+  const dirtyCard = list.querySelectorAll("article")[0];
+  const dirtyCaption = dirtyCard.querySelectorAll("textarea")[0];
+  dirtyCaption.value = "local edit";
+  dirtyCaption.dispatchEvent({ type: "input" });
+  const dirtyUrl = dirtyCard.children[0].children[1].src;
+  const replacedUrl = list.querySelectorAll("article")[1].children[0].children[1].src;
+  assert.equal(runtime.objectUrls.size, 2);
+
+  runtime.document.getElementById("schedule-refresh").dispatchEvent({ type: "click" });
+  await settle();
+
+  const refreshedCards = list.querySelectorAll("article");
+  assert.equal(refreshedCards[0].querySelectorAll("textarea")[0].value, "local edit");
+  assert.equal(refreshedCards[0].children[0].children[1].src, dirtyUrl);
+  assert.equal(runtime.objectUrls.has(dirtyUrl), true);
+  assert.equal(runtime.objectUrls.has(replacedUrl), false);
+  assert.equal(runtime.objectUrls.size, 2);
+  assert.equal(calls.filter(({ pathName }) => pathName.endsWith("/preview")).length, 3);
+
+  runtime.window.location.hash = "#dashboard";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+  assert.equal(runtime.objectUrls.size, 0);
+});
+
 test("admin runtime leaves sending and unknown schedule rows read-only", async () => {
   const runtime = createAdminRuntime({
     token: "secret",

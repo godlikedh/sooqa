@@ -436,7 +436,9 @@ paths:
       description: >-
         Orders draft, queued, sending, failed, and unknown posts by
         scheduled_at then stable ID. Published and cancelled history is hidden
-        unless include_history is true.
+        unless include_history is true. Each list item may include optional
+        bounded still-preview metadata; fetch its bytes through the authenticated
+        media preview route.
       security:
         - bearerAuth: []
       parameters:
@@ -1139,6 +1141,11 @@ components:
         media_kind: { type: string, nullable: true, enum: [video, image, animation, audio] }
         source_url: { type: string, format: uri, nullable: true }
         storage_url: { type: string, format: uri, nullable: true }
+        preview:
+          type: object
+          allOf:
+            - $ref: '#/components/schemas/MediaPreview'
+          nullable: true
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         revision: { type: integer, format: int64, minimum: 0 }
