@@ -105,9 +105,12 @@ services:
         condition: service_healthy
       telegram-bot-api:
         condition: service_healthy
-    environment: *sooqa-environment
+    environment:
+      <<: *sooqa-environment
+      SOOQA_TELEGRAM_LOCAL_FILE_ROOT: /var/lib/telegram-bot-api
     volumes:
       - home-sooqa-work:/var/lib/sooqa/work
+      - home-telegram-bot-api-data:/var/lib/telegram-bot-api:ro
 
 volumes:
   home-postgres-data:

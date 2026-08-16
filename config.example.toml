@@ -50,6 +50,9 @@ poll_timeout_seconds = 30
 upload_timeout_seconds = 3600
 # Telegram-source download budget; the local Bot API has no download limit.
 source_download_max_bytes = 2147483648
+# Worker-only absolute root for files returned by a local Bot API server. The
+# home Compose deployment supplies /var/lib/telegram-bot-api automatically.
+# local_file_root = "/var/lib/telegram-bot-api"
 # Private Telegram channel used for durable media storage.
 # storage_chat_id = -1001234567890
 
