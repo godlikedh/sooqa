@@ -61,9 +61,11 @@ literals, unsupported hosts, and non-default ports are rejected. The inspected
 canonical URL is checked against the same family and allowlist before it reaches
 the child, so metadata cannot redirect execution to a new host or weaken the
 initial SSRF boundary. A `t.co` submission is first resolved with a bounded
-redirect-disabled, no-proxy preflight; every redirect target must remain an
-X/Twitter host before the final URL is passed to yt-dlp. Its child environment
-is cleared and
+redirect-disabled, no-proxy preflight using the shared DNS resolver; every hop
+rejects private or special addresses and pins the HTTP connection to the
+validated address. Every redirect target must remain an X/Twitter status host
+before the final URL is passed to yt-dlp, and non-status X pages are rejected
+before the child starts. Its child environment is cleared and
 rebuilt with only a fixed `PATH`; `--ignore-config`, `--no-cookies`, and
 `--no-cookies-from-browser` are explicit, and no netrc or browser state is
 available. Remote components are disabled, and plugin discovery is reset to

@@ -11,6 +11,7 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
+use crate::direct_http::{self, HostResolver};
 use crate::publication::{PublishOutcome, TempDirectory, publish_or_reuse};
 use crate::{
     CommandError, DEFAULT_COMMAND_PATH, DEFAULT_MAX_OUTPUT_BYTES, DownloadError, DownloadLimits,
@@ -41,6 +42,11 @@ const MAX_YTDLP_METADATA_EXTENSION_BYTES: usize = 32;
 const MAX_TCO_REDIRECTS: u32 = 5;
 const MAX_TCO_LOCATION_BYTES: usize = 2 * 1024;
 const TCO_PREFLIGHT_USER_AGENT: &str = "sooqa-tco-preflight/1";
+type TcoClientFactory = Arc<
+    dyn Fn(&direct_http::ResolvedTarget, Duration) -> Result<reqwest::Client, DownloadError>
+        + Send
+        + Sync,
+>;
 const RUNTIME_FIXTURE: &[u8] = br#"{
   "id": "sooqa-runtime-fixture",
   "title": "sooqa runtime fixture",
@@ -156,6 +162,8 @@ pub struct YtDlpDownloader {
     config: YtDlpConfig,
     inspection_limits: DownloadLimits,
     runner: Arc<dyn ExternalCommandRunner>,
+    resolver: Arc<dyn HostResolver>,
+    tco_client_factory: TcoClientFactory,
 }
 
 impl YtDlpDownloader {
@@ -172,7 +180,37 @@ impl YtDlpDownloader {
         inspection_limits: DownloadLimits,
         runner: Arc<dyn ExternalCommandRunner>,
     ) -> Self {
-        Self { config, inspection_limits, runner }
+        Self::with_runner_and_resolver(
+            config,
+            inspection_limits,
+            runner,
+            direct_http::default_host_resolver(),
+        )
+    }
+
+    fn with_runner_and_resolver(
+        config: YtDlpConfig,
+        inspection_limits: DownloadLimits,
+        runner: Arc<dyn ExternalCommandRunner>,
+        resolver: Arc<dyn HostResolver>,
+    ) -> Self {
+        Self::with_runner_resolver_and_client(
+            config,
+            inspection_limits,
+            runner,
+            resolver,
+            Arc::new(direct_http::client_for),
+        )
+    }
+
+    fn with_runner_resolver_and_client(
+        config: YtDlpConfig,
+        inspection_limits: DownloadLimits,
+        runner: Arc<dyn ExternalCommandRunner>,
+        resolver: Arc<dyn HostResolver>,
+        tco_client_factory: TcoClientFactory,
+    ) -> Self {
+        Self { config, inspection_limits, runner, resolver, tco_client_factory }
     }
 
     async fn run_with_output_limit(
@@ -439,22 +477,12 @@ impl YtDlpDownloader {
     }
 
     async fn resolve_tco_target(&self, source_url: &str) -> Result<String, DownloadError> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(self.inspection_limits.timeout)
-            .timeout(self.inspection_limits.timeout)
-            .build()
-            .map_err(|_| {
-                DownloadError::terminal(
-                    "tco_resolution",
-                    "could not build the t.co redirect preflight client",
-                )
-            })?;
-        resolve_tco_target_with_client(
+        resolve_tco_target_with_resolver(
             source_url,
-            &client,
+            self.resolver.as_ref(),
+            self.inspection_limits.timeout,
             self.inspection_limits.max_redirects.min(MAX_TCO_REDIRECTS),
+            &self.tco_client_factory,
         )
         .await
     }
@@ -580,6 +608,11 @@ impl SourceDownloader for YtDlpDownloader {
             "--no-progress".to_owned(),
         ];
         let submitted_provider_family = provider_family_for_source_url(&submitted_url)?;
+        if submitted_provider_family == Some(YtDlpProviderFamily::X)
+            || provider_family_for_canonical_url(&extraction_url)? == Some(YtDlpProviderFamily::X)
+        {
+            validate_public_video_path(YtDlpProviderFamily::X, &extraction_url)?;
+        }
         args.extend(self.security_args(submitted_provider_family));
         args.extend([
             "--format".to_owned(),
@@ -660,6 +693,9 @@ impl SourceDownloader for YtDlpDownloader {
             .ok()
             .flatten()
             .or_else(|| provider_family_for_canonical_url(&source_url).ok().flatten());
+        if provider_family == Some(YtDlpProviderFamily::X) {
+            validate_public_video_path(YtDlpProviderFamily::X, &source_url)?;
+        }
         let attempt_max_bytes =
             limits.max_bytes.checked_mul(YTDLP_ATTEMPT_MAX_BYTES_MULTIPLIER).ok_or_else(|| {
                 DownloadError::terminal(
@@ -979,10 +1015,12 @@ fn is_tco_url(value: &str) -> Result<bool, DownloadError> {
     Ok(url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("t.co")))
 }
 
-async fn resolve_tco_target_with_client(
+async fn resolve_tco_target_with_resolver(
     source_url: &str,
-    client: &reqwest::Client,
+    resolver: &dyn HostResolver,
+    timeout: Duration,
     max_redirects: u32,
+    client_factory: &TcoClientFactory,
 ) -> Result<String, DownloadError> {
     let source_url = validate_source_url(source_url)?;
     let mut current_url = Url::parse(&source_url).expect("validated source URL should parse");
@@ -994,17 +1032,26 @@ async fn resolve_tco_target_with_client(
     }
 
     for redirect_number in 0..=max_redirects {
+        let target = direct_http::resolve_target(resolver, &current_url).await?;
+        let client = client_factory(&target, timeout)?;
         let response = client
-            .get(current_url.clone())
+            .get(target.url)
             .header(reqwest::header::RANGE, "bytes=0-0")
             .header(reqwest::header::USER_AGENT, TCO_PREFLIGHT_USER_AGENT)
             .send()
             .await
-            .map_err(|_| {
-                DownloadError::retryable(
-                    "tco_resolution",
-                    "the t.co redirect preflight could not reach its target",
-                )
+            .map_err(|error| {
+                if error.is_timeout() || error.is_connect() {
+                    DownloadError::retryable(
+                        "tco_resolution",
+                        "the t.co redirect preflight could not reach its target",
+                    )
+                } else {
+                    DownloadError::terminal(
+                        "tco_resolution",
+                        "the t.co redirect preflight request failed",
+                    )
+                }
             })?;
 
         if response.status().is_redirection() {
@@ -1039,6 +1086,7 @@ async fn resolve_tco_target_with_client(
             false,
         ) == Some(YtDlpProviderFamily::X)
         {
+            validate_public_video_path(YtDlpProviderFamily::X, current_url.as_str())?;
             return Ok(current_url.to_string());
         }
 
@@ -1539,6 +1587,8 @@ fn mime_type_for_ext(ext: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
+        net::{IpAddr, Ipv4Addr},
         os::unix::fs::PermissionsExt,
         path::PathBuf,
         process::{Command, Stdio},
@@ -1546,10 +1596,51 @@ mod tests {
     };
 
     use super::*;
+    use crate::{HostResolver, ResolvedAddress};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[derive(Clone)]
+    struct StaticResolver {
+        addresses: HashMap<String, Vec<ResolvedAddress>>,
+    }
+
+    #[async_trait]
+    impl HostResolver for StaticResolver {
+        async fn resolve(
+            &self,
+            host: &str,
+            _port: u16,
+        ) -> Result<Vec<ResolvedAddress>, DownloadError> {
+            self.addresses.get(host).cloned().ok_or_else(|| {
+                DownloadError::terminal("dns_resolution", "test resolver has no such host")
+            })
+        }
+    }
+
+    struct RecordingRunner {
+        calls: Mutex<Vec<ExternalCommand>>,
+    }
+
+    #[async_trait]
+    impl ExternalCommandRunner for RecordingRunner {
+        async fn run(
+            &self,
+            command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            self.calls.lock().expect("test mutex should not be poisoned").push(command);
+            Ok(ExternalCommandOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: br#"{"id":"abc","title":"Example","webpage_url":"http://x.com/creator/status/123","extractor":"Twitter","duration":3.5,"filesize":17,"width":1280,"height":720,"ext":"mp4","vcodec":"h264","acodec":"aac","format_id":"best"}"#.to_vec(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            })
+        }
+    }
 
     struct RuntimeProbeRunner {
         calls: Mutex<Vec<ExternalCommand>>,
@@ -1877,50 +1968,151 @@ mod tests {
         (address, server)
     }
 
-    fn tco_test_client(address: std::net::SocketAddr) -> reqwest::Client {
-        reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(1))
-            .resolve("t.co", address)
-            .resolve("x.com", address)
-            .build()
-            .expect("t.co test client should build")
+    fn tco_resolver(address: std::net::SocketAddr, x_ip: IpAddr) -> StaticResolver {
+        let tco_ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        StaticResolver {
+            addresses: HashMap::from([
+                ("t.co".to_owned(), vec![ResolvedAddress { ip: tco_ip, connect_ip: address.ip() }]),
+                ("x.com".to_owned(), vec![ResolvedAddress { ip: x_ip, connect_ip: address.ip() }]),
+            ]),
+        }
+    }
+
+    fn tco_test_client_factory(address: std::net::SocketAddr) -> TcoClientFactory {
+        Arc::new(move |target, timeout| {
+            let host = target.url.host_str().expect("test target should have a host");
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(timeout)
+                .connect_timeout(timeout)
+                .resolve(host, address)
+                .build()
+                .map_err(|error| {
+                    DownloadError::terminal(
+                        "http_client",
+                        format!("could not build test HTTP client: {error}"),
+                    )
+                })
+        })
     }
 
     #[tokio::test]
-    async fn tco_preflight_resolves_only_to_a_validated_x_target_before_ytdlp() {
+    async fn tco_inspection_pins_safe_dns_and_preserves_submitted_provenance() {
         let (address, server) = tco_redirect_fixture(vec![
             tco_redirect_response("http://x.com/creator/status/123"),
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
         ])
         .await;
-        let target =
-            resolve_tco_target_with_client("http://t.co/short-link", &tco_test_client(address), 2)
-                .await
-                .expect("t.co should resolve to the X page URL");
+        let runner = Arc::new(RecordingRunner { calls: Mutex::new(Vec::new()) });
+        let downloader = YtDlpDownloader::with_runner_resolver_and_client(
+            YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
+            DownloadLimits { max_bytes: 1024, max_redirects: 2, timeout: Duration::from_secs(1) },
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            Arc::new(tco_resolver(address, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))),
+            tco_test_client_factory(address),
+        );
+        let inspection = downloader
+            .inspect(&SourceInput {
+                ingest_request_id: Uuid::new_v4(),
+                source_url: "http://t.co/short-link".to_owned(),
+                page_url: None,
+            })
+            .await
+            .expect("t.co should resolve to the X status URL");
 
-        assert_eq!(target, "http://x.com/creator/status/123");
+        assert_eq!(inspection.source_url, "http://t.co/short-link");
+        assert_eq!(inspection.resolved_url.as_deref(), Some("http://x.com/creator/status/123"));
+        {
+            let calls = runner.calls.lock().expect("test mutex should not be poisoned");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].args().last().expect("yt-dlp URL argument should exist").to_string_lossy(),
+                "http://x.com/creator/status/123"
+            );
+        }
         server.await.expect("t.co redirect fixture should finish");
     }
 
     #[tokio::test]
-    async fn tco_preflight_rejects_an_open_redirect_before_following_untrusted_target() {
-        let (address, server) = tco_redirect_fixture(vec![
-            tco_redirect_response("http://x.com/creator/status/123"),
-            tco_redirect_response("http://169.254.169.254/latest/meta-data"),
-        ])
-        .await;
-        let error =
-            resolve_tco_target_with_client("http://t.co/short-link", &tco_test_client(address), 2)
-                .await
-                .expect_err("an X open redirect to a private target must be blocked");
+    async fn tco_inspection_rejects_forbidden_dns_before_starting_ytdlp() {
+        let (address, server) =
+            tco_redirect_fixture(vec![tco_redirect_response("http://x.com/creator/status/123")])
+                .await;
+        let runner = Arc::new(RecordingRunner { calls: Mutex::new(Vec::new()) });
+        let downloader = YtDlpDownloader::with_runner_resolver_and_client(
+            YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
+            DownloadLimits { max_bytes: 1024, max_redirects: 2, timeout: Duration::from_secs(1) },
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            Arc::new(tco_resolver(address, IpAddr::V4(Ipv4Addr::LOCALHOST))),
+            tco_test_client_factory(address),
+        );
+        let error = downloader
+            .inspect(&SourceInput {
+                ingest_request_id: Uuid::new_v4(),
+                source_url: "http://t.co/short-link".to_owned(),
+                page_url: None,
+            })
+            .await
+            .expect_err("a forbidden X DNS result must be blocked");
 
         assert!(matches!(
             error,
-            DownloadError::Terminal { ref class, .. } if class == "source_redirect_not_allowed"
+            DownloadError::Terminal { ref class, .. } if class == "ssrf_blocked"
         ));
+        assert!(runner.calls.lock().expect("test mutex should not be poisoned").is_empty());
         server.await.expect("t.co redirect fixture should finish");
+    }
+
+    #[tokio::test]
+    async fn tco_inspection_rejects_non_status_x_pages_before_starting_ytdlp() {
+        let (address, server) = tco_redirect_fixture(vec![
+            tco_redirect_response("http://x.com/home"),
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+        ])
+        .await;
+        let runner = Arc::new(RecordingRunner { calls: Mutex::new(Vec::new()) });
+        let downloader = YtDlpDownloader::with_runner_resolver_and_client(
+            YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
+            DownloadLimits { max_bytes: 1024, max_redirects: 2, timeout: Duration::from_secs(1) },
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            Arc::new(tco_resolver(address, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))),
+            tco_test_client_factory(address),
+        );
+        let error = downloader
+            .inspect(&SourceInput {
+                ingest_request_id: Uuid::new_v4(),
+                source_url: "http://t.co/short-link".to_owned(),
+                page_url: None,
+            })
+            .await
+            .expect_err("non-status X pages must be rejected during preflight");
+
+        assert_eq!(error.class(), "ytdlp_unsupported_surface");
+        assert!(runner.calls.lock().expect("test mutex should not be poisoned").is_empty());
+        server.await.expect("t.co redirect fixture should finish");
+    }
+
+    #[tokio::test]
+    async fn direct_non_status_x_pages_are_rejected_before_starting_ytdlp() {
+        let runner = Arc::new(RecordingRunner { calls: Mutex::new(Vec::new()) });
+        let downloader = YtDlpDownloader::with_runner_and_resolver(
+            YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
+            DownloadLimits::default(),
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            Arc::new(StaticResolver { addresses: HashMap::new() }),
+        );
+        let error = downloader
+            .inspect(&SourceInput {
+                ingest_request_id: Uuid::new_v4(),
+                source_url: "https://x.com/home".to_owned(),
+                page_url: None,
+            })
+            .await
+            .expect_err("non-status X pages must be rejected before inspection");
+
+        assert_eq!(error.class(), "ytdlp_unsupported_surface");
+        assert!(runner.calls.lock().expect("test mutex should not be poisoned").is_empty());
     }
 
     #[tokio::test]

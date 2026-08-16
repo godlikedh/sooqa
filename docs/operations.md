@@ -188,7 +188,9 @@ forcing one client for every page.
 The submitted URL remains the ingest provenance. After inspection, the worker
 uses the validated canonical `resolved_url` for yt-dlp execution and checks its
 scheme, credentials, port, family, and host against the same policy before
-starting the child. The configured high-quality format is attempted first. For
+starting the child. `t.co` inspection resolves each bounded hop with the shared
+DNS/private-address guard and pinned connection, and rejects non-status X pages
+before starting the child. The configured high-quality format is attempted first. For
 YouTube only, if a fresh
 attempt reports the specific media-byte `HTTP Error 403`, the worker starts one
 more high-quality attempt with fresh extractor state; if that also receives the
