@@ -283,7 +283,37 @@ function createAdminRuntime({ token = "", handler, clipboard, execCommand = () =
   let objectUrlNumber = 0;
   const windowListeners = new Map();
   const intervalListeners = new Map();
+  const intersectionObservers = new Set();
   let nextIntervalId = 1;
+  class FakeIntersectionObserver {
+    constructor(callback) {
+      this.callback = callback;
+      this.targets = new Set();
+      this.disconnected = false;
+      intersectionObservers.add(this);
+    }
+
+    observe(target) {
+      if (!this.disconnected) this.targets.add(target);
+    }
+
+    unobserve(target) {
+      this.targets.delete(target);
+    }
+
+    disconnect() {
+      this.disconnected = true;
+      this.targets.clear();
+    }
+
+    intersect(isIntersecting = true) {
+      if (!this.targets.size || this.disconnected) return;
+      this.callback(
+        [...this.targets].map((target) => ({ target, isIntersecting })),
+        this,
+      );
+    }
+  }
   const window = {
     document,
     location: { origin: "http://sooqa.test", hash: "" },
@@ -302,6 +332,7 @@ function createAdminRuntime({ token = "", handler, clipboard, execCommand = () =
       revokeObjectURL: (value) => objectUrls.delete(value),
     },
     crypto: { randomUUID: () => "admin-test-key" },
+    IntersectionObserver: FakeIntersectionObserver,
     addEventListener: (type, listener) => windowListeners.set(type, listener),
     clearTimeout: () => {},
     setTimeout: () => 0,
@@ -335,6 +366,12 @@ function createAdminRuntime({ token = "", handler, clipboard, execCommand = () =
     },
     intervalCount() {
       return intervalListeners.size;
+    },
+    intersectSchedulePreviews(isIntersecting = true) {
+      for (const observer of intersectionObservers) observer.intersect(isIntersecting);
+    },
+    activeIntersectionObserverCount() {
+      return [...intersectionObservers].filter((observer) => !observer.disconnected).length;
     },
   };
 }
@@ -701,7 +738,7 @@ test("admin runtime keeps schedule forms editable across refresh and fences ever
   assert.match(list.textContent, /No unpublished schedule work/);
 });
 
-test("admin runtime renders only advertised schedule previews and keeps failures usable", async () => {
+test("admin runtime lazily renders advertised schedule previews and keeps failures usable", async () => {
   const calls = [];
   const posts = [
     {
@@ -736,13 +773,21 @@ test("admin runtime renders only advertised schedule previews and keeps failures
 
   const cards = runtime.document.getElementById("schedule-list").querySelectorAll("article");
   assert.equal(cards.length, 3);
+  assert.equal(calls.filter(({ pathName }) => pathName.endsWith("/preview")).length, 0);
+  runtime.intersectSchedulePreviews();
+  await settle();
   assert.equal(calls.filter(({ pathName }) => pathName.endsWith("/preview")).length, 2);
   for (const call of calls.filter(({ pathName }) => pathName.endsWith("/preview"))) {
     assert.equal(call.options.headers.get("Authorization"), "Bearer secret");
+    assert.equal(call.options.headers.get("Accept"), "image/*");
     assert.doesNotMatch(call.pathName, /secret/);
   }
 
   const readyVisual = cards[0].children[0];
+  assert.equal(readyVisual.children[0].hidden, false);
+  assert.equal(readyVisual.children[1].hidden, true);
+  assert.equal(runtime.objectUrls.size, 1);
+  readyVisual.children[1].dispatchEvent({ type: "load" });
   assert.equal(readyVisual.children[0].hidden, true);
   assert.equal(readyVisual.children[1].hidden, false);
   assert.equal(runtime.objectUrls.size, 1);
@@ -794,6 +839,9 @@ test("admin runtime revokes replaced schedule previews while preserving a dirty 
   await settle();
 
   const list = runtime.document.getElementById("schedule-list");
+  assert.equal(calls.filter(({ pathName }) => pathName.endsWith("/preview")).length, 0);
+  runtime.intersectSchedulePreviews();
+  await settle();
   const dirtyCard = list.querySelectorAll("article")[0];
   const dirtyCaption = dirtyCard.querySelectorAll("textarea")[0];
   dirtyCaption.value = "local edit";
@@ -810,6 +858,11 @@ test("admin runtime revokes replaced schedule previews while preserving a dirty 
   assert.equal(refreshedCards[0].children[0].children[1].src, dirtyUrl);
   assert.equal(runtime.objectUrls.has(dirtyUrl), true);
   assert.equal(runtime.objectUrls.has(replacedUrl), false);
+  assert.equal(runtime.objectUrls.size, 1);
+  assert.equal(calls.filter(({ pathName }) => pathName.endsWith("/preview")).length, 2);
+
+  runtime.intersectSchedulePreviews();
+  await settle();
   assert.equal(runtime.objectUrls.size, 2);
   assert.equal(calls.filter(({ pathName }) => pathName.endsWith("/preview")).length, 3);
 
@@ -817,6 +870,7 @@ test("admin runtime revokes replaced schedule previews while preserving a dirty 
   runtime.dispatchWindow("hashchange");
   await settle();
   assert.equal(runtime.objectUrls.size, 0);
+  assert.equal(runtime.activeIntersectionObserverCount(), 0);
 });
 
 test("admin runtime leaves sending and unknown schedule rows read-only", async () => {

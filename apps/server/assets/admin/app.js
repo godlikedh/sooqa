@@ -274,7 +274,6 @@
     const requestOptions = options || {};
     const headers = new Headers(requestOptions.headers || {});
     headers.set("Authorization", `Bearer ${state.token}`);
-    headers.set("Accept", "application/json");
     if (requestOptions.body && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
@@ -573,6 +572,8 @@
     const entry = state.schedulePreviewEntries.get(postId);
     if (!entry) return;
     entry.active = false;
+    if (entry.observer && typeof entry.observer.disconnect === "function") entry.observer.disconnect();
+    entry.observer = null;
     revokePreviewObjectUrl(entry.objectUrl, state.schedulePreviewUrls);
     entry.objectUrl = null;
     state.schedulePreviewEntries.delete(postId);
@@ -649,6 +650,11 @@
       }
       previewUrls.add(objectUrl);
       previewEntry.objectUrl = objectUrl;
+      image.addEventListener("load", () => {
+        if (!isCurrent()) return;
+        image.hidden = false;
+        placeholder.hidden = true;
+      }, { once: true });
       image.addEventListener("error", () => {
         if (!isCurrent()) return;
         revokePreviewObjectUrl(objectUrl, previewUrls);
@@ -658,8 +664,6 @@
         placeholder.lastChild.textContent = "Preview unavailable";
       }, { once: true });
       image.src = objectUrl;
-      image.hidden = false;
-      placeholder.hidden = true;
     } catch (_error) {
       if (objectUrl) revokePreviewObjectUrl(objectUrl, previewUrls);
       if (isCurrent()) {
@@ -867,13 +871,29 @@
     return { "Idempotency-Key": `admin-ui:${randomKey()}` };
   }
 
+  function observeSchedulePreview(target, load) {
+    if (typeof window.IntersectionObserver !== "function") {
+      void load();
+      return null;
+    }
+    const observer = new window.IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        observer.unobserve(entry.target);
+        void load();
+      }
+    }, { rootMargin: "200px" });
+    observer.observe(target);
+    return observer;
+  }
+
   function renderScheduleCard(item) {
     const card = node("article", "schedule-card");
     card.dataset.postId = item.id || "";
     const visual = node("div", "media-visual schedule-visual");
     const placeholder = schedulePlaceholder(item);
     visual.append(placeholder);
-    const previewEntry = { active: true, objectUrl: null };
+    const previewEntry = { active: true, objectUrl: null, observer: null };
     state.schedulePreviewEntries.set(item.id, previewEntry);
     if (item.preview?.url) {
       const image = node("img");
@@ -882,7 +902,7 @@
       image.decoding = "async";
       image.hidden = true;
       visual.append(image);
-      void loadMediaPreview(
+      previewEntry.observer = observeSchedulePreview(visual, () => loadMediaPreview(
         item.preview.url,
         image,
         placeholder,
@@ -891,7 +911,7 @@
           && state.schedulePreviewEntries.get(item.id) === previewEntry,
         state.schedulePreviewUrls,
         previewEntry,
-      );
+      ));
     }
 
     const main = node("div", "schedule-main");
