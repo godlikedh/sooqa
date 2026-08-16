@@ -142,12 +142,14 @@ copy path for trusted-LAN HTTP sessions. If both paths fail, the full UUID is
 shown in a selectable field and the owner receives an explicit error message.
 
 Large-media capture uses Telegram's official local Bot API server when the home
-deployment is cut over manually. URL/link source downloads, Telegram-source
-downloads, and canonical normalized storage output have separate budgets. The
-source budgets may exceed the cloud Bot API's download limit; only the
-canonical normalized object is uploaded, and its configurable ceiling remains
-below the local server's documented 2000 MB upload maximum. Original inputs
-remain transient workspace artifacts.
+deployment is cut over manually. The home worker mounts the local server's data
+volume read-only and confines absolute `getFile` paths to that mount; relative
+paths and cloud downloads remain bounded HTTP transfers. URL/link source
+downloads, Telegram-source downloads, and canonical normalized storage output
+have separate budgets. The source budgets may exceed the cloud Bot API's
+download limit; only the canonical normalized object is uploaded, and its
+configurable ceiling remains below the local server's documented 2000 MB upload
+maximum. Original inputs remain transient workspace artifacts.
 Telegram storage uploads also use a separate bounded deadline suitable for
 2 GB-class transfers; it is independent from polling and download stall
 timeouts.

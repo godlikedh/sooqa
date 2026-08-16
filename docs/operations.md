@@ -121,6 +121,11 @@ separate:
 - `SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES` bounds URL/link source staging and
   may be larger than 2 GB because normalization can reduce the source;
 - `SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES` bounds Telegram-source staging;
+- `SOOQA_TELEGRAM_LOCAL_FILE_ROOT` optionally enables worker-side copying of
+  absolute paths returned by a local Bot API server. The root must be absolute;
+  every configured local path is canonicalized and confined beneath it. The
+  home Compose deployment sets this to `/var/lib/telegram-bot-api` only for the
+  worker and mounts that volume read-only;
 - `SOOQA_TELEGRAM_UPLOAD_TIMEOUT_SECONDS` bounds one Telegram storage upload
   independently from polling and download timeouts. It defaults to one hour
   and is capped at 24 hours;
@@ -339,12 +344,18 @@ caption, media kind, MIME type, name, and advertised size, then acknowledges
 the update. It does not create a workspace or download media bytes.
 
 The worker creates the generation workspace while probing and reconstructs the
-source from the durable `file_id`. The download is streamed into the private
-workspace with `SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES`, then probed and
-processed under the normal durable lease/retry flow. A replayed update uses the
-same Telegram update idempotency key, so it returns the existing ingest without
-another acceptance job or eager download. This keeps the polling loop
-responsive while a large worker download is running.
+source from the durable `file_id`. Relative file paths and cloud Bot API files
+are streamed over the bounded HTTP route. In local Bot API mode, an absolute
+`getFile` path is copied only when the worker has the configured read-only file
+root; canonicalization rejects traversal, outside-root paths, symlink escapes,
+and non-regular files. Both paths use the same size-limited temporary file and
+atomic publication, and the reported size must match the copied bytes. Internal
+Bot API paths are not persisted or included in normal API/log output. A
+terminal local-path/configuration error is not retried five times as an HTTP
+download. A replayed update uses the same Telegram update idempotency key, so it
+returns the existing ingest without another acceptance job or eager download.
+This keeps the polling loop responsive while a large worker download is
+running.
 
 ## Local companion and 2ch capture
 
@@ -560,8 +571,12 @@ The official `tdlib/telegram-bot-api` source is built at the commit pinned in
 `deploy/telegram-bot-api/Dockerfile`. The local server runs with `--local`,
 stores its working state in the dedicated `home-telegram-bot-api-data` volume,
 and exposes port 8081 only to the Compose network. sooqa reaches it as
-`http://telegram-bot-api:8081`; the server and worker share only the separate
-`home-sooqa-work` volume for sooqa media workspaces.
+`http://telegram-bot-api:8081`; the server and worker share the separate
+`home-sooqa-work` volume for sooqa media workspaces, while the worker alone
+mounts `home-telegram-bot-api-data` read-only at
+`/var/lib/telegram-bot-api`. This second mount lets the worker copy the
+absolute paths returned by `getFile` without putting those paths into an HTTP
+file URL. Relative paths continue to use the bounded HTTP route.
 
 Do not run this cutover automatically. To move a running bot from the cloud to
 the local server, obtain owner authorization, stop every sooqa poller, call
