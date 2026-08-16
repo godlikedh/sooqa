@@ -38,6 +38,9 @@ const MAX_YTDLP_METADATA_EXTRACTOR_BYTES: usize = 128;
 const MAX_YTDLP_METADATA_FORMAT_BYTES: usize = 1024;
 const MAX_YTDLP_METADATA_MIME_BYTES: usize = 128;
 const MAX_YTDLP_METADATA_EXTENSION_BYTES: usize = 32;
+const MAX_TCO_REDIRECTS: u32 = 5;
+const MAX_TCO_LOCATION_BYTES: usize = 2 * 1024;
+const TCO_PREFLIGHT_USER_AGENT: &str = "sooqa-tco-preflight/1";
 const RUNTIME_FIXTURE: &[u8] = br#"{
   "id": "sooqa-runtime-fixture",
   "title": "sooqa runtime fixture",
@@ -434,6 +437,27 @@ impl YtDlpDownloader {
         }
         args
     }
+
+    async fn resolve_tco_target(&self, source_url: &str) -> Result<String, DownloadError> {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(self.inspection_limits.timeout)
+            .timeout(self.inspection_limits.timeout)
+            .build()
+            .map_err(|_| {
+                DownloadError::terminal(
+                    "tco_resolution",
+                    "could not build the t.co redirect preflight client",
+                )
+            })?;
+        resolve_tco_target_with_client(
+            source_url,
+            &client,
+            self.inspection_limits.max_redirects.min(MAX_TCO_REDIRECTS),
+        )
+        .await
+    }
 }
 
 impl YtDlpDownloader {
@@ -542,7 +566,12 @@ impl YtDlpDownloader {
 impl SourceDownloader for YtDlpDownloader {
     async fn inspect(&self, source: &SourceInput) -> Result<SourceInspection, DownloadError> {
         validate_limits(&self.inspection_limits, self.inspection_limits.timeout)?;
-        let source_url = validate_source_url(&source.source_url)?;
+        let submitted_url = validate_source_url(&source.source_url)?;
+        let extraction_url = if is_tco_url(&submitted_url)? {
+            self.resolve_tco_target(&submitted_url).await?
+        } else {
+            submitted_url.clone()
+        };
         let mut args = vec![
             "--dump-single-json".to_owned(),
             "--skip-download".to_owned(),
@@ -550,23 +579,23 @@ impl SourceDownloader for YtDlpDownloader {
             "--no-warnings".to_owned(),
             "--no-progress".to_owned(),
         ];
-        let submitted_provider_family = provider_family_for_source_url(&source_url)?;
+        let submitted_provider_family = provider_family_for_source_url(&submitted_url)?;
         args.extend(self.security_args(submitted_provider_family));
         args.extend([
             "--format".to_owned(),
             self.config.format_selection.clone(),
             "--".to_owned(),
-            source_url.clone(),
+            extraction_url.clone(),
         ]);
         let output = self
             .run_with_output_limit(
                 args,
                 self.inspection_limits.timeout,
-                &source_url,
+                &extraction_url,
                 self.config.metadata_max_output_bytes,
             )
             .await?;
-        let mut metadata = parse_metadata(&output.stdout, &source_url)?;
+        let mut metadata = parse_metadata(&output.stdout, &extraction_url)?;
         if metadata.filesize_bytes.is_some_and(|bytes| bytes > self.inspection_limits.max_bytes) {
             return Err(DownloadError::terminal(
                 "source_too_large",
@@ -583,15 +612,17 @@ impl SourceDownloader for YtDlpDownloader {
             .as_deref()
             .map(validate_source_url)
             .transpose()?
-            .or_else(|| Some(source_url.clone()));
+            .or_else(|| Some(extraction_url.clone()));
         if submitted_provider_family.is_some()
-            || is_tco_url(&source_url)?
-            || provider_family_for_canonical_url(resolved_url.as_deref().unwrap_or(&source_url))?
-                .is_some()
+            || is_tco_url(&submitted_url)?
+            || provider_family_for_canonical_url(
+                resolved_url.as_deref().unwrap_or(&extraction_url),
+            )?
+            .is_some()
         {
             let family = validate_provider_metadata(
-                &source_url,
-                resolved_url.as_deref().unwrap_or(&source_url),
+                &submitted_url,
+                resolved_url.as_deref().unwrap_or(&extraction_url),
                 media_kind,
                 Some(&metadata),
             )?;
@@ -946,6 +977,114 @@ fn is_tco_url(value: &str) -> Result<bool, DownloadError> {
     let normalized = validate_source_url(value)?;
     let url = Url::parse(&normalized).expect("validated source URL should parse");
     Ok(url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("t.co")))
+}
+
+async fn resolve_tco_target_with_client(
+    source_url: &str,
+    client: &reqwest::Client,
+    max_redirects: u32,
+) -> Result<String, DownloadError> {
+    let source_url = validate_source_url(source_url)?;
+    let mut current_url = Url::parse(&source_url).expect("validated source URL should parse");
+    if !is_tco_url(&source_url)? {
+        return Err(DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co preflight requires a t.co source URL",
+        ));
+    }
+
+    for redirect_number in 0..=max_redirects {
+        let response = client
+            .get(current_url.clone())
+            .header(reqwest::header::RANGE, "bytes=0-0")
+            .header(reqwest::header::USER_AGENT, TCO_PREFLIGHT_USER_AGENT)
+            .send()
+            .await
+            .map_err(|_| {
+                DownloadError::retryable(
+                    "tco_resolution",
+                    "the t.co redirect preflight could not reach its target",
+                )
+            })?;
+
+        if response.status().is_redirection() {
+            if redirect_number >= max_redirects {
+                return Err(DownloadError::terminal(
+                    "redirect_limit",
+                    "the t.co redirect chain exceeded the configured limit",
+                ));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| {
+                    DownloadError::terminal(
+                        "source_redirect_not_allowed",
+                        "the t.co redirect response did not include a Location header",
+                    )
+                })?
+                .to_str()
+                .map_err(|_| {
+                    DownloadError::terminal(
+                        "source_redirect_not_allowed",
+                        "the t.co redirect Location header was not valid UTF-8",
+                    )
+                })?;
+            current_url = validate_tco_redirect_target(&current_url, location)?;
+            continue;
+        }
+
+        if provider_family_for_host(
+            current_url.host_str().expect("validated URL has a host"),
+            false,
+        ) == Some(YtDlpProviderFamily::X)
+        {
+            return Ok(current_url.to_string());
+        }
+
+        return Err(DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co URL did not resolve to an X/Twitter page",
+        ));
+    }
+
+    Err(DownloadError::terminal(
+        "redirect_limit",
+        "the t.co redirect chain exceeded the configured limit",
+    ))
+}
+
+fn validate_tco_redirect_target(current_url: &Url, location: &str) -> Result<Url, DownloadError> {
+    if location.len() > MAX_TCO_LOCATION_BYTES || location.chars().any(char::is_control) {
+        return Err(DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co redirect Location header exceeded its safety limit",
+        ));
+    }
+
+    let target = current_url.join(location).map_err(|_| {
+        DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co redirect Location header was not a valid URL",
+        )
+    })?;
+    let normalized = validate_source_url(target.as_str()).map_err(|_| {
+        DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co redirect target failed URL validation",
+        )
+    })?;
+    let target = Url::parse(&normalized).expect("validated redirect URL should parse");
+    let is_x_target = target
+        .host_str()
+        .is_some_and(|host| provider_family_for_host(host, false) == Some(YtDlpProviderFamily::X));
+    if !is_x_target {
+        return Err(DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co redirect target is not an X/Twitter host",
+        ));
+    }
+    Ok(target)
 }
 
 fn extractor_matches_provider(family: YtDlpProviderFamily, extractor: &str) -> bool {
@@ -1705,6 +1844,83 @@ mod tests {
             .expect_err("oversized provider response should fail preflight");
         assert!(error.contains("oversized health response"));
         server.await.expect("provider fixture should finish");
+    }
+
+    fn tco_redirect_response(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    async fn tco_redirect_fixture(
+        responses: Vec<String>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").await.expect("t.co redirect fixture should bind");
+        let address = listener.local_addr().expect("t.co redirect fixture address should be known");
+        let server = tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) =
+                    listener.accept().await.expect("t.co redirect request should arrive");
+                let mut request = [0_u8; 4096];
+                let read = stream
+                    .read(&mut request)
+                    .await
+                    .expect("t.co redirect request should be readable");
+                assert!(read > 0, "t.co redirect request should not be empty");
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("t.co redirect response should be writable");
+            }
+        });
+        (address, server)
+    }
+
+    fn tco_test_client(address: std::net::SocketAddr) -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(1))
+            .resolve("t.co", address)
+            .resolve("x.com", address)
+            .build()
+            .expect("t.co test client should build")
+    }
+
+    #[tokio::test]
+    async fn tco_preflight_resolves_only_to_a_validated_x_target_before_ytdlp() {
+        let (address, server) = tco_redirect_fixture(vec![
+            tco_redirect_response("http://x.com/creator/status/123"),
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+        ])
+        .await;
+        let target =
+            resolve_tco_target_with_client("http://t.co/short-link", &tco_test_client(address), 2)
+                .await
+                .expect("t.co should resolve to the X page URL");
+
+        assert_eq!(target, "http://x.com/creator/status/123");
+        server.await.expect("t.co redirect fixture should finish");
+    }
+
+    #[tokio::test]
+    async fn tco_preflight_rejects_an_open_redirect_before_following_untrusted_target() {
+        let (address, server) = tco_redirect_fixture(vec![
+            tco_redirect_response("http://x.com/creator/status/123"),
+            tco_redirect_response("http://169.254.169.254/latest/meta-data"),
+        ])
+        .await;
+        let error =
+            resolve_tco_target_with_client("http://t.co/short-link", &tco_test_client(address), 2)
+                .await
+                .expect_err("an X open redirect to a private target must be blocked");
+
+        assert!(matches!(
+            error,
+            DownloadError::Terminal { ref class, .. } if class == "source_redirect_not_allowed"
+        ));
+        server.await.expect("t.co redirect fixture should finish");
     }
 
     #[tokio::test]

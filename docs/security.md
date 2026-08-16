@@ -60,16 +60,20 @@ only when canonical inspection produces an X/Twitter status. Credentials, IP
 literals, unsupported hosts, and non-default ports are rejected. The inspected
 canonical URL is checked against the same family and allowlist before it reaches
 the child, so metadata cannot redirect execution to a new host or weaken the
-initial SSRF boundary. Its child environment is cleared and
+initial SSRF boundary. A `t.co` submission is first resolved with a bounded
+redirect-disabled, no-proxy preflight; every redirect target must remain an
+X/Twitter host before the final URL is passed to yt-dlp. Its child environment
+is cleared and
 rebuilt with only a fixed `PATH`; `--ignore-config`, `--no-cookies`, and
 `--no-cookies-from-browser` are explicit, and no netrc or browser state is
 available. Remote components are disabled, and plugin discovery is reset to
 the exact `/usr/local/share/sooqa/yt-dlp-plugins` directory containing the
 pinned bgutil plugin. The home image pins the official yt-dlp and Deno
 distributions by version and SHA-256 checksum, plus the plugin release ZIP by
-its release checksum. yt-dlp may follow provider redirects and fetch
-provider/CDN URLs after an allowlisted page is accepted, which is part of the
-single-admin deployment's explicit trust boundary. The home Compose PO-token
+its release checksum. yt-dlp may follow provider/CDN redirects after an
+allowlisted page is accepted, which is part of the single-admin deployment's
+explicit trust boundary; the separate `t.co` preflight prevents an open
+redirect from reaching yt-dlp first. The home Compose PO-token
 provider is private-network-only, has no host-published port, and is checked
 for the pinned `1.3.1` version at worker startup. Each yt-dlp attempt gets a
 unique job-owned directory with a relative output and explicit home/temp paths;
