@@ -44,6 +44,10 @@ pub trait HostResolver: Send + Sync {
 #[derive(Debug, Default)]
 struct SystemResolver;
 
+pub(crate) fn default_host_resolver() -> Arc<dyn HostResolver> {
+    Arc::new(SystemResolver)
+}
+
 #[async_trait]
 impl HostResolver for SystemResolver {
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<ResolvedAddress>, DownloadError> {
@@ -72,7 +76,7 @@ pub struct DirectHttpDownloader {
 
 impl DirectHttpDownloader {
     pub fn new(inspection_limits: DownloadLimits) -> Self {
-        Self::with_resolver(inspection_limits, Arc::new(SystemResolver))
+        Self::with_resolver(inspection_limits, default_host_resolver())
     }
 
     pub fn with_resolver(
@@ -92,8 +96,8 @@ impl DirectHttpDownloader {
         let mut current_url = start_url;
 
         for redirect_number in 0..=limits.max_redirects {
-            let target = self.resolve_target(&current_url).await?;
-            let client = self.client_for(&target, limits.timeout)?;
+            let target = resolve_target(self.resolver.as_ref(), &current_url).await?;
+            let client = client_for(&target, limits.timeout)?;
             let request = client.get(target.url.clone());
             let request =
                 if inspect_prefix { request.header(RANGE, "bytes=0-511") } else { request };
@@ -141,76 +145,6 @@ impl DirectHttpDownloader {
             "redirect_limit",
             "source exceeded the configured redirect limit",
         ))
-    }
-
-    async fn resolve_target(&self, url: &Url) -> Result<ResolvedTarget, DownloadError> {
-        validate_url(url)?;
-        let port = url.port_or_known_default().ok_or_else(|| {
-            DownloadError::terminal("missing_source_port", "source URL has no usable port")
-        })?;
-
-        let (host, is_domain, addresses) = match url.host() {
-            Some(Host::Domain(domain)) => {
-                let addresses = self.resolver.resolve(domain, port).await?;
-                (domain.to_owned(), true, addresses)
-            }
-            Some(Host::Ipv4(address)) => {
-                let ip = IpAddr::V4(address);
-                (address.to_string(), false, vec![ResolvedAddress::same(ip)])
-            }
-            Some(Host::Ipv6(address)) => {
-                let ip = IpAddr::V6(address);
-                (address.to_string(), false, vec![ResolvedAddress::same(ip)])
-            }
-            None => {
-                return Err(DownloadError::terminal(
-                    "missing_source_host",
-                    "source URL has no host",
-                ));
-            }
-        };
-
-        if addresses.is_empty() {
-            return Err(DownloadError::retryable(
-                "dns_resolution",
-                "host resolved to no addresses",
-            ));
-        }
-
-        if let Some(blocked) = addresses.iter().find(|address| is_blocked_ip(address.ip)) {
-            return Err(DownloadError::terminal(
-                "ssrf_blocked",
-                format!("source resolved to a forbidden address: {}", blocked.ip),
-            ));
-        }
-
-        Ok(ResolvedTarget {
-            url: url.clone(),
-            host,
-            is_domain,
-            port,
-            connect_ip: addresses[0].connect_ip,
-        })
-    }
-
-    fn client_for(
-        &self,
-        target: &ResolvedTarget,
-        timeout: Duration,
-    ) -> Result<Client, DownloadError> {
-        let mut builder = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .timeout(timeout)
-            .connect_timeout(timeout)
-            .read_timeout(timeout);
-        if target.is_domain {
-            builder =
-                builder.resolve(&target.host, SocketAddr::new(target.connect_ip, target.port));
-        }
-        builder.build().map_err(|error| {
-            DownloadError::terminal("http_client", format!("could not build HTTP client: {error}"))
-        })
     }
 }
 
@@ -353,12 +287,77 @@ async fn stream_to_file(
 }
 
 #[derive(Debug)]
-struct ResolvedTarget {
-    url: Url,
+pub(crate) struct ResolvedTarget {
+    pub(crate) url: Url,
     host: String,
     is_domain: bool,
     port: u16,
     connect_ip: IpAddr,
+}
+
+pub(crate) async fn resolve_target(
+    resolver: &dyn HostResolver,
+    url: &Url,
+) -> Result<ResolvedTarget, DownloadError> {
+    validate_url(url)?;
+    let port = url.port_or_known_default().ok_or_else(|| {
+        DownloadError::terminal("missing_source_port", "source URL has no usable port")
+    })?;
+
+    let (host, is_domain, addresses) = match url.host() {
+        Some(Host::Domain(domain)) => {
+            let addresses = resolver.resolve(domain, port).await?;
+            (domain.to_owned(), true, addresses)
+        }
+        Some(Host::Ipv4(address)) => {
+            let ip = IpAddr::V4(address);
+            (address.to_string(), false, vec![ResolvedAddress::same(ip)])
+        }
+        Some(Host::Ipv6(address)) => {
+            let ip = IpAddr::V6(address);
+            (address.to_string(), false, vec![ResolvedAddress::same(ip)])
+        }
+        None => {
+            return Err(DownloadError::terminal("missing_source_host", "source URL has no host"));
+        }
+    };
+
+    if addresses.is_empty() {
+        return Err(DownloadError::retryable("dns_resolution", "host resolved to no addresses"));
+    }
+
+    if let Some(blocked) = addresses.iter().find(|address| is_blocked_ip(address.ip)) {
+        return Err(DownloadError::terminal(
+            "ssrf_blocked",
+            format!("source resolved to a forbidden address: {}", blocked.ip),
+        ));
+    }
+
+    Ok(ResolvedTarget {
+        url: url.clone(),
+        host,
+        is_domain,
+        port,
+        connect_ip: addresses[0].connect_ip,
+    })
+}
+
+pub(crate) fn client_for(
+    target: &ResolvedTarget,
+    timeout: Duration,
+) -> Result<Client, DownloadError> {
+    let mut builder = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(timeout)
+        .connect_timeout(timeout)
+        .read_timeout(timeout);
+    if target.is_domain {
+        builder = builder.resolve(&target.host, SocketAddr::new(target.connect_ip, target.port));
+    }
+    builder.build().map_err(|error| {
+        DownloadError::terminal("http_client", format!("could not build HTTP client: {error}"))
+    })
 }
 
 struct FetchResult {

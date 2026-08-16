@@ -11,6 +11,7 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
+use crate::direct_http::{self, HostResolver};
 use crate::publication::{PublishOutcome, TempDirectory, publish_or_reuse};
 use crate::{
     CommandError, DEFAULT_COMMAND_PATH, DEFAULT_MAX_OUTPUT_BYTES, DownloadError, DownloadLimits,
@@ -31,6 +32,21 @@ pub const MAX_YTDLP_FORMAT_SELECTION_BYTES: usize = 1024;
 pub const YTDLP_PROGRESSIVE_FALLBACK_FORMAT: &str =
     "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]";
 pub const DEFAULT_YTDLP_METADATA_MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_YTDLP_METADATA_ID_BYTES: usize = 256;
+const MAX_YTDLP_METADATA_TEXT_BYTES: usize = 4 * 1024;
+const MAX_YTDLP_METADATA_URL_BYTES: usize = 2 * 1024;
+const MAX_YTDLP_METADATA_EXTRACTOR_BYTES: usize = 128;
+const MAX_YTDLP_METADATA_FORMAT_BYTES: usize = 1024;
+const MAX_YTDLP_METADATA_MIME_BYTES: usize = 128;
+const MAX_YTDLP_METADATA_EXTENSION_BYTES: usize = 32;
+const MAX_TCO_REDIRECTS: u32 = 5;
+const MAX_TCO_LOCATION_BYTES: usize = 2 * 1024;
+const TCO_PREFLIGHT_USER_AGENT: &str = "sooqa-tco-preflight/1";
+type TcoClientFactory = Arc<
+    dyn Fn(&direct_http::ResolvedTarget, Duration) -> Result<reqwest::Client, DownloadError>
+        + Send
+        + Sync,
+>;
 const RUNTIME_FIXTURE: &[u8] = br#"{
   "id": "sooqa-runtime-fixture",
   "title": "sooqa runtime fixture",
@@ -42,6 +58,28 @@ const RUNTIME_FIXTURE: &[u8] = br#"{
   "acodec": "none"
 }
 "#;
+
+/// The provider families that the page adapter may handle. This is
+/// deliberately a closed set: configuring an arbitrary hostname must not
+/// turn yt-dlp into a general-purpose downloader.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum YtDlpProviderFamily {
+    Youtube,
+    Tiktok,
+    Instagram,
+    X,
+}
+
+impl YtDlpProviderFamily {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Youtube => "youtube",
+            Self::Tiktok => "tiktok",
+            Self::Instagram => "instagram",
+            Self::X => "x",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct YtDlpConfig {
@@ -124,6 +162,8 @@ pub struct YtDlpDownloader {
     config: YtDlpConfig,
     inspection_limits: DownloadLimits,
     runner: Arc<dyn ExternalCommandRunner>,
+    resolver: Arc<dyn HostResolver>,
+    tco_client_factory: TcoClientFactory,
 }
 
 impl YtDlpDownloader {
@@ -140,7 +180,37 @@ impl YtDlpDownloader {
         inspection_limits: DownloadLimits,
         runner: Arc<dyn ExternalCommandRunner>,
     ) -> Self {
-        Self { config, inspection_limits, runner }
+        Self::with_runner_and_resolver(
+            config,
+            inspection_limits,
+            runner,
+            direct_http::default_host_resolver(),
+        )
+    }
+
+    fn with_runner_and_resolver(
+        config: YtDlpConfig,
+        inspection_limits: DownloadLimits,
+        runner: Arc<dyn ExternalCommandRunner>,
+        resolver: Arc<dyn HostResolver>,
+    ) -> Self {
+        Self::with_runner_resolver_and_client(
+            config,
+            inspection_limits,
+            runner,
+            resolver,
+            Arc::new(direct_http::client_for),
+        )
+    }
+
+    fn with_runner_resolver_and_client(
+        config: YtDlpConfig,
+        inspection_limits: DownloadLimits,
+        runner: Arc<dyn ExternalCommandRunner>,
+        resolver: Arc<dyn HostResolver>,
+        tco_client_factory: TcoClientFactory,
+    ) -> Self {
+        Self { config, inspection_limits, runner, resolver, tco_client_factory }
     }
 
     async fn run_with_output_limit(
@@ -188,6 +258,7 @@ impl YtDlpDownloader {
         source_url: &str,
         output_directory: &Path,
         max_bytes: u64,
+        provider_family: Option<YtDlpProviderFamily>,
     ) -> Result<ExternalCommandOutput, DownloadError> {
         if timeout.is_zero() {
             return Err(DownloadError::terminal(
@@ -220,7 +291,7 @@ impl YtDlpDownloader {
             ));
         }
         if !output.success {
-            return Err(map_download_failure(&output, source_url));
+            return Err(map_download_failure(&output, source_url, provider_family));
         }
         Ok(output)
     }
@@ -260,7 +331,7 @@ impl YtDlpDownloader {
             "--skip-download".to_owned(),
             "--no-playlist".to_owned(),
         ];
-        args.extend(self.security_args());
+        args.extend(self.security_args(None));
         args.extend(["--load-info-json".to_owned(), fixture_path.display().to_string()]);
         let command = args
             .into_iter()
@@ -384,8 +455,8 @@ impl YtDlpDownloader {
         Ok(())
     }
 
-    fn security_args(&self) -> Vec<String> {
-        vec![
+    fn security_args(&self, provider_family: Option<YtDlpProviderFamily>) -> Vec<String> {
+        let mut args = vec![
             "--ignore-config".to_owned(),
             "--no-plugin-dirs".to_owned(),
             "--plugin-dirs".to_owned(),
@@ -395,9 +466,25 @@ impl YtDlpDownloader {
             "--no-cookies-from-browser".to_owned(),
             "--js-runtimes".to_owned(),
             format!("deno:{}", self.config.deno_path.display()),
-            "--extractor-args".to_owned(),
-            format!("youtubepot-bgutilhttp:base_url={}", self.config.pot_provider_url),
-        ]
+        ];
+        if provider_family == Some(YtDlpProviderFamily::Youtube) {
+            args.extend([
+                "--extractor-args".to_owned(),
+                format!("youtubepot-bgutilhttp:base_url={}", self.config.pot_provider_url),
+            ]);
+        }
+        args
+    }
+
+    async fn resolve_tco_target(&self, source_url: &str) -> Result<String, DownloadError> {
+        resolve_tco_target_with_resolver(
+            source_url,
+            self.resolver.as_ref(),
+            self.inspection_limits.timeout,
+            self.inspection_limits.max_redirects.min(MAX_TCO_REDIRECTS),
+            &self.tco_client_factory,
+        )
+        .await
     }
 }
 
@@ -407,10 +494,12 @@ impl YtDlpDownloader {
         inspection: &SourceInspection,
         destination: &Path,
         limits: &DownloadLimits,
-        source_url: &str,
         attempt_max_bytes: u64,
         format_selection: &str,
+        provider_family: Option<YtDlpProviderFamily>,
     ) -> Result<DownloadedSource, DownloadError> {
+        let source_url = inspection.resolved_url.as_deref().unwrap_or(&inspection.source_url);
+        let source_url = validate_source_url(source_url)?;
         validate_format_selection(format_selection)
             .map_err(|error| DownloadError::terminal("ytdlp_format", error.to_string()))?;
         let attempt_path = destination.with_file_name(format!(".sooqa-ytdlp-{}", Uuid::new_v4()));
@@ -429,7 +518,7 @@ impl YtDlpDownloader {
             "--force-overwrites".to_owned(),
             "--no-cache-dir".to_owned(),
         ];
-        args.extend(self.security_args());
+        args.extend(self.security_args(provider_family));
         args.extend([
             "--paths".to_owned(),
             "home:.".to_owned(),
@@ -444,8 +533,15 @@ impl YtDlpDownloader {
             "--".to_owned(),
             source_url.to_owned(),
         ]);
-        self.run_sequence(args, limits.timeout, source_url, attempt.path(), attempt_max_bytes)
-            .await?;
+        self.run_sequence(
+            args,
+            limits.timeout,
+            &source_url,
+            attempt.path(),
+            attempt_max_bytes,
+            provider_family,
+        )
+        .await?;
 
         let final_path = single_regular_file(attempt.path()).await.map_err(|source| {
             DownloadError::terminal(
@@ -498,7 +594,12 @@ impl YtDlpDownloader {
 impl SourceDownloader for YtDlpDownloader {
     async fn inspect(&self, source: &SourceInput) -> Result<SourceInspection, DownloadError> {
         validate_limits(&self.inspection_limits, self.inspection_limits.timeout)?;
-        let source_url = validate_source_url(&source.source_url)?;
+        let submitted_url = validate_source_url(&source.source_url)?;
+        let extraction_url = if is_tco_url(&submitted_url)? {
+            self.resolve_tco_target(&submitted_url).await?
+        } else {
+            submitted_url.clone()
+        };
         let mut args = vec![
             "--dump-single-json".to_owned(),
             "--skip-download".to_owned(),
@@ -506,22 +607,28 @@ impl SourceDownloader for YtDlpDownloader {
             "--no-warnings".to_owned(),
             "--no-progress".to_owned(),
         ];
-        args.extend(self.security_args());
+        let submitted_provider_family = provider_family_for_source_url(&submitted_url)?;
+        if submitted_provider_family == Some(YtDlpProviderFamily::X)
+            || provider_family_for_canonical_url(&extraction_url)? == Some(YtDlpProviderFamily::X)
+        {
+            validate_public_video_path(YtDlpProviderFamily::X, &extraction_url)?;
+        }
+        args.extend(self.security_args(submitted_provider_family));
         args.extend([
             "--format".to_owned(),
             self.config.format_selection.clone(),
             "--".to_owned(),
-            source_url.clone(),
+            extraction_url.clone(),
         ]);
         let output = self
             .run_with_output_limit(
                 args,
                 self.inspection_limits.timeout,
-                &source_url,
+                &extraction_url,
                 self.config.metadata_max_output_bytes,
             )
             .await?;
-        let metadata = parse_metadata(&output.stdout, &source_url)?;
+        let mut metadata = parse_metadata(&output.stdout, &extraction_url)?;
         if metadata.filesize_bytes.is_some_and(|bytes| bytes > self.inspection_limits.max_bytes) {
             return Err(DownloadError::terminal(
                 "source_too_large",
@@ -538,7 +645,22 @@ impl SourceDownloader for YtDlpDownloader {
             .as_deref()
             .map(validate_source_url)
             .transpose()?
-            .or_else(|| Some(source_url.clone()));
+            .or_else(|| Some(extraction_url.clone()));
+        if submitted_provider_family.is_some()
+            || is_tco_url(&submitted_url)?
+            || provider_family_for_canonical_url(
+                resolved_url.as_deref().unwrap_or(&extraction_url),
+            )?
+            .is_some()
+        {
+            let family = validate_provider_metadata(
+                &submitted_url,
+                resolved_url.as_deref().unwrap_or(&extraction_url),
+                media_kind,
+                Some(&metadata),
+            )?;
+            metadata.platform = Some(family.as_str().to_owned());
+        }
         let metadata = serde_json::to_value(&metadata).map_err(|error| {
             DownloadError::terminal(
                 "ytdlp_metadata",
@@ -567,6 +689,13 @@ impl SourceDownloader for YtDlpDownloader {
         validate_limits(limits, limits.timeout)?;
         let source_url = inspection.resolved_url.as_deref().unwrap_or(&inspection.source_url);
         let source_url = validate_source_url(source_url)?;
+        let provider_family = provider_family_for_source_url(&inspection.source_url)
+            .ok()
+            .flatten()
+            .or_else(|| provider_family_for_canonical_url(&source_url).ok().flatten());
+        if provider_family == Some(YtDlpProviderFamily::X) {
+            validate_public_video_path(YtDlpProviderFamily::X, &source_url)?;
+        }
         let attempt_max_bytes =
             limits.max_bytes.checked_mul(YTDLP_ATTEMPT_MAX_BYTES_MULTIPLIER).ok_or_else(|| {
                 DownloadError::terminal(
@@ -581,9 +710,9 @@ impl SourceDownloader for YtDlpDownloader {
                 inspection,
                 destination,
                 limits,
-                &source_url,
                 attempt_max_bytes,
                 &high_quality_format,
+                provider_family,
             )
             .await;
         match first_attempt {
@@ -601,9 +730,9 @@ impl SourceDownloader for YtDlpDownloader {
                 inspection,
                 destination,
                 limits,
-                &source_url,
                 attempt_max_bytes,
                 &high_quality_format,
+                provider_family,
             )
             .await;
         match second_attempt {
@@ -613,9 +742,9 @@ impl SourceDownloader for YtDlpDownloader {
                     inspection,
                     destination,
                     limits,
-                    &source_url,
                     attempt_max_bytes,
                     YTDLP_PROGRESSIVE_FALLBACK_FORMAT,
+                    provider_family,
                 )
                 .await
                 .map_err(|fallback_error| {
@@ -669,6 +798,7 @@ pub struct YtDlpMetadata {
     pub title: Option<String>,
     pub webpage_url: Option<String>,
     pub extractor: Option<String>,
+    pub platform: Option<String>,
     pub duration_ms: Option<u64>,
     pub filesize_bytes: Option<u64>,
     pub width: Option<u32>,
@@ -700,6 +830,8 @@ impl YtDlpMetadata {
 
 #[derive(Debug, Deserialize)]
 struct RawYtDlpMetadata {
+    #[serde(rename = "_type")]
+    item_type: Option<String>,
     id: Option<String>,
     title: Option<String>,
     webpage_url: Option<String>,
@@ -719,6 +851,12 @@ struct RawYtDlpMetadata {
     format: Option<String>,
     thumbnail: Option<String>,
     uploader: Option<String>,
+    #[serde(default)]
+    entries: Option<serde_json::Value>,
+    playlist_count: Option<u64>,
+    n_entries: Option<u64>,
+    is_live: Option<bool>,
+    live_status: Option<String>,
 }
 
 fn parse_metadata(input: &[u8], source_url: &str) -> Result<YtDlpMetadata, DownloadError> {
@@ -728,25 +866,448 @@ fn parse_metadata(input: &[u8], source_url: &str) -> Result<YtDlpMetadata, Downl
             format!("yt-dlp returned invalid JSON: {error}"),
         )
     })?;
-    let mime_type = raw.mime_type.or_else(|| mime_type_for_ext(raw.ext.as_deref()));
+    if raw.entries.as_ref().is_some_and(|entries| !entries.is_null())
+        || raw.playlist_count.is_some_and(|count| count > 1)
+        || raw.n_entries.is_some_and(|count| count > 1)
+        || raw.item_type.as_deref().is_some_and(|item_type| {
+            matches!(item_type.to_ascii_lowercase().as_str(), "playlist" | "multi_video")
+        })
+    {
+        return Err(DownloadError::terminal(
+            "ytdlp_unsupported_surface",
+            "yt-dlp returned a playlist or multiple media entries; submit one public video URL",
+        ));
+    }
+    if raw.is_live == Some(true)
+        || raw.live_status.as_deref().is_some_and(|status| {
+            matches!(status.to_ascii_lowercase().as_str(), "is_live" | "post_live" | "is_upcoming")
+        })
+    {
+        return Err(DownloadError::terminal(
+            "ytdlp_unsupported_surface",
+            "live streams and live-event pages are not supported",
+        ));
+    }
+
+    let id = bounded_metadata_string(raw.id, MAX_YTDLP_METADATA_ID_BYTES, "content id")?;
+    let title = bounded_metadata_string(raw.title, MAX_YTDLP_METADATA_TEXT_BYTES, "title")?;
+    let webpage_url =
+        bounded_metadata_string(raw.webpage_url, MAX_YTDLP_METADATA_URL_BYTES, "canonical URL")?;
+    let original_url =
+        bounded_metadata_string(raw.original_url, MAX_YTDLP_METADATA_URL_BYTES, "original URL")?;
+    let extractor_key = bounded_metadata_string(
+        raw.extractor_key,
+        MAX_YTDLP_METADATA_EXTRACTOR_BYTES,
+        "extractor",
+    )?;
+    let extractor =
+        bounded_metadata_string(raw.extractor, MAX_YTDLP_METADATA_EXTRACTOR_BYTES, "extractor")?;
+    let ext = bounded_metadata_string(raw.ext, MAX_YTDLP_METADATA_EXTENSION_BYTES, "extension")?;
+    let mime_type_value =
+        bounded_metadata_string(raw.mime_type, MAX_YTDLP_METADATA_MIME_BYTES, "MIME type")?;
+    let format_id =
+        bounded_metadata_string(raw.format_id, MAX_YTDLP_METADATA_ID_BYTES, "format id")?;
+    let format = bounded_metadata_string(raw.format, MAX_YTDLP_METADATA_FORMAT_BYTES, "format")?;
+    let thumbnail =
+        bounded_metadata_string(raw.thumbnail, MAX_YTDLP_METADATA_URL_BYTES, "thumbnail URL")?;
+    let uploader =
+        bounded_metadata_string(raw.uploader, MAX_YTDLP_METADATA_TEXT_BYTES, "uploader")?;
+    let vcodec = bounded_metadata_string(raw.vcodec, MAX_YTDLP_METADATA_ID_BYTES, "video codec")?;
+    let acodec = bounded_metadata_string(raw.acodec, MAX_YTDLP_METADATA_ID_BYTES, "audio codec")?;
+    let mime_type = mime_type_value.or_else(|| mime_type_for_ext(ext.as_deref()));
     Ok(YtDlpMetadata {
-        id: raw.id,
-        title: raw.title,
-        webpage_url: raw.webpage_url.or(raw.original_url).or_else(|| Some(source_url.to_owned())),
-        extractor: raw.extractor_key.or(raw.extractor),
+        id,
+        title,
+        webpage_url: webpage_url.or(original_url).or_else(|| Some(source_url.to_owned())),
+        extractor: extractor_key.or(extractor),
+        platform: None,
         duration_ms: raw.duration.and_then(duration_to_ms),
         filesize_bytes: raw.filesize.or(raw.filesize_approx),
         width: raw.width,
         height: raw.height,
-        ext: raw.ext,
+        ext,
         mime_type,
-        vcodec: raw.vcodec,
-        acodec: raw.acodec,
-        format_id: raw.format_id,
-        format: raw.format,
-        thumbnail: raw.thumbnail,
-        uploader: raw.uploader,
+        vcodec,
+        acodec,
+        format_id,
+        format,
+        thumbnail,
+        uploader,
     })
+}
+
+fn bounded_metadata_string(
+    value: Option<String>,
+    max_bytes: usize,
+    field: &str,
+) -> Result<Option<String>, DownloadError> {
+    let Some(value) = value else { return Ok(None) };
+    if value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(DownloadError::terminal(
+            "ytdlp_metadata",
+            format!("yt-dlp {field} metadata exceeds its bounded text policy"),
+        ));
+    }
+    Ok(Some(value))
+}
+
+const TIKTOK_SUBMITTED_HOSTS: &[&str] =
+    &["tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com"];
+const INSTAGRAM_SUBMITTED_HOSTS: &[&str] = &["instagram.com", "www.instagram.com"];
+const X_SUBMITTED_HOSTS: &[&str] = &["x.com", "www.x.com", "twitter.com", "www.twitter.com"];
+const TIKTOK_CANONICAL_HOSTS: &[&str] =
+    &["tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com"];
+const INSTAGRAM_CANONICAL_HOSTS: &[&str] = &["instagram.com", "www.instagram.com"];
+const X_CANONICAL_HOSTS: &[&str] = &["x.com", "www.x.com", "twitter.com", "www.twitter.com"];
+
+pub fn ytdlp_allowed_hosts_include_youtube(allowed_hosts: &[String]) -> bool {
+    allowed_hosts
+        .iter()
+        .any(|host| provider_family_for_host(host, false) == Some(YtDlpProviderFamily::Youtube))
+}
+
+fn provider_family_for_source_url(
+    value: &str,
+) -> Result<Option<YtDlpProviderFamily>, DownloadError> {
+    let normalized = validate_source_url(value)?;
+    let url = Url::parse(&normalized).expect("validated source URL should parse");
+    let host = url.host_str().expect("validated source URL has a host");
+    Ok(provider_family_for_host(host, false))
+}
+
+fn provider_family_for_canonical_url(
+    value: &str,
+) -> Result<Option<YtDlpProviderFamily>, DownloadError> {
+    let normalized = validate_source_url(value)?;
+    let url = Url::parse(&normalized).expect("validated canonical URL should parse");
+    let host = url.host_str().expect("validated source URL has a host");
+    Ok(provider_family_for_host(host, true))
+}
+
+pub(crate) fn provider_family_for_host(host: &str, canonical: bool) -> Option<YtDlpProviderFamily> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if is_domain_or_subdomain(&host, "youtube.com") || is_domain_or_subdomain(&host, "youtu.be") {
+        return Some(YtDlpProviderFamily::Youtube);
+    }
+    let tiktok_hosts = if canonical { TIKTOK_CANONICAL_HOSTS } else { TIKTOK_SUBMITTED_HOSTS };
+    if tiktok_hosts.iter().any(|candidate| *candidate == host) {
+        return Some(YtDlpProviderFamily::Tiktok);
+    }
+    let instagram_hosts =
+        if canonical { INSTAGRAM_CANONICAL_HOSTS } else { INSTAGRAM_SUBMITTED_HOSTS };
+    if instagram_hosts.iter().any(|candidate| *candidate == host) {
+        return Some(YtDlpProviderFamily::Instagram);
+    }
+    let x_hosts = if canonical { X_CANONICAL_HOSTS } else { X_SUBMITTED_HOSTS };
+    if x_hosts.iter().any(|candidate| *candidate == host) {
+        return Some(YtDlpProviderFamily::X);
+    }
+    None
+}
+
+fn is_domain_or_subdomain(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+fn is_tco_url(value: &str) -> Result<bool, DownloadError> {
+    let normalized = validate_source_url(value)?;
+    let url = Url::parse(&normalized).expect("validated source URL should parse");
+    Ok(url.host_str().is_some_and(|host| host.eq_ignore_ascii_case("t.co")))
+}
+
+async fn resolve_tco_target_with_resolver(
+    source_url: &str,
+    resolver: &dyn HostResolver,
+    timeout: Duration,
+    max_redirects: u32,
+    client_factory: &TcoClientFactory,
+) -> Result<String, DownloadError> {
+    let source_url = validate_source_url(source_url)?;
+    let mut current_url = Url::parse(&source_url).expect("validated source URL should parse");
+    if !is_tco_url(&source_url)? {
+        return Err(DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co preflight requires a t.co source URL",
+        ));
+    }
+
+    for redirect_number in 0..=max_redirects {
+        let target = direct_http::resolve_target(resolver, &current_url).await?;
+        let client = client_factory(&target, timeout)?;
+        let response = client
+            .get(target.url)
+            .header(reqwest::header::RANGE, "bytes=0-0")
+            .header(reqwest::header::USER_AGENT, TCO_PREFLIGHT_USER_AGENT)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() || error.is_connect() {
+                    DownloadError::retryable(
+                        "tco_resolution",
+                        "the t.co redirect preflight could not reach its target",
+                    )
+                } else {
+                    DownloadError::terminal(
+                        "tco_resolution",
+                        "the t.co redirect preflight request failed",
+                    )
+                }
+            })?;
+
+        if response.status().is_redirection() {
+            if redirect_number >= max_redirects {
+                return Err(DownloadError::terminal(
+                    "redirect_limit",
+                    "the t.co redirect chain exceeded the configured limit",
+                ));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| {
+                    DownloadError::terminal(
+                        "source_redirect_not_allowed",
+                        "the t.co redirect response did not include a Location header",
+                    )
+                })?
+                .to_str()
+                .map_err(|_| {
+                    DownloadError::terminal(
+                        "source_redirect_not_allowed",
+                        "the t.co redirect Location header was not valid UTF-8",
+                    )
+                })?;
+            current_url = validate_tco_redirect_target(&current_url, location)?;
+            continue;
+        }
+
+        if provider_family_for_host(
+            current_url.host_str().expect("validated URL has a host"),
+            false,
+        ) == Some(YtDlpProviderFamily::X)
+        {
+            validate_public_video_path(YtDlpProviderFamily::X, current_url.as_str())?;
+            return Ok(current_url.to_string());
+        }
+
+        return Err(DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co URL did not resolve to an X/Twitter page",
+        ));
+    }
+
+    Err(DownloadError::terminal(
+        "redirect_limit",
+        "the t.co redirect chain exceeded the configured limit",
+    ))
+}
+
+fn validate_tco_redirect_target(current_url: &Url, location: &str) -> Result<Url, DownloadError> {
+    if location.len() > MAX_TCO_LOCATION_BYTES || location.chars().any(char::is_control) {
+        return Err(DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co redirect Location header exceeded its safety limit",
+        ));
+    }
+
+    let target = current_url.join(location).map_err(|_| {
+        DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co redirect Location header was not a valid URL",
+        )
+    })?;
+    let normalized = validate_source_url(target.as_str()).map_err(|_| {
+        DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co redirect target failed URL validation",
+        )
+    })?;
+    let target = Url::parse(&normalized).expect("validated redirect URL should parse");
+    let is_x_target = target
+        .host_str()
+        .is_some_and(|host| provider_family_for_host(host, false) == Some(YtDlpProviderFamily::X));
+    if !is_x_target {
+        return Err(DownloadError::terminal(
+            "source_redirect_not_allowed",
+            "the t.co redirect target is not an X/Twitter host",
+        ));
+    }
+    Ok(target)
+}
+
+fn extractor_matches_provider(family: YtDlpProviderFamily, extractor: &str) -> bool {
+    let extractor = extractor.trim().to_ascii_lowercase();
+    match family {
+        YtDlpProviderFamily::Youtube => {
+            matches!(extractor.as_str(), "youtube" | "youtubeshorts" | "youtube:shorts")
+        }
+        YtDlpProviderFamily::Tiktok => extractor == "tiktok",
+        YtDlpProviderFamily::Instagram => extractor == "instagram",
+        YtDlpProviderFamily::X => matches!(extractor.as_str(), "twitter" | "x"),
+    }
+}
+
+fn validate_provider_metadata(
+    source_url: &str,
+    canonical_url: &str,
+    media_kind: SourceMediaKind,
+    metadata: Option<&YtDlpMetadata>,
+) -> Result<YtDlpProviderFamily, DownloadError> {
+    let submitted_family = provider_family_for_source_url(source_url)?;
+    let canonical_family = provider_family_for_canonical_url(canonical_url)?;
+    let is_short_link = is_tco_url(source_url)?;
+    let family = match (submitted_family, canonical_family, is_short_link) {
+        (Some(submitted), Some(canonical), false) if submitted == canonical => submitted,
+        (None, Some(YtDlpProviderFamily::X), true) => YtDlpProviderFamily::X,
+        (Some(_), Some(_), false) => {
+            return Err(DownloadError::terminal(
+                "source_provider_mismatch",
+                "yt-dlp canonical URL belongs to a different provider family",
+            ));
+        }
+        (None, _, true) => {
+            return Err(DownloadError::terminal(
+                "source_provider_mismatch",
+                "t.co short links must resolve to an X/Twitter video post",
+            ));
+        }
+        (None, _, false) => {
+            return Err(DownloadError::terminal(
+                "source_provider_not_supported",
+                "yt-dlp returned a URL outside the supported provider families",
+            ));
+        }
+        (Some(_), None, false) => {
+            return Err(DownloadError::terminal(
+                "source_provider_mismatch",
+                "yt-dlp canonical URL is not a supported host for the submitted provider",
+            ));
+        }
+        (Some(_), _, true) => {
+            return Err(DownloadError::terminal(
+                "source_provider_mismatch",
+                "short-link handling is only available for t.co submissions",
+            ));
+        }
+    };
+
+    if matches!(
+        family,
+        YtDlpProviderFamily::Tiktok | YtDlpProviderFamily::Instagram | YtDlpProviderFamily::X
+    ) && media_kind != SourceMediaKind::Video
+    {
+        return Err(DownloadError::terminal(
+            "source_media_kind_not_supported",
+            "the submitted provider URL did not resolve to a video",
+        ));
+    }
+    validate_public_video_path(family, canonical_url)?;
+
+    if let Some(metadata) = metadata {
+        if let Some(metadata_url) = metadata.webpage_url.as_deref() {
+            let metadata_url = validate_source_url(metadata_url)?;
+            let canonical_url = validate_source_url(canonical_url)?;
+            if metadata_url != canonical_url {
+                return Err(DownloadError::terminal(
+                    "source_provider_mismatch",
+                    "yt-dlp metadata canonical URL disagrees with the inspected URL",
+                ));
+            }
+        }
+        let Some(extractor) = metadata.extractor.as_deref() else {
+            return Err(DownloadError::terminal(
+                "source_extractor_not_allowed",
+                "yt-dlp did not report a provider extractor identity",
+            ));
+        };
+        if !extractor_matches_provider(family, extractor) {
+            return Err(DownloadError::terminal(
+                "source_extractor_not_allowed",
+                "yt-dlp extractor identity does not match the submitted provider family",
+            ));
+        }
+        if metadata.platform.as_deref().is_some_and(|platform| platform != family.as_str()) {
+            return Err(DownloadError::terminal(
+                "source_provider_mismatch",
+                "yt-dlp metadata provider identity does not match its canonical URL",
+            ));
+        }
+        if matches!(
+            family,
+            YtDlpProviderFamily::Tiktok | YtDlpProviderFamily::Instagram | YtDlpProviderFamily::X
+        ) && metadata.media_kind() != SourceMediaKind::Video
+        {
+            return Err(DownloadError::terminal(
+                "source_media_kind_not_supported",
+                "yt-dlp metadata describes a non-video result",
+            ));
+        }
+    }
+
+    Ok(family)
+}
+
+fn validate_public_video_path(
+    family: YtDlpProviderFamily,
+    canonical_url: &str,
+) -> Result<(), DownloadError> {
+    let url = Url::parse(canonical_url).map_err(|_| {
+        DownloadError::terminal("invalid_source_url", "yt-dlp canonical URL could not be parsed")
+    })?;
+    let segments = url.path().split('/').filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+    let supported = match family {
+        YtDlpProviderFamily::Youtube => true,
+        YtDlpProviderFamily::Tiktok => {
+            segments.len() == 3
+                && segments[0].starts_with('@')
+                && segments[1].eq_ignore_ascii_case("video")
+                && !segments[2].is_empty()
+        }
+        YtDlpProviderFamily::Instagram => {
+            segments.len() == 2
+                && matches!(segments[0].to_ascii_lowercase().as_str(), "reel" | "p")
+                && !segments[1].is_empty()
+        }
+        YtDlpProviderFamily::X => {
+            segments.len() == 3
+                && segments[1].eq_ignore_ascii_case("status")
+                && !segments[0].is_empty()
+                && !segments[2].is_empty()
+        }
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(DownloadError::terminal(
+            "ytdlp_unsupported_surface",
+            "only a single public video post/reel URL is supported for this provider",
+        ))
+    }
+}
+
+pub(crate) fn validate_provider_inspection(
+    inspection: &SourceInspection,
+) -> Result<YtDlpProviderFamily, DownloadError> {
+    let canonical_url = inspection.resolved_url.as_deref().unwrap_or(&inspection.source_url);
+    let metadata = match inspection.metadata.as_object() {
+        Some(object) if !object.is_empty() => {
+            Some(serde_json::from_value::<YtDlpMetadata>(inspection.metadata.clone()).map_err(
+                |error| {
+                    DownloadError::terminal(
+                        "ytdlp_metadata",
+                        format!("yt-dlp inspection metadata is invalid: {error}"),
+                    )
+                },
+            )?)
+        }
+        _ => None,
+    };
+    validate_provider_metadata(
+        &inspection.source_url,
+        canonical_url,
+        inspection.media_kind,
+        metadata.as_ref(),
+    )
 }
 
 fn validate_format_selection(value: &str) -> Result<(), YtDlpConfigError> {
@@ -845,6 +1406,7 @@ fn map_process_failure(
     output: &ExternalCommandOutput,
     source_url: &str,
     allow_media_data_recovery: bool,
+    provider_family: Option<YtDlpProviderFamily>,
 ) -> DownloadError {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().replace(source_url, "<source-url>");
     let message = if stderr.is_empty() {
@@ -852,8 +1414,26 @@ fn map_process_failure(
     } else {
         format!("yt-dlp exited unsuccessfully with status {:?}: {stderr}", output.exit_code)
     };
-    if allow_media_data_recovery && is_media_data_forbidden_message(&stderr) {
+    if allow_media_data_recovery
+        && provider_family == Some(YtDlpProviderFamily::Youtube)
+        && is_media_data_forbidden_message(&stderr)
+    {
         DownloadError::retryable("ytdlp_media_forbidden", message)
+    } else if is_auth_required_message(&stderr) {
+        DownloadError::terminal(
+            "ytdlp_auth_required",
+            "the provider requires an account, login, or private-content access",
+        )
+    } else if is_content_unavailable_message(&stderr) {
+        DownloadError::terminal(
+            "ytdlp_content_unavailable",
+            "the requested provider video is removed or unavailable",
+        )
+    } else if is_unsupported_surface_message(&stderr) {
+        DownloadError::terminal(
+            "ytdlp_unsupported_surface",
+            "the provider URL is not a supported single public video surface",
+        )
     } else if is_transient_failure(&stderr) {
         DownloadError::retryable("ytdlp_upstream", message)
     } else {
@@ -862,11 +1442,15 @@ fn map_process_failure(
 }
 
 fn map_inspection_failure(output: &ExternalCommandOutput, source_url: &str) -> DownloadError {
-    map_process_failure(output, source_url, false)
+    map_process_failure(output, source_url, false, None)
 }
 
-fn map_download_failure(output: &ExternalCommandOutput, source_url: &str) -> DownloadError {
-    map_process_failure(output, source_url, true)
+fn map_download_failure(
+    output: &ExternalCommandOutput,
+    source_url: &str,
+    provider_family: Option<YtDlpProviderFamily>,
+) -> DownloadError {
+    map_process_failure(output, source_url, true, provider_family)
 }
 
 fn is_media_data_forbidden(error: &DownloadError) -> bool {
@@ -877,6 +1461,73 @@ fn is_media_data_forbidden_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("unable to download video data")
         && (message.contains("http error 403") || message.contains("http 403"))
+}
+
+fn is_auth_required_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "sign in",
+        "log in",
+        "login required",
+        "private video",
+        "private post",
+        "private account",
+        "private content",
+        "followers-only",
+        "followers only",
+        "only followers",
+        "account required",
+        "age-restricted",
+        "age restricted",
+        "confirm your age",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+fn is_content_unavailable_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "video unavailable",
+        "this video is unavailable",
+        "content is unavailable",
+        "content isn't available",
+        "content is not available",
+        "post not found",
+        "does not exist",
+        "has been removed",
+        "was removed",
+        "has been deleted",
+        "was deleted",
+        "no longer available",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+fn is_unsupported_surface_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "unsupported url",
+        "unsupported page",
+        "playlist",
+        "profile",
+        "user page",
+        "feed",
+        "story",
+        "stories",
+        "live stream",
+        "live event",
+        "space",
+        "spaces",
+        "carousel",
+        "gallery",
+        "image-only",
+        "not a video",
+        "multiple entries",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 fn is_transient_failure(message: &str) -> bool {
@@ -936,6 +1587,8 @@ fn mime_type_for_ext(ext: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
+        net::{IpAddr, Ipv4Addr},
         os::unix::fs::PermissionsExt,
         path::PathBuf,
         process::{Command, Stdio},
@@ -943,10 +1596,51 @@ mod tests {
     };
 
     use super::*;
+    use crate::{HostResolver, ResolvedAddress};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[derive(Clone)]
+    struct StaticResolver {
+        addresses: HashMap<String, Vec<ResolvedAddress>>,
+    }
+
+    #[async_trait]
+    impl HostResolver for StaticResolver {
+        async fn resolve(
+            &self,
+            host: &str,
+            _port: u16,
+        ) -> Result<Vec<ResolvedAddress>, DownloadError> {
+            self.addresses.get(host).cloned().ok_or_else(|| {
+                DownloadError::terminal("dns_resolution", "test resolver has no such host")
+            })
+        }
+    }
+
+    struct RecordingRunner {
+        calls: Mutex<Vec<ExternalCommand>>,
+    }
+
+    #[async_trait]
+    impl ExternalCommandRunner for RecordingRunner {
+        async fn run(
+            &self,
+            command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            self.calls.lock().expect("test mutex should not be poisoned").push(command);
+            Ok(ExternalCommandOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: br#"{"id":"abc","title":"Example","webpage_url":"http://x.com/creator/status/123","extractor":"Twitter","duration":3.5,"filesize":17,"width":1280,"height":720,"ext":"mp4","vcodec":"h264","acodec":"aac","format_id":"best"}"#.to_vec(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            })
+        }
+    }
 
     struct RuntimeProbeRunner {
         calls: Mutex<Vec<ExternalCommand>>,
@@ -1021,12 +1715,81 @@ mod tests {
         let downloader = YtDlpDownloader::new(
             YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
         );
-        let args = downloader.security_args();
+        let args = downloader.security_args(Some(YtDlpProviderFamily::Youtube));
 
         assert!(args.iter().any(|argument| {
             argument == "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"
         }));
         assert!(!args.iter().any(|argument| argument == "youtube:player-client=mweb"));
+
+        let social_args = downloader.security_args(Some(YtDlpProviderFamily::Tiktok));
+        assert!(!social_args.iter().any(|argument| argument == "--extractor-args"));
+    }
+
+    #[test]
+    fn metadata_parser_rejects_playlists_live_pages_and_oversized_text() {
+        for input in [
+            br#"{"id":"playlist","entries":[],"extractor":"TikTok"}"# as &[u8],
+            br#"{"id":"live","is_live":true,"extractor":"Instagram"}"# as &[u8],
+        ] {
+            let error = parse_metadata(input, "https://www.tiktok.com/@creator/video/123")
+                .expect_err("unsupported surfaces must be terminal");
+            assert_eq!(error.class(), "ytdlp_unsupported_surface");
+        }
+
+        let oversized_title = format!(
+            r#"{{"id":"id","title":"{}","extractor":"TikTok"}}"#,
+            "x".repeat(MAX_YTDLP_METADATA_TEXT_BYTES + 1)
+        );
+        let error =
+            parse_metadata(oversized_title.as_bytes(), "https://www.tiktok.com/@creator/video/123")
+                .expect_err("oversized metadata must be terminal");
+        assert_eq!(error.class(), "ytdlp_metadata");
+    }
+
+    #[test]
+    fn media_byte_403_recovery_is_youtube_only() {
+        let output = ExternalCommandOutput {
+            success: false,
+            exit_code: Some(1),
+            stdout: Vec::new(),
+            stderr: b"ERROR: unable to download video data: HTTP Error 403: Forbidden".to_vec(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let youtube = map_download_failure(
+            &output,
+            "https://www.youtube.com/watch?v=video",
+            Some(YtDlpProviderFamily::Youtube),
+        );
+        assert_eq!(youtube.class(), "ytdlp_media_forbidden");
+        assert!(youtube.is_retryable());
+
+        let tiktok = map_download_failure(
+            &output,
+            "https://www.tiktok.com/@creator/video/123",
+            Some(YtDlpProviderFamily::Tiktok),
+        );
+        assert_eq!(tiktok.class(), "ytdlp_process");
+        assert!(!tiktok.is_retryable());
+    }
+
+    #[test]
+    fn unsupported_surface_process_errors_are_terminal_and_explicit() {
+        let error = map_download_failure(
+            &ExternalCommandOutput {
+                success: false,
+                exit_code: Some(1),
+                stdout: Vec::new(),
+                stderr: b"ERROR: profile pages are not supported with --no-playlist".to_vec(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            },
+            "https://www.instagram.com/creator/",
+            Some(YtDlpProviderFamily::Instagram),
+        );
+        assert_eq!(error.class(), "ytdlp_unsupported_surface");
+        assert!(!error.is_retryable());
     }
 
     #[tokio::test]
@@ -1174,6 +1937,184 @@ mod tests {
         server.await.expect("provider fixture should finish");
     }
 
+    fn tco_redirect_response(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    async fn tco_redirect_fixture(
+        responses: Vec<String>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").await.expect("t.co redirect fixture should bind");
+        let address = listener.local_addr().expect("t.co redirect fixture address should be known");
+        let server = tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) =
+                    listener.accept().await.expect("t.co redirect request should arrive");
+                let mut request = [0_u8; 4096];
+                let read = stream
+                    .read(&mut request)
+                    .await
+                    .expect("t.co redirect request should be readable");
+                assert!(read > 0, "t.co redirect request should not be empty");
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("t.co redirect response should be writable");
+            }
+        });
+        (address, server)
+    }
+
+    fn tco_resolver(address: std::net::SocketAddr, x_ip: IpAddr) -> StaticResolver {
+        let tco_ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        StaticResolver {
+            addresses: HashMap::from([
+                ("t.co".to_owned(), vec![ResolvedAddress { ip: tco_ip, connect_ip: address.ip() }]),
+                ("x.com".to_owned(), vec![ResolvedAddress { ip: x_ip, connect_ip: address.ip() }]),
+            ]),
+        }
+    }
+
+    fn tco_test_client_factory(address: std::net::SocketAddr) -> TcoClientFactory {
+        Arc::new(move |target, timeout| {
+            let host = target.url.host_str().expect("test target should have a host");
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(timeout)
+                .connect_timeout(timeout)
+                .resolve(host, address)
+                .build()
+                .map_err(|error| {
+                    DownloadError::terminal(
+                        "http_client",
+                        format!("could not build test HTTP client: {error}"),
+                    )
+                })
+        })
+    }
+
+    #[tokio::test]
+    async fn tco_inspection_pins_safe_dns_and_preserves_submitted_provenance() {
+        let (address, server) = tco_redirect_fixture(vec![
+            tco_redirect_response("http://x.com/creator/status/123"),
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+        ])
+        .await;
+        let runner = Arc::new(RecordingRunner { calls: Mutex::new(Vec::new()) });
+        let downloader = YtDlpDownloader::with_runner_resolver_and_client(
+            YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
+            DownloadLimits { max_bytes: 1024, max_redirects: 2, timeout: Duration::from_secs(1) },
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            Arc::new(tco_resolver(address, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))),
+            tco_test_client_factory(address),
+        );
+        let inspection = downloader
+            .inspect(&SourceInput {
+                ingest_request_id: Uuid::new_v4(),
+                source_url: "http://t.co/short-link".to_owned(),
+                page_url: None,
+            })
+            .await
+            .expect("t.co should resolve to the X status URL");
+
+        assert_eq!(inspection.source_url, "http://t.co/short-link");
+        assert_eq!(inspection.resolved_url.as_deref(), Some("http://x.com/creator/status/123"));
+        {
+            let calls = runner.calls.lock().expect("test mutex should not be poisoned");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].args().last().expect("yt-dlp URL argument should exist").to_string_lossy(),
+                "http://x.com/creator/status/123"
+            );
+        }
+        server.await.expect("t.co redirect fixture should finish");
+    }
+
+    #[tokio::test]
+    async fn tco_inspection_rejects_forbidden_dns_before_starting_ytdlp() {
+        let (address, server) =
+            tco_redirect_fixture(vec![tco_redirect_response("http://x.com/creator/status/123")])
+                .await;
+        let runner = Arc::new(RecordingRunner { calls: Mutex::new(Vec::new()) });
+        let downloader = YtDlpDownloader::with_runner_resolver_and_client(
+            YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
+            DownloadLimits { max_bytes: 1024, max_redirects: 2, timeout: Duration::from_secs(1) },
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            Arc::new(tco_resolver(address, IpAddr::V4(Ipv4Addr::LOCALHOST))),
+            tco_test_client_factory(address),
+        );
+        let error = downloader
+            .inspect(&SourceInput {
+                ingest_request_id: Uuid::new_v4(),
+                source_url: "http://t.co/short-link".to_owned(),
+                page_url: None,
+            })
+            .await
+            .expect_err("a forbidden X DNS result must be blocked");
+
+        assert!(matches!(
+            error,
+            DownloadError::Terminal { ref class, .. } if class == "ssrf_blocked"
+        ));
+        assert!(runner.calls.lock().expect("test mutex should not be poisoned").is_empty());
+        server.await.expect("t.co redirect fixture should finish");
+    }
+
+    #[tokio::test]
+    async fn tco_inspection_rejects_non_status_x_pages_before_starting_ytdlp() {
+        let (address, server) = tco_redirect_fixture(vec![
+            tco_redirect_response("http://x.com/home"),
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+        ])
+        .await;
+        let runner = Arc::new(RecordingRunner { calls: Mutex::new(Vec::new()) });
+        let downloader = YtDlpDownloader::with_runner_resolver_and_client(
+            YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
+            DownloadLimits { max_bytes: 1024, max_redirects: 2, timeout: Duration::from_secs(1) },
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            Arc::new(tco_resolver(address, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))),
+            tco_test_client_factory(address),
+        );
+        let error = downloader
+            .inspect(&SourceInput {
+                ingest_request_id: Uuid::new_v4(),
+                source_url: "http://t.co/short-link".to_owned(),
+                page_url: None,
+            })
+            .await
+            .expect_err("non-status X pages must be rejected during preflight");
+
+        assert_eq!(error.class(), "ytdlp_unsupported_surface");
+        assert!(runner.calls.lock().expect("test mutex should not be poisoned").is_empty());
+        server.await.expect("t.co redirect fixture should finish");
+    }
+
+    #[tokio::test]
+    async fn direct_non_status_x_pages_are_rejected_before_starting_ytdlp() {
+        let runner = Arc::new(RecordingRunner { calls: Mutex::new(Vec::new()) });
+        let downloader = YtDlpDownloader::with_runner_and_resolver(
+            YtDlpConfig::new("yt-dlp", "best").expect("format selection should be valid"),
+            DownloadLimits::default(),
+            Arc::clone(&runner) as Arc<dyn ExternalCommandRunner>,
+            Arc::new(StaticResolver { addresses: HashMap::new() }),
+        );
+        let error = downloader
+            .inspect(&SourceInput {
+                ingest_request_id: Uuid::new_v4(),
+                source_url: "https://x.com/home".to_owned(),
+                page_url: None,
+            })
+            .await
+            .expect_err("non-status X pages must be rejected before inspection");
+
+        assert_eq!(error.class(), "ytdlp_unsupported_surface");
+        assert!(runner.calls.lock().expect("test mutex should not be poisoned").is_empty());
+    }
+
     #[tokio::test]
     async fn fake_executable_inspects_and_downloads_without_shell_interpolation() {
         let root = std::env::temp_dir().join(format!("sooqa-ytdlp-{}", uuid::Uuid::new_v4()));
@@ -1227,14 +2168,18 @@ mod tests {
             "--no-cookies-from-browser",
             "--js-runtimes",
             "deno:deno",
-            "--extractor-args",
-            "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
         ] {
             assert!(
                 inspect_args.lines().any(|line| line == argument),
                 "missing argument: {argument}"
             );
         }
+        assert!(!inspect_args.lines().any(|line| line == "--extractor-args"));
+        assert!(
+            !inspect_args
+                .lines()
+                .any(|line| line == "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416")
+        );
         assert!(!inspect_args.lines().any(|line| line == "youtube:player-client=mweb"));
         assert!(
             inspect_args
@@ -1483,8 +2428,14 @@ mod tests {
                     stderr_truncated: false,
                 },
                 "https://www.youtube.com/watch?v=terminal",
+                Some(YtDlpProviderFamily::Youtube),
             );
-            assert_eq!(error.class(), "ytdlp_process");
+            let expected_class = if stderr.contains("unavailable") {
+                "ytdlp_content_unavailable"
+            } else {
+                "ytdlp_auth_required"
+            };
+            assert_eq!(error.class(), expected_class);
             assert!(!error.is_retryable());
         }
     }
