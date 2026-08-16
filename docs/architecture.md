@@ -77,8 +77,8 @@ schema; current five-table data is retained by forward-only migrations.
 - `sooqa-jobs` defines typed job kinds and payloads. Persistence decodes the
   JSON envelope once; handlers receive a typed `JobCommand`.
 - `sooqa-media` owns direct HTTP, the exact-host 2ch mirror adapter, the
-  allowlisted yt-dlp adapter, ffprobe, ffmpeg, image normalization, hashing,
-  fingerprints, workspaces, and subprocess safety.
+  provider-family-policy yt-dlp adapter, ffprobe, ffmpeg, image normalization,
+  hashing, fingerprints, workspaces, and subprocess safety.
 - `sooqa-telegram` owns Telegram protocol mapping, storage upload effects, and
   publication copy/send effects. Polling, worker-side source downloads,
   storage uploads, and publication use separate bounded calls. Telegram file
@@ -384,12 +384,14 @@ browser-side media or scheduling authority.
 The API compares the configured bearer secret; no token administration data is
 stored in PostgreSQL. Telegram admin IDs remain configuration. Direct HTTP
 validates and pins destinations, and external commands receive argument arrays,
-bounded output, timeouts, and no shell. For allowlisted yt-dlp pages, the
+bounded output, timeouts, and no shell. For provider-policy yt-dlp pages, the
 submitted URL remains provenance while the inspected canonical URL is
-revalidated against the same scheme, credential, port, and host rules before
-download. A specific media-byte 403 gets one fresh high-quality attempt and
-one combined progressive fallback; private, account-required, removed, and
-other extractor outcomes remain terminal. Enabled yt-dlp also requires the
-pinned bgutil plugin, a private PO-token provider health/version check, and
-explicitly disabled config, cookie, browser, netrc, and remote-component
-inputs. Workspaces are derived from UUIDs and are cleaned only in known paths.
+revalidated against the same scheme, credential, port, family, extractor, and
+host rules before download. A specific YouTube media-byte 403 gets one fresh
+high-quality attempt and one combined progressive fallback; private,
+account-required, removed, unsupported-surface, and other extractor outcomes
+remain terminal. Enabled yt-dlp also requires the pinned bgutil plugin and Deno
+runtime; the private PO-token provider health/version check is required only
+for enabled YouTube hosts. Config, cookie, browser, netrc, and remote-component
+inputs are explicitly disabled. Workspaces are derived from UUIDs and are
+cleaned only in known paths.

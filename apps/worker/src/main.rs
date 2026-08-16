@@ -9,6 +9,7 @@ use sooqa_media::{
     DownloadLimits, FfprobeAdapter, ImageNormalizer, MediaWorkspace, NormalizationPlanner,
     ProcessCommandRunner, SourceDownloader, SourceDownloaderRouter, TwoChMirrorDownloader,
     YtDlpConfig, YtDlpDownloader, diagnose_binaries, is_supported_deno_version,
+    ytdlp_allowed_hosts_include_youtube,
 };
 use sooqa_persistence::{Database, JobRepository, WORKSPACE_CLEANUP_RETENTION};
 use uuid::Uuid;
@@ -137,9 +138,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
             ))
             .into());
         }
-        if let Err(error) = ytdlp.verify_pot_provider(Duration::from_secs(5)).await {
+        if ytdlp_allowed_hosts_include_youtube(&config.media.ytdlp_allowed_hosts)
+            && let Err(error) = ytdlp.verify_pot_provider(Duration::from_secs(5)).await
+        {
             return Err(std::io::Error::other(format!(
-                "yt-dlp is enabled but its PO-token provider preflight failed: {error}"
+                "YouTube yt-dlp support is enabled but its PO-token provider preflight failed: {error}"
             ))
             .into());
         }

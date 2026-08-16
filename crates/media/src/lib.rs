@@ -78,7 +78,8 @@ pub use workspace::{
 pub use ytdlp::{
     MAX_YTDLP_FORMAT_SELECTION_BYTES, YTDLP_PLUGIN_ARCHIVE_PATH, YTDLP_PLUGIN_DIRECTORY,
     YTDLP_POT_PROVIDER_VERSION, YTDLP_PROGRESSIVE_FALLBACK_FORMAT, YtDlpConfig, YtDlpConfigError,
-    YtDlpDownloader, YtDlpMetadata, is_supported_deno_version,
+    YtDlpDownloader, YtDlpMetadata, YtDlpProviderFamily, is_supported_deno_version,
+    ytdlp_allowed_hosts_include_youtube,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -236,6 +237,7 @@ fn validate_ytdlp_inspection(
             "page URL host is not enabled for yt-dlp",
         ));
     }
+    ytdlp::validate_provider_inspection(inspection)?;
     Ok(())
 }
 
@@ -257,11 +259,14 @@ impl SourceDownloaderRouter {
             ));
         }
 
-        self.ytdlp
+        let inspection = self
+            .ytdlp
             .as_ref()
             .expect("yt-dlp was checked before applying its host policy")
             .inspect(source)
-            .await
+            .await?;
+        validate_ytdlp_inspection(&inspection, &self.ytdlp_allowed_hosts)?;
+        Ok(inspection)
     }
 }
 
@@ -307,9 +312,20 @@ fn is_allowed_ytdlp_source(
     if !matches!(url.host(), Some(url::Host::Domain(_))) {
         return Ok(false);
     }
-    Ok(allowed_hosts
-        .iter()
-        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}"))))
+    let Some(family) = ytdlp::provider_family_for_host(&host, false) else {
+        if host != "t.co" {
+            return Ok(false);
+        }
+        let short_link_enabled = allowed_hosts.iter().any(|allowed| allowed == "t.co");
+        let x_family_enabled = allowed_hosts.iter().any(|allowed| {
+            ytdlp::provider_family_for_host(allowed, false) == Some(YtDlpProviderFamily::X)
+        });
+        return Ok(short_link_enabled && x_family_enabled);
+    };
+    Ok(allowed_hosts.iter().any(|allowed| {
+        ytdlp::provider_family_for_host(allowed, false) == Some(family)
+            && (host == *allowed || host.ends_with(&format!(".{allowed}")))
+    }))
 }
 
 fn should_try_ytdlp(error: &DownloadError) -> bool {
@@ -384,7 +400,7 @@ mod tests {
     fn inspection(adapter: &str, media_kind: SourceMediaKind) -> SourceInspection {
         SourceInspection {
             adapter: adapter.to_owned(),
-            source_url: "https://example.test/watch".to_owned(),
+            source_url: "https://www.youtube.com/watch?v=stub".to_owned(),
             resolved_url: None,
             media_kind,
             mime_type: Some("video/mp4".to_owned()),
@@ -397,9 +413,55 @@ mod tests {
     fn source() -> SourceInput {
         SourceInput {
             ingest_request_id: Uuid::from_u128(1),
-            source_url: "https://example.test/watch".to_owned(),
+            source_url: "https://www.youtube.com/watch?v=stub".to_owned(),
             page_url: None,
         }
+    }
+
+    fn provider_inspection(
+        source_url: &str,
+        resolved_url: &str,
+        platform: &str,
+        extractor: &str,
+        media_kind: SourceMediaKind,
+    ) -> SourceInspection {
+        SourceInspection {
+            adapter: "yt_dlp".to_owned(),
+            source_url: source_url.to_owned(),
+            resolved_url: Some(resolved_url.to_owned()),
+            media_kind,
+            mime_type: Some("video/mp4".to_owned()),
+            content_length_bytes: Some(1),
+            title: Some("Provider video".to_owned()),
+            metadata: serde_json::json!({
+                "id": "video-id",
+                "title": "Provider video",
+                "webpage_url": resolved_url,
+                "extractor": extractor,
+                "platform": platform,
+                "ext": "mp4",
+                "mime_type": "video/mp4",
+                "vcodec": "h264",
+                "acodec": "aac"
+            }),
+        }
+    }
+
+    fn provider_router(
+        selected: SourceInspection,
+        allowed_hosts: &[&str],
+    ) -> SourceDownloaderRouter {
+        SourceDownloaderRouter::new(
+            Arc::new(StubDownloader {
+                inspection: Ok(inspection("direct_http", SourceMediaKind::Unknown)),
+                downloads: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(StubDownloader {
+                inspection: Ok(selected),
+                downloads: Arc::new(AtomicUsize::new(0)),
+            }),
+            allowed_hosts.iter().map(|host| (*host).to_owned()).collect(),
+        )
     }
 
     #[test]
@@ -441,6 +503,145 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn provider_policy_accepts_public_single_video_families_and_tco_x_links() {
+        let cases = [
+            (
+                "https://vm.tiktok.com/ZMshare/",
+                "https://www.tiktok.com/@creator/video/123",
+                "tiktok",
+                "TikTok",
+                ["tiktok.com", "vm.tiktok.com"].as_slice(),
+            ),
+            (
+                "https://www.instagram.com/reel/ABC123/",
+                "https://www.instagram.com/reel/ABC123/",
+                "instagram",
+                "Instagram",
+                ["instagram.com"].as_slice(),
+            ),
+            (
+                "https://twitter.com/creator/status/123",
+                "https://x.com/creator/status/123",
+                "x",
+                "Twitter",
+                ["x.com", "twitter.com"].as_slice(),
+            ),
+            (
+                "https://t.co/short-link",
+                "https://x.com/creator/status/123",
+                "x",
+                "Twitter",
+                ["x.com", "t.co"].as_slice(),
+            ),
+        ];
+        for (source_url, resolved_url, platform, extractor, allowed_hosts) in cases {
+            let router = provider_router(
+                provider_inspection(
+                    source_url,
+                    resolved_url,
+                    platform,
+                    extractor,
+                    SourceMediaKind::Video,
+                ),
+                allowed_hosts,
+            );
+            let inspected = router
+                .inspect(&SourceInput {
+                    ingest_request_id: Uuid::from_u128(2),
+                    source_url: source_url.to_owned(),
+                    page_url: None,
+                })
+                .await
+                .expect("public provider video should pass policy");
+            assert_eq!(inspected.adapter, "yt_dlp");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_policy_rejects_cross_provider_extractors_surfaces_and_non_video_results() {
+        let cases = [
+            (
+                provider_inspection(
+                    "https://www.instagram.com/reel/ABC123/",
+                    "https://www.tiktok.com/@creator/video/123",
+                    "tiktok",
+                    "TikTok",
+                    SourceMediaKind::Video,
+                ),
+                ["instagram.com", "tiktok.com"].as_slice(),
+                "source_provider_mismatch",
+            ),
+            (
+                provider_inspection(
+                    "https://www.instagram.com/reel/ABC123/",
+                    "https://www.instagram.com/reel/ABC123/",
+                    "instagram",
+                    "TikTok",
+                    SourceMediaKind::Video,
+                ),
+                ["instagram.com"].as_slice(),
+                "source_extractor_not_allowed",
+            ),
+            (
+                provider_inspection(
+                    "https://x.com/creator/status/123",
+                    "https://x.com/creator/status/123",
+                    "x",
+                    "Twitter",
+                    SourceMediaKind::Image,
+                ),
+                ["x.com"].as_slice(),
+                "source_media_kind_not_supported",
+            ),
+            (
+                provider_inspection(
+                    "https://www.instagram.com/creator/",
+                    "https://www.instagram.com/creator/",
+                    "instagram",
+                    "Instagram",
+                    SourceMediaKind::Video,
+                ),
+                ["instagram.com"].as_slice(),
+                "ytdlp_unsupported_surface",
+            ),
+            (
+                provider_inspection(
+                    "https://t.co/not-instagram",
+                    "https://www.instagram.com/reel/ABC123/",
+                    "instagram",
+                    "Instagram",
+                    SourceMediaKind::Video,
+                ),
+                ["instagram.com", "t.co", "x.com"].as_slice(),
+                "source_provider_mismatch",
+            ),
+        ];
+        for (inspection, allowed_hosts, expected_class) in cases {
+            let source_url = inspection.source_url.clone();
+            let router = provider_router(inspection, allowed_hosts);
+            let error = router
+                .inspect(&SourceInput {
+                    ingest_request_id: Uuid::from_u128(3),
+                    source_url,
+                    page_url: None,
+                })
+                .await
+                .expect_err("unsupported provider surface should fail");
+            assert_eq!(error.class(), expected_class);
+            assert!(!error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn arbitrary_configured_hosts_do_not_enable_general_yt_dlp() {
+        let allowed = vec!["example.com".to_owned()];
+        assert!(
+            !is_allowed_ytdlp_source("https://example.com/video", &allowed)
+                .expect("safe URL should parse")
+        );
+    }
+
     #[test]
     fn source_inspection_round_trips_as_job_payload() {
         let inspection = SourceInspection {
@@ -473,7 +674,7 @@ mod tests {
                 inspection: Ok(inspection("yt_dlp", SourceMediaKind::Video)),
                 downloads: Arc::clone(&ytdlp_downloads),
             }),
-            vec!["example.test".to_owned()],
+            vec!["youtube.com".to_owned()],
         );
 
         let inspection = router.inspect(&source()).await.expect("yt-dlp inspection should win");
@@ -562,7 +763,7 @@ mod tests {
                 inspection: Ok(inspection("yt_dlp", SourceMediaKind::Video)),
                 downloads: Arc::clone(&ytdlp_downloads),
             }),
-            vec!["example.test".to_owned()],
+            vec!["youtube.com".to_owned()],
         );
 
         let inspection = router.inspect(&source()).await.expect("direct inspection should win");
@@ -592,7 +793,7 @@ mod tests {
                 downloads: Arc::new(AtomicUsize::new(0)),
             }),
             Arc::clone(&ytdlp) as Arc<dyn SourceDownloader>,
-            vec!["example.test".to_owned()],
+            vec!["youtube.com".to_owned()],
         );
         assert_eq!(
             fallback.inspect(&source()).await.expect("yt-dlp should be tried").adapter,
@@ -605,7 +806,7 @@ mod tests {
                 downloads: Arc::new(AtomicUsize::new(0)),
             }),
             ytdlp,
-            vec!["example.test".to_owned()],
+            vec!["youtube.com".to_owned()],
         );
         assert!(matches!(
             blocked.inspect(&source()).await,

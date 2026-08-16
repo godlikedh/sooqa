@@ -128,62 +128,70 @@ separate:
   object uploaded to Telegram storage. It must remain below the documented
   2000 MB local Bot API upload limit.
 
-### Allowlisted YouTube pages
+### Allowlisted social-video pages
 
 The worker is direct-only when `SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS` is empty. To
-enable public YouTube video and Shorts pages, set it to a comma-separated list
-such as:
+enable the supported public single-video families, set it to a comma-separated
+list such as:
 
 ```bash
-SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS=youtube.com,youtu.be
+SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS=youtube.com,youtu.be,tiktok.com,instagram.com,x.com,twitter.com,t.co
 ```
 
-Entries are normalized as DNS hostnames. `youtube.com` also allows its
-dot-delimited subdomains; `youtu.be` is an exact host entry. Credentials, IP
-literals, wildcards, paths, and non-default ports are rejected. Direct MP4 and
-WebM responses continue to use the direct HTTP adapter even when their host is
-not in this list. The worker logs whether yt-dlp is disabled or enabled and
-fails startup if an enabled yt-dlp, pinned plugin, Deno capability, or
-PO-token provider is missing or too old.
+Entries are normalized as DNS hostnames and must belong to the closed provider
+policy. YouTube accepts `youtube.com` and its dot-delimited subdomains plus
+`youtu.be`. TikTok accepts `tiktok.com`, `www.tiktok.com`, `vm.tiktok.com`,
+`vt.tiktok.com`, and `m.tiktok.com`; Instagram accepts `instagram.com` and
+`www.instagram.com`; X/Twitter accepts `x.com`, `www.x.com`, `twitter.com`,
+and `www.twitter.com`. `t.co` is a short-link candidate only when inspection
+resolves it to an X/Twitter status. Credentials, IP literals, wildcards, paths,
+unsupported hosts, and non-default ports are rejected. Direct MP4 and WebM
+responses continue to use the direct HTTP adapter regardless of this list.
+The worker fails startup if enabled yt-dlp runtime dependencies are missing;
+the PO-token provider is required only when a YouTube family host is enabled.
 
-The home Compose deployment uses `youtube.com,youtu.be` when the variable is
+The home Compose deployment enables all supported families when the variable is
 unset; set it to an empty value in `deploy/home/.env` for direct-only operation.
 The initial URL host is the allowlist decision point. yt-dlp is run with
 `--ignore-config`, explicit no-cookie and no-browser-cookie flags, a cleared
 environment, and no remote components. It discovers only the pinned bgutil
 plugin from `/usr/local/share/sooqa/yt-dlp-plugins`; no browser state or netrc
 credentials are available to the child. An accepted provider page can still
-follow provider redirects and fetch its CDN media URLs. The supported home
-path is public regular videos and Shorts;
-private, members-only, age-restricted, geo-bypassed, and cookie-authenticated
-media are intentionally outside this setup.
+follow provider redirects and fetch its CDN media URLs. The supported URL
+shapes are YouTube watch/Shorts pages, TikTok `/@user/video/<id>` pages or
+`vm`/`vt`/`m` share links, Instagram `/reel/<id>` and `/p/<id>` pages, and
+X/Twitter `/<user>/status/<id>` posts. Profiles, feeds, stories, live pages,
+Spaces, galleries, playlists, image-only results, private/member-only,
+age-restricted, account-required, and cookie-authenticated media are
+intentionally outside this setup.
 
 The home Compose deployment starts `brainicism/bgutil-ytdlp-pot-provider` as a
 private, health-checked service with no published host port and configures the
 worker with `http://pot-provider:4416`. The image is pinned by its multi-
 architecture digest. The server and worker do not use a Compose health
-dependency on this service: direct-only deployments remain usable when
-`SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS` is empty, while the worker's restart policy
-retries its fail-closed provider preflight when page support is enabled. The
-worker checks `/ping` for provider version `1.3.1` before enabling page jobs; a
-missing provider or version mismatch fails startup with a provider-specific
-diagnostic. Standalone deployments can set
+dependency on this service: direct-only or social-only deployments remain
+usable without a YouTube PO-token provider, while the worker's restart policy
+retries its fail-closed preflight when YouTube page support is enabled. The
+worker checks `/ping` for provider version `1.3.1` before enabling YouTube page
+jobs; a missing provider or version mismatch fails startup with a
+provider-specific diagnostic. Standalone deployments can set
 `SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL` to another validated provider origin.
 yt-dlp retains its normal supported-client selection; the pinned provider is
-made available through its extractor argument rather than forcing one client
-for every YouTube page.
+made available through its extractor argument only for YouTube rather than
+forcing one client for every page.
 
 The submitted URL remains the ingest provenance. After inspection, the worker
 uses the validated canonical `resolved_url` for yt-dlp execution and checks its
-scheme, credentials, port, and host against the same allowlist before starting
-the child. The configured high-quality format is attempted first. If a fresh
+scheme, credentials, port, family, and host against the same policy before
+starting the child. The configured high-quality format is attempted first. For
+YouTube only, if a fresh
 attempt reports the specific media-byte `HTTP Error 403`, the worker starts one
 more high-quality attempt with fresh extractor state; if that also receives the
 same error, it makes one clean attempt with the bounded combined progressive
 selection `best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]`.
 The winning selection is recorded as `input_json.download.selected_format`.
-Private, removed, account-required, and other extractor failures stay
-terminal, while a failed progressive attempt returns to the existing bounded
+Private, removed, account-required, unsupported-surface, and other extractor
+failures stay terminal, while a failed progressive attempt returns to the existing bounded
 job retry policy. Every attempt has its own directory and failed or partial
 files are removed before another attempt.
 

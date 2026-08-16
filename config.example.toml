@@ -13,9 +13,14 @@ ffmpeg_path = "ffmpeg"
 ffprobe_path = "ffprobe"
 ytdlp_path = "yt-dlp"
 ytdlp_format = "bestvideo*+bestaudio/best"
-# Empty means direct-only. Page-like URLs are sent to yt-dlp only when their
-# initial hostname is explicitly listed here; subdomains are included.
-# ytdlp_allowed_hosts = ["youtube.com", "youtu.be"]
+# Empty means direct-only. Page-like URLs are sent to yt-dlp only for the
+# closed provider families listed here. YouTube subdomains are included;
+# TikTok share hosts are limited to vm/vt/m and www. t.co is accepted only
+# when the inspected canonical URL is an X/Twitter status.
+# ytdlp_allowed_hosts = [
+#   "youtube.com", "youtu.be", "tiktok.com", "instagram.com",
+#   "x.com", "twitter.com", "t.co",
+# ]
 # The home Compose deployment overrides this with http://pot-provider:4416.
 # ytdlp_pot_provider_url = "http://127.0.0.1:4416"
 # Total deadline for one ffmpeg normalization or video-frame extraction.

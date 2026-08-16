@@ -52,12 +52,15 @@ Telegram accepts private messages from configured positive administrator IDs.
 Media is staged below UUID-derived workspaces. Direct HTTP rejects credentials,
 private/special destinations, and unsafe redirects. ffmpeg, ffprobe, and
 yt-dlp receive argument arrays, bounded output, timeouts, and no shell. yt-dlp
-is used for page-like URLs only when the submitted URL's normalized initial
-hostname is in `media.ytdlp_allowed_hosts`; exact hosts and dot-delimited
-subdomains are matched, while credentials, IP literals, and non-default ports
-are rejected. The inspected canonical URL is checked against the same policy
-before it reaches the child, so metadata cannot redirect execution to a new
-host or weaken the initial SSRF boundary. Its child environment is cleared and
+is used for page-like URLs only when the submitted URL belongs to the closed
+provider-family policy and is enabled by `media.ytdlp_allowed_hosts`. The
+policy has explicit submitted/canonical hosts, bounded extractor identities,
+and URL shapes for YouTube, TikTok, Instagram, and X/Twitter; `t.co` is accepted
+only when canonical inspection produces an X/Twitter status. Credentials, IP
+literals, unsupported hosts, and non-default ports are rejected. The inspected
+canonical URL is checked against the same family and allowlist before it reaches
+the child, so metadata cannot redirect execution to a new host or weaken the
+initial SSRF boundary. Its child environment is cleared and
 rebuilt with only a fixed `PATH`; `--ignore-config`, `--no-cookies`, and
 `--no-cookies-from-browser` are explicit, and no netrc or browser state is
 available. Remote components are disabled, and plugin discovery is reset to
@@ -71,18 +74,21 @@ provider is private-network-only, has no host-published port, and is checked
 for the pinned `1.3.1` version at worker startup. Each yt-dlp attempt gets a
 unique job-owned directory with a relative output and explicit home/temp paths;
 yt-dlp keeps its normal supported-client selection; the pinned PO-token
-provider is supplied to that selection without globally forcing an mweb client.
+provider is supplied only to YouTube selection without globally forcing an mweb
+client. TikTok, Instagram, and X/Twitter do not use the YouTube PO-token or
+media-byte recovery path.
 the worker monitors the aggregate directory while the child is running, not
 only the final file, and removes the complete directory on success, failure,
 timeout, or cancellation. The aggregate budget is three times the final source
 limit to leave room for split-stream merging. A successful attempt must leave
-exactly one regular final media file. A specific `unable to download video data:
-HTTP Error 403` failure receives one fresh high-quality attempt and then one
-clean combined-progressive fallback; the bounded
+exactly one regular final media file. A specific YouTube
+`unable to download video data: HTTP Error 403` failure receives one fresh
+high-quality attempt and then one clean combined-progressive fallback; the bounded
 `input_json.download.selected_format` marker records which format won. Other
 extractor failures remain terminal, and every failed attempt directory is
 removed. The worker also refuses to enable the adapter if the offline
-plugin/EJS/Deno probes or provider health/version check fail.
+plugin/EJS/Deno probes fail, or if the YouTube PO-token health/version check
+fails when YouTube is enabled.
 
 The local Telegram Bot API service is a private Compose-network dependency. Its
 `api_id`, `api_hash`, and bot token are deployment secrets; the service has a

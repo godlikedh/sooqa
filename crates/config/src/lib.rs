@@ -1073,12 +1073,41 @@ fn parse_ytdlp_allowed_hosts(name: &str, values: Vec<String>) -> Result<Vec<Stri
                 reason: "entries must be non-empty DNS hostnames, not IP literals",
             });
         }
-        normalized.push(host.to_ascii_lowercase());
+        let host = host.to_ascii_lowercase();
+        if !is_supported_ytdlp_host(&host) {
+            return Err(ConfigError::InvalidValue {
+                name: name.to_owned(),
+                reason: "entries must belong to a supported YouTube, TikTok, Instagram, or X provider family",
+            });
+        }
+        normalized.push(host);
     }
 
     normalized.sort_unstable();
     normalized.dedup();
     Ok(normalized)
+}
+
+fn is_supported_ytdlp_host(host: &str) -> bool {
+    host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtu.be"
+        || host.ends_with(".youtu.be")
+        || [
+            "tiktok.com",
+            "www.tiktok.com",
+            "vm.tiktok.com",
+            "vt.tiktok.com",
+            "m.tiktok.com",
+            "instagram.com",
+            "www.instagram.com",
+            "x.com",
+            "www.x.com",
+            "twitter.com",
+            "www.twitter.com",
+            "t.co",
+        ]
+        .contains(&host)
 }
 
 fn parse_ytdlp_pot_provider_url(name: &str, value: String) -> Result<String, ConfigError> {
@@ -1466,15 +1495,15 @@ mod tests {
     }
 
     #[test]
-    fn ytdlp_allowed_hosts_normalize_idna() {
+    fn ytdlp_allowed_hosts_normalize_supported_subdomains() {
         let config = AppConfig::from_toml_str(
             AppRole::Worker,
             None,
-            "[media]\nytdlp_allowed_hosts = [\"BÜCHER.example\"]\n",
+            "[media]\nytdlp_allowed_hosts = [\"WWW.YouTube.COM.\", \"VM.TIKTOK.COM\"]\n",
         )
         .expect("TOML should parse");
 
-        assert_eq!(config.media.ytdlp_allowed_hosts, ["xn--bcher-kva.example"]);
+        assert_eq!(config.media.ytdlp_allowed_hosts, ["vm.tiktok.com", "www.youtube.com"]);
     }
 
     #[test]
@@ -1499,9 +1528,17 @@ mod tests {
     }
 
     #[test]
+    fn ytdlp_allowed_hosts_reject_arbitrary_provider_domains() {
+        let contents = "[media]\nytdlp_allowed_hosts = [\"example.com\"]\n";
+        let error = AppConfig::from_toml_str(AppRole::Worker, None, contents)
+            .expect_err("arbitrary yt-dlp providers must remain disabled");
+        assert!(error.to_string().contains("supported YouTube, TikTok, Instagram, or X"));
+    }
+
+    #[test]
     fn ytdlp_allowed_hosts_are_bounded() {
         let values =
-            (0..=MAX_YTDLP_ALLOWED_HOSTS).map(|index| format!("host{index}.example")).collect();
+            (0..=MAX_YTDLP_ALLOWED_HOSTS).map(|index| format!("host{index}.youtube.com")).collect();
         let error = parse_ytdlp_allowed_hosts("media.ytdlp_allowed_hosts", values)
             .expect_err("too many host entries must fail");
         assert!(error.to_string().contains("at most 32"));

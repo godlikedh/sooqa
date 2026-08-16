@@ -33,9 +33,9 @@ workspace, `probe_asset`,
 configured, `upload_storage_asset`.
 The production worker is direct-only when `media.ytdlp_allowed_hosts` is empty;
 when hosts are configured, page-like URLs use the pinned yt-dlp/Deno runtime
-only for an exact host or dot-delimited subdomain match. Direct MP4/WebM
-responses remain on the direct adapter regardless of the page allowlist. Video
-normalization records a canonical artifact and
+only for the closed YouTube, TikTok, Instagram, and X/Twitter provider policy.
+Direct MP4/WebM responses remain on the direct adapter regardless of the page
+allowlist. Video normalization records a canonical artifact and
 queues sequence fingerprinting; the worker then performs exact-SHA reuse or
 the bounded `video_sequence_v1` identity decision before creating a
 `pending_storage` media row. Strong perceptual matches become durable
@@ -157,9 +157,10 @@ The server and worker must share `media.work_root`. The current production
 worker preflights only binaries required by its registered handlers; the
 composed probe and normalization handlers require `ffprobe` and `ffmpeg`. When
 the yt-dlp allowlist is non-empty, startup also requires the pinned `yt-dlp`,
-bgutil plugin, and Deno binaries, verifies the supported Deno version, checks
-the private PO-token provider's pinned version, and runs an offline
-yt-dlp/plugin/EJS fixture plus a Deno execution probe. The image in
+bgutil plugin, and Deno binaries, verifies the supported Deno version, and
+runs an offline yt-dlp/plugin/EJS fixture plus a Deno execution probe. When a
+YouTube family host is enabled, it also checks the private PO-token provider's
+pinned version. The image in
 `Dockerfile` contains the pinned official distributions and plugin; the home
 Compose file starts the provider privately with no host-published port.
 

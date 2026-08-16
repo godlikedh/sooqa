@@ -1816,8 +1816,17 @@ fn decode_hex_digit(value: u8) -> Option<u8> {
 }
 
 fn source_record_for_request(request: &sooqa_inbox::Ingest) -> MediaSourceInput {
+    let ytdlp = ytdlp_provenance_for_request(request);
     let (kind, normalized_url, platform, platform_content_id) = match request.kind {
-        IngestKind::Url => (SourceKind::DirectUrl, Some(request.source_url.clone()), None, None),
+        IngestKind::Url => (
+            SourceKind::DirectUrl,
+            ytdlp
+                .as_ref()
+                .and_then(|metadata| metadata.canonical_url.clone())
+                .or_else(|| Some(request.source_url.clone())),
+            ytdlp.as_ref().and_then(|metadata| metadata.platform.clone()),
+            ytdlp.as_ref().and_then(|metadata| metadata.content_id.clone()),
+        ),
         IngestKind::TelegramMessage => (
             SourceKind::Telegram,
             None,
@@ -1838,8 +1847,11 @@ fn source_record_for_request(request: &sooqa_inbox::Ingest) -> MediaSourceInput 
         normalized_url,
         platform,
         platform_content_id,
-        author_name: None,
-        title: request.page_title.clone(),
+        author_name: ytdlp.as_ref().and_then(|metadata| metadata.uploader.clone()),
+        title: request
+            .page_title
+            .clone()
+            .or_else(|| ytdlp.as_ref().and_then(|metadata| metadata.title.clone())),
         description: request.supplied_description.clone().or_else(|| {
             if request.kind == IngestKind::TelegramMessage {
                 request.supplied_caption.clone()
@@ -1850,6 +1862,49 @@ fn source_record_for_request(request: &sooqa_inbox::Ingest) -> MediaSourceInput 
         published_at: None,
         metadata: source_provenance_for_request(request),
     }
+}
+
+#[derive(Debug, Default, Clone)]
+struct YtDlpProvenance {
+    platform: Option<String>,
+    content_id: Option<String>,
+    extractor: Option<String>,
+    uploader: Option<String>,
+    title: Option<String>,
+    canonical_url: Option<String>,
+}
+
+fn ytdlp_provenance_for_request(request: &sooqa_inbox::Ingest) -> Option<YtDlpProvenance> {
+    if request.kind != IngestKind::Url {
+        return None;
+    }
+    let inspection = request.original_input.get("inspection")?;
+    if inspection.get("adapter").and_then(serde_json::Value::as_str) != Some("yt_dlp") {
+        return None;
+    }
+    let metadata = inspection.get("metadata")?;
+    Some(YtDlpProvenance {
+        platform: bounded_provenance_string(metadata.get("platform"), 64),
+        content_id: bounded_provenance_string(metadata.get("id"), 256),
+        extractor: bounded_provenance_string(metadata.get("extractor"), 128),
+        uploader: bounded_provenance_string(metadata.get("uploader"), 4 * 1024),
+        title: bounded_provenance_string(metadata.get("title"), 4 * 1024),
+        canonical_url: bounded_provenance_string(
+            inspection.get("resolved_url").or_else(|| metadata.get("webpage_url")),
+            2 * 1024,
+        ),
+    })
+}
+
+fn bounded_provenance_string(
+    value: Option<&serde_json::Value>,
+    max_bytes: usize,
+) -> Option<String> {
+    let value = value?.as_str()?;
+    if value.len() > max_bytes || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.to_owned())
 }
 
 fn original_source_url(request: &sooqa_inbox::Ingest) -> String {
@@ -1888,6 +1943,16 @@ struct SourceProvenance {
     telegram_file_unique_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     two_ch_mirror: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform_content_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extractor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uploader: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_url: Option<String>,
 }
 
 fn source_provenance_for_request(request: &sooqa_inbox::Ingest) -> serde_json::Value {
@@ -1912,6 +1977,7 @@ fn source_provenance_for_request(request: &sooqa_inbox::Ingest) -> serde_json::V
         .and_then(|value| value.get("metadata"))
         .and_then(|value| value.get("two_ch_mirror"))
         .cloned();
+    let ytdlp = ytdlp_provenance_for_request(request);
     let provenance = SourceProvenance {
         page_url: request.page_url.clone(),
         media_kind,
@@ -1925,6 +1991,11 @@ fn source_provenance_for_request(request: &sooqa_inbox::Ingest) -> serde_json::V
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned),
         two_ch_mirror,
+        platform: ytdlp.as_ref().and_then(|metadata| metadata.platform.clone()),
+        platform_content_id: ytdlp.as_ref().and_then(|metadata| metadata.content_id.clone()),
+        extractor: ytdlp.as_ref().and_then(|metadata| metadata.extractor.clone()),
+        uploader: ytdlp.as_ref().and_then(|metadata| metadata.uploader.clone()),
+        canonical_url: ytdlp.as_ref().and_then(|metadata| metadata.canonical_url.clone()),
     };
     serde_json::to_value(provenance).expect("source provenance is serializable")
 }
@@ -3097,5 +3168,43 @@ mod tests {
             Some("HTTPS://Example.COM:443/clip.webm?utm_source=feed&id=7#frame")
         );
         assert_eq!(source.normalized_url.as_deref(), Some("https://example.com/clip.webm?id=7"));
+    }
+
+    #[test]
+    fn source_record_keeps_bounded_ytdlp_provider_provenance() {
+        let submission = IngestSubmission::try_new(IngestSubmissionInput::new(
+            "https://vm.tiktok.com/ZMshare/",
+            SubmittedVia::Companion,
+        ))
+        .expect("submission should validate");
+        let mut request = Ingest::from_submission(Uuid::new_v4(), &submission);
+        request.original_input["inspection"] = serde_json::json!({
+            "adapter": "yt_dlp",
+            "resolved_url": "https://www.tiktok.com/@creator/video/123456",
+            "metadata": {
+                "platform": "tiktok",
+                "id": "123456",
+                "extractor": "TikTok",
+                "uploader": "creator",
+                "title": "A public clip",
+                "webpage_url": "https://www.tiktok.com/@creator/video/123456"
+            }
+        });
+
+        let source = source_record_for_request(&request);
+        assert_eq!(source.original_url.as_deref(), Some("https://vm.tiktok.com/ZMshare/"));
+        assert_eq!(source.platform.as_deref(), Some("tiktok"));
+        assert_eq!(source.platform_content_id.as_deref(), Some("123456"));
+        assert_eq!(source.author_name.as_deref(), Some("creator"));
+        assert_eq!(source.title.as_deref(), Some("A public clip"));
+        assert_eq!(
+            source.normalized_url.as_deref(),
+            Some("https://www.tiktok.com/@creator/video/123456")
+        );
+        assert_eq!(source.metadata["extractor"], "TikTok");
+        assert_eq!(
+            source.metadata["canonical_url"],
+            "https://www.tiktok.com/@creator/video/123456"
+        );
     }
 }
