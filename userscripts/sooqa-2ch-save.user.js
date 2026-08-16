@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         sooqa: 2ch media actions
 // @namespace    sooqa
-// @version      0.2.1
+// @version      0.2.2
 // @description  Add save, queue, and post-now controls to direct 2ch media.
 // @match        https://2ch.su/*
 // @match        https://2ch.org/*
@@ -342,45 +342,161 @@
     }
   }
 
-  function collectMetadataWithPrompt(env, action) {
-    const wantsPublicText = Boolean(action.publicText);
-    const wantsExactTime = Boolean(action.exactTime);
-    const promptParts = ["Tags (comma-separated)", "Internal description"];
-    if (wantsPublicText) promptParts.push("Public post text");
-    if (wantsExactTime) promptParts.push("Local date/time (YYYY-MM-DDTHH:MM)");
-    const value = env.prompt(promptParts.join(" | ") + ":", "");
-    if (value === null) return null;
-    const parts = String(value).split("|");
+  function metadataSurfaceTitle(action) {
+    if (action.exactTime) return "Queue media";
+    if (action.publicText) return "Post media now";
+    return "Save media";
+  }
+
+  function readMetadata(env, action, fields) {
     const metadata = {
-      tags: parseTags(parts.shift() || ""),
-      description: String(parts.shift() || "").trim(),
+      description: String(fields.description.value || "").trim(),
+      tags: parseTags(fields.tags.value),
     };
-    if (wantsPublicText) metadata.publicText = String(parts.shift() || "").trim();
-    if (wantsExactTime) {
+    if (fields.publicText) metadata.publicText = String(fields.publicText.value || "").trim();
+    if (fields.requestedPublishAt) {
       metadata.requestedPublishAt = localDateTimeToRfc3339(
-        String(parts.shift() || "").trim(),
+        fields.requestedPublishAt.value,
         env.now ? env.now() : new Date()
       );
       if (!metadata.requestedPublishAt) {
-        if (env.setStatus) env.setStatus("Enter a future local date/time");
-        return null;
+        return {
+          error: "Enter a future local date/time",
+          field: fields.requestedPublishAt,
+        };
       }
     }
-    return metadata;
+    return { metadata };
   }
 
-  function collectMetadata(env, action) {
-    const wantsPublicText = Boolean(action.publicText);
-    const wantsExactTime = Boolean(action.exactTime);
-    if (!dialogSupported(env.document)) {
-      try {
-        return Promise.resolve(collectMetadataWithPrompt(env, action));
-      } catch (_error) {
-        if (env.setStatus) env.setStatus("Detailed form unavailable");
-        return Promise.resolve(null);
-      }
+  function buildMetadataForm(env, action, onSubmit, onCancel) {
+    const form = env.document.createElement("form");
+    form.method = "dialog";
+    form.noValidate = true;
+    const fields = {};
+    const addField = (labelText, type, name, multiline = false) => {
+      const label = env.document.createElement("label");
+      const field = env.document.createElement(multiline ? "textarea" : "input");
+      field.type = type;
+      field.name = name;
+      field.id = "sooqa-metadata-" + name;
+      field.autocomplete = "off";
+      label.htmlFor = field.id;
+      label.textContent = labelText;
+      if (multiline) field.rows = 3;
+      label.append(field);
+      form.append(label);
+      fields[name] = field;
+      return field;
+    };
+
+    addField("Tags (comma-separated)", "text", "tags");
+    addField("Internal description", "text", "description", true);
+    if (action.publicText) addField("Public post text", "text", "publicText", true);
+    if (action.exactTime) {
+      const requestedPublishAt = addField("Local date/time", "datetime-local", "requestedPublishAt");
+      requestedPublishAt.required = true;
+      requestedPublishAt.step = 60;
     }
 
+    const error = env.document.createElement("div");
+    error.className = "sooqa-dialog-error";
+    error.setAttribute("aria-live", "polite");
+    const actions = env.document.createElement("div");
+    actions.className = "sooqa-dialog-actions";
+    const cancel = makeButton(env.document, "Cancel", "sooqa-cancel");
+    cancel.value = "cancel";
+    const confirm = makeButton(env.document, "Send", "sooqa-confirm", "submit");
+    confirm.value = "send";
+    actions.append(cancel, confirm);
+    form.append(error, actions);
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const result = readMetadata(env, action, fields);
+      if (result.error) {
+        error.textContent = result.error;
+        try {
+          result.field.focus();
+        } catch (_error) {
+          // Validation remains visible when focus is unavailable.
+        }
+        return;
+      }
+      onSubmit(result.metadata);
+    });
+    cancel.addEventListener("click", (event) => {
+      event.preventDefault();
+      onCancel();
+    });
+    return { form, fields, error };
+  }
+
+  function buildMetadataSurface(env, action, tagName, onSubmit, onCancel) {
+    const surface = env.document.createElement(tagName);
+    surface.className = tagName === "dialog"
+      ? "sooqa-metadata-dialog"
+      : "sooqa-metadata-overlay";
+    surface.setAttribute("role", "dialog");
+    surface.setAttribute("aria-modal", "true");
+    surface.tabIndex = -1;
+    const title = env.document.createElement("h2");
+    title.id = "sooqa-metadata-title";
+    title.textContent = metadataSurfaceTitle(action);
+    surface.setAttribute("aria-labelledby", title.id);
+    const form = buildMetadataForm(env, action, onSubmit, onCancel);
+    surface.append(title, form.form);
+    surface.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCancel();
+      }
+    });
+    return { surface, ...form };
+  }
+
+  function reportMetadataUnavailable(env) {
+    try {
+      if (env.setStatus) env.setStatus("Detailed form unavailable");
+    } catch (_error) {
+      // Status rendering must not leave the action panel locked.
+    }
+  }
+
+  function collectMetadataWithOverlay(env, action) {
+    return new Promise((resolve) => {
+      let overlay = null;
+      let settled = false;
+      const remove = () => {
+        try {
+          if (overlay && overlay.parentElement) overlay.remove();
+        } catch (_error) {
+          // Ignore cleanup errors after a structured fallback failure.
+        }
+      };
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        remove();
+        resolve(value);
+      };
+      try {
+        const form = buildMetadataSurface(env, action, "div", finish, () => finish(null));
+        overlay = form.surface;
+        env.document.body.append(overlay);
+        try {
+          form.fields.tags.focus();
+        } catch (_error) {
+          // An overlay remains usable when the browser rejects initial focus.
+        }
+      } catch (_error) {
+        reportMetadataUnavailable(env);
+        finish(null);
+      }
+    });
+  }
+
+  function collectMetadataInNativeDialog(env, action) {
     return new Promise((resolve) => {
       let dialog = null;
       let settled = false;
@@ -388,7 +504,7 @@
         try {
           if (dialog && typeof dialog.close === "function") dialog.close();
         } catch (_error) {
-          // A broken native dialog must not prevent cleanup or recovery.
+          // A broken native dialog must not prevent overlay recovery.
         }
         try {
           if (dialog && dialog.parentElement) dialog.remove();
@@ -402,89 +518,19 @@
         closeAndRemove();
         resolve(value);
       };
-      const recoverFromDialogFailure = () => {
+      const recoverToOverlay = () => {
         if (settled) return;
         settled = true;
         closeAndRemove();
-        try {
-          resolve(collectMetadataWithPrompt(env, action));
-        } catch (_error) {
-          if (env.setStatus) env.setStatus("Detailed form unavailable");
+        collectMetadataWithOverlay(env, action).then(resolve, () => {
+          reportMetadataUnavailable(env);
           resolve(null);
-        }
+        });
       };
 
       try {
-        dialog = env.document.createElement("dialog");
-        dialog.className = "sooqa-metadata-dialog";
-        const form = env.document.createElement("form");
-        form.method = "dialog";
-        const fields = [];
-
-        const addField = (labelText, type, name, multiline = false) => {
-          const label = env.document.createElement("label");
-          label.textContent = labelText;
-          const field = env.document.createElement(multiline ? "textarea" : "input");
-          field.type = type;
-          field.name = name;
-          field.autocomplete = "off";
-          if (multiline) field.rows = 3;
-          label.append(field);
-          form.append(label);
-          fields.push(field);
-          return field;
-        };
-
-        const tags = addField("Tags (comma-separated)", "text", "tags");
-        const description = addField("Internal description", "text", "description", true);
-        const publicText = wantsPublicText
-          ? addField("Public post text", "text", "publicText", true)
-          : null;
-        const requestedPublishAt = wantsExactTime
-          ? addField("Local date/time", "datetime-local", "requestedPublishAt")
-          : null;
-        if (requestedPublishAt) requestedPublishAt.required = true;
-
-        const error = env.document.createElement("div");
-        error.className = "sooqa-dialog-error";
-        const actions = env.document.createElement("div");
-        actions.className = "sooqa-dialog-actions";
-        const cancel = makeButton(env.document, "Cancel", "sooqa-cancel");
-        cancel.value = "cancel";
-        const confirm = makeButton(env.document, "Send", "sooqa-confirm", "submit");
-        confirm.value = "send";
-        actions.append(cancel, confirm);
-        form.append(error, actions);
-        dialog.append(form);
-
-        form.addEventListener("submit", (event) => {
-          event.preventDefault();
-          const metadata = {
-            description: String(description.value || "").trim(),
-            tags: parseTags(tags.value),
-          };
-          if (publicText) metadata.publicText = String(publicText.value || "").trim();
-          if (requestedPublishAt) {
-            metadata.requestedPublishAt = localDateTimeToRfc3339(
-              requestedPublishAt.value,
-              env.now ? env.now() : new Date()
-            );
-            if (!metadata.requestedPublishAt) {
-              error.textContent = "Enter a future local date/time";
-              try {
-                requestedPublishAt.focus();
-              } catch (_error) {
-                // Keep the validation message visible if focus is unavailable.
-              }
-              return;
-            }
-          }
-          finish(metadata);
-        });
-        cancel.addEventListener("click", (event) => {
-          event.preventDefault();
-          finish(null);
-        });
+        const form = buildMetadataSurface(env, action, "dialog", finish, () => finish(null));
+        dialog = form.surface;
         dialog.addEventListener("cancel", (event) => {
           event.preventDefault();
           finish(null);
@@ -493,14 +539,24 @@
         env.document.body.append(dialog);
         try {
           dialog.showModal();
-          fields[0].focus();
         } catch (_error) {
-          recoverFromDialogFailure();
+          recoverToOverlay();
+          return;
+        }
+        try {
+          form.fields.tags.focus();
+        } catch (_error) {
+          // Initial focus is best effort; keep the native form open and usable.
         }
       } catch (_error) {
-        recoverFromDialogFailure();
+        recoverToOverlay();
       }
     });
+  }
+
+  function collectMetadata(env, action) {
+    if (!dialogSupported(env.document)) return collectMetadataWithOverlay(env, action);
+    return collectMetadataInNativeDialog(env, action);
   }
 
   function loadAcceptedHistory(env) {
@@ -648,11 +704,39 @@
       "  color: #f8fafc !important;",
       "  font: 16px/1.4 system-ui, sans-serif !important;",
       "}",
+      ".sooqa-metadata-overlay {",
+      "  box-sizing: border-box !important;",
+      "  position: fixed !important;",
+      "  z-index: 2147483647 !important;",
+      "  inset: 0 !important;",
+      "  display: flex !important;",
+      "  align-items: center !important;",
+      "  justify-content: center !important;",
+      "  padding: 1rem !important;",
+      "  overflow: auto !important;",
+      "  background: rgba(2, 6, 23, 0.72) !important;",
+      "  color: #f8fafc !important;",
+      "  font: 16px/1.4 system-ui, sans-serif !important;",
+      "}",
+      ".sooqa-metadata-overlay form {",
+      "  box-sizing: border-box !important;",
+      "  width: min(32rem, calc(100vw - 2rem)) !important;",
+      "  max-height: calc(100vh - 2rem) !important;",
+      "  overflow: auto !important;",
+      "  padding: 1rem !important;",
+      "  border: 1px solid #64748b !important;",
+      "  border-radius: 0.5rem !important;",
+      "  background: #111827 !important;",
+      "  color: #f8fafc !important;",
+      "  font: inherit !important;",
+      "}",
       ".sooqa-metadata-dialog[open] { display: block !important; visibility: visible !important; }",
       ".sooqa-metadata-dialog::backdrop { background: rgba(2, 6, 23, 0.72) !important; }",
       ".sooqa-metadata-dialog form { display: grid !important; gap: 0.75rem !important; margin: 0 !important; }",
-      ".sooqa-metadata-dialog label { display: grid !important; gap: 0.35rem !important; font-weight: 600 !important; }",
-      ".sooqa-metadata-dialog input, .sooqa-metadata-dialog textarea {",
+      ".sooqa-metadata-overlay form { display: grid !important; gap: 0.75rem !important; margin: 0 !important; }",
+      ".sooqa-metadata-dialog h2, .sooqa-metadata-overlay h2 { margin: 0 !important; font: 700 1.15rem/1.3 system-ui, sans-serif !important; }",
+      ".sooqa-metadata-dialog label, .sooqa-metadata-overlay label { display: grid !important; gap: 0.35rem !important; font-weight: 600 !important; }",
+      ".sooqa-metadata-dialog input, .sooqa-metadata-dialog textarea, .sooqa-metadata-overlay input, .sooqa-metadata-overlay textarea {",
       "  box-sizing: border-box;",
       "  width: 100% !important;",
       "  min-height: 2.25rem !important;",
@@ -663,9 +747,9 @@
       "  color: #0f172a !important;",
       "  font: inherit !important;",
       "}",
-      ".sooqa-metadata-dialog textarea { min-height: 5rem !important; resize: vertical !important; }",
+      ".sooqa-metadata-dialog textarea, .sooqa-metadata-overlay textarea { min-height: 5rem !important; resize: vertical !important; }",
       ".sooqa-dialog-actions { display: flex !important; justify-content: flex-end !important; gap: 0.5rem !important; }",
-      ".sooqa-dialog-actions button { min-height: 2.25rem !important; padding: 0.35rem 0.75rem !important; }",
+      ".sooqa-dialog-actions button { min-height: 2.25rem !important; padding: 0.35rem 0.75rem !important; border: 1px solid #94a3b8 !important; border-radius: 0.25rem !important; background: #e2e8f0 !important; color: #0f172a !important; font: inherit !important; cursor: pointer !important; }",
       ".sooqa-dialog-error { min-height: 1.2em; color: #fecaca; }",
       ".sooqa-history-control { margin: 0.5rem 0; }",
       "@media (max-width: 42rem) { .sooqa-attachment-row { flex-wrap: wrap; } }",
