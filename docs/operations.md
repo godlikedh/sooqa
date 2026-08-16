@@ -204,7 +204,7 @@ files are removed before another attempt.
 
 The home image downloads the official standalone `yt-dlp` distribution, the
 `bgutil-ytdlp-pot-provider` plugin `1.3.1`, and a pinned Deno runtime. The
-current Dockerfile pins yt-dlp `2026.06.09`, Deno `2.8.1`, and the plugin ZIP
+current Dockerfile pins yt-dlp `2026.07.04`, Deno `2.8.1`, and the plugin ZIP
 with architecture-specific or release SHA-256 checksums. When the allowlist is
 enabled, worker startup runs an offline local-info fixture through yt-dlp with
 the configured plugin/EJS/Deno flags, checks that the bundled EJS and pinned
