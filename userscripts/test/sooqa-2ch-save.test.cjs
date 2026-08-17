@@ -18,7 +18,16 @@ class FakeElement {
     this.className = "";
     this.textContent = "";
     this.value = "";
-    this.type = "";
+    this._type = "";
+    Object.defineProperty(this, "type", {
+      configurable: true,
+      enumerable: true,
+      get: () => this.tagName === "TEXTAREA" ? "textarea" : this._type,
+      set: (value) => {
+        if (this.tagName === "TEXTAREA") throw new TypeError("textarea.type is read-only");
+        this._type = String(value);
+      },
+    });
     this.disabled = false;
     this.inert = false;
     this.open = false;
@@ -1176,9 +1185,40 @@ test("accepted history is mirror-canonical, thread-local, bounded, and clearable
   assert.equal(boundedStorage.get("sooqa_accepted_actions_v1").length, 200);
 });
 
+test("all detailed actions keep real textareas in native and overlay forms", async () => {
+  for (const renderer of ["native", "overlay"]) {
+    const requests = [];
+    const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+    if (renderer === "overlay") browser.document.disableDialog = true;
+    const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+    browser.document.body.append(post);
+    userscript.boot(browser.root);
+
+    for (const [actionKey, expected] of [
+      ["save_detailed", { inputs: 1, textareas: 1 }],
+      ["post_now_detailed", { inputs: 1, textareas: 2 }],
+      ["queue_exact", { inputs: 2, textareas: 2 }],
+    ]) {
+      actionButton(post, actionKey).click();
+      const surface = browser.document.body.querySelector(renderer === "native" ? "dialog" : ".sooqa-metadata-overlay");
+      assert.ok(surface);
+      assert.equal(surface.querySelectorAll("input").length, expected.inputs);
+      assert.equal(surface.querySelectorAll("textarea").length, expected.textareas);
+      for (const textarea of surface.querySelectorAll("textarea")) assert.equal(textarea.type, "textarea");
+      if (actionKey === "queue_exact") {
+        assert.equal(surface.querySelectorAll("input")[1].type, "datetime-local");
+      }
+      surface.querySelector(".sooqa-cancel").click();
+      await new Promise((resolve) => setImmediate(resolve));
+      assertActionButtonsState(post, false);
+    }
+    assert.equal(requests.length, 0);
+  }
+});
+
 test("metadata contains no backend secrets, polling, or stale update metadata", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "sooqa-2ch-save.user.js"), "utf8");
-  assert.match(source, /@version\s+0\.2\.2/);
+  assert.match(source, /@version\s+0\.2\.3/);
   assert.match(source, /@updateURL\s+https:\/\/raw\.githubusercontent\.com\/godlikedh\/sooqa\/main/);
   assert.match(source, /@downloadURL\s+https:\/\/raw\.githubusercontent\.com\/godlikedh\/sooqa\/main/);
   assert.match(source, /GM_xmlhttpRequest/);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         sooqa: 2ch media actions
 // @namespace    sooqa
-// @version      0.2.2
+// @version      0.2.3
 // @description  Add save, queue, and post-now controls to direct 2ch media.
 // @match        https://2ch.su/*
 // @match        https://2ch.org/*
@@ -377,7 +377,7 @@
     const addField = (labelText, type, name, multiline = false) => {
       const label = env.document.createElement("label");
       const field = env.document.createElement(multiline ? "textarea" : "input");
-      field.type = type;
+      if (!multiline) field.type = type;
       field.name = name;
       field.id = "sooqa-metadata-" + name;
       field.autocomplete = "off";
