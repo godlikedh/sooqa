@@ -850,34 +850,63 @@ test("structured overlay traps focus, inerts the page, and restores focus", asyn
   browser.document.body.append(post);
   userscript.boot(browser.root);
 
-  const trigger = actionButton(post, "save_detailed");
+  const trigger = actionButton(post, "queue_exact");
   browser.document.activeElement = trigger;
   trigger.click();
   const overlay = browser.document.body.querySelector(".sooqa-metadata-overlay");
   const focusable = overlay.querySelectorAll("input, textarea, button");
   assert.ok(overlay);
   assert.equal(post.inert, true);
+  assert.deepEqual(focusable.map((element) => element.name || element.textContent), [
+    "tags",
+    "description",
+    "publicText",
+    "requestedPublishAt",
+    "Cancel",
+    "Send",
+  ]);
 
-  browser.document.activeElement = focusable[focusable.length - 1];
-  let tabPrevented = false;
+  browser.document.activeElement = focusable[0];
+  for (let index = 1; index < focusable.length; index += 1) {
+    let tabPrevented = false;
+    overlay.dispatchEvent({
+      type: "keydown",
+      key: "Tab",
+      preventDefault: () => { tabPrevented = true; },
+    });
+    assert.equal(tabPrevented, true);
+    assert.equal(browser.document.activeElement, focusable[index]);
+  }
+  let wrapPrevented = false;
   overlay.dispatchEvent({
     type: "keydown",
     key: "Tab",
-    preventDefault: () => { tabPrevented = true; },
+    preventDefault: () => { wrapPrevented = true; },
   });
-  assert.equal(tabPrevented, true);
+  assert.equal(wrapPrevented, true);
   assert.equal(browser.document.activeElement, focusable[0]);
 
-  browser.document.activeElement = focusable[0];
-  let reverseTabPrevented = false;
+  let reverseWrapPrevented = false;
   overlay.dispatchEvent({
     type: "keydown",
     key: "Tab",
     shiftKey: true,
-    preventDefault: () => { reverseTabPrevented = true; },
+    preventDefault: () => { reverseWrapPrevented = true; },
   });
-  assert.equal(reverseTabPrevented, true);
+  assert.equal(reverseWrapPrevented, true);
   assert.equal(browser.document.activeElement, focusable[focusable.length - 1]);
+  for (let index = focusable.length - 1; index > 0; index -= 1) {
+    let reverseTabPrevented = false;
+    overlay.dispatchEvent({
+      type: "keydown",
+      key: "Tab",
+      shiftKey: true,
+      preventDefault: () => { reverseTabPrevented = true; },
+    });
+    assert.equal(reverseTabPrevented, true);
+    assert.equal(browser.document.activeElement, focusable[index - 1]);
+  }
+  assert.equal(browser.document.activeElement, focusable[0]);
 
   overlay.dispatchEvent({ type: "keydown", key: "Escape" });
   await new Promise((resolve) => setImmediate(resolve));
@@ -886,6 +915,26 @@ test("structured overlay traps focus, inerts the page, and restores focus", asyn
   assert.equal(browser.document.activeElement, trigger);
   assertActionButtonsState(post, false);
   assert.equal(requests.length, 0);
+});
+
+test("native dialog focus uses the browser modal sequence", () => {
+  const requests = [];
+  const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+  const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+  browser.document.body.append(post);
+  userscript.boot(browser.root);
+
+  actionButton(post, "save_detailed").click();
+  const dialog = browser.document.body.querySelector("dialog");
+  assert.ok(dialog);
+  let tabPrevented = false;
+  dialog.dispatchEvent({
+    type: "keydown",
+    key: "Tab",
+    preventDefault: () => { tabPrevented = true; },
+  });
+  assert.equal(tabPrevented, false);
+  dialog.querySelector(".sooqa-cancel").click();
 });
 
 test("native initial focus failure leaves the structured form usable", async () => {

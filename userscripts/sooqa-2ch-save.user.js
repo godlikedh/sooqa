@@ -433,19 +433,8 @@
   }
 
   function metadataFocusableElements(surface) {
-    const elements = [];
-    for (const selector of ["button", "input", "textarea", "select", "a[href]"]) {
-      for (const element of Array.from(surface.querySelectorAll(selector))) {
-        if (
-          !elements.includes(element) &&
-          !element.disabled &&
-          element.tabIndex !== -1
-        ) {
-          elements.push(element);
-        }
-      }
-    }
-    return elements;
+    return Array.from(surface.querySelectorAll("button, input, textarea, select, a[href]"))
+      .filter((element) => !element.disabled && element.tabIndex !== -1);
   }
 
   function buildMetadataSurface(env, action, tagName, onSubmit, onCancel) {
@@ -465,33 +454,35 @@
     if (panel !== surface) panel.className = "sooqa-metadata-overlay-panel";
     panel.append(title, form.form);
     if (panel !== surface) surface.append(panel);
-    surface.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onCancel();
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const focusable = metadataFocusableElements(surface);
-      event.preventDefault();
-      if (!focusable.length) {
-        try {
-          surface.focus();
-        } catch (_error) {
-          // Keep the overlay open when focus is unavailable.
+    if (tagName !== "dialog") {
+      surface.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          onCancel();
+          return;
         }
-        return;
-      }
-      const currentIndex = focusable.indexOf(env.document.activeElement);
-      const nextIndex = event.shiftKey
-        ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
-        : (currentIndex < 0 || currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
-      try {
-        focusable[nextIndex].focus();
-      } catch (_error) {
-        // Keep the overlay open when a browser rejects focus movement.
-      }
-    });
+        if (event.key !== "Tab") return;
+        const focusable = metadataFocusableElements(surface);
+        event.preventDefault();
+        if (!focusable.length) {
+          try {
+            surface.focus();
+          } catch (_error) {
+            // Keep the overlay open when focus is unavailable.
+          }
+          return;
+        }
+        const currentIndex = focusable.indexOf(env.document.activeElement);
+        const nextIndex = event.shiftKey
+          ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
+          : (currentIndex < 0 || currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
+        try {
+          focusable[nextIndex].focus();
+        } catch (_error) {
+          // Keep the overlay open when a browser rejects focus movement.
+        }
+      });
+    }
     return { surface, ...form };
   }
 
