@@ -440,9 +440,12 @@ backend token. Each media preview gets `Post now`, `Post now…`, `Queue`,
 documented metadata: internal tags/description, optional public post text, and
 the required browser-local exact time for `Queue…`; exact time is converted to
 an RFC3339 instant before submission. Their modal layout is userscript-owned so
-board CSS cannot make the form unusable; if native modal opening or focus fails,
-the existing prompt fallback is used. Cancel, Escape, and submission are
-one-shot exits that restore the action buttons.
+board CSS cannot make the form unusable. Native dialog support is preferred;
+otherwise a labelled in-page overlay provides the same structured fields,
+traps keyboard focus, makes the underlying page inert while open, and restores
+focus when it closes. An initial focus failure leaves the form open and usable,
+and metadata never falls back to a pipe-delimited prompt. Cancel, Escape, and
+submission are one-shot exits that restore the action buttons.
 Native `figure.post__image` filename/preview pairs are treated as one
 attachment, so galleries retain their existing preview structure while rows
 are added around each item.

@@ -1,6 +1,6 @@
 # sooqa 2ch userscript
 
-Current userscript version: `0.2.1`.
+Current userscript version: `0.2.2`.
 
 Install [`sooqa-2ch-save.user.js`](https://raw.githubusercontent.com/godlikedh/sooqa/main/userscripts/sooqa-2ch-save.user.js)
 in Tampermonkey on these supported HTTPS domains:
@@ -27,10 +27,13 @@ the script prompts on first use.
 Plain actions send no metadata. `Save…` asks for tags and an internal
 description; `Post now…` adds public post text; and `Queue…` additionally asks
 for a required browser-local date/time, which is sent as an RFC3339 instant.
-Detailed actions use a userscript-owned modal layout with an existing prompt
-fallback if the browser cannot open or focus the native dialog. Cancel, Escape,
-and submission always restore the action buttons. Blank optional text is
-omitted, and textarea line breaks are preserved.
+Detailed actions use separate labelled fields in a userscript-owned native
+dialog when available, with a styled in-page overlay fallback when native
+dialog opening is unavailable. The fallback keeps the same fields, including
+the browser-local calendar/time picker for `Queue…`; metadata never uses a
+pipe-delimited prompt. Cancel, Escape, and submission always restore the action
+buttons. Blank optional text is omitted, and textarea line breaks and literal
+pipe characters are preserved.
 `Queue` uses the normal cadence. The request is synchronous from the browser's
 perspective: `Accepted request` means the companion/backend accepted an ingest
 request, not that the media has finished downloading or appeared in Telegram

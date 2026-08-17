@@ -20,6 +20,7 @@ class FakeElement {
     this.value = "";
     this.type = "";
     this.disabled = false;
+    this.inert = false;
     this.open = false;
     this.style = {};
   }
@@ -32,6 +33,13 @@ class FakeElement {
       }
       if (item.parentElement) {
         item.parentElement.children = item.parentElement.children.filter((child) => child !== item);
+      }
+      if (
+        this === this.ownerDocument.body &&
+        this.ownerDocument.throwOnMetadataSurfaceAppend &&
+        (item.className === "sooqa-metadata-dialog" || item.className === "sooqa-metadata-overlay")
+      ) {
+        throw new Error("metadata surface append failed");
       }
       item.parentElement = this;
       this.children.push(item);
@@ -148,6 +156,7 @@ class FakeElement {
     if (this.ownerDocument && this.ownerDocument.throwOnFocus) {
       throw new Error("focus failed");
     }
+    if (this.ownerDocument) this.ownerDocument.activeElement = this;
   }
 
   showModal() {
@@ -169,13 +178,21 @@ class FakeDocument extends FakeElement {
     this.location = { href: url };
     this.title = "Fixture thread";
     this.body = new FakeElement("body", this);
+    this.activeElement = null;
     this.observers = [];
     this.throwOnFocus = false;
     this.throwOnShowModal = false;
+    this.disableDialog = false;
+    this.throwOnMetadataSurfaceAppend = false;
   }
 
   createElement(tagName) {
-    return new FakeElement(tagName, this);
+    const element = new FakeElement(tagName, this);
+    if (String(tagName).toLowerCase() === "dialog" && this.disableDialog) {
+      element.showModal = undefined;
+      element.close = undefined;
+    }
+    return element;
   }
 
   querySelectorAll(selector) {
@@ -770,28 +787,260 @@ test("detailed dialog cancel and Escape finish once and restore controls", async
   assertActionButtonsState(post, false);
 });
 
-test("detailed dialog open and focus failures fall back without dead buttons", async () => {
-  for (const failure of ["showModal", "focus"]) {
+test("detailed actions use a structured overlay when native dialogs are unavailable", async () => {
+  for (const failure of ["showModal", "unsupported"]) {
     const requests = [];
     const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
-    browser.root.prompt = () => "cats|internal|Public fallback";
+    let promptCalls = 0;
+    browser.root.prompt = () => {
+      promptCalls += 1;
+      return "pipe|prompt|fallback";
+    };
     browser.document.throwOnShowModal = failure === "showModal";
-    browser.document.throwOnFocus = failure === "focus";
+    browser.document.disableDialog = failure === "unsupported";
     const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
     browser.document.body.append(post);
     userscript.boot(browser.root);
 
     actionButton(post, "post_now_detailed").click();
+    let overlay = browser.document.body.querySelector(".sooqa-metadata-overlay");
+    assert.ok(overlay);
+    assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+    assertActionButtonsState(post, true);
+    assert.equal(
+      overlay.querySelector("h2").parentElement,
+      overlay.querySelector("form").parentElement,
+    );
+    assert.equal(overlay.querySelectorAll("input").length, 1);
+    assert.equal(overlay.querySelectorAll("textarea").length, 2);
+
+    if (failure === "unsupported") {
+      overlay.dispatchEvent({ type: "keydown", key: "Escape" });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(requests.length, 0);
+      assertActionButtonsState(post, false);
+      actionButton(post, "post_now_detailed").click();
+      overlay = browser.document.body.querySelector(".sooqa-metadata-overlay");
+      assert.ok(overlay);
+    }
+
+    overlay.querySelector("input").value = "Cats, cats";
+    overlay.querySelectorAll("textarea")[0].value = "Internal | note\nline";
+    overlay.querySelectorAll("textarea")[1].value = "Public | text\nline";
+    overlay.querySelectorAll("button")[1].click();
     await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(browser.document.body.querySelectorAll(".sooqa-metadata-overlay").length, 0);
     assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
     assertActionButtonsState(post, false);
     assert.equal(requests.length, 1);
     const payload = requestPayload(requests[0]);
     assert.equal(payload.requested_action, "post_now");
     assert.deepEqual(payload.tags, ["cats"]);
-    assert.equal(payload.description, "internal");
-    assert.equal(payload.requested_post_caption, "Public fallback");
+    assert.equal(payload.description, "Internal | note\nline");
+    assert.equal(payload.requested_post_caption, "Public | text\nline");
+    assert.equal(promptCalls, 0);
   }
+});
+
+test("structured overlay traps focus, inerts the page, and restores focus", async () => {
+  const requests = [];
+  const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+  browser.document.disableDialog = true;
+  const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+  browser.document.body.append(post);
+  userscript.boot(browser.root);
+
+  const trigger = actionButton(post, "queue_exact");
+  browser.document.activeElement = trigger;
+  trigger.click();
+  const overlay = browser.document.body.querySelector(".sooqa-metadata-overlay");
+  const focusable = overlay.querySelectorAll("input, textarea, button");
+  assert.ok(overlay);
+  assert.equal(post.inert, true);
+  assert.deepEqual(focusable.map((element) => element.name || element.textContent), [
+    "tags",
+    "description",
+    "publicText",
+    "requestedPublishAt",
+    "Cancel",
+    "Send",
+  ]);
+
+  browser.document.activeElement = focusable[0];
+  for (let index = 1; index < focusable.length; index += 1) {
+    let tabPrevented = false;
+    overlay.dispatchEvent({
+      type: "keydown",
+      key: "Tab",
+      preventDefault: () => { tabPrevented = true; },
+    });
+    assert.equal(tabPrevented, true);
+    assert.equal(browser.document.activeElement, focusable[index]);
+  }
+  let wrapPrevented = false;
+  overlay.dispatchEvent({
+    type: "keydown",
+    key: "Tab",
+    preventDefault: () => { wrapPrevented = true; },
+  });
+  assert.equal(wrapPrevented, true);
+  assert.equal(browser.document.activeElement, focusable[0]);
+
+  let reverseWrapPrevented = false;
+  overlay.dispatchEvent({
+    type: "keydown",
+    key: "Tab",
+    shiftKey: true,
+    preventDefault: () => { reverseWrapPrevented = true; },
+  });
+  assert.equal(reverseWrapPrevented, true);
+  assert.equal(browser.document.activeElement, focusable[focusable.length - 1]);
+  for (let index = focusable.length - 1; index > 0; index -= 1) {
+    let reverseTabPrevented = false;
+    overlay.dispatchEvent({
+      type: "keydown",
+      key: "Tab",
+      shiftKey: true,
+      preventDefault: () => { reverseTabPrevented = true; },
+    });
+    assert.equal(reverseTabPrevented, true);
+    assert.equal(browser.document.activeElement, focusable[index - 1]);
+  }
+  assert.equal(browser.document.activeElement, focusable[0]);
+
+  overlay.dispatchEvent({ type: "keydown", key: "Escape" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.body.querySelectorAll(".sooqa-metadata-overlay").length, 0);
+  assert.equal(post.inert, false);
+  assert.equal(browser.document.activeElement, trigger);
+  assertActionButtonsState(post, false);
+  assert.equal(requests.length, 0);
+});
+
+test("native dialog focus uses the browser modal sequence", () => {
+  const requests = [];
+  const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+  const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+  browser.document.body.append(post);
+  userscript.boot(browser.root);
+
+  actionButton(post, "save_detailed").click();
+  const dialog = browser.document.body.querySelector("dialog");
+  assert.ok(dialog);
+  let tabPrevented = false;
+  dialog.dispatchEvent({
+    type: "keydown",
+    key: "Tab",
+    preventDefault: () => { tabPrevented = true; },
+  });
+  assert.equal(tabPrevented, false);
+  dialog.querySelector(".sooqa-cancel").click();
+});
+
+test("native initial focus failure leaves the structured form usable", async () => {
+  const requests = [];
+  const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+  let promptCalls = 0;
+  browser.root.prompt = () => {
+    promptCalls += 1;
+    return "pipe|prompt|fallback";
+  };
+  browser.document.throwOnFocus = true;
+  const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+  browser.document.body.append(post);
+  userscript.boot(browser.root);
+
+  actionButton(post, "post_now_detailed").click();
+  const dialog = browser.document.body.querySelector("dialog");
+  assert.ok(dialog);
+  assert.equal(browser.document.body.querySelectorAll(".sooqa-metadata-overlay").length, 0);
+  assertActionButtonsState(post, true);
+  dialog.querySelector("input").value = "cats";
+  dialog.querySelectorAll("textarea")[0].value = "internal";
+  dialog.querySelectorAll("textarea")[1].value = "public";
+  dialog.querySelectorAll("button")[1].click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assertActionButtonsState(post, false);
+  assert.equal(requests.length, 1);
+  const payload = requestPayload(requests[0]);
+  assert.equal(payload.requested_action, "post_now");
+  assert.equal(payload.requested_post_caption, "public");
+  assert.equal(promptCalls, 0);
+});
+
+test("Queue overlay keeps fields open for invalid time and uses the local picker", async () => {
+  const requests = [];
+  const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+  browser.document.disableDialog = true;
+  const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+  browser.document.body.append(post);
+  userscript.boot(browser.root);
+
+  actionButton(post, "queue_exact").click();
+  const overlay = browser.document.body.querySelector(".sooqa-metadata-overlay");
+  assert.ok(overlay);
+  assert.equal(overlay.querySelectorAll("input").length, 2);
+  assert.equal(overlay.querySelectorAll("input")[1].type, "datetime-local");
+  assert.equal(overlay.querySelectorAll("textarea").length, 2);
+  overlay.querySelectorAll("input")[0].value = "Cats, cats";
+  overlay.querySelectorAll("textarea")[0].value = "Internal";
+  overlay.querySelectorAll("textarea")[1].value = "Public";
+  overlay.querySelectorAll("button")[1].click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 0);
+  assert.equal(browser.document.body.querySelectorAll(".sooqa-metadata-overlay").length, 1);
+  assert.match(overlay.querySelector(".sooqa-dialog-error").textContent, /future local date\/time/);
+  assert.equal(overlay.querySelectorAll("input")[0].value, "Cats, cats");
+  assert.equal(overlay.querySelectorAll("textarea")[0].value, "Internal");
+  assert.equal(overlay.querySelectorAll("textarea")[1].value, "Public");
+  assertActionButtonsState(post, true);
+
+  overlay.querySelectorAll("input")[1].value = "2000-01-01T00:00";
+  overlay.querySelectorAll("button")[1].click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 0);
+  assert.equal(browser.document.body.querySelectorAll(".sooqa-metadata-overlay").length, 1);
+  assert.match(overlay.querySelector(".sooqa-dialog-error").textContent, /future local date\/time/);
+  assert.equal(overlay.querySelectorAll("input")[0].value, "Cats, cats");
+  assert.equal(overlay.querySelectorAll("input")[1].value, "2000-01-01T00:00");
+  assert.equal(overlay.querySelectorAll("textarea")[0].value, "Internal");
+  assert.equal(overlay.querySelectorAll("textarea")[1].value, "Public");
+  assertActionButtonsState(post, true);
+
+  overlay.querySelectorAll("input")[1].value = futureLocalDateTime();
+  overlay.querySelectorAll("button")[1].click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.body.querySelectorAll(".sooqa-metadata-overlay").length, 0);
+  assertActionButtonsState(post, false);
+  assert.equal(requests.length, 1);
+  const payload = requestPayload(requests[0]);
+  assert.equal(payload.requested_action, "queue");
+  assert.equal(payload.requested_post_caption, "Public");
+  assert.match(payload.requested_publish_at, /^\d{4}-\d{2}-\d{2}T.*Z$/);
+});
+
+test("both structured renderers failing restore controls without prompting", async () => {
+  const requests = [];
+  const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+  let promptCalls = 0;
+  browser.root.prompt = () => {
+    promptCalls += 1;
+    return "pipe|prompt|fallback";
+  };
+  browser.document.throwOnMetadataSurfaceAppend = true;
+  const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+  browser.document.body.append(post);
+  userscript.boot(browser.root);
+
+  actionButton(post, "save_detailed").click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
+  assert.equal(browser.document.body.querySelectorAll(".sooqa-metadata-overlay").length, 0);
+  assert.equal(post.querySelector(".sooqa-action-status").textContent, "Detailed form unavailable");
+  assertActionButtonsState(post, false);
+  assert.equal(requests.length, 0);
+  assert.equal(promptCalls, 0);
 });
 
 test("buttons suppress in-flight duplicates, reuse timeout IDs, and reset after response", () => {
@@ -929,10 +1178,13 @@ test("accepted history is mirror-canonical, thread-local, bounded, and clearable
 
 test("metadata contains no backend secrets, polling, or stale update metadata", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "sooqa-2ch-save.user.js"), "utf8");
-  assert.match(source, /@version\s+0\.2\.1/);
+  assert.match(source, /@version\s+0\.2\.2/);
   assert.match(source, /@updateURL\s+https:\/\/raw\.githubusercontent\.com\/godlikedh\/sooqa\/main/);
   assert.match(source, /@downloadURL\s+https:\/\/raw\.githubusercontent\.com\/godlikedh\/sooqa\/main/);
   assert.match(source, /GM_xmlhttpRequest/);
+  assert.match(source, /sooqa-metadata-overlay/);
+  assert.doesNotMatch(source, /collectMetadataWithPrompt/);
+  assert.doesNotMatch(source, /\.split\(["']\|["']\)/);
   assert.doesNotMatch(source, /setInterval|setTimeout|\/api\/v1\/(ingests|media)/);
   assert.doesNotMatch(source, /telegram|bot.?token|backend.?token/i);
 });
