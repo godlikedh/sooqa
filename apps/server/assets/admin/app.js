@@ -708,7 +708,7 @@
     if (media.preview?.url) {
       const image = node("img");
       image.alt = `Bounded preview for ${media.kind || "media"}`;
-      image.loading = "lazy";
+      image.loading = "eager";
       image.decoding = "async";
       image.hidden = true;
       visual.append(image);
@@ -898,7 +898,7 @@
     if (item.preview?.url) {
       const image = node("img");
       image.alt = `Bounded preview for ${item.media_kind || "media"}`;
-      image.loading = "lazy";
+      image.loading = "eager";
       image.decoding = "async";
       image.hidden = true;
       visual.append(image);

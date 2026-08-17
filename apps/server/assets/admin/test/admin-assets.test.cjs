@@ -564,6 +564,9 @@ test("admin runtime keeps media lookup, preview fetches, edits, retry, and publi
   assert.equal(grid.querySelector("script"), null);
   const previewCall = calls.find(({ pathName }) => pathName.endsWith("/preview"));
   assert.equal(previewCall.pathName, "/api/v1/media/media-1/preview");
+  const mediaImage = grid.querySelector("img");
+  assert.equal(mediaImage.loading, "eager");
+  assert.equal(mediaImage.hidden, true);
   assert.equal([...runtime.objectUrls].length, 1);
   const firstObjectUrl = [...runtime.objectUrls][0];
   assert.match(firstObjectUrl, /^blob:/);
@@ -786,6 +789,7 @@ test("admin runtime lazily renders advertised schedule previews and keeps failur
   const readyVisual = cards[0].children[0];
   assert.equal(readyVisual.children[0].hidden, false);
   assert.equal(readyVisual.children[1].hidden, true);
+  assert.equal(readyVisual.children[1].loading, "eager");
   assert.equal(runtime.objectUrls.size, 1);
   readyVisual.children[1].dispatchEvent({ type: "load" });
   assert.equal(readyVisual.children[0].hidden, true);
