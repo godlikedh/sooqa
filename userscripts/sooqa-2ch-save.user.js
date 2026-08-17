@@ -432,6 +432,22 @@
     return { form, fields, error };
   }
 
+  function metadataFocusableElements(surface) {
+    const elements = [];
+    for (const selector of ["button", "input", "textarea", "select", "a[href]"]) {
+      for (const element of Array.from(surface.querySelectorAll(selector))) {
+        if (
+          !elements.includes(element) &&
+          !element.disabled &&
+          element.tabIndex !== -1
+        ) {
+          elements.push(element);
+        }
+      }
+    }
+    return elements;
+  }
+
   function buildMetadataSurface(env, action, tagName, onSubmit, onCancel) {
     const surface = env.document.createElement(tagName);
     surface.className = tagName === "dialog"
@@ -445,11 +461,35 @@
     title.textContent = metadataSurfaceTitle(action);
     surface.setAttribute("aria-labelledby", title.id);
     const form = buildMetadataForm(env, action, onSubmit, onCancel);
-    surface.append(title, form.form);
+    const panel = tagName === "dialog" ? surface : env.document.createElement("div");
+    if (panel !== surface) panel.className = "sooqa-metadata-overlay-panel";
+    panel.append(title, form.form);
+    if (panel !== surface) surface.append(panel);
     surface.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         event.preventDefault();
         onCancel();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = metadataFocusableElements(surface);
+      event.preventDefault();
+      if (!focusable.length) {
+        try {
+          surface.focus();
+        } catch (_error) {
+          // Keep the overlay open when focus is unavailable.
+        }
+        return;
+      }
+      const currentIndex = focusable.indexOf(env.document.activeElement);
+      const nextIndex = event.shiftKey
+        ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
+        : (currentIndex < 0 || currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
+      try {
+        focusable[nextIndex].focus();
+      } catch (_error) {
+        // Keep the overlay open when a browser rejects focus movement.
       }
     });
     return { surface, ...form };
@@ -467,6 +507,8 @@
     return new Promise((resolve) => {
       let overlay = null;
       let settled = false;
+      const previousActiveElement = env.document.activeElement || null;
+      const inertSiblings = [];
       const remove = () => {
         try {
           if (overlay && overlay.parentElement) overlay.remove();
@@ -474,16 +516,56 @@
           // Ignore cleanup errors after a structured fallback failure.
         }
       };
+      const restoreInertSiblings = () => {
+        for (const { element, inert } of inertSiblings) {
+          try {
+            element.inert = inert;
+          } catch (_error) {
+            // Ignore cleanup errors for browsers without inert support.
+          }
+        }
+      };
+      const restoreFocus = () => {
+        try {
+          if (previousActiveElement && typeof previousActiveElement.focus === "function") {
+            previousActiveElement.focus();
+          }
+        } catch (_error) {
+          // Focus restoration is best effort after the overlay is gone.
+        }
+      };
+      const notifyFocusRestore = () => {
+        try {
+          if (env.onMetadataClosed) {
+            env.onMetadataClosed(restoreFocus);
+            return;
+          }
+        } catch (_error) {
+          // Fall through to best-effort asynchronous restoration.
+        }
+        Promise.resolve().then(restoreFocus);
+      };
       const finish = (value) => {
         if (settled) return;
         settled = true;
         remove();
+        restoreInertSiblings();
         resolve(value);
+        notifyFocusRestore();
       };
       try {
         const form = buildMetadataSurface(env, action, "div", finish, () => finish(null));
         overlay = form.surface;
         env.document.body.append(overlay);
+        for (const element of Array.from(env.document.body.children || [])) {
+          if (element === overlay) continue;
+          inertSiblings.push({ element, inert: element.inert });
+          try {
+            element.inert = true;
+          } catch (_error) {
+            // Focus trapping still protects the overlay when inert is unavailable.
+          }
+        }
         try {
           form.fields.tags.focus();
         } catch (_error) {
@@ -718,7 +800,7 @@
       "  color: #f8fafc !important;",
       "  font: 16px/1.4 system-ui, sans-serif !important;",
       "}",
-      ".sooqa-metadata-overlay form {",
+      ".sooqa-metadata-overlay-panel {",
       "  box-sizing: border-box !important;",
       "  width: min(32rem, calc(100vw - 2rem)) !important;",
       "  max-height: calc(100vh - 2rem) !important;",
@@ -729,6 +811,8 @@
       "  background: #111827 !important;",
       "  color: #f8fafc !important;",
       "  font: inherit !important;",
+      "  display: grid !important;",
+      "  gap: 0.75rem !important;",
       "}",
       ".sooqa-metadata-dialog[open] { display: block !important; visibility: visible !important; }",
       ".sooqa-metadata-dialog::backdrop { background: rgba(2, 6, 23, 0.72) !important; }",
@@ -805,14 +889,24 @@
       if (state.retry && state.retry.actionKey !== action.key) state.retry = null;
       if (!state.retry) {
         let metadata = null;
+        let restoreFocus = null;
         if (action.detailed) {
           state.collecting = true;
           setButtonsDisabled(panel, true);
           try {
-            metadata = await collectMetadata({ ...env, setStatus }, action);
+            metadata = await collectMetadata({
+              ...env,
+              setStatus,
+              onMetadataClosed: (focus) => { restoreFocus = focus; },
+            }, action);
           } finally {
             state.collecting = false;
             if (!state.sending) setButtonsDisabled(panel, false);
+            if (restoreFocus) {
+              const focus = restoreFocus;
+              restoreFocus = null;
+              focus();
+            }
           }
           if (!metadata || state.sending || state.retry) return;
         }

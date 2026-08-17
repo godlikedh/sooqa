@@ -20,6 +20,7 @@ class FakeElement {
     this.value = "";
     this.type = "";
     this.disabled = false;
+    this.inert = false;
     this.open = false;
     this.style = {};
   }
@@ -155,6 +156,7 @@ class FakeElement {
     if (this.ownerDocument && this.ownerDocument.throwOnFocus) {
       throw new Error("focus failed");
     }
+    if (this.ownerDocument) this.ownerDocument.activeElement = this;
   }
 
   showModal() {
@@ -176,6 +178,7 @@ class FakeDocument extends FakeElement {
     this.location = { href: url };
     this.title = "Fixture thread";
     this.body = new FakeElement("body", this);
+    this.activeElement = null;
     this.observers = [];
     this.throwOnFocus = false;
     this.throwOnShowModal = false;
@@ -804,6 +807,10 @@ test("detailed actions use a structured overlay when native dialogs are unavaila
     assert.ok(overlay);
     assert.equal(browser.document.body.querySelectorAll("dialog").length, 0);
     assertActionButtonsState(post, true);
+    assert.equal(
+      overlay.querySelector("h2").parentElement,
+      overlay.querySelector("form").parentElement,
+    );
     assert.equal(overlay.querySelectorAll("input").length, 1);
     assert.equal(overlay.querySelectorAll("textarea").length, 2);
 
@@ -833,6 +840,52 @@ test("detailed actions use a structured overlay when native dialogs are unavaila
     assert.equal(payload.requested_post_caption, "Public | text\nline");
     assert.equal(promptCalls, 0);
   }
+});
+
+test("structured overlay traps focus, inerts the page, and restores focus", async () => {
+  const requests = [];
+  const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+  browser.document.disableDialog = true;
+  const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+  browser.document.body.append(post);
+  userscript.boot(browser.root);
+
+  const trigger = actionButton(post, "save_detailed");
+  browser.document.activeElement = trigger;
+  trigger.click();
+  const overlay = browser.document.body.querySelector(".sooqa-metadata-overlay");
+  const focusable = overlay.querySelectorAll("input, textarea, button");
+  assert.ok(overlay);
+  assert.equal(post.inert, true);
+
+  browser.document.activeElement = focusable[focusable.length - 1];
+  let tabPrevented = false;
+  overlay.dispatchEvent({
+    type: "keydown",
+    key: "Tab",
+    preventDefault: () => { tabPrevented = true; },
+  });
+  assert.equal(tabPrevented, true);
+  assert.equal(browser.document.activeElement, focusable[0]);
+
+  browser.document.activeElement = focusable[0];
+  let reverseTabPrevented = false;
+  overlay.dispatchEvent({
+    type: "keydown",
+    key: "Tab",
+    shiftKey: true,
+    preventDefault: () => { reverseTabPrevented = true; },
+  });
+  assert.equal(reverseTabPrevented, true);
+  assert.equal(browser.document.activeElement, focusable[focusable.length - 1]);
+
+  overlay.dispatchEvent({ type: "keydown", key: "Escape" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(browser.document.body.querySelectorAll(".sooqa-metadata-overlay").length, 0);
+  assert.equal(post.inert, false);
+  assert.equal(browser.document.activeElement, trigger);
+  assertActionButtonsState(post, false);
+  assert.equal(requests.length, 0);
 });
 
 test("native initial focus failure leaves the structured form usable", async () => {
