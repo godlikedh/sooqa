@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 use sooqa_library::MediaStorageState;
 use sooqa_publisher::{
     Channel, ChannelUpdate, NewChannel, NewPost, Post, PostCursor, PostExactSchedule, PostListItem,
-    PostPage, PostSchedule, PostState, PostUpdate, PublicationAction, PublicationDecision,
-    PublicationIntent,
+    PostPage, PostPreview, PostSchedule, PostState, PostUpdate, PublicationAction,
+    PublicationDecision, PublicationIntent,
 };
 use time::{OffsetDateTime, Time};
 use uuid::Uuid;
@@ -755,6 +755,7 @@ struct PostResponse {
     media_kind: Option<String>,
     source_url: Option<String>,
     storage_url: Option<String>,
+    preview: Option<PostPreviewResponse>,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -764,7 +765,7 @@ struct PostResponse {
 
 impl PostResponse {
     fn from_post(post: &Post) -> Self {
-        Self::from_post_with_metadata(post, None, None, None, None)
+        Self::from_post_with_metadata(post, None, None, None, None, None)
     }
 
     fn from_list_item(item: &PostListItem) -> Self {
@@ -774,6 +775,9 @@ impl PostResponse {
             Some(item.media_kind.clone()),
             item.source_url.clone(),
             item.storage_url.clone(),
+            item.preview
+                .as_ref()
+                .map(|preview| PostPreviewResponse::from_preview(item.post.media_id, preview)),
         )
     }
 
@@ -783,6 +787,7 @@ impl PostResponse {
         media_kind: Option<String>,
         source_url: Option<String>,
         storage_url: Option<String>,
+        preview: Option<PostPreviewResponse>,
     ) -> Self {
         Self {
             id: post.id,
@@ -803,11 +808,39 @@ impl PostResponse {
             media_kind,
             source_url,
             storage_url,
+            preview,
             created_at: post.created_at,
             updated_at: post.updated_at,
             revision: post.revision,
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct PostPreviewResponse {
+    url: String,
+    mime_type: String,
+    width: u32,
+    height: u32,
+    size_bytes: u32,
+    etag: String,
+}
+
+impl PostPreviewResponse {
+    fn from_preview(media_id: Uuid, preview: &PostPreview) -> Self {
+        Self {
+            url: format!("/api/v1/media/{media_id}/preview"),
+            mime_type: preview.mime_type.clone(),
+            width: preview.width,
+            height: preview.height,
+            size_bytes: preview.size_bytes,
+            etag: format!("\"{}\"", hex_digest(&preview.sha256)),
+        }
+    }
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn schedule_mode(post: &Post) -> &'static str {

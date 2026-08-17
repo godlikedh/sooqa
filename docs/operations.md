@@ -81,9 +81,12 @@ only public text and, for exact queueing, a future local browser time. A repeat
 draft is resolved from Dashboard rather than in the Media page.
 
 Schedule loads `GET /api/v1/posts?limit=50` in scheduled-time/UUID order and
-does not request publication history. Cadence rows are marked separately from
-explicit-time rows. Draft, queued, and failed cards may patch only the public
-caption, cancel the post, request immediate publication, or call
+does not request publication history. Rows with optional preview metadata fetch
+the same authenticated bounded still bytes as Media; audio, older, and failed
+previews retain the kind placeholder, and Schedule never becomes a playback
+surface. Cadence rows are marked separately from explicit-time rows. Draft,
+queued, and failed cards may patch only the public caption, cancel the post,
+request immediate publication, or call
 `/schedule-exact` with a future browser-local instant. Exact scheduling writes
 only the selected post, allows collisions, bypasses cadence/window rules, and
 leaves other posts untouched. Sending and unknown rows remain visible but

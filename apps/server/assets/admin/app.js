@@ -21,6 +21,8 @@
     scheduleCursor: null,
     scheduleItems: [],
     scheduleEditing: new Set(),
+    schedulePreviewEntries: new Map(),
+    schedulePreviewUrls: new Set(),
   };
 
   const $ = (id) => document.getElementById(id);
@@ -254,6 +256,7 @@
   function lock() {
     stopIngestAutoRefresh();
     invalidateMediaPreviews();
+    invalidateSchedulePreviews();
     discardScheduleEdits();
     state.token = "";
     try {
@@ -271,10 +274,10 @@
     const requestOptions = options || {};
     const headers = new Headers(requestOptions.headers || {});
     headers.set("Authorization", `Bearer ${state.token}`);
-    headers.set("Accept", "application/json");
     if (requestOptions.body && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
+    if (!headers.has("Accept")) headers.set("Accept", "application/json");
     const response = await fetch(path, { ...requestOptions, headers, credentials: "same-origin" });
     if (response.status === 401) {
       lock();
@@ -550,15 +553,34 @@
   }
 
   function revokeMediaPreviews() {
-    if (window.URL && typeof window.URL.revokeObjectURL === "function") {
-      for (const objectUrl of state.mediaPreviewUrls) window.URL.revokeObjectURL(objectUrl);
-    }
+    for (const objectUrl of state.mediaPreviewUrls) revokePreviewObjectUrl(objectUrl, state.mediaPreviewUrls);
     state.mediaPreviewUrls.clear();
+  }
+
+  function revokePreviewObjectUrl(objectUrl, previewUrls) {
+    if (!objectUrl) return;
+    if (window.URL && typeof window.URL.revokeObjectURL === "function") window.URL.revokeObjectURL(objectUrl);
+    previewUrls.delete(objectUrl);
   }
 
   function invalidateMediaPreviews() {
     state.mediaRenderGeneration += 1;
     revokeMediaPreviews();
+  }
+
+  function revokeSchedulePreview(postId) {
+    const entry = state.schedulePreviewEntries.get(postId);
+    if (!entry) return;
+    entry.active = false;
+    if (entry.observer && typeof entry.observer.disconnect === "function") entry.observer.disconnect();
+    entry.observer = null;
+    revokePreviewObjectUrl(entry.objectUrl, state.schedulePreviewUrls);
+    entry.objectUrl = null;
+    state.schedulePreviewEntries.delete(postId);
+  }
+
+  function invalidateSchedulePreviews() {
+    for (const postId of state.schedulePreviewEntries.keys()) revokeSchedulePreview(postId);
   }
 
   function sameOriginApiPath(value) {
@@ -610,23 +632,45 @@
     return placeholder;
   }
 
-  async function loadMediaPreview(path, image, placeholder, renderGeneration) {
+  async function loadMediaPreview(path, image, placeholder, isCurrent, previewUrls, previewEntry) {
     const safePath = sameOriginApiPath(path);
     if (!safePath || !window.URL || typeof window.URL.createObjectURL !== "function") return;
+    if (!isCurrent()) return;
+    let objectUrl = null;
     try {
       const response = await request(safePath, { headers: { Accept: "image/*" } });
       const blob = await response.blob();
-      const objectUrl = window.URL.createObjectURL(blob);
-      if (renderGeneration !== state.mediaRenderGeneration) {
-        window.URL.revokeObjectURL(objectUrl);
+      if (!blob || typeof blob.type !== "string" || !blob.type.startsWith("image/")) {
+        throw new UiError("The preview response was not an image.");
+      }
+      objectUrl = window.URL.createObjectURL(blob);
+      if (!isCurrent()) {
+        revokePreviewObjectUrl(objectUrl, previewUrls);
         return;
       }
-      state.mediaPreviewUrls.add(objectUrl);
+      previewUrls.add(objectUrl);
+      previewEntry.objectUrl = objectUrl;
+      image.addEventListener("load", () => {
+        if (!isCurrent()) return;
+        image.hidden = false;
+        placeholder.hidden = true;
+      }, { once: true });
+      image.addEventListener("error", () => {
+        if (!isCurrent()) return;
+        revokePreviewObjectUrl(objectUrl, previewUrls);
+        if (previewEntry.objectUrl === objectUrl) previewEntry.objectUrl = null;
+        image.hidden = true;
+        placeholder.hidden = false;
+        placeholder.lastChild.textContent = "Preview unavailable";
+      }, { once: true });
       image.src = objectUrl;
-      image.hidden = false;
-      placeholder.hidden = true;
     } catch (_error) {
-      placeholder.lastChild.textContent = "Preview unavailable";
+      if (objectUrl) revokePreviewObjectUrl(objectUrl, previewUrls);
+      if (isCurrent()) {
+        image.hidden = true;
+        placeholder.hidden = false;
+        placeholder.lastChild.textContent = "Preview unavailable";
+      }
     }
   }
 
@@ -664,11 +708,18 @@
     if (media.preview?.url) {
       const image = node("img");
       image.alt = `Bounded preview for ${media.kind || "media"}`;
-      image.loading = "lazy";
+      image.loading = "eager";
       image.decoding = "async";
       image.hidden = true;
       visual.append(image);
-      void loadMediaPreview(media.preview.url, image, placeholder, renderGeneration);
+      void loadMediaPreview(
+        media.preview.url,
+        image,
+        placeholder,
+        () => renderGeneration === state.mediaRenderGeneration,
+        state.mediaPreviewUrls,
+        { objectUrl: null },
+      );
     }
 
     const main = node("div", "media-main");
@@ -820,11 +871,48 @@
     return { "Idempotency-Key": `admin-ui:${randomKey()}` };
   }
 
+  function observeSchedulePreview(target, load) {
+    if (typeof window.IntersectionObserver !== "function") {
+      void load();
+      return null;
+    }
+    const observer = new window.IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        observer.unobserve(entry.target);
+        void load();
+      }
+    }, { rootMargin: "200px" });
+    observer.observe(target);
+    return observer;
+  }
+
   function renderScheduleCard(item) {
     const card = node("article", "schedule-card");
     card.dataset.postId = item.id || "";
     const visual = node("div", "media-visual schedule-visual");
-    visual.append(schedulePlaceholder(item));
+    const placeholder = schedulePlaceholder(item);
+    visual.append(placeholder);
+    const previewEntry = { active: true, objectUrl: null, observer: null };
+    state.schedulePreviewEntries.set(item.id, previewEntry);
+    if (item.preview?.url) {
+      const image = node("img");
+      image.alt = `Bounded preview for ${item.media_kind || "media"}`;
+      image.loading = "eager";
+      image.decoding = "async";
+      image.hidden = true;
+      visual.append(image);
+      previewEntry.observer = observeSchedulePreview(visual, () => loadMediaPreview(
+        item.preview.url,
+        image,
+        placeholder,
+        () => state.page === "schedule"
+          && previewEntry.active
+          && state.schedulePreviewEntries.get(item.id) === previewEntry,
+        state.schedulePreviewUrls,
+        previewEntry,
+      ));
+    }
 
     const main = node("div", "schedule-main");
     const heading = node("div", "schedule-heading");
@@ -947,6 +1035,14 @@
         .filter((child) => child.dataset.postId)
         .map((child) => [child.dataset.postId, child]),
     );
+    const preservedPostIds = new Set(
+      items
+        .filter((item) => existingCards.has(item.id) && state.scheduleEditing.has(item.id))
+        .map((item) => item.id),
+    );
+    for (const postId of state.schedulePreviewEntries.keys()) {
+      if (!preservedPostIds.has(postId)) revokeSchedulePreview(postId);
+    }
     clear(list);
     if (!items.length) {
       list.append(node("p", "empty-state", "No unpublished schedule work."));
@@ -1134,7 +1230,10 @@
     if (state.page === "media") invalidateMediaPreviews();
     const requested = window.location.hash.slice(1);
     const nextPage = PAGE_NAMES.has(requested) ? requested : "dashboard";
-    if (state.page === "schedule" && nextPage !== "schedule") discardScheduleEdits();
+    if (state.page === "schedule" && nextPage !== "schedule") {
+      invalidateSchedulePreviews();
+      discardScheduleEdits();
+    }
     state.page = nextPage;
     for (const page of document.querySelectorAll("[data-page]")) page.hidden = page.dataset.page !== state.page;
     for (const navigation of document.querySelectorAll("[data-page-link]")) navigation.classList.toggle("active", navigation.dataset.pageLink === state.page);
@@ -1214,6 +1313,7 @@
   window.addEventListener("pagehide", () => {
     stopIngestAutoRefresh();
     invalidateMediaPreviews();
+    invalidateSchedulePreviews();
     discardScheduleEdits();
   });
 

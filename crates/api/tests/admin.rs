@@ -211,7 +211,7 @@ async fn admin_api_lists_ingests_media_schedule_dashboard_and_channel_settings(p
                 .method(Method::GET)
                 .uri(format!("/api/v1/media/{media_id}/preview"))
                 .header("authorization", "Bearer test-api-token")
-                .header("if-none-match", etag)
+                .header("if-none-match", &etag)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -226,6 +226,9 @@ async fn admin_api_lists_ingests_media_schedule_dashboard_and_channel_settings(p
     assert_eq!(schedule["items"][0]["schedule_mode"], "explicit");
     assert_eq!(schedule["items"][0]["source_url"], "https://2ch.su/b/src/api-admin.webm");
     assert_eq!(schedule["items"][0]["storage_url"], "https://t.me/c/3971341583/57");
+    assert_eq!(schedule["items"][0]["preview"]["url"], format!("/api/v1/media/{media_id}/preview"));
+    assert_eq!(schedule["items"][0]["preview"]["mime_type"], "image/jpeg");
+    assert_eq!(schedule["items"][0]["preview"]["etag"], etag);
 
     let (status, dashboard) = request(&app, Method::GET, "/api/v1/dashboard", Value::Null).await;
     assert_eq!(status, StatusCode::OK);

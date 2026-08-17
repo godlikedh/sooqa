@@ -121,12 +121,12 @@ text, identifiers, hashes, workflow data, and schedules are excluded.
 
 The Schedule page renders post text through DOM text/value properties and keeps
 its bearer token in the existing session-only storage. It exposes only bounded
-unpublished rows, sends revision-fenced mutations to PostgreSQL, and does not
-keep a client-side timer or queue. Exact browser-local times are converted to
-RFC3339 before the API validates them as future instants; sending and unknown
-rows have no retry or removal controls because their Telegram outcome is
-ambiguous. Refreshes may preserve a local form temporarily, but the persisted
-post revision remains authoritative.
+unpublished rows, fetches advertised still previews through the authenticated
+same-origin media route, and never adds media playback or a source/Telegram
+proxy. Preview object URLs are revoked on replacement, navigation, lock, and
+unload; sending and unknown rows have no retry or removal controls because
+their Telegram outcome is ambiguous. Refreshes may preserve a local form
+temporarily, but the persisted post revision remains authoritative.
 
 Workspaces reject separators and parent-directory components in file names.
 Temporary files are published only after validation, and cleanup is limited to

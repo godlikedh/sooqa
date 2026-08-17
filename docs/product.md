@@ -123,12 +123,13 @@ Post now/Queue actions and ellipsis dialogs for optional public text and an
 exact future browser-local time; repeat drafts go back to Dashboard decisions.
 Schedule is a bounded chronological editor for unpublished posts. It hides
 published and cancelled history, distinguishes cadence from exact-time work,
-and uses kind placeholders plus source/storage links without becoming a media
-playback surface. Draft, queued, and failed rows can edit or clear only public
-post text, set any future browser-local exact instant (including collisions),
-request Post now, or remove the post while keeping media. Sending and unknown
-rows remain visible and read-only because an ambiguous send is not safe to
-retry automatically.
+and shows optional bounded still previews from the existing media preview
+route, falling back to kind placeholders without becoming a media playback
+surface. Draft, queued, and failed rows can edit or clear only public post
+text, set any future browser-local exact instant (including collisions), request
+Post now, or remove the post while keeping media. Sending and unknown rows
+remain visible and read-only because an ambiguous send is not safe to retry
+automatically.
 Schedule forms use the post revision fence, and a first-page refresh preserves
 each actively edited form instead of replacing it; leaving the page discards
 those unsaved forms.
