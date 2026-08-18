@@ -85,6 +85,17 @@ pub struct MediaStream {
     pub index: u32,
     pub kind: MediaStreamKind,
     pub codec: Option<String>,
+    /// Container codec tag, such as `avc1` or `avc3` for MP4/H.264.
+    #[serde(default)]
+    pub codec_tag: Option<String>,
+    /// The codec MIME string contains the MP4 avcC declaration, for example
+    /// `avc1.640028`; it is kept separate from `level`, which is authoritative
+    /// SPS metadata.
+    #[serde(default)]
+    pub codec_mime: Option<String>,
+    /// H.264 level reported from the stream's SPS.
+    #[serde(default)]
+    pub level: Option<u32>,
     pub profile: Option<String>,
     pub pixel_format: Option<String>,
     pub width: Option<u32>,
@@ -189,6 +200,12 @@ struct RawStream {
     index: Option<u32>,
     codec_type: Option<String>,
     codec_name: Option<String>,
+    codec_tag_string: Option<String>,
+    mime_codec_string: Option<String>,
+    // Some ffprobe builds report an unknown H.264 level as -99. Keep the raw
+    // JSON value permissive so that insufficient metadata falls back to a
+    // transcode instead of making the whole probe unreadable.
+    level: Option<serde_json::Value>,
     profile: Option<String>,
     pix_fmt: Option<String>,
     width: Option<u32>,
@@ -233,6 +250,11 @@ fn parse_stream(stream: RawStream) -> Result<MediaStream, ProbeError> {
         index,
         kind,
         codec: optional_value(stream.codec_name),
+        codec_tag: optional_value(stream.codec_tag_string),
+        codec_mime: optional_value(stream.mime_codec_string),
+        level: stream
+            .level
+            .and_then(|value| value.as_i64().and_then(|level| u32::try_from(level).ok())),
         profile: optional_value(stream.profile),
         pixel_format: optional_value(stream.pix_fmt),
         width: stream.width,
@@ -350,6 +372,9 @@ mod tests {
           "index": 0,
           "codec_type": "video",
           "codec_name": "h264",
+          "codec_tag_string": "avc1",
+          "mime_codec_string": "avc1.640028",
+          "level": 40,
           "profile": "High",
           "pix_fmt": "yuv420p",
           "width": 1920,
@@ -407,6 +432,9 @@ mod tests {
         assert_eq!(probe.bit_rate, Some(628000));
         assert_eq!(probe.streams.len(), 2);
         assert_eq!(probe.streams[0].kind, MediaStreamKind::Video);
+        assert_eq!(probe.streams[0].codec_tag.as_deref(), Some("avc1"));
+        assert_eq!(probe.streams[0].codec_mime.as_deref(), Some("avc1.640028"));
+        assert_eq!(probe.streams[0].level, Some(40));
         assert_eq!(probe.streams[0].rotation_degrees, Some(90));
         assert_eq!(
             probe.streams[0].frame_rate,
@@ -423,6 +451,13 @@ mod tests {
         assert_eq!(probe.size_bytes, 17);
         assert_eq!(probe.duration_ms, None);
         assert_eq!(probe.bit_rate, None);
+    }
+
+    #[test]
+    fn unknown_negative_h264_level_remains_insufficient_metadata() {
+        let json = PROBE_JSON.replace("\"level\": 40", "\"level\": -99");
+        let probe = parse_probe_json(json.as_bytes(), 999).expect("fixture should remain parseable");
+        assert_eq!(probe.streams[0].level, None);
     }
 
     #[tokio::test]

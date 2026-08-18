@@ -24,12 +24,12 @@ use sooqa_library::{
     MediaSourceInput, NewMedia, SourceKind, StorageUploadStore,
 };
 use sooqa_media::{
-    ArtifactPublicationError, DownloadError, DownloadLimits, DownloadedSource, FfmpegExecutor,
-    FfprobeAdapter, FrameExtractionError, FrameExtractor, ImageNormalizer, MediaProbe,
-    MediaStreamKind, MediaWorkspace, NormalizationExecutionError, NormalizationPlanner,
-    SequenceAlignmentConfig, SourceDownloader, SourceInput, WorkspaceArea, WorkspaceError,
-    decode_first_preview_frame, encode_bounded_preview, publish_artifact, sha256_file,
-    validate_bounded_preview_for_mime,
+    ArtifactPublicationError, CANONICAL_VIDEO_PROFILE_VERSION, DownloadError, DownloadLimits,
+    DownloadedSource, FfmpegExecutor, FfprobeAdapter, FrameExtractionError, FrameExtractor,
+    ImageNormalizer, MediaProbe, MediaStreamKind, MediaWorkspace, NormalizationExecutionError,
+    NormalizationPlanner, SequenceAlignmentConfig, SourceDownloader, SourceInput, WorkspaceArea,
+    WorkspaceError, decode_first_preview_frame, encode_bounded_preview, publish_artifact,
+    sha256_file, validate_bounded_preview_for_mime,
 };
 use sooqa_persistence::{
     AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
@@ -841,7 +841,16 @@ async fn normalize_asset(
             .await;
         }
     };
-    let result = match executor.execute(&plan, std::future::pending()).await {
+    let result = match execute_video_normalization(
+        planner,
+        executor,
+        &input_path,
+        &output_path,
+        &probe,
+        plan,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(error) => {
             let retryable = normalization_error_is_retryable(&error);
@@ -864,6 +873,202 @@ async fn normalize_asset(
         .complete_asset_normalization(ingest_request_id, &job_attempt, normalization)
         .await
         .map_err(map_inbox_error)?;
+    Ok(())
+}
+
+struct VideoCandidateCleanup {
+    paths: Vec<PathBuf>,
+}
+
+impl VideoCandidateCleanup {
+    fn push(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+
+    fn disarm(&mut self) {
+        self.paths.clear();
+    }
+}
+
+impl Drop for VideoCandidateCleanup {
+    fn drop(&mut self) {
+        // Async cleanup is attempted on normal paths below. This synchronous
+        // guard covers task cancellation or worker shutdown between awaits.
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+async fn execute_video_normalization(
+    planner: &NormalizationPlanner,
+    executor: &FfmpegExecutor,
+    input_path: &Path,
+    output_path: &Path,
+    probe: &MediaProbe,
+    initial_plan: sooqa_media::NormalizationPlan,
+) -> Result<sooqa_media::NormalizationResult, NormalizationExecutionError> {
+    if initial_plan.mode() == sooqa_media::NormalizationMode::Remux {
+        let result = executor.execute(&initial_plan, std::future::pending()).await?;
+        if result.digest.bytes <= planner.profile().target_max_bytes {
+            return Ok(result);
+        }
+        // The input probe is the remux eligibility evidence. If a remux adds
+        // enough container overhead to cross the target, fall through to the
+        // bounded transcode ladder rather than publishing an over-target file.
+        let _ = tokio::fs::remove_file(output_path).await;
+    }
+
+    let video = probe
+        .streams
+        .iter()
+        .find(|stream| stream.kind == MediaStreamKind::Video)
+        .ok_or(NormalizationExecutionError::OutputHasNoVideo)?;
+    let ladder = planner.resolution_ladder(video);
+    if ladder.is_empty() {
+        return Err(NormalizationExecutionError::InvalidOutputProfile {
+            message: "video dimensions are missing or invalid",
+        });
+    }
+
+    let mut candidates = Vec::new();
+    let mut candidate_paths = VideoCandidateCleanup { paths: Vec::new() };
+    let mut attempts = 0;
+    'candidates: for dimensions in ladder {
+        for crf in planner.profile().preferred_crf..=planner.profile().maximum_crf {
+            attempts += 1;
+            let candidate_path = output_path
+                .with_file_name(format!(".sooqa-inline-candidate-{}.mp4", Uuid::new_v4()));
+            candidate_paths.push(candidate_path.clone());
+            let plan =
+                match planner.plan_candidate(input_path, &candidate_path, probe, dimensions, crf) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        cleanup_video_candidates(candidate_paths.paths()).await;
+                        return Err(NormalizationExecutionError::InvalidOutputProfile {
+                            message: match error {
+                                sooqa_media::NormalizationError::InvalidCandidateDimensions {
+                                    ..
+                                } => "candidate dimensions are outside the canonical profile",
+                                _ => "candidate normalization plan is invalid",
+                            },
+                        });
+                    }
+                };
+            let result = match executor.execute(&plan, std::future::pending()).await {
+                Ok(result) => result,
+                Err(error) => {
+                    cleanup_video_candidates(candidate_paths.paths()).await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) =
+                validate_adapted_dimensions(&result.probe, dimensions, video, planner.profile())
+            {
+                cleanup_video_candidates(candidate_paths.paths()).await;
+                return Err(error);
+            }
+            let fits = result.digest.bytes <= planner.profile().target_max_bytes;
+            candidates.push(result);
+            if fits {
+                break 'candidates;
+            }
+        }
+    }
+    let sizes = candidates.iter().map(|candidate| candidate.digest.bytes).collect::<Vec<_>>();
+    let selected_index = select_video_candidate_index(&sizes, planner.profile().target_max_bytes)
+        .ok_or(NormalizationExecutionError::InvalidOutputProfile {
+        message: "no bounded video adaptation candidate was produced",
+    })?;
+    let mut selected = candidates.swap_remove(selected_index);
+    let selected_path = selected.output_path.clone();
+    match publish_artifact(&selected_path, output_path).await {
+        Ok(()) => {}
+        Err(ArtifactPublicationError::DestinationConflict) => {
+            // The canonical path can be a stale artifact left by a previous
+            // interrupted normalization attempt. It is a workspace-owned output,
+            // so replace it only after the candidate has been fully validated.
+            let _ = tokio::fs::remove_file(output_path).await;
+            if let Err(error) = publish_artifact(&selected_path, output_path).await {
+                cleanup_video_candidates(candidate_paths.paths()).await;
+                return Err(NormalizationExecutionError::OutputPublish {
+                    path: output_path.to_owned(),
+                    message: error.to_string(),
+                });
+            }
+        }
+        Err(error) => {
+            cleanup_video_candidates(candidate_paths.paths()).await;
+            return Err(NormalizationExecutionError::OutputPublish {
+                path: output_path.to_owned(),
+                message: error.to_string(),
+            });
+        }
+    }
+    selected.output_path = output_path.to_owned();
+    for candidate in candidate_paths.paths() {
+        let _ = tokio::fs::remove_file(candidate).await;
+    }
+    candidate_paths.disarm();
+    debug!(
+        attempts,
+        selected_bytes = selected.digest.bytes,
+        target_bytes = planner.profile().target_max_bytes,
+        "selected bounded video adaptation candidate"
+    );
+    Ok(selected)
+}
+
+async fn cleanup_video_candidates(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+fn select_video_candidate_index(sizes: &[u64], target_max_bytes: u64) -> Option<usize> {
+    if sizes.is_empty() {
+        return None;
+    }
+    Some(sizes.iter().position(|size| *size <= target_max_bytes).unwrap_or(0))
+}
+
+fn validate_adapted_dimensions(
+    probe: &MediaProbe,
+    requested: sooqa_media::VideoDimensions,
+    source: &sooqa_media::MediaStream,
+    profile: sooqa_media::CanonicalVideoProfile,
+) -> Result<(), NormalizationExecutionError> {
+    let video = probe
+        .streams
+        .iter()
+        .find(|stream| stream.kind == MediaStreamKind::Video)
+        .ok_or(NormalizationExecutionError::OutputHasNoVideo)?;
+    let Some((width, height)) = video.width.zip(video.height) else {
+        return Err(NormalizationExecutionError::InvalidOutputProfile {
+            message: "adapted video dimensions are missing",
+        });
+    };
+    if width == 0
+        || height == 0
+        || !width.is_multiple_of(2)
+        || !height.is_multiple_of(2)
+        || width > requested.width
+        || height > requested.height
+        || width > profile.max_width
+        || height > profile.max_height
+        || (source.width.zip(source.height).is_some_and(|(source_width, source_height)| {
+            source_width.min(source_height) >= profile.minimum_short_edge
+                && width.min(height) < profile.minimum_short_edge
+        }))
+    {
+        return Err(NormalizationExecutionError::InvalidOutputProfile {
+            message: "adapted video dimensions exceed the bounded ladder",
+        });
+    }
     Ok(())
 }
 
@@ -1110,6 +1315,7 @@ async fn normalize_exact_asset(
         file_size_bytes: digest.bytes,
         sha256: digest.sha256,
         media_kind,
+        profile_version: None,
         mime_type: source_mime_type(request),
         container: probe.container_format.clone(),
         video_codec: video.and_then(|stream| stream.codec.clone()),
@@ -1211,6 +1417,7 @@ fn normalization_metadata(result: sooqa_media::NormalizationResult) -> AssetNorm
         file_size_bytes: result.digest.bytes,
         sha256: result.digest.sha256,
         media_kind: SourceMediaKind::Video,
+        profile_version: Some(CANONICAL_VIDEO_PROFILE_VERSION.to_owned()),
         mime_type: Some("video/mp4".to_owned()),
         container: result.probe.container_format,
         video_codec: video.and_then(|stream| stream.codec.clone()),
@@ -1231,6 +1438,7 @@ fn image_normalization_metadata(
         file_size_bytes: result.canonical_digest.bytes,
         sha256: result.canonical_digest.sha256,
         media_kind: SourceMediaKind::Image,
+        profile_version: None,
         mime_type: Some(result.format.mime_type().to_owned()),
         container: Some(result.format.extension().to_owned()),
         video_codec: None,
@@ -3128,6 +3336,13 @@ mod tests {
         assert!(failure.message.contains("101 bytes"));
         assert!(failure.message.contains("100 bytes"));
         assert!(normalized_storage_limit_failure(100, 100).is_none());
+    }
+
+    #[test]
+    fn candidate_selection_uses_first_actual_fit_and_quality_floor_fallback() {
+        assert_eq!(select_video_candidate_index(&[18, 15, 12], 14), Some(2));
+        assert_eq!(select_video_candidate_index(&[18, 15], 14), Some(0));
+        assert_eq!(select_video_candidate_index(&[], 14), None);
     }
 
     #[test]

@@ -155,6 +155,21 @@ Telegram storage uploads also use a separate bounded deadline suitable for
 2 GB-class transfers; it is independent from polling and download stall
 timeouts.
 
+Canonical video normalization is versioned as `canonical_video_v2`. The
+validated inline-playback policy defaults to a 14 MiB target, preferred CRF 23,
+maximum CRF 27, and a 480-pixel minimum short edge. Compatible videos already
+at or below the target are remuxed without re-encoding. Larger videos try CRF
+adaptation before descending an aspect-preserving even-dimension ladder. Actual
+candidate bytes are checked after every attempt; when the target cannot be met
+without crossing either quality floor, the larger preferred-quality canonical
+artifact is retained. Native inputs below the floor are never upscaled.
+
+New Telegram storage video uploads carry explicit canonical duration,
+dimensions, `supports_streaming=true`, and the existing persisted bounded JPEG
+preview as the thumbnail. Preview staging is temporary and has no derivative
+media or backfill path. Publication copies the corrected storage message, so
+its Telegram presentation metadata is preserved.
+
 Telegram file acceptance is metadata-only: the polling server validates and
 queues the file ID before acknowledging the update. The worker performs the
 bounded source download asynchronously from that durable file ID, and replayed

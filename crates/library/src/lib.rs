@@ -501,6 +501,16 @@ pub trait StorageUploadStore: Clone + Send + Sync + 'static {
 
     async fn find_media(&self, media_id: Uuid) -> Result<Option<Media>, Self::Error>;
 
+    /// Loads the already-bounded persisted preview bytes for an upload. The
+    /// default keeps storage adapters that do not retain previews compatible;
+    /// the PostgreSQL implementation validates the bytes before returning.
+    async fn find_media_preview(
+        &self,
+        _media_id: Uuid,
+    ) -> Result<Option<MediaPreviewData>, Self::Error> {
+        Ok(None)
+    }
+
     async fn find_storage_caption_metadata(
         &self,
         media_id: Uuid,

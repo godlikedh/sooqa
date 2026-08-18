@@ -239,6 +239,24 @@ state machine on the same row: `pending_storage`, `ready`,
 ambiguous results. Exact-SHA deduplication preserves the first source identity
 and only fills missing non-identity metadata from later observations.
 
+Video normalization uses the versioned `canonical_video_v2` profile. The media
+planner remuxes only a target-eligible MP4 whose H.264 container `avcC`
+declaration matches the authoritative SPS level and has sufficient level
+capacity; contradictory or incomplete declarations take the transcode path.
+Oversized candidates are bounded by preferred/max CRF and an even,
+aspect-preserving resolution ladder with a configurable minimum short edge.
+The worker checks actual candidate bytes after ffmpeg/ffprobe, retains the first
+largest preferred-quality candidate when no candidate reaches the byte target,
+and publishes only one canonical artifact. All subprocess work remains outside
+database transactions.
+
+For new video storage uploads, the Telegram boundary receives probed duration,
+width, height, and the persisted bounded JPEG preview. It validates thumbnail
+constraints before the network call, stages the preview only for multipart
+upload, and cleans that temporary path after the call. Publication copies the
+storage message, preserving these Telegram presentation fields without a
+variant table or existing-message backfill.
+
 The administrator library list is cursor-bounded. Its single metadata update
 command replaces the complete normalized tag set and description while holding
 the media row revision fence; the transaction commits before any later

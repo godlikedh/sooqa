@@ -194,10 +194,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
     handlers.register(JobType::ProbeAsset, move |job| probe_handler(job));
     tracing::info!("Telegram and upload ingest probe job handler enabled");
     let processing_timeout = Duration::from_secs(config.media.processing_timeout_seconds);
-    let normalization_planner = NormalizationPlanner::new(
-        config.media.ffmpeg_path.clone(),
-        CanonicalVideoProfile::default(),
-    )?;
+    let canonical_video_profile = CanonicalVideoProfile {
+        target_max_bytes: config.media.inline_video.target_max_bytes,
+        preferred_crf: config.media.inline_video.preferred_crf,
+        maximum_crf: config.media.inline_video.maximum_crf,
+        minimum_short_edge: config.media.inline_video.minimum_short_edge,
+        ..Default::default()
+    };
+    let normalization_planner =
+        NormalizationPlanner::new(config.media.ffmpeg_path.clone(), canonical_video_profile)?;
     let (normalization_executor, frame_extractor) = media_processing_components(
         config.media.ffmpeg_path.clone(),
         config.media.ffprobe_path.clone(),

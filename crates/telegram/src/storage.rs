@@ -1,8 +1,11 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use sooqa_library::{
-    MediaKind, StorageCaptionMetadata, StorageReceipt, StorageUploadReservation,
+    MediaKind, MediaPreviewData, StorageCaptionMetadata, StorageReceipt, StorageUploadReservation,
     StorageUploadReservationRequest, StorageUploadStore,
 };
 use sooqa_media::sha256_file;
@@ -17,6 +20,7 @@ use teloxide::{
     },
 };
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::TeloxideApi;
@@ -35,6 +39,10 @@ pub struct StorageUploadRequest {
     pub media_kind: MediaKind,
     pub local_work_path: PathBuf,
     pub caption: String,
+    pub duration: Option<u32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub thumbnail_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -137,6 +145,12 @@ pub enum StorageUploadError {
     Hash(#[source] sooqa_media::HashError),
     #[error("media hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
+    #[error("video metadata field {field} is invalid")]
+    InvalidVideoMetadata { field: &'static str },
+    #[error("video thumbnail is invalid: {reason}")]
+    InvalidVideoThumbnail { reason: &'static str },
+    #[error("could not stage video thumbnail {path}: {source}")]
+    ThumbnailStaging { path: PathBuf, source: std::io::Error },
     #[error("storage upload is already in progress until {retry_at:?}")]
     InProgress { retry_at: Option<time::OffsetDateTime> },
     #[error("storage upload for media {0} requires explicit reconciliation")]
@@ -285,6 +299,38 @@ where
             });
         }
 
+        let (duration, width, height, thumbnail) = if media.kind == MediaKind::Video {
+            let duration = match media.duration_ms {
+                Some(duration_ms) if duration_ms > 0 => {
+                    Some(u32::try_from(duration_ms.div_ceil(1_000)).map_err(|_| {
+                        StorageUploadError::InvalidVideoMetadata { field: "duration_ms" }
+                    })?)
+                }
+                Some(_) => {
+                    return Err(StorageUploadError::InvalidVideoMetadata { field: "duration_ms" });
+                }
+                None => {
+                    return Err(StorageUploadError::InvalidVideoMetadata { field: "duration_ms" });
+                }
+            };
+            let width = checked_video_dimension(media.width, "width")?;
+            if width.is_none() {
+                return Err(StorageUploadError::InvalidVideoMetadata { field: "width" });
+            }
+            let height = checked_video_dimension(media.height, "height")?;
+            if height.is_none() {
+                return Err(StorageUploadError::InvalidVideoMetadata { field: "height" });
+            }
+            let thumbnail = self
+                .store
+                .find_media_preview(input.media_id)
+                .await
+                .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
+            (duration, width, height, thumbnail)
+        } else {
+            (None, None, None, None)
+        };
+
         let reservation = self
             .store
             .reserve_storage_upload(StorageUploadReservationRequest {
@@ -314,12 +360,28 @@ where
             }
         };
 
+        let thumbnail_path = match thumbnail {
+            Some(preview) => match stage_video_thumbnail(&local_work_path, preview).await {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    let _ = self.store.release_storage_upload(media_id, owner_token).await;
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+
         let request = StorageUploadRequest {
             storage_chat_id: self.storage_chat_id,
             media_kind: media.kind,
             local_work_path,
             caption: storage_caption(&caption_metadata),
+            duration,
+            width,
+            height,
+            thumbnail_path,
         };
+        let thumbnail_cleanup = StagedThumbnailCleanup(request.thumbnail_path.clone());
         let mut upload = Box::pin(self.api.upload_media(request));
         let mut renewal = tokio::time::interval(STORAGE_UPLOAD_RENEW_INTERVAL);
         renewal.tick().await;
@@ -339,15 +401,18 @@ where
                         if let Err(mark_error) =
                             self.store.mark_storage_upload_unknown(media_id, owner_token).await
                         {
+                            remove_staged_thumbnail(&thumbnail_cleanup.0).await;
                             return Err(StorageUploadError::AmbiguousPersistence(Box::new(
                                 mark_error,
                             )));
                         }
+                        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
                         return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
                     }
                 }
             }
         };
+        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
         let uploaded = match uploaded {
             Ok(uploaded) => uploaded,
             Err(error) => {
@@ -355,10 +420,13 @@ where
                     if let Err(mark_error) =
                         self.store.mark_storage_upload_unknown(media_id, owner_token).await
                     {
+                        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
                         return Err(StorageUploadError::AmbiguousPersistence(Box::new(mark_error)));
                     }
+                    remove_staged_thumbnail(&thumbnail_cleanup.0).await;
                     return Err(StorageUploadError::AmbiguousApi(Box::new(error)));
                 }
+                remove_staged_thumbnail(&thumbnail_cleanup.0).await;
                 self.store.release_storage_upload(media_id, owner_token).await.map_err(
                     |release_error| StorageUploadError::Persistence(Box::new(release_error)),
                 )?;
@@ -386,13 +454,89 @@ where
                 if let Err(mark_error) =
                     self.store.mark_storage_upload_unknown(media_id, owner_token).await
                 {
+                    remove_staged_thumbnail(&thumbnail_cleanup.0).await;
                     return Err(StorageUploadError::AmbiguousPersistence(Box::new(mark_error)));
                 }
+                remove_staged_thumbnail(&thumbnail_cleanup.0).await;
                 return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
             }
         };
         Ok(StorageUploadOutcome::Uploaded(object))
     }
+}
+
+async fn remove_staged_thumbnail(path: &Option<PathBuf>) {
+    if let Some(path) = path {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+struct StagedThumbnailCleanup(Option<PathBuf>);
+
+impl Drop for StagedThumbnailCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn checked_video_dimension(
+    value: Option<i32>,
+    field: &'static str,
+) -> Result<Option<u32>, StorageUploadError> {
+    value
+        .map(|value| {
+            u32::try_from(value)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or(StorageUploadError::InvalidVideoMetadata { field })
+        })
+        .transpose()
+}
+
+async fn stage_video_thumbnail(
+    canonical_path: &Path,
+    preview: MediaPreviewData,
+) -> Result<PathBuf, StorageUploadError> {
+    if preview.metadata.mime_type != "image/jpeg" {
+        return Err(StorageUploadError::InvalidVideoThumbnail {
+            reason: "Telegram video thumbnails must be JPEG",
+        });
+    }
+    if preview.bytes.is_empty() || preview.bytes.len() >= 200 * 1024 {
+        return Err(StorageUploadError::InvalidVideoThumbnail {
+            reason: "thumbnail must be smaller than 200 KiB",
+        });
+    }
+    if preview.metadata.width == 0
+        || preview.metadata.width > 320
+        || preview.metadata.height == 0
+        || preview.metadata.height > 320
+    {
+        return Err(StorageUploadError::InvalidVideoThumbnail {
+            reason: "thumbnail dimensions must not exceed 320x320",
+        });
+    }
+    let Some(parent) = canonical_path.parent() else {
+        return Err(StorageUploadError::InvalidVideoThumbnail {
+            reason: "canonical media path has no workspace parent",
+        });
+    };
+    let path = parent.join(format!(".sooqa-storage-thumbnail-{}.jpg", Uuid::new_v4()));
+    let mut file =
+        tokio::fs::OpenOptions::new().write(true).create_new(true).open(&path).await.map_err(
+            |source| StorageUploadError::ThumbnailStaging { path: path.clone(), source },
+        )?;
+    if let Err(source) = file.write_all(&preview.bytes).await {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(StorageUploadError::ThumbnailStaging { path, source });
+    }
+    if let Err(source) = file.flush().await {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(StorageUploadError::ThumbnailStaging { path, source });
+    }
+    Ok(path)
 }
 
 const MAX_STORAGE_CAPTION_CHARS: usize = 1_024;
@@ -488,39 +632,39 @@ impl TelegramStorageApi for TeloxideApi {
         request: StorageUploadRequest,
     ) -> Result<StorageUploadResult, Self::Error> {
         let chat_id = ChatId(request.storage_chat_id);
-        let message = match request.media_kind {
-            MediaKind::Video => self
-                .upload_bot()
-                .send_video(chat_id, InputFile::file(request.local_work_path))
-                .caption(request.caption)
-                .supports_streaming(true)
-                .send()
-                .await
-                .map_err(StorageUploadApiError::Api)?,
-            MediaKind::Image => self
-                .upload_bot()
-                .send_photo(chat_id, InputFile::file(request.local_work_path))
-                .caption(request.caption)
-                .send()
-                .await
-                .map_err(StorageUploadApiError::Api)?,
-            MediaKind::Audio => self
-                .upload_bot()
-                .send_audio(chat_id, InputFile::file(request.local_work_path))
-                .caption(request.caption)
-                .send()
-                .await
-                .map_err(StorageUploadApiError::Api)?,
-            MediaKind::Animation => self
-                .upload_bot()
-                .send_animation(chat_id, InputFile::file(request.local_work_path))
-                .caption(request.caption)
-                .send()
-                .await
-                .map_err(StorageUploadApiError::Api)?,
+        let requested_media_kind = request.media_kind;
+        let (media_kind, message) = match requested_media_kind {
+            MediaKind::Video => (MediaKind::Video, self.send_video_with_metadata(request).await?),
+            MediaKind::Image => (
+                MediaKind::Image,
+                self.upload_bot()
+                    .send_photo(chat_id, InputFile::file(request.local_work_path))
+                    .caption(request.caption)
+                    .send()
+                    .await
+                    .map_err(StorageUploadApiError::Api)?,
+            ),
+            MediaKind::Audio => (
+                MediaKind::Audio,
+                self.upload_bot()
+                    .send_audio(chat_id, InputFile::file(request.local_work_path))
+                    .caption(request.caption)
+                    .send()
+                    .await
+                    .map_err(StorageUploadApiError::Api)?,
+            ),
+            MediaKind::Animation => (
+                MediaKind::Animation,
+                self.upload_bot()
+                    .send_animation(chat_id, InputFile::file(request.local_work_path))
+                    .caption(request.caption)
+                    .send()
+                    .await
+                    .map_err(StorageUploadApiError::Api)?,
+            ),
         };
 
-        let reference = match request.media_kind {
+        let reference = match media_kind {
             MediaKind::Video => {
                 message.video().map(|video| (&video.file.id, &video.file.unique_id))
             }
@@ -535,7 +679,7 @@ impl TelegramStorageApi for TeloxideApi {
                 message.animation().map(|animation| (&animation.file.id, &animation.file.unique_id))
             }
         }
-        .ok_or(StorageUploadApiError::MissingFileReference { media_kind: request.media_kind })?;
+        .ok_or(StorageUploadApiError::MissingFileReference { media_kind: requested_media_kind })?;
 
         Ok(StorageUploadResult {
             storage_message_id: i64::from(message.id.0),
@@ -573,6 +717,32 @@ impl TelegramStorageApi for TeloxideApi {
             ChatMemberKind::Administrator(_) => Err(StorageUploadApiError::StorageBotCannotPost),
             _ => Err(StorageUploadApiError::StorageBotNotAdministrator),
         }
+    }
+}
+
+impl TeloxideApi {
+    async fn send_video_with_metadata(
+        &self,
+        request: StorageUploadRequest,
+    ) -> Result<teloxide::types::Message, StorageUploadApiError> {
+        let mut send = self
+            .upload_bot()
+            .send_video(ChatId(request.storage_chat_id), InputFile::file(request.local_work_path))
+            .caption(request.caption)
+            .supports_streaming(true);
+        if let Some(duration) = request.duration {
+            send = send.duration(duration);
+        }
+        if let Some(width) = request.width {
+            send = send.width(width);
+        }
+        if let Some(height) = request.height {
+            send = send.height(height);
+        }
+        if let Some(thumbnail_path) = request.thumbnail_path {
+            send = send.thumbnail(InputFile::file(thumbnail_path));
+        }
+        send.send().await.map_err(StorageUploadApiError::Api)
     }
 }
 
@@ -678,6 +848,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockStore {
         canonical: Arc<Mutex<Option<Media>>>,
+        preview: Arc<Mutex<Option<MediaPreviewData>>>,
         active: Arc<Mutex<Option<StorageReceipt>>>,
         reserved: Arc<Mutex<bool>>,
         released: Arc<Mutex<bool>>,
@@ -692,6 +863,13 @@ mod tests {
 
         async fn find_media(&self, _media_id: Uuid) -> Result<Option<Media>, Self::Error> {
             Ok(self.canonical.lock().expect("mock mutex should not be poisoned").clone())
+        }
+
+        async fn find_media_preview(
+            &self,
+            _media_id: Uuid,
+        ) -> Result<Option<MediaPreviewData>, Self::Error> {
+            Ok(self.preview.lock().expect("mock mutex should not be poisoned").clone())
         }
 
         async fn find_storage_caption_metadata(
@@ -805,9 +983,9 @@ mod tests {
             container: Some("mp4".to_owned()),
             video_codec: None,
             audio_codec: None,
-            width: None,
-            height: None,
-            duration_ms: None,
+            width: Some(320),
+            height: Some(240),
+            duration_ms: Some(1_000),
             bit_rate: None,
             file_size_bytes: None,
             sha256: Some(sha256),
@@ -848,6 +1026,51 @@ mod tests {
         assert!(matches!(outcome, StorageUploadOutcome::Reused(_)));
         assert!(api.requests.lock().unwrap().is_empty());
         tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn video_upload_carries_duration_dimensions_and_persisted_jpeg_thumbnail() {
+        let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let digest = sha256_file(&path).await.expect("fixture should hash");
+        let api = MockApi::default();
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
+        *store.preview.lock().unwrap() = Some(MediaPreviewData {
+            metadata: sooqa_library::MediaPreviewMetadata {
+                mime_type: "image/jpeg".to_owned(),
+                width: 320,
+                height: 180,
+                size_bytes: 12,
+                sha256: vec![0; 32],
+            },
+            bytes: b"jpeg preview".to_vec(),
+        });
+        let provider = StorageUploadProvider::new(api.clone(), store, -100123)
+            .expect("storage chat ID should be valid");
+
+        provider.upload(input()).await.expect("upload should succeed");
+        let request = api.requests.lock().unwrap().pop().expect("one upload should be sent");
+        assert_eq!(request.duration, Some(1));
+        assert_eq!(request.width, Some(320));
+        assert_eq!(request.height, Some(240));
+        let thumbnail_path = request.thumbnail_path.expect("thumbnail should be staged");
+        assert!(!thumbnail_path.exists(), "staged thumbnail must be cleaned after upload");
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn staged_thumbnail_guard_cleans_up_when_upload_is_cancelled() {
+        let directory = std::env::temp_dir().join(format!("sooqa-thumbnail-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.expect("fixture directory should be created");
+        let path = directory.join("thumbnail.jpg");
+        tokio::fs::write(&path, b"thumbnail").await.expect("fixture should be written");
+        {
+            let _guard = StagedThumbnailCleanup(Some(path.clone()));
+        }
+        assert!(!path.exists(), "staged thumbnail should be removed by its guard");
+        tokio::fs::remove_dir(directory).await.expect("fixture directory should be removed");
     }
 
     #[tokio::test]
