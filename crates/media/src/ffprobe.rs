@@ -456,7 +456,8 @@ mod tests {
     #[test]
     fn unknown_negative_h264_level_remains_insufficient_metadata() {
         let json = PROBE_JSON.replace("\"level\": 40", "\"level\": -99");
-        let probe = parse_probe_json(json.as_bytes(), 999).expect("fixture should remain parseable");
+        let probe =
+            parse_probe_json(json.as_bytes(), 999).expect("fixture should remain parseable");
         assert_eq!(probe.streams[0].level, None);
     }
 
