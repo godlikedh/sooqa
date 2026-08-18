@@ -355,6 +355,12 @@
     };
     if (fields.publicText) metadata.publicText = String(fields.publicText.value || "").trim();
     if (fields.requestedPublishAt) {
+      if (fields.requestedPublishAt.validity?.badInput) {
+        return {
+          error: "Enter a future local date/time or leave it blank for cadence",
+          field: fields.requestedPublishAt,
+        };
+      }
       const localTime = String(fields.requestedPublishAt.value || "").trim();
       if (localTime) {
         metadata.requestedPublishAt = localDateTimeToRfc3339(

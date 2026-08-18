@@ -18,6 +18,7 @@ class FakeElement {
     this.className = "";
     this.textContent = "";
     this.value = "";
+    this.validity = { badInput: false };
     this._type = "";
     Object.defineProperty(this, "type", {
       configurable: true,
@@ -1002,6 +1003,33 @@ test("Queue detailed forms use cadence when the local time is blank", async () =
     assert.equal(payload.requested_post_caption, "Public cadence text");
     assert.equal("requested_publish_at" in payload, false);
     assertActionButtonsState(post, false);
+  }
+});
+
+test("Queue detailed forms reject malformed local time instead of using cadence", async () => {
+  for (const renderer of ["native", "overlay"]) {
+    const requests = [];
+    const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+    if (renderer === "overlay") browser.document.disableDialog = true;
+    const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+    browser.document.body.append(post);
+    userscript.boot(browser.root);
+
+    actionButton(post, "queue_exact").click();
+    const selector = renderer === "native" ? "dialog" : ".sooqa-metadata-overlay";
+    const surface = browser.document.body.querySelector(selector);
+    assert.ok(surface);
+    const requestedPublishAt = surface.querySelectorAll("input")[1];
+    requestedPublishAt.value = "";
+    requestedPublishAt.validity.badInput = true;
+    surface.querySelectorAll("button")[1].click();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(requests.length, 0);
+    assert.equal(browser.document.body.querySelectorAll(selector).length, 1);
+    assert.match(surface.querySelector(".sooqa-dialog-error").textContent, /future local date\/time/);
+    assert.equal(browser.document.activeElement, requestedPublishAt);
+    assertActionButtonsState(post, true);
   }
 });
 
