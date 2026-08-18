@@ -21,8 +21,11 @@ audio, fast start, and stripped incidental metadata by default.
 The current profile version is `canonical_video_v2`. It adds a bounded Telegram
 inline-playback policy: a 14 MiB target, preferred CRF 23, maximum CRF 27, and a
 480-pixel minimum short edge. CRF is tried before resolution reduction. Every
-candidate is checked by its actual output bytes; if no candidate fits before
-both floors, the largest preferred-quality candidate is retained.
+candidate is checked by its actual output bytes, and candidates above the
+configured normalized-storage ceiling are discarded. If no candidate fits the
+inline target before both quality floors, the earliest highest-quality
+candidate within that storage ceiling is retained; if none is storable,
+normalization fails clearly.
 
 `NormalizationPlanner` selects a remux plan only when the probe proves the
 input is MP4-compatible, within profile limits, unrotated, and already uses

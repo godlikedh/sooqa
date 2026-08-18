@@ -240,15 +240,17 @@ ambiguous results. Exact-SHA deduplication preserves the first source identity
 and only fills missing non-identity metadata from later observations.
 
 Video normalization uses the versioned `canonical_video_v2` profile. The media
-planner remuxes only a target-eligible MP4 whose H.264 container `avcC`
+planner identifies compatible MP4 remux candidates whose H.264 container `avcC`
 declaration matches the authoritative SPS level and has sufficient level
 capacity; contradictory or incomplete declarations take the transcode path.
 Oversized candidates are bounded by preferred/max CRF and an even,
 aspect-preserving resolution ladder with a configurable minimum short edge.
-The worker checks actual candidate bytes after ffmpeg/ffprobe, retains the first
-largest preferred-quality candidate when no candidate reaches the byte target,
-and publishes only one canonical artifact. All subprocess work remains outside
-database transactions.
+The worker checks actual candidate bytes after ffmpeg/ffprobe, discards
+candidates above `normalized_storage_max_bytes`, retains the first
+highest-quality candidate within that ceiling when no candidate reaches the
+inline byte target, and publishes only one canonical artifact. If none is
+storable, normalization fails. All subprocess work remains outside database
+transactions.
 
 For new video storage uploads, the Telegram boundary receives probed duration,
 width, height, and the persisted bounded JPEG preview. It validates thumbnail

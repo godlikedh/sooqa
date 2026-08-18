@@ -8,7 +8,7 @@ use sooqa_library::{
     MediaKind, MediaPreviewData, StorageCaptionMetadata, StorageReceipt, StorageUploadReservation,
     StorageUploadReservationRequest, StorageUploadStore,
 };
-use sooqa_media::sha256_file;
+use sooqa_media::{sha256_file, validate_bounded_preview_for_mime};
 use teloxide::{
     payloads::{
         EditMessageCaptionSetters, SendAnimationSetters, SendAudioSetters, SendPhotoSetters,
@@ -504,18 +504,20 @@ async fn stage_video_thumbnail(
             reason: "Telegram video thumbnails must be JPEG",
         });
     }
-    if preview.bytes.is_empty() || preview.bytes.len() >= 200 * 1024 {
+    let (actual_width, actual_height) =
+        validate_bounded_preview_for_mime(&preview.bytes, Some("image/jpeg")).map_err(|_| {
+            StorageUploadError::InvalidVideoThumbnail {
+                reason: "thumbnail bytes must be a bounded JPEG",
+            }
+        })?;
+    if preview.metadata.width != actual_width || preview.metadata.height != actual_height {
         return Err(StorageUploadError::InvalidVideoThumbnail {
-            reason: "thumbnail must be smaller than 200 KiB",
+            reason: "thumbnail dimensions do not match encoded JPEG",
         });
     }
-    if preview.metadata.width == 0
-        || preview.metadata.width > 320
-        || preview.metadata.height == 0
-        || preview.metadata.height > 320
-    {
+    if preview.metadata.sha256.len() != 32 {
         return Err(StorageUploadError::InvalidVideoThumbnail {
-            reason: "thumbnail dimensions must not exceed 320x320",
+            reason: "thumbnail SHA-256 must contain 32 bytes",
         });
     }
     let Some(parent) = canonical_path.parent() else {
@@ -535,6 +537,19 @@ async fn stage_video_thumbnail(
     if let Err(source) = file.flush().await {
         let _ = tokio::fs::remove_file(&path).await;
         return Err(StorageUploadError::ThumbnailStaging { path, source });
+    }
+    let digest = match sha256_file(&path).await {
+        Ok(digest) => digest,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(StorageUploadError::Hash(error));
+        }
+    };
+    if digest.sha256 != hex_encode(&preview.metadata.sha256) {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(StorageUploadError::InvalidVideoThumbnail {
+            reason: "thumbnail SHA-256 does not match encoded JPEG",
+        });
     }
     Ok(path)
 }
@@ -792,6 +807,7 @@ fn is_idempotent_caption_edit_error(error: &teloxide::RequestError) -> bool {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use sha2::Digest;
     use sooqa_library::{Media, MediaStorageState, StorageReceipt};
     use time::OffsetDateTime;
 
@@ -1033,6 +1049,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
         tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
         let digest = sha256_file(&path).await.expect("fixture should hash");
+        let (thumbnail, thumbnail_sha256) = valid_thumbnail();
         let api = MockApi::default();
         let store = MockStore::default();
         *store.canonical.lock().unwrap() =
@@ -1040,12 +1057,12 @@ mod tests {
         *store.preview.lock().unwrap() = Some(MediaPreviewData {
             metadata: sooqa_library::MediaPreviewMetadata {
                 mime_type: "image/jpeg".to_owned(),
-                width: 320,
-                height: 180,
-                size_bytes: 12,
-                sha256: vec![0; 32],
+                width: 2,
+                height: 2,
+                size_bytes: thumbnail.len() as u32,
+                sha256: thumbnail_sha256,
             },
-            bytes: b"jpeg preview".to_vec(),
+            bytes: thumbnail,
         });
         let provider = StorageUploadProvider::new(api.clone(), store, -100123)
             .expect("storage chat ID should be valid");
@@ -1061,6 +1078,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_corrupt_video_thumbnail_before_network_upload() {
+        let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let digest = sha256_file(&path).await.expect("fixture should hash");
+        let api = MockApi::default();
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
+        *store.preview.lock().unwrap() = Some(MediaPreviewData {
+            metadata: sooqa_library::MediaPreviewMetadata {
+                mime_type: "image/jpeg".to_owned(),
+                width: 2,
+                height: 2,
+                size_bytes: 11,
+                sha256: vec![0; 32],
+            },
+            bytes: b"not a jpeg".to_vec(),
+        });
+        let provider = StorageUploadProvider::new(api.clone(), store, -100123)
+            .expect("storage chat ID should be valid");
+
+        let error = provider.upload(input()).await.expect_err("corrupt thumbnail must be rejected");
+        assert!(matches!(error, StorageUploadError::InvalidVideoThumbnail { .. }));
+        assert!(api.requests.lock().unwrap().is_empty());
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn rejects_video_thumbnail_when_metadata_dimensions_do_not_match_bytes() {
+        let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let digest = sha256_file(&path).await.expect("fixture should hash");
+        let (thumbnail, thumbnail_sha256) = valid_thumbnail();
+        let api = MockApi::default();
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
+        *store.preview.lock().unwrap() = Some(MediaPreviewData {
+            metadata: sooqa_library::MediaPreviewMetadata {
+                mime_type: "image/jpeg".to_owned(),
+                width: 320,
+                height: 180,
+                size_bytes: thumbnail.len() as u32,
+                sha256: thumbnail_sha256,
+            },
+            bytes: thumbnail,
+        });
+        let provider = StorageUploadProvider::new(api.clone(), store, -100123)
+            .expect("storage chat ID should be valid");
+
+        let error =
+            provider.upload(input()).await.expect_err("mismatched metadata must be rejected");
+        assert!(matches!(error, StorageUploadError::InvalidVideoThumbnail { .. }));
+        assert!(api.requests.lock().unwrap().is_empty());
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
     async fn staged_thumbnail_guard_cleans_up_when_upload_is_cancelled() {
         let directory = std::env::temp_dir().join(format!("sooqa-thumbnail-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&directory).await.expect("fixture directory should be created");
@@ -1071,6 +1146,17 @@ mod tests {
         }
         assert!(!path.exists(), "staged thumbnail should be removed by its guard");
         tokio::fs::remove_dir(directory).await.expect("fixture directory should be removed");
+    }
+
+    fn valid_thumbnail() -> (Vec<u8>, Vec<u8>) {
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([64, 128, 192]));
+        let mut output = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut output, image::ImageFormat::Jpeg)
+            .expect("test thumbnail should encode");
+        let bytes = output.into_inner();
+        let sha256 = sha2::Sha256::digest(&bytes).to_vec();
+        (bytes, sha256)
     }
 
     #[tokio::test]

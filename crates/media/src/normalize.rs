@@ -216,6 +216,21 @@ impl NormalizationPlan {
         command.arg("-progress").arg("pipe:1").arg(output.as_ref().as_os_str())
     }
 
+    /// Returns an equivalent plan that writes to a caller-owned attempt path.
+    /// The worker uses this for remux decisions so a candidate can be inspected
+    /// before it is published to the canonical destination.
+    pub fn with_output(&self, output: impl AsRef<Path>) -> Self {
+        let args = self.command.args();
+        let mut command = ExternalCommand::new(self.command.program().to_owned())
+            .timeout(self.command.timeout_duration())
+            .max_output_bytes(self.command.max_output_bytes_limit());
+        for arg in &args[..args.len().saturating_sub(1)] {
+            command = command.arg(arg.clone());
+        }
+        command = command.arg(output.as_ref().as_os_str());
+        Self { mode: self.mode, command, output: output.as_ref().to_owned(), profile: self.profile }
+    }
+
     pub fn output(&self) -> &Path {
         &self.output
     }
@@ -251,9 +266,7 @@ impl NormalizationPlanner {
         probe: &MediaProbe,
     ) -> Result<NormalizationPlan, NormalizationError> {
         let video = first_video_stream(probe).ok_or(NormalizationError::NoVideoStream)?;
-        let mode = if probe.size_bytes <= self.profile.target_max_bytes
-            && is_remux_compatible(probe, video, self.profile)
-        {
+        let mode = if is_remux_compatible(probe, video, self.profile) {
             NormalizationMode::Remux
         } else {
             NormalizationMode::Transcode
@@ -318,6 +331,16 @@ impl NormalizationPlanner {
     pub fn canonical_dimensions(&self, video: &MediaStream) -> Option<VideoDimensions> {
         let (width, height) = video.width.zip(video.height)?;
         bounded_dimensions(width, height, self.profile.max_width, self.profile.max_height)
+    }
+
+    /// Returns the effective lower bound for adaptation. A source whose aspect
+    /// ratio forces its highest non-upscaled canonical dimensions below the
+    /// configured floor must retain that native canonical size rather than be
+    /// rejected for falling below the floor.
+    pub fn effective_minimum_short_edge(&self, video: &MediaStream) -> Option<u32> {
+        self.canonical_dimensions(video).map(|dimensions| {
+            self.profile.minimum_short_edge.min(dimensions.width.min(dimensions.height))
+        })
     }
 
     /// Returns a bounded descending resolution ladder. The first size is the
@@ -597,17 +620,21 @@ fn validate_candidate_dimensions(
     source: &MediaStream,
     profile: CanonicalVideoProfile,
 ) -> Result<(), NormalizationError> {
+    let effective_minimum_short_edge = source
+        .width
+        .zip(source.height)
+        .and_then(|(width, height)| {
+            bounded_dimensions(width, height, profile.max_width, profile.max_height)
+        })
+        .map(|canonical| profile.minimum_short_edge.min(canonical.width.min(canonical.height)));
     if dimensions.width == 0
         || dimensions.height == 0
         || !dimensions.width.is_multiple_of(2)
         || !dimensions.height.is_multiple_of(2)
         || dimensions.width > profile.max_width
         || dimensions.height > profile.max_height
-        || (source
-            .width
-            .zip(source.height)
-            .is_some_and(|(width, height)| width.min(height) >= profile.minimum_short_edge)
-            && dimensions.width.min(dimensions.height) < profile.minimum_short_edge)
+        || effective_minimum_short_edge
+            .is_some_and(|minimum| dimensions.width.min(dimensions.height) < minimum)
     {
         return Err(NormalizationError::InvalidCandidateDimensions { dimensions });
     }
@@ -872,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_compatible_mp4_transcodes_instead_of_remuxing() {
+    fn oversized_compatible_mp4_still_tries_remux_before_adaptation() {
         let planner = NormalizationPlanner::new("ffmpeg", Default::default())
             .expect("default profile should be valid");
         let mut probe = video_probe(
@@ -887,16 +914,70 @@ mod tests {
         probe.size_bytes = 15 * 1024 * 1024;
         let plan = planner
             .plan("input.mp4", "output.mp4", &probe)
-            .expect("oversized input should still produce a bounded transcode plan");
-        assert_eq!(plan.mode(), NormalizationMode::Transcode);
+            .expect("oversized input should still produce a remux candidate");
+        assert_eq!(plan.mode(), NormalizationMode::Remux);
         let command_args = args(&plan);
-        assert!(command_args.windows(2).any(|pair| pair == ["-crf", "23"]));
-        assert!(command_args.windows(2).any(|pair| {
-            pair == [
-                "-vf",
-                "scale='1920':'1080':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p",
-            ]
-        }));
+        assert!(command_args.windows(2).any(|pair| pair == ["-c", "copy"]));
+        assert!(!command_args.iter().any(|argument| argument == "-crf"));
+    }
+
+    #[test]
+    fn effective_floor_accepts_portrait_canonical_size_below_configured_floor() {
+        let planner = NormalizationPlanner::new("ffmpeg", Default::default())
+            .expect("default profile should be valid");
+        let probe = video_probe(
+            "matroska,webm",
+            "vp9",
+            "yuv420p",
+            1080,
+            2560,
+            Some(FrameRate { numerator: 30, denominator: 1 }),
+            Some("opus"),
+        );
+        assert_eq!(
+            planner.canonical_dimensions(&probe.streams[0]),
+            Some(VideoDimensions { width: 456, height: 1080 })
+        );
+        assert_eq!(planner.effective_minimum_short_edge(&probe.streams[0]), Some(456));
+        planner
+            .plan_candidate(
+                "input.webm",
+                "output.mp4",
+                &probe,
+                VideoDimensions { width: 456, height: 1080 },
+                23,
+            )
+            .expect("highest portrait canonical dimensions should remain valid");
+    }
+
+    #[test]
+    fn effective_floor_accepts_aspect_limited_size_with_higher_configured_floor() {
+        let profile = CanonicalVideoProfile { minimum_short_edge: 720, ..Default::default() };
+        let planner = NormalizationPlanner::new("ffmpeg", profile)
+            .expect("higher floor profile should be valid");
+        let probe = video_probe(
+            "matroska,webm",
+            "vp9",
+            "yuv420p",
+            1080,
+            1920,
+            Some(FrameRate { numerator: 30, denominator: 1 }),
+            Some("opus"),
+        );
+        assert_eq!(
+            planner.canonical_dimensions(&probe.streams[0]),
+            Some(VideoDimensions { width: 608, height: 1080 })
+        );
+        assert_eq!(planner.effective_minimum_short_edge(&probe.streams[0]), Some(608));
+        planner
+            .plan_candidate(
+                "input.webm",
+                "output.mp4",
+                &probe,
+                VideoDimensions { width: 608, height: 1080 },
+                23,
+            )
+            .expect("aspect-limited canonical dimensions should remain valid");
     }
 
     #[test]

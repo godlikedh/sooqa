@@ -67,7 +67,39 @@ impl FfprobeAdapter {
             });
         }
 
-        parse_probe_json(&output.stdout, metadata.len())
+        let mut probe = parse_probe_json(&output.stdout, metadata.len())?;
+        if probe.streams.iter().any(needs_targeted_avcc_probe) {
+            // Debian Bookworm's ffprobe does not expose mime_codec_string.
+            // Keep the regular probe bounded and obtain only the first video
+            // stream's avcC declaration in a separate bounded command. Any
+            // failure of this optional metadata probe is fail-closed: the
+            // stream remains non-remuxable and normalization will transcode.
+            if let Some(output) = self.targeted_avcc_probe(input).await {
+                merge_targeted_avcc(&mut probe, &output);
+            }
+        }
+        Ok(probe)
+    }
+
+    async fn targeted_avcc_probe(&self, input: &Path) -> Option<Vec<u8>> {
+        let command = ExternalCommand::new(self.executable.clone())
+            .arg("-v")
+            .arg("error")
+            .arg("-select_streams")
+            .arg("v:0")
+            .arg("-show_entries")
+            .arg("stream=index,extradata")
+            .arg("-show_data")
+            .arg("-of")
+            .arg("json")
+            .arg(input.as_os_str())
+            .timeout(self.timeout)
+            .max_output_bytes(self.max_output_bytes);
+        let output = self.runner.run(command).await.ok()?;
+        if !output.success || output.stdout_truncated || output.stderr_truncated {
+            return None;
+        }
+        Some(output.stdout)
     }
 }
 
@@ -202,6 +234,7 @@ struct RawStream {
     codec_name: Option<String>,
     codec_tag_string: Option<String>,
     mime_codec_string: Option<String>,
+    extradata: Option<String>,
     // Some ffprobe builds report an unknown H.264 level as -99. Keep the raw
     // JSON value permissive so that insufficient metadata falls back to a
     // transcode instead of making the whole probe unreadable.
@@ -218,6 +251,51 @@ struct RawStream {
     sample_rate: Option<String>,
     channels: Option<u16>,
     bit_rate: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAvccProbe {
+    #[serde(default)]
+    streams: Vec<RawAvccStream>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAvccStream {
+    index: Option<u32>,
+    extradata: Option<String>,
+}
+
+fn needs_targeted_avcc_probe(stream: &MediaStream) -> bool {
+    stream.kind == MediaStreamKind::Video
+        && stream.codec_mime.is_none()
+        && stream.codec.as_deref().is_some_and(|codec| codec.eq_ignore_ascii_case("h264"))
+        && stream
+            .codec_tag
+            .as_deref()
+            .is_some_and(|tag| tag.eq_ignore_ascii_case("avc1") || tag.eq_ignore_ascii_case("avc3"))
+}
+
+fn merge_targeted_avcc(probe: &mut MediaProbe, input: &[u8]) {
+    let Ok(raw) = serde_json::from_slice::<RawAvccProbe>(input) else { return };
+    for stream in &mut probe.streams {
+        if !needs_targeted_avcc_probe(stream) {
+            continue;
+        }
+        let Some(extradata) = raw
+            .streams
+            .iter()
+            .find(|candidate| candidate.index == Some(stream.index))
+            .and_then(|candidate| candidate.extradata.as_deref())
+        else {
+            continue;
+        };
+        stream.codec_mime = codec_mime_from_metadata(
+            stream.codec.as_deref(),
+            stream.codec_tag.as_deref(),
+            None,
+            Some(extradata),
+        );
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,12 +324,21 @@ fn parse_stream(stream: RawStream) -> Result<MediaStream, ProbeError> {
         .transpose()?;
     let rotation_degrees = parse_rotation(&stream);
 
+    let codec = optional_value(stream.codec_name);
+    let codec_tag = optional_value(stream.codec_tag_string);
+    let codec_mime = codec_mime_from_metadata(
+        codec.as_deref(),
+        codec_tag.as_deref(),
+        optional_value(stream.mime_codec_string),
+        stream.extradata.as_deref(),
+    );
+
     Ok(MediaStream {
         index,
         kind,
-        codec: optional_value(stream.codec_name),
-        codec_tag: optional_value(stream.codec_tag_string),
-        codec_mime: optional_value(stream.mime_codec_string),
+        codec,
+        codec_tag,
+        codec_mime,
         level: stream
             .level
             .and_then(|value| value.as_i64().and_then(|level| u32::try_from(level).ok())),
@@ -266,6 +353,118 @@ fn parse_stream(stream: RawStream) -> Result<MediaStream, ProbeError> {
         channels: stream.channels,
         bit_rate: parse_optional_u64(stream.bit_rate.as_deref(), "stream.bit_rate")?,
     })
+}
+
+const MAX_AVCC_EXTRADATA_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct AvcCDeclaration {
+    profile_idc: u8,
+    profile_compatibility: u8,
+    level_idc: u8,
+}
+
+/// ffprobe's `-show_data` stream dump is a bounded hexdump, not a raw hex
+/// string. Decode only the contiguous four-hex-digit words before each line's
+/// ASCII column and stop once the small avcC envelope has been collected.
+fn parse_avcc_extradata(value: &str) -> Option<AvcCDeclaration> {
+    let mut bytes = Vec::new();
+    for line in value.lines() {
+        let Some((_, payload)) = line.split_once(':') else { continue };
+        for token in payload.split_whitespace() {
+            if token.len() != 4 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                break;
+            }
+            let word = u16::from_str_radix(token, 16).ok()?;
+            bytes.extend_from_slice(&word.to_be_bytes());
+            if bytes.len() >= MAX_AVCC_EXTRADATA_BYTES {
+                return parse_avcc_bytes(&bytes);
+            }
+        }
+    }
+    parse_avcc_bytes(&bytes)
+}
+
+fn parse_avcc_bytes(bytes: &[u8]) -> Option<AvcCDeclaration> {
+    if bytes.len() < 8 || bytes[0] != 1 || bytes[4] & 0x03 != 3 {
+        return None;
+    }
+    let declaration = AvcCDeclaration {
+        profile_idc: bytes[1],
+        profile_compatibility: bytes[2],
+        level_idc: bytes[3],
+    };
+    let sps_count = usize::from(bytes[5] & 0x1f);
+    if sps_count == 0 {
+        return None;
+    }
+    let mut offset = 6;
+    for _ in 0..sps_count {
+        let length =
+            usize::from(u16::from_be_bytes([*bytes.get(offset)?, *bytes.get(offset + 1)?]));
+        offset = offset.checked_add(2)?.checked_add(length)?;
+        if offset > bytes.len() {
+            return None;
+        }
+    }
+    let pps_count = usize::from(*bytes.get(offset)?);
+    offset = offset.checked_add(1)?;
+    if pps_count == 0 {
+        return None;
+    }
+    for _ in 0..pps_count {
+        let length =
+            usize::from(u16::from_be_bytes([*bytes.get(offset)?, *bytes.get(offset + 1)?]));
+        offset = offset.checked_add(2)?.checked_add(length)?;
+        if offset > bytes.len() {
+            return None;
+        }
+    }
+    Some(declaration)
+}
+
+fn codec_mime_from_metadata(
+    codec: Option<&str>,
+    codec_tag: Option<&str>,
+    reported_mime: Option<String>,
+    extradata: Option<&str>,
+) -> Option<String> {
+    let avcc = extradata.and_then(parse_avcc_extradata);
+    let is_h264_avc = codec.is_some_and(|value| value.eq_ignore_ascii_case("h264"))
+        && codec_tag.is_some_and(|value| {
+            value.eq_ignore_ascii_case("avc1") || value.eq_ignore_ascii_case("avc3")
+        });
+
+    // An avc1/avc3 stream with malformed avcC bytes must not inherit a
+    // contradictory newer-field declaration and become remuxable.
+    if is_h264_avc && extradata.is_some_and(|value| !value.trim().is_empty()) && avcc.is_none() {
+        return None;
+    }
+
+    match (reported_mime, avcc) {
+        (Some(reported), Some(avcc)) => {
+            let suffix = reported.split_once('.')?.1;
+            if suffix.len() != 6 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            let profile = u8::from_str_radix(&suffix[..2], 16).ok()?;
+            let compatibility = u8::from_str_radix(&suffix[2..4], 16).ok()?;
+            let level = u8::from_str_radix(&suffix[4..], 16).ok()?;
+            (profile == avcc.profile_idc
+                && compatibility == avcc.profile_compatibility
+                && level == avcc.level_idc)
+                .then_some(reported)
+        }
+        (Some(reported), None) => Some(reported),
+        (None, Some(avcc)) => {
+            let codec_tag = codec_tag?;
+            Some(format!(
+                "{codec_tag}.{:02x}{:02x}{:02x}",
+                avcc.profile_idc, avcc.profile_compatibility, avcc.level_idc
+            ))
+        }
+        (None, None) => None,
+    }
 }
 
 fn parse_rotation(stream: &RawStream) -> Option<i32> {
@@ -356,6 +555,7 @@ fn bounded_text(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         ffi::OsString,
         sync::{Arc, Mutex},
     };
@@ -406,8 +606,8 @@ mod tests {
 
     #[derive(Clone)]
     struct RecordingRunner {
-        command: Arc<Mutex<Option<ExternalCommand>>>,
-        output: ExternalCommandOutput,
+        commands: Arc<Mutex<Vec<ExternalCommand>>>,
+        outputs: Arc<Mutex<VecDeque<ExternalCommandOutput>>>,
     }
 
     #[async_trait]
@@ -416,8 +616,16 @@ mod tests {
             &self,
             command: ExternalCommand,
         ) -> Result<ExternalCommandOutput, CommandError> {
-            *self.command.lock().expect("test mutex should not be poisoned") = Some(command);
-            Ok(self.output.clone())
+            self.commands.lock().expect("test mutex should not be poisoned").push(command);
+            self.outputs.lock().expect("test mutex should not be poisoned").pop_front().ok_or_else(
+                || CommandError::Spawn {
+                    program: PathBuf::from("ffprobe"),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "recording runner ran out of outputs",
+                    ),
+                },
+            )
         }
     }
 
@@ -445,6 +653,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_bookworm_avcc_dump_when_mime_codec_string_is_absent() {
+        let json = PROBE_JSON
+            .replace("          \"mime_codec_string\": \"avc1.640028\",\n", "")
+            .replace(
+                "          \"level\": 40,",
+                "          \"extradata\": \"\\n00000000: 0164 0028 ffe1 0002 6701 0100 0168  .d.(....gd...h\\n\",\n          \"level\": 40,",
+            );
+        let probe = parse_probe_json(json.as_bytes(), 999)
+            .expect("Bookworm-style fixture should parse into a media probe");
+
+        assert_eq!(probe.streams[0].codec_tag.as_deref(), Some("avc1"));
+        assert_eq!(probe.streams[0].codec_mime.as_deref(), Some("avc1.640028"));
+    }
+
+    #[test]
+    fn contradictory_reported_mime_and_avcc_dump_are_rejected() {
+        let json = PROBE_JSON.replace(
+            "          \"level\": 40,",
+            "          \"extradata\": \"\\n00000000: 0164 0028 ffe1 0002 6701 0100 0168\\n\",\n          \"level\": 40,",
+        );
+        let json = json.replace("avc1.640028", "avc1.420028");
+        let probe = parse_probe_json(json.as_bytes(), 999)
+            .expect("contradictory metadata should remain parseable");
+
+        assert_eq!(probe.streams[0].codec_mime, None);
+    }
+
+    #[test]
+    fn malformed_avcc_dump_is_not_used_for_remux_metadata() {
+        let json = PROBE_JSON.replace(
+            "          \"level\": 40,",
+            "          \"extradata\": \"\\n00000000: 0164 0028\\n\",\n          \"level\": 40,",
+        );
+        let probe = parse_probe_json(json.as_bytes(), 999)
+            .expect("malformed metadata should remain parseable");
+
+        assert_eq!(probe.streams[0].codec_mime, None);
+    }
+
+    #[test]
     fn uses_file_size_when_ffprobe_does_not_report_one() {
         let json = br#"{"streams":[],"format":{"format_name":"wav","duration":"N/A","size":"N/A","bit_rate":"N/A"}}"#;
         let probe = parse_probe_json(json, 17).expect("fixture should parse");
@@ -463,17 +711,17 @@ mod tests {
 
     #[tokio::test]
     async fn passes_safe_ffprobe_arguments_and_parses_output() {
-        let command = Arc::new(Mutex::new(None));
+        let commands = Arc::new(Mutex::new(Vec::new()));
         let runner = Arc::new(RecordingRunner {
-            command: Arc::clone(&command),
-            output: ExternalCommandOutput {
+            commands: Arc::clone(&commands),
+            outputs: Arc::new(Mutex::new(VecDeque::from([ExternalCommandOutput {
                 success: true,
                 exit_code: Some(0),
                 stdout: PROBE_JSON.as_bytes().to_vec(),
                 stderr: Vec::new(),
                 stdout_truncated: false,
                 stderr_truncated: false,
-            },
+            }]))),
         });
         let adapter = FfprobeAdapter::with_runner(
             "/usr/local/bin/ffprobe",
@@ -486,10 +734,11 @@ mod tests {
 
         let probe = adapter.probe(&path).await.expect("probe should succeed");
         assert_eq!(probe.size_bytes, 123456);
-        let command = command
+        let command = commands
             .lock()
             .expect("test mutex should not be poisoned")
-            .clone()
+            .first()
+            .cloned()
             .expect("runner should record command");
         assert_eq!(command.program(), Path::new("/usr/local/bin/ffprobe"));
         assert_eq!(
@@ -503,22 +752,121 @@ mod tests {
                 OsString::from("json"),
             ]
         );
-        assert_eq!(command.args()[6], path.as_os_str());
+        assert!(!command.args().iter().any(|argument| argument == "-show_data"));
+        assert_eq!(
+            command.args().last().map(|argument| argument.as_os_str()),
+            Some(path.as_os_str())
+        );
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn targeted_bookworm_probe_is_bounded_and_fills_missing_codec_mime() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let base_json =
+            PROBE_JSON.replace("          \"mime_codec_string\": \"avc1.640028\",\n", "");
+        let runner = Arc::new(RecordingRunner {
+            commands: Arc::clone(&commands),
+            outputs: Arc::new(Mutex::new(VecDeque::from([
+                ExternalCommandOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: base_json.into_bytes(),
+                    stderr: Vec::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+                ExternalCommandOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: br#"{"streams":[{"index":0,"extradata":"\n00000000: 0164 0028 ffe1 0002 6701 0100 0168  .d.(....gd...h\n"}]}"#.to_vec(),
+                    stderr: Vec::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+            ]))),
+        });
+        let adapter = FfprobeAdapter::with_runner(
+            "/usr/local/bin/ffprobe",
+            Duration::from_secs(4),
+            4096,
+            runner,
+        );
+        let path = std::env::temp_dir().join(format!("sooqa-probe-{}.bin", uuid::Uuid::new_v4()));
+        tokio::fs::write(&path, b"fixture").await.expect("fixture should be writable");
+
+        let probe = adapter.probe(&path).await.expect("probe should succeed");
+        assert_eq!(probe.streams[0].codec_mime.as_deref(), Some("avc1.640028"));
+        {
+            let commands = commands.lock().expect("test mutex should not be poisoned");
+            assert_eq!(commands.len(), 2);
+            assert_eq!(
+                commands[1].args(),
+                &[
+                    OsString::from("-v"),
+                    OsString::from("error"),
+                    OsString::from("-select_streams"),
+                    OsString::from("v:0"),
+                    OsString::from("-show_entries"),
+                    OsString::from("stream=index,extradata"),
+                    OsString::from("-show_data"),
+                    OsString::from("-of"),
+                    OsString::from("json"),
+                    path.as_os_str().to_owned(),
+                ]
+            );
+        }
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn targeted_probe_failure_fails_closed_without_rejecting_base_probe() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let base_json =
+            PROBE_JSON.replace("          \"mime_codec_string\": \"avc1.640028\",\n", "");
+        let runner = Arc::new(RecordingRunner {
+            commands,
+            outputs: Arc::new(Mutex::new(VecDeque::from([
+                ExternalCommandOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: base_json.into_bytes(),
+                    stderr: Vec::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+                ExternalCommandOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    stdout: Vec::new(),
+                    stderr: b"unsupported option".to_vec(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+            ]))),
+        });
+        let adapter = FfprobeAdapter::with_runner("ffprobe", Duration::from_secs(1), 4096, runner);
+        let path = std::env::temp_dir().join(format!("sooqa-probe-{}.bin", uuid::Uuid::new_v4()));
+        tokio::fs::write(&path, b"fixture").await.expect("fixture should be writable");
+
+        let probe = adapter.probe(&path).await.expect("base probe should remain usable");
+        assert_eq!(probe.streams[0].codec_mime, None);
         tokio::fs::remove_file(path).await.expect("fixture should be removed");
     }
 
     #[tokio::test]
     async fn classifies_nonzero_ffprobe_exit_as_terminal() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
         let runner = Arc::new(RecordingRunner {
-            command: Arc::new(Mutex::new(None)),
-            output: ExternalCommandOutput {
+            commands,
+            outputs: Arc::new(Mutex::new(VecDeque::from([ExternalCommandOutput {
                 success: false,
                 exit_code: Some(1),
                 stdout: Vec::new(),
                 stderr: b"Invalid data found when processing input".to_vec(),
                 stdout_truncated: false,
                 stderr_truncated: false,
-            },
+            }]))),
         });
         let adapter = FfprobeAdapter::with_runner("ffprobe", Duration::from_secs(1), 4096, runner);
         let path = std::env::temp_dir().join(format!("sooqa-probe-{}.bin", uuid::Uuid::new_v4()));

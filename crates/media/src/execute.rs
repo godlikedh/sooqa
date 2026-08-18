@@ -344,6 +344,10 @@ pub enum NormalizationExecutionError {
     OutputHasNoVideo,
     #[error("normalized output does not satisfy the canonical profile: {message}")]
     InvalidOutputProfile { message: &'static str },
+    #[error(
+        "normalized output is {bytes} bytes, above the configured storage ceiling of {limit} bytes"
+    )]
+    OutputExceedsStorageLimit { bytes: u64, limit: u64 },
     #[error("could not validate normalized output: {0}")]
     Probe(#[from] ProbeError),
     #[error("could not hash normalized output: {0}")]

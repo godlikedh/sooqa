@@ -33,7 +33,8 @@ normalized_storage_max_bytes = 1900000000
 
 [media.inline_video]
 # Bounded Telegram inline-playback target; adaptation never goes below the
-# configured quality floor when this target cannot be met.
+# configured quality floor when this target cannot be met. Candidates also
+# must remain within media.normalized_storage_max_bytes.
 target_max_bytes = 14680064
 preferred_crf = 23
 maximum_crf = 27

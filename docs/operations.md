@@ -153,9 +153,12 @@ The corresponding environment overrides are
 `SOOQA_MEDIA_INLINE_VIDEO_MINIMUM_SHORT_EDGE`. A compatible MP4 at or below
 the target is remuxed. Oversized inputs try preferred CRF, then CRF values up
 to the maximum, then an aspect-preserving even-dimension ladder down to the
-minimum short edge. Every candidate is checked by actual output bytes. If the
-target cannot be met without crossing a quality floor, the largest
-preferred-quality candidate is retained and Telegram remains click-to-play.
+minimum short edge. Every candidate is checked by actual output bytes, and
+candidates above `normalized_storage_max_bytes` are discarded. If the target
+cannot be met without crossing a quality floor, the earliest highest-quality
+candidate within that storage ceiling is retained and Telegram remains
+click-to-play. If no candidate is within the storage ceiling, normalization
+fails instead of producing an unstorable artifact.
 Native inputs smaller than the floor are never upscaled.
 
 ### Allowlisted social-video pages
