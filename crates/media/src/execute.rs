@@ -344,6 +344,10 @@ pub enum NormalizationExecutionError {
     OutputHasNoVideo,
     #[error("normalized output does not satisfy the canonical profile: {message}")]
     InvalidOutputProfile { message: &'static str },
+    #[error(
+        "normalized output is {bytes} bytes, above the configured storage ceiling of {limit} bytes"
+    )]
+    OutputExceedsStorageLimit { bytes: u64, limit: u64 },
     #[error("could not validate normalized output: {0}")]
     Probe(#[from] ProbeError),
     #[error("could not hash normalized output: {0}")]
@@ -458,6 +462,9 @@ mod tests {
                 index: 0,
                 kind: MediaStreamKind::Video,
                 codec: Some("h264".to_owned()),
+                codec_tag: Some("avc1".to_owned()),
+                codec_mime: Some("avc1.640028".to_owned()),
+                level: Some(40),
                 profile: Some("High".to_owned()),
                 pixel_format: Some("yuv420p".to_owned()),
                 width: Some(320),

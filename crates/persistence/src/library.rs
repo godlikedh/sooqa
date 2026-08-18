@@ -1298,6 +1298,13 @@ impl StorageUploadStore for LibraryRepository {
         LibraryRepository::find_media(self, media_id).await
     }
 
+    async fn find_media_preview(
+        &self,
+        media_id: Uuid,
+    ) -> Result<Option<MediaPreviewData>, Self::Error> {
+        LibraryRepository::find_media_preview(self, media_id).await
+    }
+
     async fn find_storage_caption_metadata(
         &self,
         media_id: Uuid,

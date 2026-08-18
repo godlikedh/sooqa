@@ -37,6 +37,10 @@ const MAX_TELEGRAM_UPLOAD_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_NORMALIZED_STORAGE_MAX_BYTES: u64 = 1_900_000_000;
+const DEFAULT_INLINE_VIDEO_TARGET_MAX_BYTES: u64 = 14 * 1024 * 1024;
+const DEFAULT_INLINE_VIDEO_PREFERRED_CRF: u8 = 23;
+const DEFAULT_INLINE_VIDEO_MAXIMUM_CRF: u8 = 27;
+const DEFAULT_INLINE_VIDEO_MINIMUM_SHORT_EDGE: u32 = 480;
 const TELEGRAM_LOCAL_MAX_UPLOAD_BYTES: u64 = 2_000_000_000;
 const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_LEVEL: &str = "info";
@@ -248,6 +252,15 @@ pub struct MediaConfig {
     pub processing_timeout_seconds: u64,
     pub source_download_max_bytes: u64,
     pub normalized_storage_max_bytes: u64,
+    pub inline_video: InlineVideoConfig,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct InlineVideoConfig {
+    pub target_max_bytes: u64,
+    pub preferred_crf: u8,
+    pub maximum_crf: u8,
+    pub minimum_short_edge: u32,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -421,6 +434,28 @@ impl AppConfig {
                     .media
                     .normalized_storage_max_bytes
                     .unwrap_or(DEFAULT_NORMALIZED_STORAGE_MAX_BYTES),
+                inline_video: InlineVideoConfig {
+                    target_max_bytes: raw
+                        .media
+                        .inline_video
+                        .target_max_bytes
+                        .unwrap_or(DEFAULT_INLINE_VIDEO_TARGET_MAX_BYTES),
+                    preferred_crf: raw
+                        .media
+                        .inline_video
+                        .preferred_crf
+                        .unwrap_or(DEFAULT_INLINE_VIDEO_PREFERRED_CRF),
+                    maximum_crf: raw
+                        .media
+                        .inline_video
+                        .maximum_crf
+                        .unwrap_or(DEFAULT_INLINE_VIDEO_MAXIMUM_CRF),
+                    minimum_short_edge: raw
+                        .media
+                        .inline_video
+                        .minimum_short_edge
+                        .unwrap_or(DEFAULT_INLINE_VIDEO_MINIMUM_SHORT_EDGE),
+                },
             },
             companion: CompanionConfig {
                 listen_address: raw
@@ -482,7 +517,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.ytdlp_allowed_hosts={} media.ytdlp_pot_provider_url={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} companion.listen_address={} companion.request_body_limit_bytes={} companion.request_timeout_seconds={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.ytdlp_allowed_hosts={} media.ytdlp_pot_provider_url={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} media.inline_video.target_max_bytes={} media.inline_video.preferred_crf={} media.inline_video.maximum_crf={} media.inline_video.minimum_short_edge={} companion.listen_address={} companion.request_body_limit_bytes={} companion.request_timeout_seconds={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -500,6 +535,10 @@ impl AppConfig {
             self.media.processing_timeout_seconds,
             self.media.source_download_max_bytes,
             self.media.normalized_storage_max_bytes,
+            self.media.inline_video.target_max_bytes,
+            self.media.inline_video.preferred_crf,
+            self.media.inline_video.maximum_crf,
+            self.media.inline_video.minimum_short_edge,
             self.companion.listen_address,
             self.companion.request_body_limit_bytes,
             self.companion.request_timeout_seconds,
@@ -586,6 +625,7 @@ impl AppConfig {
                     reason: "expected a positive integer",
                 })?;
         }
+        self.apply_inline_video_environment(&mut optional_env_string)?;
         if let Some(value) = optional_env_string("SOOQA_COMPANION_LISTEN_ADDRESS")? {
             self.companion.listen_address = value;
         }
@@ -674,6 +714,41 @@ impl AppConfig {
                     name: "SOOQA_TELEGRAM_STORAGE_CHAT_ID".to_owned(),
                     reason: "expected a negative Telegram chat ID",
                 })?);
+        }
+        Ok(())
+    }
+
+    fn apply_inline_video_environment<F>(&mut self, mut get: F) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    {
+        if let Some(value) = get("SOOQA_MEDIA_INLINE_VIDEO_TARGET_MAX_BYTES")? {
+            self.media.inline_video.target_max_bytes =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_MEDIA_INLINE_VIDEO_TARGET_MAX_BYTES".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
+        }
+        if let Some(value) = get("SOOQA_MEDIA_INLINE_VIDEO_PREFERRED_CRF")? {
+            self.media.inline_video.preferred_crf =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_MEDIA_INLINE_VIDEO_PREFERRED_CRF".to_owned(),
+                    reason: "expected an integer between 0 and 51",
+                })?;
+        }
+        if let Some(value) = get("SOOQA_MEDIA_INLINE_VIDEO_MAXIMUM_CRF")? {
+            self.media.inline_video.maximum_crf =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_MEDIA_INLINE_VIDEO_MAXIMUM_CRF".to_owned(),
+                    reason: "expected an integer between 0 and 51",
+                })?;
+        }
+        if let Some(value) = get("SOOQA_MEDIA_INLINE_VIDEO_MINIMUM_SHORT_EDGE")? {
+            self.media.inline_video.minimum_short_edge =
+                value.parse().map_err(|_| ConfigError::InvalidValue {
+                    name: "SOOQA_MEDIA_INLINE_VIDEO_MINIMUM_SHORT_EDGE".to_owned(),
+                    reason: "expected a positive integer",
+                })?;
         }
         Ok(())
     }
@@ -834,6 +909,42 @@ impl AppConfig {
                 reason: "must be below Telegram's 2000 MB local upload limit",
             });
         }
+        if self.media.inline_video.target_max_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video.target_max_bytes".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.media.inline_video.preferred_crf > 51 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video.preferred_crf".to_owned(),
+                reason: "must be between 0 and 51",
+            });
+        }
+        if self.media.inline_video.maximum_crf > 51 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video.maximum_crf".to_owned(),
+                reason: "must be between 0 and 51",
+            });
+        }
+        if self.media.inline_video.preferred_crf > self.media.inline_video.maximum_crf {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video".to_owned(),
+                reason: "preferred_crf must not exceed maximum_crf",
+            });
+        }
+        if self.media.inline_video.minimum_short_edge == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video.minimum_short_edge".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.media.inline_video.minimum_short_edge > 1080 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video.minimum_short_edge".to_owned(),
+                reason: "must be at most the canonical 1080p short-edge limit",
+            });
+        }
         parse_ytdlp_allowed_hosts(
             "media.ytdlp_allowed_hosts",
             self.media.ytdlp_allowed_hosts.clone(),
@@ -953,6 +1064,16 @@ struct RawMediaConfig {
     processing_timeout_seconds: Option<u64>,
     source_download_max_bytes: Option<u64>,
     normalized_storage_max_bytes: Option<u64>,
+    inline_video: RawInlineVideoConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawInlineVideoConfig {
+    target_max_bytes: Option<u64>,
+    preferred_crf: Option<u8>,
+    maximum_crf: Option<u8>,
+    minimum_short_edge: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1619,6 +1740,16 @@ mod tests {
         );
         assert_eq!(config.media.source_download_max_bytes, DEFAULT_SOURCE_DOWNLOAD_MAX_BYTES);
         assert_eq!(config.media.normalized_storage_max_bytes, DEFAULT_NORMALIZED_STORAGE_MAX_BYTES);
+        assert_eq!(
+            config.media.inline_video.target_max_bytes,
+            DEFAULT_INLINE_VIDEO_TARGET_MAX_BYTES
+        );
+        assert_eq!(config.media.inline_video.preferred_crf, DEFAULT_INLINE_VIDEO_PREFERRED_CRF);
+        assert_eq!(config.media.inline_video.maximum_crf, DEFAULT_INLINE_VIDEO_MAXIMUM_CRF);
+        assert_eq!(
+            config.media.inline_video.minimum_short_edge,
+            DEFAULT_INLINE_VIDEO_MINIMUM_SHORT_EDGE
+        );
         assert_eq!(config.telegram.storage_chat_id, Some(-1001234567890));
     }
 
@@ -1730,6 +1861,54 @@ mod tests {
             too_long_processing_timeout.validate(),
             Err(ConfigError::InvalidValue { name, .. }) if name == "media.processing_timeout_seconds"
         ));
+
+        let reversed_crf = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media.inline_video]\npreferred_crf = 28\nmaximum_crf = 27\n",
+        )
+        .expect("TOML should parse");
+        assert!(matches!(
+            reversed_crf.validate(),
+            Err(ConfigError::InvalidValue { name, .. }) if name == "media.inline_video"
+        ));
+
+        let invalid_floor = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media.inline_video]\nminimum_short_edge = 1081\n",
+        )
+        .expect("TOML should parse");
+        assert!(matches!(
+            invalid_floor.validate(),
+            Err(ConfigError::InvalidValue { name, .. }) if name == "media.inline_video.minimum_short_edge"
+        ));
+    }
+
+    #[test]
+    fn inline_video_environment_overrides_are_applied() {
+        let mut config = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media.inline_video]\ntarget_max_bytes = 100\npreferred_crf = 18\nmaximum_crf = 20\nminimum_short_edge = 240\n",
+        )
+        .expect("TOML should parse");
+        config
+            .apply_inline_video_environment(|name| {
+                Ok(match name {
+                    "SOOQA_MEDIA_INLINE_VIDEO_TARGET_MAX_BYTES" => Some("12000000".to_owned()),
+                    "SOOQA_MEDIA_INLINE_VIDEO_PREFERRED_CRF" => Some("24".to_owned()),
+                    "SOOQA_MEDIA_INLINE_VIDEO_MAXIMUM_CRF" => Some("26".to_owned()),
+                    "SOOQA_MEDIA_INLINE_VIDEO_MINIMUM_SHORT_EDGE" => Some("360".to_owned()),
+                    _ => None,
+                })
+            })
+            .expect("inline video environment should parse");
+
+        assert_eq!(config.media.inline_video.target_max_bytes, 12_000_000);
+        assert_eq!(config.media.inline_video.preferred_crf, 24);
+        assert_eq!(config.media.inline_video.maximum_crf, 26);
+        assert_eq!(config.media.inline_video.minimum_short_edge, 360);
     }
 
     #[test]

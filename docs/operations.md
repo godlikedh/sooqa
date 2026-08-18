@@ -137,6 +137,31 @@ separate:
   object uploaded to Telegram storage. It must remain below the documented
   2000 MB local Bot API upload limit.
 
+Canonical video adaptation uses the versioned `canonical_video_v2` profile. Its
+validated defaults are configured under `[media.inline_video]`:
+
+```toml
+target_max_bytes = 14680064 # 14 MiB
+preferred_crf = 23
+maximum_crf = 27
+minimum_short_edge = 480
+```
+
+The corresponding environment overrides are
+`SOOQA_MEDIA_INLINE_VIDEO_TARGET_MAX_BYTES`,
+`SOOQA_MEDIA_INLINE_VIDEO_PREFERRED_CRF`,
+`SOOQA_MEDIA_INLINE_VIDEO_MAXIMUM_CRF`, and
+`SOOQA_MEDIA_INLINE_VIDEO_MINIMUM_SHORT_EDGE`. A compatible MP4 at or below
+the target is remuxed. Oversized inputs try preferred CRF, then CRF values up
+to the maximum, then an aspect-preserving even-dimension ladder down to the
+minimum short edge. Every candidate is checked by actual output bytes, and
+candidates above `normalized_storage_max_bytes` are discarded. If the target
+cannot be met without crossing a quality floor, the earliest highest-quality
+candidate within that storage ceiling is retained and Telegram remains
+click-to-play. If no candidate is within the storage ceiling, normalization
+fails instead of producing an unstorable artifact.
+Native inputs smaller than the floor are never upscaled.
+
 ### Allowlisted social-video pages
 
 The worker is direct-only when `SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS` is empty. To
@@ -612,12 +637,15 @@ and [upstream server README](https://github.com/tdlib/telegram-bot-api#usage)
 for Telegram-side requirements.
 
 Canonical videos are uploaded to the private storage channel with Telegram's
-`supports_streaming=true` `sendVideo` flag. The canonical video profile already
-produces MP4/H.264 video with optional AAC audio and fast-start metadata, so
-newly stored videos can begin playback before the full file is downloaded by a
-client. Images, animations, and audio use their existing upload methods and do
-not receive this video-only flag. This does not change existing storage
-messages; it applies to new uploads after deployment.
+`supports_streaming=true` `sendVideo` flag plus explicit probed duration, width,
+and height. The persisted bounded JPEG preview is validated against Telegram's
+thumbnail limits, staged only for the multipart request, and removed after the
+request. The canonical video profile produces MP4/H.264 video with optional AAC
+audio and fast-start metadata, so newly stored videos can begin playback before
+the full file is downloaded by a client. Images, animations, and audio use their
+existing upload methods and do not receive this video-only metadata. This does
+not change existing storage messages; it applies to new uploads after
+deployment.
 
 ## Storage ambiguity
 

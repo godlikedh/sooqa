@@ -2985,6 +2985,10 @@ mod tests {
                 media_kind: MediaKind::Video,
                 local_work_path: path,
                 caption: "sooqa".to_owned(),
+                duration: Some(1),
+                width: Some(320),
+                height: Some(240),
+                thumbnail_path: None,
             })
             .await
             .expect("local Bot API upload should succeed");

@@ -57,8 +57,9 @@ pub use image_normalize::{
     validate_bounded_preview_for_mime,
 };
 pub use normalize::{
-    AudioCodec, CanonicalContainer, CanonicalVideoProfile, NormalizationError, NormalizationMode,
-    NormalizationPlan, NormalizationPlanner, PixelFormat, ProfileError, VideoCodec, VideoPreset,
+    AudioCodec, CANONICAL_VIDEO_PROFILE_VERSION, CanonicalContainer, CanonicalVideoProfile,
+    NormalizationError, NormalizationMode, NormalizationPlan, NormalizationPlanner, PixelFormat,
+    ProfileError, VideoCodec, VideoDimensions, VideoPreset,
 };
 pub use sequence_alignment::{
     SequenceAlignment, SequenceAlignmentConfig, SequenceAlignmentError, SequenceClassification,

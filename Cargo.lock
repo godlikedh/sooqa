@@ -2290,8 +2290,10 @@ name = "sooqa-telegram"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "image",
  "reqwest",
  "serde_json",
+ "sha2",
  "sooqa-library",
  "sooqa-media",
  "teloxide",

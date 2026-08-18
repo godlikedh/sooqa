@@ -31,6 +31,15 @@ source_download_max_bytes = 8589934592
 # Must remain below Telegram local Bot API's documented 2000 MB upload limit.
 normalized_storage_max_bytes = 1900000000
 
+[media.inline_video]
+# Bounded Telegram inline-playback target; adaptation never goes below the
+# configured quality floor when this target cannot be met. Candidates also
+# must remain within media.normalized_storage_max_bytes.
+target_max_bytes = 14680064
+preferred_crf = 23
+maximum_crf = 27
+minimum_short_edge = 480
+
 [companion]
 listen_address = "127.0.0.1:47831"
 backend_url = "http://127.0.0.1:8080"

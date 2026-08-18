@@ -53,6 +53,8 @@ pub struct AssetNormalization {
     pub file_size_bytes: u64,
     pub sha256: String,
     pub media_kind: SourceMediaKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_version: Option<String>,
     pub mime_type: Option<String>,
     pub container: Option<String>,
     pub video_codec: Option<String>,
