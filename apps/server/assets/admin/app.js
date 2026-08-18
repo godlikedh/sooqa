@@ -1091,14 +1091,14 @@
     state.publication = { media, action };
     const dialog = $("publication-dialog");
     const exact = action === "queue_exact";
-    $("publication-dialog-title").textContent = exact ? "Queue at an exact time" : "Post now with public text";
+    $("publication-dialog-title").textContent = exact ? "Queue with optional exact time" : "Post now with public text";
     const context = $("publication-dialog-context");
     clear(context);
     context.append(idReference("Media", media.id), node("span", "", " · internal description and tags stay separate."));
     $("publication-caption").value = "";
     $("publication-time").value = "";
     $("publication-time").min = localDateTimeValue(new Date(Date.now() + 60_000));
-    $("publication-time").required = exact;
+    $("publication-time").required = false;
     $("publication-time-field").hidden = !exact;
     $("publication-error").hidden = true;
     $("publication-submit").textContent = exact ? "Queue intent" : "Post intent";
@@ -1137,7 +1137,8 @@
     const caption = $("publication-caption").value.trim() || undefined;
     let requestedPublishAt;
     try {
-      if (current.action === "queue_exact") requestedPublishAt = localFutureTimeToIso($("publication-time").value);
+      const localTime = $("publication-time").value;
+      if (current.action === "queue_exact" && localTime) requestedPublishAt = localFutureTimeToIso(localTime);
     } catch (error) {
       $("publication-error").textContent = error instanceof Error ? error.message : "The exact time is invalid.";
       $("publication-error").hidden = false;

@@ -77,8 +77,9 @@ The response changes the caption marker to `Syncing`; `Retry sync` calls the
 durable retry endpoint after a failure. Preview bytes are fetched through the
 authenticated API and held only in revocable browser object URLs. Ready cards'
 Post now/Queue actions create publication intents; ellipsis variants collect
-only public text and, for exact queueing, a future local browser time. A repeat
-draft is resolved from Dashboard rather than in the Media page.
+only public text and an optional future local browser time. Leaving the
+`Queue…` time blank uses normal cadence; a populated time queues exactly. A
+repeat draft is resolved from Dashboard rather than in the Media page.
 
 Schedule loads `GET /api/v1/posts?limit=50` in scheduled-time/UUID order and
 does not request publication history. Rows with optional preview metadata fetch
@@ -438,8 +439,9 @@ stores it in Tampermonkey's private storage. It never receives or stores the
 backend token. Each media preview gets `Post now`, `Post now…`, `Queue`,
 `Queue…`, `Save`, and `Save…` actions. Detailed actions collect only their
 documented metadata: internal tags/description, optional public post text, and
-the required browser-local exact time for `Queue…`; exact time is converted to
-an RFC3339 instant before submission. Their modal layout is userscript-owned so
+an optional browser-local exact time for `Queue…`. A blank time uses normal
+cadence; a populated future time is converted to an RFC3339 instant before
+submission. Their modal layout is userscript-owned so
 board CSS cannot make the form unusable. Native dialog support is preferred;
 otherwise a labelled in-page overlay provides the same structured fields,
 traps keyboard focus, makes the underlying page inert while open, and restores

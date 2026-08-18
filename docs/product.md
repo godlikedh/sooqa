@@ -120,7 +120,9 @@ description/tags edits separate from public publication text, shows the durable
 caption-sync state and retry, and fetches a bounded preview through the
 authenticated API into a revocable browser object URL. Ready media offers plain
 Post now/Queue actions and ellipsis dialogs for optional public text and an
-exact future browser-local time; repeat drafts go back to Dashboard decisions.
+optional future browser-local time; a blank Queue time uses normal cadence,
+while a populated time schedules exactly. Repeat drafts go back to Dashboard
+decisions.
 Schedule is a bounded chronological editor for unpublished posts. It hides
 published and cancelled history, distinguishes cadence from exact-time work,
 and shows optional bounded still previews from the existing media preview

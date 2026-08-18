@@ -18,6 +18,7 @@ class FakeElement {
     this.className = "";
     this.textContent = "";
     this.value = "";
+    this.validity = { badInput: false };
     this._type = "";
     Object.defineProperty(this, "type", {
       configurable: true,
@@ -669,7 +670,7 @@ test("plain actions forward each typed intent without metadata", () => {
   }
 });
 
-test("Post now… asks for public text and Queue… adds an exact future time", async () => {
+test("Post now… asks for public text and Queue… can add an exact future time", async () => {
   const requests = [];
   const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
   const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
@@ -978,7 +979,61 @@ test("native initial focus failure leaves the structured form usable", async () 
   assert.equal(promptCalls, 0);
 });
 
-test("Queue overlay keeps fields open for invalid time and uses the local picker", async () => {
+test("Queue detailed forms use cadence when the local time is blank", async () => {
+  for (const renderer of ["native", "overlay"]) {
+    const requests = [];
+    const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+    if (renderer === "overlay") browser.document.disableDialog = true;
+    const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+    browser.document.body.append(post);
+    userscript.boot(browser.root);
+
+    actionButton(post, "queue_exact").click();
+    const surface = browser.document.body.querySelector(renderer === "native" ? "dialog" : ".sooqa-metadata-overlay");
+    assert.ok(surface);
+    assert.equal(surface.querySelectorAll("input")[1].type, "datetime-local");
+    assert.equal(surface.querySelectorAll("input")[1].required, false);
+    surface.querySelectorAll("textarea")[1].value = "Public cadence text";
+    surface.querySelectorAll("button")[1].click();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(requests.length, 1);
+    const payload = requestPayload(requests[0]);
+    assert.equal(payload.requested_action, "queue");
+    assert.equal(payload.requested_post_caption, "Public cadence text");
+    assert.equal("requested_publish_at" in payload, false);
+    assertActionButtonsState(post, false);
+  }
+});
+
+test("Queue detailed forms reject malformed local time instead of using cadence", async () => {
+  for (const renderer of ["native", "overlay"]) {
+    const requests = [];
+    const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
+    if (renderer === "overlay") browser.document.disableDialog = true;
+    const post = createPost(browser.document, ["https://2ch.org/b/src/1/clip.webm"]);
+    browser.document.body.append(post);
+    userscript.boot(browser.root);
+
+    actionButton(post, "queue_exact").click();
+    const selector = renderer === "native" ? "dialog" : ".sooqa-metadata-overlay";
+    const surface = browser.document.body.querySelector(selector);
+    assert.ok(surface);
+    const requestedPublishAt = surface.querySelectorAll("input")[1];
+    requestedPublishAt.value = "";
+    requestedPublishAt.validity.badInput = true;
+    surface.querySelectorAll("button")[1].click();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(requests.length, 0);
+    assert.equal(browser.document.body.querySelectorAll(selector).length, 1);
+    assert.match(surface.querySelector(".sooqa-dialog-error").textContent, /future local date\/time/);
+    assert.equal(browser.document.activeElement, requestedPublishAt);
+    assertActionButtonsState(post, true);
+  }
+});
+
+test("Queue overlay keeps fields open for an invalid populated time and accepts a future time", async () => {
   const requests = [];
   const browser = createBrowser("https://2ch.org/b/res/1.html", requests);
   browser.document.disableDialog = true;
@@ -995,16 +1050,6 @@ test("Queue overlay keeps fields open for invalid time and uses the local picker
   overlay.querySelectorAll("input")[0].value = "Cats, cats";
   overlay.querySelectorAll("textarea")[0].value = "Internal";
   overlay.querySelectorAll("textarea")[1].value = "Public";
-  overlay.querySelectorAll("button")[1].click();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(requests.length, 0);
-  assert.equal(browser.document.body.querySelectorAll(".sooqa-metadata-overlay").length, 1);
-  assert.match(overlay.querySelector(".sooqa-dialog-error").textContent, /future local date\/time/);
-  assert.equal(overlay.querySelectorAll("input")[0].value, "Cats, cats");
-  assert.equal(overlay.querySelectorAll("textarea")[0].value, "Internal");
-  assert.equal(overlay.querySelectorAll("textarea")[1].value, "Public");
-  assertActionButtonsState(post, true);
-
   overlay.querySelectorAll("input")[1].value = "2000-01-01T00:00";
   overlay.querySelectorAll("button")[1].click();
   await new Promise((resolve) => setImmediate(resolve));
@@ -1218,7 +1263,7 @@ test("all detailed actions keep real textareas in native and overlay forms", asy
 
 test("metadata contains no backend secrets, polling, or stale update metadata", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "sooqa-2ch-save.user.js"), "utf8");
-  assert.match(source, /@version\s+0\.2\.3/);
+  assert.match(source, /@version\s+0\.2\.4/);
   assert.match(source, /@updateURL\s+https:\/\/raw\.githubusercontent\.com\/godlikedh\/sooqa\/main/);
   assert.match(source, /@downloadURL\s+https:\/\/raw\.githubusercontent\.com\/godlikedh\/sooqa\/main/);
   assert.match(source, /GM_xmlhttpRequest/);

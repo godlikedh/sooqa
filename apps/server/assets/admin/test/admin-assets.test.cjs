@@ -602,6 +602,17 @@ test("admin runtime keeps media lookup, preview fetches, edits, retry, and publi
   assert.match(plainPublication.options.headers.get("Idempotency-Key"), /^admin-ui:/);
 
   buttonWithText(runtime.document.getElementById("media-grid"), "Queue…").dispatchEvent({ type: "click" });
+  assert.equal(runtime.document.getElementById("publication-time").required, false);
+  runtime.document.getElementById("publication-caption").value = "<cadence text>";
+  runtime.document.getElementById("publication-form").dispatchEvent({ type: "submit" });
+  await settle();
+  const cadencePublication = calls.filter(({ pathName }) => pathName.includes("/publication-intent")).at(-1);
+  assert.deepEqual(JSON.parse(cadencePublication.options.body), {
+    requested_action: "queue",
+    requested_post_caption: "<cadence text>",
+  });
+
+  buttonWithText(runtime.document.getElementById("media-grid"), "Queue…").dispatchEvent({ type: "click" });
   const future = new Date(Date.now() + 3_600_000);
   const pad = (value) => String(value).padStart(2, "0");
   runtime.document.getElementById("publication-caption").value = "<public text>";

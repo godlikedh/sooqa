@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         sooqa: 2ch media actions
 // @namespace    sooqa
-// @version      0.2.3
+// @version      0.2.4
 // @description  Add save, queue, and post-now controls to direct 2ch media.
 // @match        https://2ch.su/*
 // @match        https://2ch.org/*
@@ -355,15 +355,24 @@
     };
     if (fields.publicText) metadata.publicText = String(fields.publicText.value || "").trim();
     if (fields.requestedPublishAt) {
-      metadata.requestedPublishAt = localDateTimeToRfc3339(
-        fields.requestedPublishAt.value,
-        env.now ? env.now() : new Date()
-      );
-      if (!metadata.requestedPublishAt) {
+      if (fields.requestedPublishAt.validity?.badInput) {
         return {
-          error: "Enter a future local date/time",
+          error: "Enter a future local date/time or leave it blank for cadence",
           field: fields.requestedPublishAt,
         };
+      }
+      const localTime = String(fields.requestedPublishAt.value || "").trim();
+      if (localTime) {
+        metadata.requestedPublishAt = localDateTimeToRfc3339(
+          localTime,
+          env.now ? env.now() : new Date()
+        );
+        if (!metadata.requestedPublishAt) {
+          return {
+            error: "Enter a future local date/time or leave it blank for cadence",
+            field: fields.requestedPublishAt,
+          };
+        }
       }
     }
     return { metadata };
@@ -394,8 +403,8 @@
     addField("Internal description", "text", "description", true);
     if (action.publicText) addField("Public post text", "text", "publicText", true);
     if (action.exactTime) {
-      const requestedPublishAt = addField("Local date/time", "datetime-local", "requestedPublishAt");
-      requestedPublishAt.required = true;
+      const requestedPublishAt = addField("Local date/time (optional; blank uses cadence)", "datetime-local", "requestedPublishAt");
+      requestedPublishAt.required = false;
       requestedPublishAt.step = 60;
     }
 
