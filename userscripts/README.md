@@ -1,6 +1,6 @@
 # sooqa 2ch userscript
 
-Current userscript version: `0.2.3`.
+Current userscript version: `0.2.4`.
 
 Install [`sooqa-2ch-save.user.js`](https://raw.githubusercontent.com/godlikedh/sooqa/main/userscripts/sooqa-2ch-save.user.js)
 in Tampermonkey on these supported HTTPS domains:
@@ -26,7 +26,8 @@ the script prompts on first use.
 
 Plain actions send no metadata. `Save…` asks for tags and an internal
 description; `Post now…` adds public post text; and `Queue…` additionally asks
-for a required browser-local date/time, which is sent as an RFC3339 instant.
+for an optional browser-local date/time. A blank date/time uses the normal
+cadence; a populated future date/time is sent as an RFC3339 exact instant.
 Detailed actions use separate labelled fields in a userscript-owned native
 dialog when available, with a styled in-page overlay fallback when native
 dialog opening is unavailable. The fallback keeps the same fields, including
