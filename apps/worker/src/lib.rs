@@ -197,15 +197,41 @@ pub struct HandlerFailure {
     pub class: String,
     pub message: String,
     pub defer_until: Option<OffsetDateTime>,
+    pub retry_without_consuming_attempt: bool,
 }
 
 impl HandlerFailure {
     pub fn retryable(class: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { retryable: true, class: class.into(), message: message.into(), defer_until: None }
+        Self {
+            retryable: true,
+            class: class.into(),
+            message: message.into(),
+            defer_until: None,
+            retry_without_consuming_attempt: false,
+        }
+    }
+
+    pub fn retryable_without_consuming_attempt(
+        class: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            retryable: true,
+            class: class.into(),
+            message: message.into(),
+            defer_until: None,
+            retry_without_consuming_attempt: true,
+        }
     }
 
     pub fn permanent(class: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { retryable: false, class: class.into(), message: message.into(), defer_until: None }
+        Self {
+            retryable: false,
+            class: class.into(),
+            message: message.into(),
+            defer_until: None,
+            retry_without_consuming_attempt: false,
+        }
     }
 
     pub fn defer(
@@ -218,6 +244,7 @@ impl HandlerFailure {
             class: class.into(),
             message: message.into(),
             defer_until: Some(defer_until),
+            retry_without_consuming_attempt: false,
         }
     }
 }
@@ -2429,7 +2456,10 @@ where
                 return Ok(());
             }
             if matches!(&error, StorageUploadError::CancelledBeforeDispatch) {
-                return Err(HandlerFailure::retryable("storage_upload_cancelled", message));
+                return Err(HandlerFailure::retryable_without_consuming_attempt(
+                    "storage_upload_cancelled",
+                    message,
+                ));
             }
             if error.is_ambiguous() {
                 return Err(HandlerFailure::permanent("storage_upload_unknown", message));
@@ -3293,15 +3323,21 @@ impl Worker {
                 info!(worker_id = %self.worker_id, job_id = %job.id, "job deferred until dependent lease expires");
             }
             Err(failure) if failure.retryable => {
-                let updated = self
-                    .repository
-                    .retry_lease(
-                        lease,
-                        OffsetDateTime::now_utc() + TimeDuration::seconds(1),
-                        &failure.class,
-                        &failure.message,
-                    )
-                    .await?;
+                let run_at = OffsetDateTime::now_utc() + TimeDuration::seconds(1);
+                let updated = if failure.retry_without_consuming_attempt {
+                    self.repository
+                        .retry_lease_without_consuming_attempt(
+                            lease,
+                            run_at,
+                            &failure.class,
+                            &failure.message,
+                        )
+                        .await?
+                } else {
+                    self.repository
+                        .retry_lease(lease, run_at, &failure.class, &failure.message)
+                        .await?
+                };
                 if updated.status == JobStatus::Queued {
                     counters.retried += 1;
                     info!(worker_id = %self.worker_id, job_id = %job.id, "job scheduled for retry");

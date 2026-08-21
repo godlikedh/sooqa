@@ -231,6 +231,44 @@ impl JobRepository {
         row.into_job()
     }
 
+    /// Requeues a job after a proven safe cancellation without consuming an
+    /// attempt. The lease may already be expired when a heartbeat loss was
+    /// the cancellation signal; the caller must only use this for work that
+    /// never reached its external side effect.
+    pub async fn retry_lease_without_consuming_attempt(
+        &self,
+        lease: &JobLease,
+        run_at: OffsetDateTime,
+        error_class: &str,
+        error_message: &str,
+    ) -> Result<Job, JobRepositoryError> {
+        let row = sqlx::query_as::<_, JobRow>(
+            r#"
+            UPDATE queue.jobs
+            SET state = 'queued', attempt_count = GREATEST(attempt_count - 1, 0),
+                run_at = $4, lease_token = NULL, lease_owner = NULL,
+                lease_expires_at = NULL, last_heartbeat_at = NULL,
+                error_class = $5, error_message = $6,
+                completed_at = NULL, updated_at = now()
+            WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
+            RETURNING id, kind, payload, state, priority, run_at, attempt_count,
+                      max_attempts, lease_token, lease_owner, lease_expires_at,
+                      last_heartbeat_at, error_class, error_message, dedupe_key,
+                      created_at, updated_at, completed_at
+            "#,
+        )
+        .bind(lease.job_id)
+        .bind(&lease.worker_id)
+        .bind(lease.lease_token)
+        .bind(run_at)
+        .bind(error_class)
+        .bind(error_message)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(JobRepositoryError::LeaseLost)?;
+        row.into_job()
+    }
+
     pub async fn defer_lease(
         &self,
         lease: &JobLease,

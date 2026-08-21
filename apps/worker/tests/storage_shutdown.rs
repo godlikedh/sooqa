@@ -277,6 +277,11 @@ async fn assert_storage_unknown(database: &Database, fixture: &StorageFixture) {
 async fn worker_shutdown_before_storage_dispatch_releases_and_requeues(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let fixture = seed_storage_upload(&database).await;
+    sqlx::query("UPDATE queue.jobs SET max_attempts = 1 WHERE id = $1")
+        .bind(fixture.job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
     let api = ControllableTelegram {
         request_started: Arc::new(Notify::new()),
         release_request: Arc::new(Notify::new()),
@@ -359,6 +364,131 @@ async fn worker_shutdown_before_storage_dispatch_releases_and_requeues(pool: sql
             .await
             .unwrap(),
         "queued"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT attempt_count FROM queue.jobs WHERE id = $1")
+            .bind(fixture.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        database.inbox().find(fixture.ingest_id).await.unwrap().unwrap().status,
+        IngestStatus::Storing
+    );
+    tokio::fs::remove_dir_all(fixture.root).await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn heartbeat_loss_before_storage_dispatch_releases_and_requeues_final_attempt(
+    pool: sqlx::PgPool,
+) {
+    let database = Database::from_pool(pool);
+    let fixture = seed_storage_upload(&database).await;
+    sqlx::query("UPDATE queue.jobs SET max_attempts = 1 WHERE id = $1")
+        .bind(fixture.job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let api = ControllableTelegram {
+        request_started: Arc::new(Notify::new()),
+        release_request: Arc::new(Notify::new()),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let gate = ReservationGateStore {
+        inner: database.library(),
+        reserved: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+    };
+    let reserved = Arc::clone(&gate.reserved);
+    let release = Arc::clone(&gate.release);
+    let cancelled = Arc::new(Notify::new());
+    let cancelled_signal = Arc::clone(&cancelled);
+    let provider = StorageUploadProvider::new(api.clone(), gate, -100123)
+        .unwrap()
+        .with_work_root(fixture.root.clone());
+    let mut registry = HandlerRegistry::new();
+    let handler = upload_storage_asset_cancellable_handler(database.inbox(), provider);
+    registry.register_cancellable(JobType::UploadStorageAsset, move |job, cancellation| {
+        let storage_cancellation = cancellation.storage_upload();
+        let cancelled_signal = Arc::clone(&cancelled_signal);
+        tokio::spawn(async move {
+            storage_cancellation.cancelled().await;
+            cancelled_signal.notify_one();
+        });
+        handler(job, cancellation)
+    });
+    let worker = Worker::new(
+        database.jobs(),
+        registry,
+        "storage-heartbeat-before-dispatch",
+        Duration::from_millis(10),
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let worker_task = tokio::spawn(async move {
+        worker
+            .run(async move {
+                let _ = shutdown_receiver.await;
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), reserved.notified())
+        .await
+        .expect("storage reservation should be reached");
+    sqlx::query(
+        "UPDATE queue.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(fixture.job_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
+        .await
+        .expect("heartbeat loss should cancel the upload before dispatch");
+    release.notify_one();
+    shutdown_sender.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(8), worker_task)
+        .await
+        .expect("worker should stop after safe heartbeat cancellation")
+        .expect("worker task should join")
+        .expect("safe heartbeat cancellation should not fail the worker");
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1")
+            .bind(fixture.media_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "pending_storage"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT storage_token FROM media WHERE id = $1")
+            .bind(fixture.media_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(api.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(fixture.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "queued"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT attempt_count FROM queue.jobs WHERE id = $1")
+            .bind(fixture.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
     );
     assert_eq!(
         database.inbox().find(fixture.ingest_id).await.unwrap().unwrap().status,
