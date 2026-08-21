@@ -18,6 +18,16 @@ it: take a backup before upgrades and apply forward migrations in place. sooqa
 does not drop schemas or volumes automatically. The explicit legacy-reset
 procedure later in this document is destructive and owner-run.
 
+The supported populated upgrade boundary is migration
+`0006_remove_unused_ingest_status`. The PostgreSQL integration suite seeds that
+five-table schema with active and terminal ingests, all media storage states,
+channels, posts, and queue lifecycle states, then runs the real repository
+migrator through the current HEAD (including `0007` and `0008`) and exercises
+current repository reads and transitions. Future forward migrations are
+included by the same HEAD migrator automatically. The test uses only a
+uniquely named temporary database; it does not reset or inspect a home or
+production database.
+
 ## Server and worker
 
 Configure the API secret and database URL in the environment:
