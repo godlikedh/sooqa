@@ -19,13 +19,6 @@ pub(crate) async fn settle(
 ) -> Result<Job, JobRepositoryError> {
     let allow_expired = settlement.allows_expired_lease();
     let command = match command {
-        Some(command) if allow_expired => match load_running_job(pool, lease, true).await {
-            Ok(_) => command.clone(),
-            Err(JobRepositoryError::LeaseLost) => {
-                return load_already_requeued(pool, lease, &settlement, Some(command)).await;
-            }
-            Err(error) => return Err(error),
-        },
         Some(command) => command.clone(),
         None => match load_running_job(pool, lease, allow_expired).await {
             Ok(job) => job.command,
@@ -35,7 +28,8 @@ pub(crate) async fn settle(
             Err(error) => return Err(error),
         },
     };
-    match &command {
+    let fallback_settlement = settlement.clone();
+    let result = match &command {
         JobCommand::PublishPost(_) => {
             crate::publisher::settle_publish_job(pool, lease, &command, settlement).await
         }
@@ -63,6 +57,12 @@ pub(crate) async fn settle(
         JobCommand::CleanupWorkspace(_) => {
             crate::cleanup::settle_job(pool, lease, &command, settlement).await
         }
+    };
+    match result {
+        Err(JobRepositoryError::LeaseLost) if allow_expired => {
+            load_already_requeued(pool, lease, &fallback_settlement, Some(&command)).await
+        }
+        result => result,
     }
 }
 

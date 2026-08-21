@@ -366,6 +366,93 @@ async fn expired_storage_safe_cancellation_is_non_consuming_and_idempotent(pool:
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
+async fn expired_storage_safe_cancellation_replays_after_queue_race(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let media = database
+        .library()
+        .resolve_media(ingest(vec![74_u8; 32], "https://example.test/storage-safe-race"))
+        .await
+        .unwrap()
+        .media;
+    let job = database
+        .jobs()
+        .enqueue(
+            NewJob::upload_storage_asset(media.id)
+                .dedupe_key(format!("storage-safe-race:{}", Uuid::new_v4())),
+        )
+        .await
+        .unwrap();
+    let claimed = database
+        .jobs()
+        .claim_next(
+            "storage-safe-race-worker",
+            std::time::Duration::from_secs(30),
+            &[JobType::UploadStorageAsset],
+        )
+        .await
+        .unwrap()
+        .expect("storage job should claim");
+    let lease = claimed.lease().expect("storage job should carry a lease");
+    sqlx::query(
+        "UPDATE queue.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    // Hold the queue row while the family transaction acquires its media
+    // lock. The simulated safe-cancellation writer then requeues the job;
+    // settlement must recognize that replay after its queue lock is lost.
+    let mut blocker = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM queue.jobs WHERE id = $1 FOR UPDATE")
+        .bind(job.id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let settlement_database = database.clone();
+    let settlement_job = claimed.clone();
+    let settlement_lease = lease.clone();
+    let settlement_task = tokio::spawn(async move {
+        settlement_database
+            .jobs()
+            .settle_lease(
+                &settlement_job,
+                &settlement_lease,
+                JobSettlement::retry_without_consuming_attempt(
+                    OffsetDateTime::now_utc(),
+                    "storage_upload_cancelled",
+                    "storage upload was safely cancelled before Telegram dispatch",
+                ),
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'queued', attempt_count = GREATEST(attempt_count - 1, 0), run_at = now(), lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, last_heartbeat_at = NULL, error_class = 'storage_upload_cancelled', error_message = 'storage upload was safely cancelled before Telegram dispatch', completed_at = NULL, updated_at = now() WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+    blocker.commit().await.unwrap();
+
+    let replayed = settlement_task.await.unwrap().unwrap();
+    assert_eq!(replayed.status, JobStatus::Queued);
+    assert_eq!(replayed.attempt_count, 0);
+    assert_eq!(replayed.id, job.id);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1")
+            .bind(media.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "pending_storage"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn concurrent_same_sha_resolves_to_one_media_row(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let digest = vec![8_u8; 32];
