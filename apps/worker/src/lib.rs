@@ -1034,7 +1034,7 @@ fn probe_stage_may_run(status: IngestStatus) -> bool {
 
 fn download_stage_may_run(request: &sooqa_inbox::Ingest) -> bool {
     matches!(request.status, IngestStatus::Downloading | IngestStatus::FailedRetryable)
-        && request.original_input.get("download").is_none()
+        && request.input_data().map(|data| data.download.is_none()).unwrap_or(false)
 }
 
 fn normalization_stage_may_run(status: IngestStatus) -> bool {
