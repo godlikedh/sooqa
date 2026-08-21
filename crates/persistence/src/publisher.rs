@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use sha2::{Digest, Sha256};
-use sooqa_jobs::JobAttempt;
+use sooqa_jobs::JobLease;
 use sooqa_publisher::{
     Channel, ChannelUpdate, ChannelValidationError, MAX_REPEAT_EVIDENCE_BYTES,
     MAX_REPEAT_EVIDENCE_CONFLICTS, NewChannel, NewPost, Post, PostCursor, PostExactSchedule,
@@ -37,7 +37,7 @@ pub struct MaterializationResult {
 pub struct PublishLease {
     pub generation: i32,
     pub token: Uuid,
-    pub attempt: JobAttempt,
+    pub attempt: JobLease,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -974,7 +974,7 @@ impl PublisherRepository {
         &self,
         id: Uuid,
         expected_revision: i64,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
     ) -> Result<PublishClaim, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let channel_id = post_channel_id(&mut transaction, id).await?;
@@ -1134,7 +1134,7 @@ impl PublisherRepository {
     pub async fn reconcile_interrupted_publish(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
     ) -> Result<bool, PublisherRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let channel_id = post_channel_id(&mut transaction, id).await?;
@@ -1592,7 +1592,7 @@ struct PublishJobRow {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct PublishJobAttemptRow {
+struct PublishJobLeaseRow {
     id: Uuid,
     attempt_count: i32,
     max_attempts: i32,
@@ -1613,9 +1613,9 @@ async fn lock_publish_job(
 async fn lock_current_job_attempt(
     transaction: &mut Transaction<'_, Postgres>,
     post_id: Uuid,
-    attempt: &JobAttempt,
-) -> Result<PublishJobAttemptRow, PublisherRepositoryError> {
-    sqlx::query_as::<_, PublishJobAttemptRow>(
+    attempt: &JobLease,
+) -> Result<PublishJobLeaseRow, PublisherRepositoryError> {
+    sqlx::query_as::<_, PublishJobLeaseRow>(
         "SELECT id, attempt_count, max_attempts FROM queue.jobs WHERE id = $1 AND kind = 'publish_post' AND payload->>'post_id' = $5 AND state = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_expires_at > clock_timestamp() FOR UPDATE",
     )
     .bind(attempt.job_id)

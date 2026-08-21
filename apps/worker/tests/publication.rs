@@ -439,9 +439,8 @@ async fn worker_shutdown_requeues_claimed_publication_for_reconciliation(pool: s
         let publisher = publisher.clone();
         let signal = Arc::clone(&signal);
         Box::pin(async move {
-            let attempt = job
-                .attempt()
-                .ok_or_else(|| HandlerFailure::permanent("test", "job has no lease"))?;
+            let attempt =
+                job.lease().ok_or_else(|| HandlerFailure::permanent("test", "job has no lease"))?;
             let (post_id, expected_revision) = match &job.command {
                 sooqa_jobs::JobCommand::PublishPost(payload) => {
                     (payload.post_id, payload.expected_revision)

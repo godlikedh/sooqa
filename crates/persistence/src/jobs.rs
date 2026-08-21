@@ -110,7 +110,7 @@ impl JobRepository {
             "#,
         )
         .bind(lease.job_id)
-        .bind(&lease.worker_id)
+        .bind(&lease.lease_owner)
         .bind(lease_seconds)
         .bind(lease.lease_token)
         .fetch_optional(&self.pool)
@@ -135,7 +135,7 @@ impl JobRepository {
             "#,
         )
         .bind(lease.job_id)
-        .bind(&lease.worker_id)
+        .bind(&lease.lease_owner)
         .bind(lease.lease_token)
         .fetch_optional(&self.pool)
         .await?;
@@ -191,7 +191,7 @@ impl JobRepository {
             "#,
         )
         .bind(lease.job_id)
-        .bind(&lease.worker_id)
+        .bind(&lease.lease_owner)
         .bind(lease.lease_token)
         .bind(run_at)
         .bind(error_class)
@@ -261,7 +261,7 @@ impl JobRepository {
             "#,
         )
         .bind(lease.job_id)
-        .bind(&lease.worker_id)
+        .bind(&lease.lease_owner)
         .bind(lease.lease_token)
         .bind(run_at)
         .bind(error_class)
@@ -304,7 +304,7 @@ impl JobRepository {
             "#,
         )
         .bind(lease.job_id)
-        .bind(&lease.worker_id)
+        .bind(&lease.lease_owner)
         .bind(lease.lease_token)
         .bind(error_class)
         .bind(error_message)

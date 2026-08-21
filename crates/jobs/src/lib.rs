@@ -24,7 +24,6 @@ pub enum JobType {
     SyncStorageCaption,
     PublishPost,
     CleanupWorkspace,
-    RecoverStaleJobs,
 }
 
 impl JobType {
@@ -41,7 +40,6 @@ impl JobType {
             Self::SyncStorageCaption => "sync_storage_caption",
             Self::PublishPost => "publish_post",
             Self::CleanupWorkspace => "cleanup_workspace",
-            Self::RecoverStaleJobs => "recover_stale_jobs",
         }
     }
 }
@@ -68,7 +66,6 @@ impl TryFrom<&str> for JobType {
             "sync_storage_caption" => Ok(Self::SyncStorageCaption),
             "publish_post" => Ok(Self::PublishPost),
             "cleanup_workspace" => Ok(Self::CleanupWorkspace),
-            "recover_stale_jobs" => Ok(Self::RecoverStaleJobs),
             unknown => Err(unknown.to_owned()),
         }
     }
@@ -171,10 +168,6 @@ pub struct CleanupWorkspacePayload {
     pub workspace_id: Uuid,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EmptyJobPayload {}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum JobCommand {
     InspectSource(InspectSourcePayload),
@@ -188,7 +181,6 @@ pub enum JobCommand {
     SyncStorageCaption(MediaJobPayload),
     PublishPost(PublishPostPayload),
     CleanupWorkspace(CleanupWorkspacePayload),
-    RecoverStaleJobs(EmptyJobPayload),
 }
 
 impl JobCommand {
@@ -205,7 +197,6 @@ impl JobCommand {
             Self::SyncStorageCaption(_) => JobType::SyncStorageCaption,
             Self::PublishPost(_) => JobType::PublishPost,
             Self::CleanupWorkspace(_) => JobType::CleanupWorkspace,
-            Self::RecoverStaleJobs(_) => JobType::RecoverStaleJobs,
         }
     }
 
@@ -229,7 +220,6 @@ impl JobCommand {
             JobType::SyncStorageCaption => decode!(MediaJobPayload, SyncStorageCaption),
             JobType::PublishPost => decode!(PublishPostPayload, PublishPost),
             JobType::CleanupWorkspace => decode!(CleanupWorkspacePayload, CleanupWorkspace),
-            JobType::RecoverStaleJobs => decode!(EmptyJobPayload, RecoverStaleJobs),
         }
     }
 
@@ -246,7 +236,6 @@ impl JobCommand {
             Self::SyncStorageCaption(payload) => serde_json::to_value(payload),
             Self::PublishPost(payload) => serde_json::to_value(payload),
             Self::CleanupWorkspace(payload) => serde_json::to_value(payload),
-            Self::RecoverStaleJobs(payload) => serde_json::to_value(payload),
         }
         .expect("job payloads must be JSON serializable")
     }
@@ -350,16 +339,10 @@ impl NewJob {
     pub fn run_at_value(&self) -> Option<OffsetDateTime> {
         self.run_at
     }
-    pub fn available_at_value(&self) -> Option<OffsetDateTime> {
-        self.run_at
-    }
     pub fn max_attempts_value(&self) -> i32 {
         self.max_attempts
     }
     pub fn dedupe_key_value(&self) -> Option<&str> {
-        self.dedupe_key.as_deref()
-    }
-    pub fn idempotency_key_value(&self) -> Option<&str> {
         self.dedupe_key.as_deref()
     }
 
@@ -371,9 +354,6 @@ impl NewJob {
         self.run_at = Some(run_at);
         self
     }
-    pub fn available_at(self, run_at: OffsetDateTime) -> Self {
-        self.run_at(run_at)
-    }
     pub fn max_attempts(mut self, max_attempts: i32) -> Self {
         self.max_attempts = max_attempts;
         self
@@ -381,9 +361,6 @@ impl NewJob {
     pub fn dedupe_key(mut self, key: impl Into<String>) -> Self {
         self.dedupe_key = Some(key.into());
         self
-    }
-    pub fn idempotency_key(self, key: impl Into<String>) -> Self {
-        self.dedupe_key(key)
     }
 }
 
@@ -417,14 +394,9 @@ impl Job {
         Some(JobLease {
             job_id: self.id,
             attempt_number: self.attempt_count,
-            worker_id: self.lease_owner.clone()?,
             lease_owner: self.lease_owner.clone()?,
             lease_token: self.lease_token?,
         })
-    }
-
-    pub fn attempt(&self) -> Option<JobLease> {
-        self.lease()
     }
 }
 
@@ -432,16 +404,14 @@ impl Job {
 pub struct JobLease {
     pub job_id: JobId,
     pub attempt_number: i32,
-    pub worker_id: String,
     pub lease_owner: String,
     pub lease_token: Uuid,
 }
 
-pub type JobAttempt = JobLease;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn typed_inspection_payload_round_trips() {
@@ -504,5 +474,46 @@ mod tests {
     fn retry_wait_is_represented_by_run_at_and_queued_state() {
         assert_eq!(JobStatus::Queued.as_str(), "queued");
         assert_eq!(JobType::InspectSource.as_str(), "inspect_source");
+    }
+
+    #[test]
+    fn current_queued_payloads_decode_without_legacy_commands() {
+        let ingest_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let media_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let post_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let workspace_id = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
+        let inspection = json!({
+            "adapter": "direct_http",
+            "source_url": "https://example.test/media.mp4",
+            "resolved_url": null,
+            "media_kind": "video",
+            "mime_type": "video/mp4",
+            "content_length_bytes": 1024,
+            "title": null,
+            "metadata": {}
+        });
+        let payloads = [
+            (JobType::InspectSource, json!({ "ingest_id": ingest_id })),
+            (JobType::DownloadSource, json!({ "ingest_id": ingest_id, "inspection": inspection })),
+            (JobType::ProbeAsset, json!({ "ingest_id": ingest_id })),
+            (JobType::NormalizeAsset, json!({ "ingest_id": ingest_id })),
+            (JobType::ComputeFingerprint, json!({ "ingest_id": ingest_id })),
+            (JobType::FinalizeIngest, json!({ "ingest_id": ingest_id })),
+            (JobType::MaterializePublication, json!({ "ingest_id": ingest_id })),
+            (JobType::UploadStorageAsset, json!({ "media_id": media_id, "generation": 1 })),
+            (JobType::SyncStorageCaption, json!({ "media_id": media_id, "generation": 1 })),
+            (JobType::PublishPost, json!({ "post_id": post_id, "expected_revision": 2 })),
+            (
+                JobType::CleanupWorkspace,
+                json!({ "ingest_id": ingest_id, "workspace_id": workspace_id }),
+            ),
+        ];
+
+        for (job_type, payload) in payloads {
+            JobCommand::from_payload(job_type, payload).unwrap_or_else(|error| {
+                panic!("current payload for {job_type} must decode: {error}")
+            });
+        }
+        assert!(JobType::try_from("recover_stale_jobs").is_err());
     }
 }
