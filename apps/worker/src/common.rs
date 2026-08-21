@@ -1,7 +1,5 @@
-pub(crate) use std::{
+use std::{
     collections::HashMap,
-    fmt::Display,
-    fs,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -9,48 +7,19 @@ pub(crate) use std::{
     time::Duration,
 };
 
-pub(crate) use async_trait::async_trait;
-pub(crate) use sooqa_inbox::{
-    AssetNormalization, AssetThumbnailNormalization, IngestFinalization, IngestKind, IngestStatus,
-    SourceDownload, SourceMediaKind,
+use sooqa_inbox::{IngestKind, SourceMediaKind};
+use sooqa_jobs::{Job, JobType};
+use sooqa_media::{
+    DiskAdmissionError, FfmpegExecutor, FrameExtractor, WorkspaceError, check_disk_space,
 };
-pub(crate) use sooqa_jobs::{Job, JobCommand, JobLease, JobStatus, JobType};
-pub(crate) use sooqa_library::{
-    MAX_MEDIA_PREVIEW_BYTES, MediaIngest, MediaKind, MediaMetadata, MediaPreviewInput,
-    MediaSourceInput, NewMedia, SourceKind, StorageUploadStore, VideoDuplicateClassification,
-    VideoDuplicateEvidence, VideoDuplicateMatch, VideoFingerprintCandidate, VideoFingerprintInput,
-    VideoIdentityDecision,
-};
-pub(crate) use sooqa_media::{
-    ArtifactPublicationError, CANONICAL_VIDEO_PROFILE_VERSION, DiskAdmissionError, DownloadError,
-    DownloadLimits, DownloadedSource, FfmpegExecutor, FfprobeAdapter, FrameExtractionError,
-    FrameExtractor, ImageNormalizer, MediaProbe, MediaStreamKind, MediaWorkspace,
-    NormalizationExecutionError, NormalizationPlanner, SequenceAlignmentConfig,
-    SequenceClassification, SourceDownloader, SourceInput, VideoSequenceFingerprint, WorkspaceArea,
-    WorkspaceError, align_video_sequences, check_disk_space, decode_first_preview_frame,
-    encode_bounded_preview, publish_artifact, sha256_file, validate_bounded_preview_for_mime,
-};
-pub(crate) use sooqa_persistence::{
-    AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
-    IngestFinalizationStart, IngestFingerprintStart, IngestVideoIdentityStart, JobRepository,
-    JobRepositoryError, LibraryRepository, LibraryRepositoryError, SourceDownloadStart,
-    SourceInspectionStart, WorkspaceCleanupStart,
-};
-pub(crate) use sooqa_telegram::StorageUploadError;
-pub(crate) use sooqa_telegram::{
-    StorageCaptionEditRequest, StorageUploadCancellation, StorageUploadInput,
-    StorageUploadProvider, TelegramApi, TelegramPublicationApi, TelegramPublicationRequest,
-    TelegramStorageApi, TelegramStorageCaptionApi, storage_caption,
-};
-pub(crate) use thiserror::Error;
-pub(crate) use time::{Duration as TimeDuration, OffsetDateTime};
-pub(crate) use tokio::{
-    sync::{oneshot, watch},
-    task::JoinError,
-    time::sleep,
-};
-pub(crate) use tracing::{debug, error, info, warn};
-pub(crate) use uuid::Uuid;
+use sooqa_persistence::LibraryRepositoryError;
+use sooqa_persistence::{InboxRepository, InboxRepositoryError};
+use sooqa_telegram::StorageUploadCancellation;
+use time::OffsetDateTime;
+use tracing::warn;
+use uuid::Uuid;
+
+pub(crate) const DISK_ADMISSION_RETRY_DELAY: time::Duration = time::Duration::minutes(1);
 
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFailure>> + Send + 'static>>;
 pub type HandlerFn = Arc<dyn Fn(Job) -> HandlerFuture + Send + Sync>;
@@ -75,10 +44,6 @@ impl HandlerCancellation {
         self.storage_upload.clone()
     }
 }
-pub type IdentityAlignmentHook = Arc<dyn Fn() + Send + Sync>;
-
-pub(crate) const DISK_ADMISSION_RETRY_DELAY: TimeDuration = TimeDuration::minutes(1);
-pub(crate) const DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Admission policy for operations that may create large workspace artifacts.
 /// The policy is deliberately per operation: the filesystem check observes
@@ -165,107 +130,6 @@ pub fn media_processing_components(
         ),
         FrameExtractor::new(ffmpeg_executable, timeout),
     )
-}
-
-#[async_trait]
-pub trait TelegramSourceDownloader: Send + Sync {
-    async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), HandlerFailure>;
-}
-
-/// A best-effort startup probe for optional Telegram storage.  It is
-/// intentionally separate from [`Worker::run`]: a remote outage must not
-/// prevent non-storage jobs from being claimed, and storage jobs continue to
-/// use their durable handler retry policy.
-#[async_trait]
-pub trait StoragePreflight: Send + 'static {
-    type Error: Display + Send + Sync + 'static;
-
-    async fn verify_storage_chat(&self) -> Result<(), Self::Error>;
-
-    fn is_terminal_configuration(error: &Self::Error) -> bool;
-}
-
-#[async_trait]
-impl<A, S> StoragePreflight for StorageUploadProvider<A, S>
-where
-    A: sooqa_telegram::TelegramStorageApi,
-    S: StorageUploadStore,
-{
-    type Error = StorageUploadError;
-
-    async fn verify_storage_chat(&self) -> Result<(), Self::Error> {
-        StorageUploadProvider::verify_storage_chat(self).await
-    }
-
-    fn is_terminal_configuration(error: &Self::Error) -> bool {
-        error.is_terminal_configuration()
-    }
-}
-
-pub fn spawn_storage_preflight<P>(preflight: P, storage_chat_id: i64) -> tokio::task::JoinHandle<()>
-where
-    P: StoragePreflight,
-{
-    tokio::spawn(async move {
-        match preflight.verify_storage_chat().await {
-            Ok(()) => info!(
-                target: "sooqa.telegram",
-                status = "ready",
-                phase = "worker_storage_preflight",
-                storage_chat_id,
-                "Telegram storage chat preflight passed"
-            ),
-            Err(error) if P::is_terminal_configuration(&error) => error!(
-                target: "sooqa.telegram",
-                status = "terminally_misconfigured",
-                phase = "worker_storage_preflight",
-                storage_chat_id,
-                error = %error,
-                "Telegram storage preflight found invalid remote permissions or authentication; storage jobs remain enabled"
-            ),
-            Err(error) => warn!(
-                target: "sooqa.telegram",
-                status = "degraded",
-                phase = "worker_storage_preflight",
-                storage_chat_id,
-                error = %error,
-                "Telegram storage preflight unavailable; storage jobs will use normal retry policy"
-            ),
-        }
-    })
-}
-
-#[async_trait]
-impl TelegramSourceDownloader for sooqa_telegram::TeloxideApi {
-    async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), HandlerFailure> {
-        TelegramApi::download_file(self, file_id, destination).await.map_err(|error| {
-            if <sooqa_telegram::TeloxideApi as TelegramApi>::is_retryable_error(&error) {
-                HandlerFailure::retryable("telegram_source_download", error.to_string())
-            } else {
-                HandlerFailure::permanent("telegram_source_download", error.to_string())
-            }
-        })
-    }
-}
-
-pub(crate) struct DownloadAttemptArtifact {
-    path: PathBuf,
-}
-
-impl DownloadAttemptArtifact {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for DownloadAttemptArtifact {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -428,29 +292,6 @@ pub(crate) async fn load_ingest_for_admission(
         .await
         .map_err(map_inbox_error)?
         .ok_or_else(|| HandlerFailure::permanent("ingest_missing", "ingest request was not found"))
-}
-
-pub(crate) fn probe_stage_may_run(status: IngestStatus) -> bool {
-    matches!(
-        status,
-        IngestStatus::Queued
-            | IngestStatus::Downloading
-            | IngestStatus::Probing
-            | IngestStatus::FailedRetryable
-    )
-}
-
-pub(crate) fn download_stage_may_run(request: &sooqa_inbox::Ingest) -> bool {
-    matches!(request.status, IngestStatus::Downloading | IngestStatus::FailedRetryable)
-        && request.input_data().map(|data| data.download.is_none()).unwrap_or(false)
-}
-
-pub(crate) fn normalization_stage_may_run(status: IngestStatus) -> bool {
-    matches!(status, IngestStatus::Normalizing | IngestStatus::FailedRetryable)
-}
-
-pub(crate) fn fingerprint_stage_may_run(status: IngestStatus) -> bool {
-    matches!(status, IngestStatus::Fingerprinting | IngestStatus::FailedRetryable)
 }
 
 pub(crate) async fn source_artifact_exists(path: &Path) -> Result<bool, HandlerFailure> {

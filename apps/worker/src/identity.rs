@@ -1,6 +1,41 @@
 //! Media identity finalization and fingerprint jobs.
 
-use crate::common::*;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use sooqa_inbox::{
+    AssetNormalization, AssetThumbnailNormalization, IngestFinalization, IngestKind, IngestStatus,
+    SourceMediaKind,
+};
+use sooqa_jobs::{Job, JobCommand};
+use sooqa_library::{
+    MAX_MEDIA_PREVIEW_BYTES, MediaIngest, MediaKind, MediaMetadata, MediaPreviewInput,
+    MediaSourceInput, NewMedia, SourceKind, VideoDuplicateClassification, VideoDuplicateEvidence,
+    VideoDuplicateMatch, VideoFingerprintCandidate, VideoFingerprintInput, VideoIdentityDecision,
+};
+use sooqa_media::{
+    FrameExtractionError, FrameExtractor, MediaWorkspace, SequenceAlignmentConfig,
+    SequenceClassification, VideoSequenceFingerprint, WorkspaceArea, align_video_sequences,
+    encode_bounded_preview, sha256_file, validate_bounded_preview_for_mime,
+};
+use sooqa_persistence::{
+    InboxRepository, IngestFinalizationStart, IngestFingerprintStart, IngestVideoIdentityStart,
+    LibraryRepository,
+};
+use uuid::Uuid;
+
+use crate::common::{
+    HandlerFailure, HandlerFn, WorkspaceAdmission, load_ingest_for_admission, map_inbox_error,
+    map_library_error, map_workspace_error, request_media_kind, workspace_input,
+};
+
+pub type IdentityAlignmentHook = Arc<dyn Fn() + Send + Sync>;
+
+pub(crate) fn fingerprint_stage_may_run(status: IngestStatus) -> bool {
+    matches!(status, IngestStatus::Fingerprinting | IngestStatus::FailedRetryable)
+}
 
 pub fn finalize_ingest_handler(
     inbox: InboxRepository,
@@ -1061,10 +1096,12 @@ async fn fail_finalization(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
     use sooqa_inbox::{Ingest, IngestSubmission, IngestSubmissionInput, SubmittedVia};
+    use sooqa_jobs::JobStatus;
     use sooqa_media::{CommandError, FrameExtractionError};
+    use time::OffsetDateTime;
 
     use super::*;
 

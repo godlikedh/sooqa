@@ -1,6 +1,83 @@
 //! Source ingest, inspection, download, and probe jobs.
 
-use crate::common::*;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use async_trait::async_trait;
+use sooqa_inbox::{IngestKind, IngestStatus, SourceDownload};
+use sooqa_jobs::{Job, JobCommand};
+use sooqa_media::{
+    ArtifactPublicationError, DownloadError, DownloadLimits, DownloadedSource, FfprobeAdapter,
+    MediaWorkspace, SourceDownloader, SourceInput, WorkspaceArea, publish_artifact,
+};
+use sooqa_persistence::{
+    AssetProbeStart, InboxRepository, SourceDownloadStart, SourceInspectionStart,
+};
+use sooqa_telegram::TelegramApi;
+use uuid::Uuid;
+
+use crate::common::{
+    HandlerFailure, HandlerFn, WorkspaceAdmission, load_ingest_for_admission, map_inbox_error,
+    map_workspace_error, source_artifact_exists,
+};
+
+const DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+#[async_trait]
+pub trait TelegramSourceDownloader: Send + Sync {
+    async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), HandlerFailure>;
+}
+
+#[async_trait]
+impl TelegramSourceDownloader for sooqa_telegram::TeloxideApi {
+    async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), HandlerFailure> {
+        TelegramApi::download_file(self, file_id, destination).await.map_err(|error| {
+            if <sooqa_telegram::TeloxideApi as TelegramApi>::is_retryable_error(&error) {
+                HandlerFailure::retryable("telegram_source_download", error.to_string())
+            } else {
+                HandlerFailure::permanent("telegram_source_download", error.to_string())
+            }
+        })
+    }
+}
+
+pub(crate) struct DownloadAttemptArtifact {
+    path: PathBuf,
+}
+
+impl DownloadAttemptArtifact {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for DownloadAttemptArtifact {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub(crate) fn probe_stage_may_run(status: IngestStatus) -> bool {
+    matches!(
+        status,
+        IngestStatus::Queued
+            | IngestStatus::Downloading
+            | IngestStatus::Probing
+            | IngestStatus::FailedRetryable
+    )
+}
+
+pub(crate) fn download_stage_may_run(request: &sooqa_inbox::Ingest) -> bool {
+    matches!(request.status, IngestStatus::Downloading | IngestStatus::FailedRetryable)
+        && request.input_data().map(|data| data.download.is_none()).unwrap_or(false)
+}
 
 pub fn inspect_source_handler(
     inbox: InboxRepository,

@@ -1,11 +1,36 @@
 //! Canonical media normalization jobs.
 
-use crate::common::*;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use sooqa_inbox::{AssetNormalization, AssetThumbnailNormalization, IngestStatus, SourceMediaKind};
+use sooqa_jobs::{Job, JobCommand};
+use sooqa_media::{
+    ArtifactPublicationError, CANONICAL_VIDEO_PROFILE_VERSION, FfmpegExecutor, ImageNormalizer,
+    MediaProbe, MediaStreamKind, MediaWorkspace, NormalizationExecutionError, NormalizationPlanner,
+    WorkspaceArea, decode_first_preview_frame, encode_bounded_preview, publish_artifact,
+    sha256_file,
+};
+use sooqa_persistence::{AssetNormalizationStart, InboxRepository};
+use tracing::{debug, warn};
+use uuid::Uuid;
+
+use crate::common::{
+    HandlerFailure, HandlerFn, WorkspaceAdmission, load_ingest_for_admission, map_inbox_error,
+    map_workspace_error, request_media_kind, source_artifact_exists, workspace_input,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct NormalizationLimits {
     max_normalized_storage_bytes: u64,
     admission: WorkspaceAdmission,
+}
+
+pub(crate) fn normalization_stage_may_run(status: IngestStatus) -> bool {
+    matches!(status, IngestStatus::Normalizing | IngestStatus::FailedRetryable)
 }
 
 pub fn normalize_asset_handler(
@@ -958,8 +983,10 @@ mod tests {
         collections::VecDeque,
         path::Path,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
+    use async_trait::async_trait;
     use tokio::sync::Notify;
 
     use sooqa_media::{

@@ -1,6 +1,20 @@
 //! Durable queue runner and lease lifecycle.
 
-use crate::common::*;
+use std::{future::Future, time::Duration};
+
+use thiserror::Error;
+use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio::{
+    sync::{oneshot, watch},
+    task::JoinError,
+    time::sleep,
+};
+use tracing::{debug, info, warn};
+
+use sooqa_jobs::{Job, JobLease, JobStatus, JobType};
+use sooqa_persistence::{JobRepository, JobRepositoryError};
+
+use crate::common::{HandlerCancellation, HandlerEntry, HandlerFailure, HandlerRegistry};
 
 #[derive(Debug, Default)]
 struct WorkerLogCounters {
@@ -413,6 +427,10 @@ fn validate_timing(poll_interval: Duration, lease_duration: Duration) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use sooqa_persistence::InboxRepositoryError;
+
+    use crate::common::{HandlerFuture, map_inbox_error, media_processing_components};
+
     use super::*;
 
     fn test_handler(_job: Job) -> HandlerFuture {
