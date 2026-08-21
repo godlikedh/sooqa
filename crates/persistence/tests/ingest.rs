@@ -433,6 +433,11 @@ async fn corrupt_durable_envelope_returns_a_bounded_repository_error(pool: sqlx:
         result,
         Err(InboxRepositoryError::InputEnvelope(sooqa_inbox::IngestDataError::Malformed(_)))
     ));
+    let force_save = database.inbox().force_save(ingest.ingest.id).await;
+    assert!(matches!(
+        force_save,
+        Err(InboxRepositoryError::InputEnvelope(sooqa_inbox::IngestDataError::Malformed(_)))
+    ));
 }
 
 #[sqlx::test(migrations = "../../migrations")]

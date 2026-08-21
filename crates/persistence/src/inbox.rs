@@ -291,7 +291,10 @@ impl InboxRepository {
             let accepted_media_id = input_data
                 .duplicate_decision
                 .as_ref()
-                .filter(|decision| decision.version == 1 && decision.kind == "accepted")
+                .filter(|decision| {
+                    decision.version == 1
+                        && decision.kind == sooqa_inbox::DuplicateDecisionKind::Accepted
+                })
                 .map(|decision| decision.media_id);
             if !request.force_save
                 && accepted_media_id.is_some()
@@ -370,7 +373,7 @@ impl InboxRepository {
         let mut input_data = request.input_data().map_err(InboxRepositoryError::InputEnvelope)?;
         input_data.duplicate_decision = Some(sooqa_inbox::DuplicateDecisionData {
             version: 1,
-            kind: "accepted".to_owned(),
+            kind: sooqa_inbox::DuplicateDecisionKind::Accepted,
             media_id,
         });
         request.set_input_data(input_data).map_err(InboxRepositoryError::InputEnvelope)?;
@@ -936,7 +939,7 @@ impl InboxRepository {
                 request.force_save = true;
                 request.workspace_id = Uuid::now_v7();
                 request.duplicate_evidence = None;
-                clear_pipeline_artifacts(&mut request);
+                clear_pipeline_artifacts(&mut request)?;
                 request.transition_to(IngestStatus::Queued)?;
                 request.error_code = None;
                 request.error_message = None;
@@ -1678,16 +1681,15 @@ fn stage_dedupe_key(request: &Ingest, initial_key: &str) -> String {
     if request.force_save { format!("{initial_key}:force_save") } else { initial_key.to_owned() }
 }
 
-fn clear_pipeline_artifacts(request: &mut Ingest) {
-    if let Ok(mut data) = request.input_data() {
-        data.inspection = None;
-        data.download = None;
-        data.probe = None;
-        data.probed_media_kind = None;
-        data.normalization = None;
-        data.finalization = None;
-        let _ = request.set_input_data(data);
-    }
+fn clear_pipeline_artifacts(request: &mut Ingest) -> Result<(), InboxRepositoryError> {
+    let mut data = request.input_data().map_err(InboxRepositoryError::InputEnvelope)?;
+    data.inspection = None;
+    data.download = None;
+    data.probe = None;
+    data.probed_media_kind = None;
+    data.normalization = None;
+    data.finalization = None;
+    request.set_input_data(data).map_err(InboxRepositoryError::InputEnvelope)
 }
 
 fn request_media_kind(request: &Ingest) -> Result<Option<SourceMediaKind>, InboxRepositoryError> {

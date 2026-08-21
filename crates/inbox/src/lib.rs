@@ -20,6 +20,7 @@ pub const MAX_REQUESTED_POST_CAPTION_LENGTH: usize = 1_024;
 pub const INGEST_DATA_VERSION: u16 = 1;
 const MAX_INGEST_DATA_BYTES: usize = 256 * 1024;
 const DUPLICATE_DECISION_MARKER_KEY: &str = "_sooqa_duplicate_decision_v1";
+const DUPLICATE_DECISION_VERSION: u8 = 1;
 
 fn is_envelope_key(key: &str) -> bool {
     matches!(
@@ -228,10 +229,16 @@ impl IngestProbe {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DuplicateDecisionKind {
+    Accepted,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DuplicateDecisionData {
     pub version: u8,
-    pub kind: String,
+    pub kind: DuplicateDecisionKind,
     pub media_id: Uuid,
 }
 
@@ -313,7 +320,13 @@ impl IngestData {
                 return Err(IngestDataError::UnsupportedVersion(version));
             }
             let data = serde_json::from_value::<Self>(value.clone()).map_err(|error| {
-                let field = if object.contains_key("inspection") { " inspection" } else { "" };
+                let field = if object.contains_key("inspection") {
+                    " inspection"
+                } else if object.contains_key(DUPLICATE_DECISION_MARKER_KEY) {
+                    " duplicate decision"
+                } else {
+                    ""
+                };
                 IngestDataError::Malformed(format!("versioned envelope{field}: {error}"))
             })?;
             return data.validate();
@@ -394,6 +407,14 @@ impl IngestData {
         }
         validate_extensions(&self.source.extensions, "source")?;
         validate_extensions(&self.extensions, "envelope")?;
+        if let Some(decision) = &self.duplicate_decision
+            && decision.version != DUPLICATE_DECISION_VERSION
+        {
+            return Err(IngestDataError::Malformed(format!(
+                "duplicate decision marker version {} is not supported",
+                decision.version
+            )));
+        }
         if self.probe.as_ref().is_some_and(|probe| !probe.as_value().is_object()) {
             return Err(IngestDataError::Malformed("probe must be a JSON object".to_owned()));
         }
@@ -1689,7 +1710,7 @@ mod tests {
       "finalization": {"media_id": "00000000-0000-0000-0000-000000000001"},
       "_sooqa_duplicate_decision_v1": {
         "version": 1,
-        "kind": "pending",
+        "kind": "accepted",
         "media_id": "00000000-0000-0000-0000-000000000002"
       }
     }
@@ -1761,6 +1782,30 @@ mod tests {
         assert!(matches!(
             IngestData::decode(&json!({"version": 1, "source": {}, "probe": "broken"})),
             Err(IngestDataError::Malformed(_))
+        ));
+        assert!(matches!(
+            IngestData::decode(&json!({
+                "version": 1,
+                "source": {},
+                "_sooqa_duplicate_decision_v1": {
+                    "version": 1,
+                    "kind": "pending",
+                    "media_id": "00000000-0000-0000-0000-000000000001"
+                }
+            })),
+            Err(IngestDataError::Malformed(message)) if message.contains("duplicate decision")
+        ));
+        assert!(matches!(
+            IngestData::decode(&json!({
+                "version": 1,
+                "source": {},
+                "_sooqa_duplicate_decision_v1": {
+                    "version": 2,
+                    "kind": "accepted",
+                    "media_id": "00000000-0000-0000-0000-000000000001"
+                }
+            })),
+            Err(IngestDataError::Malformed(message)) if message.contains("marker version 2")
         ));
         assert!(matches!(IngestData::decode(&json!(null)), Err(IngestDataError::NotAnObject)));
     }
