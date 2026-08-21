@@ -75,6 +75,8 @@ struct ReservationGateStore {
     release: Arc<Notify>,
     release_completed: Option<Arc<Notify>>,
     continue_release: Option<Arc<Notify>>,
+    complete_committed: Option<Arc<Notify>>,
+    continue_complete: Option<Arc<Notify>>,
     fail_unknown_once: Option<Arc<AtomicBool>>,
     unknown_failed: Option<Arc<Notify>>,
 }
@@ -138,7 +140,16 @@ impl StorageUploadStore for ReservationGateStore {
         owner_token: Uuid,
         attachment: StorageUploadAttachment,
     ) -> Result<StorageReceipt, Self::Error> {
-        self.inner.complete_storage_upload(media_id, owner_token, attachment).await
+        let result = self.inner.complete_storage_upload(media_id, owner_token, attachment).await;
+        if result.is_ok() {
+            if let Some(signal) = &self.complete_committed {
+                signal.notify_one();
+            }
+            if let Some(signal) = &self.continue_complete {
+                signal.notified().await;
+            }
+        }
+        result
     }
 
     async fn release_storage_upload(
@@ -321,6 +332,8 @@ async fn worker_shutdown_before_storage_dispatch_releases_and_requeues(pool: sql
         release: Arc::new(Notify::new()),
         release_completed: None,
         continue_release: None,
+        complete_committed: None,
+        continue_complete: None,
         fail_unknown_once: None,
         unknown_failed: None,
     };
@@ -459,6 +472,148 @@ async fn stale_active_storage_reservation_reconciles_unknown_after_grace(pool: s
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
+async fn stale_ready_storage_completion_succeeds_without_resend_on_final_attempt(
+    pool: sqlx::PgPool,
+) {
+    let database = Database::from_pool(pool);
+    let fixture = seed_storage_upload(&database).await;
+    sqlx::query("UPDATE queue.jobs SET max_attempts = 1 WHERE id = $1")
+        .bind(fixture.job_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let request_started = Arc::new(Notify::new());
+    let release_request = Arc::new(Notify::new());
+    let complete_committed = Arc::new(Notify::new());
+    let continue_complete = Arc::new(Notify::new());
+    let api = ControllableTelegram {
+        request_started: Arc::clone(&request_started),
+        release_request: Arc::clone(&release_request),
+        calls: Arc::new(AtomicUsize::new(0)),
+        ambiguous: false,
+    };
+    let gate = ReservationGateStore {
+        inner: database.library(),
+        reserved: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        release_completed: None,
+        continue_release: None,
+        complete_committed: Some(Arc::clone(&complete_committed)),
+        continue_complete: Some(Arc::clone(&continue_complete)),
+        fail_unknown_once: None,
+        unknown_failed: None,
+    };
+    gate.release.notify_one();
+    let provider = StorageUploadProvider::new(api.clone(), gate, -100123)
+        .unwrap()
+        .with_work_root(fixture.root.clone());
+    let mut registry = HandlerRegistry::new();
+    let handler = upload_storage_asset_cancellable_handler(database.inbox(), provider);
+    registry.register_cancellable(JobType::UploadStorageAsset, move |job, cancellation| {
+        handler(job, cancellation)
+    });
+    let worker = Worker::new(
+        database.jobs(),
+        registry,
+        "stale-ready-storage-worker",
+        Duration::from_millis(10),
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let worker_task = tokio::spawn(async move {
+        worker
+            .run(async move {
+                let _ = shutdown_receiver.await;
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), request_started.notified())
+        .await
+        .expect("Telegram upload should be dispatched");
+    release_request.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), complete_committed.notified())
+        .await
+        .expect("storage completion should commit before cancellation");
+    let _ = shutdown_sender.send(());
+    tokio::time::timeout(Duration::from_secs(8), worker_task)
+        .await
+        .expect("worker should stop after cancellation")
+        .expect("worker task should join")
+        .expect("cancellation should settle without a worker error");
+
+    let claimed = database
+        .jobs()
+        .claim_next(
+            "stale-ready-recovery-worker",
+            Duration::from_secs(30),
+            &[JobType::UploadStorageAsset],
+        )
+        .await
+        .unwrap();
+    assert!(claimed.is_none(), "the completed lease should remain running until recovery");
+    sqlx::query(
+        "UPDATE queue.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(fixture.job_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(database.jobs().recover_stale_leases().await.unwrap(), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(fixture.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "succeeded"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>("SELECT error_class FROM queue.jobs WHERE id = $1")
+            .bind(fixture.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT error_message FROM queue.jobs WHERE id = $1"
+        )
+        .bind(fixture.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        None
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT completed_at IS NOT NULL FROM queue.jobs WHERE id = $1"
+        )
+        .bind(fixture.job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap()
+    );
+    let ingest = database.inbox().find(fixture.ingest_id).await.unwrap().unwrap();
+    assert_eq!(ingest.status, IngestStatus::Completed);
+    assert_eq!(ingest.error_code, None);
+    assert_eq!(api.calls.load(Ordering::Relaxed), 1);
+    assert!(
+        database
+            .jobs()
+            .claim_next("no-resend-worker", Duration::from_secs(30), &[JobType::UploadStorageAsset])
+            .await
+            .unwrap()
+            .is_none(),
+        "a ready storage receipt must not be uploaded again"
+    );
+    tokio::fs::remove_dir_all(fixture.root).await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn failed_unknown_mark_stays_running_until_stale_recovery_without_resend(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let fixture = seed_storage_upload(&database).await;
@@ -477,6 +632,8 @@ async fn failed_unknown_mark_stays_running_until_stale_recovery_without_resend(p
         release: Arc::new(Notify::new()),
         release_completed: None,
         continue_release: None,
+        complete_committed: None,
+        continue_complete: None,
         fail_unknown_once: Some(Arc::clone(&fail_unknown_once)),
         unknown_failed: Some(Arc::clone(&unknown_failed)),
     };
@@ -570,6 +727,8 @@ async fn heartbeat_loss_before_storage_dispatch_releases_and_requeues_final_atte
         release: Arc::new(Notify::new()),
         release_completed: None,
         continue_release: None,
+        complete_committed: None,
+        continue_complete: None,
         fail_unknown_once: None,
         unknown_failed: None,
     };

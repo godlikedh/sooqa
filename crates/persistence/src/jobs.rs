@@ -380,6 +380,13 @@ impl JobRepository {
                              SELECT 1
                              FROM media
                              WHERE media.id::text = queue.jobs.payload->>'media_id'
+                               AND media.storage_state = 'ready'
+                         ) THEN 'succeeded'
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
                                AND media.storage_state = 'pending_storage'
                                AND media.storage_token IS NULL
                          ) THEN 'queued'
@@ -420,6 +427,13 @@ impl JobRepository {
                              SELECT 1
                              FROM media
                              WHERE media.id::text = queue.jobs.payload->>'media_id'
+                               AND media.storage_state = 'ready'
+                         ) THEN NULL
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
                                AND media.storage_state = 'pending_storage'
                                AND media.storage_token IS NULL
                          ) THEN 'storage_upload_cancelled'
@@ -431,12 +445,26 @@ impl JobRepository {
                              SELECT 1
                              FROM media
                              WHERE media.id::text = queue.jobs.payload->>'media_id'
+                               AND media.storage_state = 'ready'
+                         ) THEN NULL
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
                                AND media.storage_state = 'pending_storage'
                                AND media.storage_token IS NULL
                          ) THEN 'storage upload was safely cancelled before Telegram dispatch'
                     ELSE COALESCE(error_message, 'job lease expired')
                 END,
                 completed_at = CASE
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
+                               AND media.storage_state = 'ready'
+                         ) THEN now()
                     WHEN kind = 'upload_storage_asset'
                          AND EXISTS (
                              SELECT 1
@@ -500,6 +528,9 @@ impl JobRepository {
                     .execute(&mut *transaction)
                     .await?;
                 }
+            }
+            if job.kind == JobType::UploadStorageAsset.as_str() && job.state == "succeeded" {
+                reconcile_exhausted_job(&mut transaction, job).await?;
             }
             if job.state == "failed"
                 && (job.attempt_count >= job.max_attempts
