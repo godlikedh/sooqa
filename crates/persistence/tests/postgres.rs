@@ -63,8 +63,18 @@ async fn drop_legacy_upgrade_database(
     target_pool: &sqlx::PgPool,
     database_name: &str,
 ) -> Result<(), sqlx::Error> {
+    let Some(suffix) = database_name.strip_prefix("sooqa_upgrade_") else {
+        return Err(sqlx::Error::InvalidArgument(
+            "refusing to drop a non-test database".to_owned(),
+        ));
+    };
+    if suffix.len() != 32 || !suffix.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(sqlx::Error::InvalidArgument(
+            "refusing to drop a database without a UUID-derived test name".to_owned(),
+        ));
+    }
     target_pool.close().await;
-    let result = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{database_name}\""))
+    let result = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{database_name}\" WITH (FORCE)"))
         .execute(admin_pool)
         .await
         .map(|_| ());
@@ -139,17 +149,37 @@ async fn populated_previous_schema_migrates_through_head_and_preserves_records()
     let (admin_pool, target_pool, target_url, database_name) =
         create_legacy_upgrade_database().await;
     let target_pool_for_task = target_pool.clone();
+    let cleanup_pool_url = target_url.clone();
     let upgrade = tokio::spawn(async move {
         run_populated_upgrade(target_pool_for_task, target_url).await;
     });
     let upgrade_result = upgrade.await;
+    // Keep an independent backend open so cleanup also covers the repository
+    // pool created inside the spawned upgrade task.
+    let cleanup_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(cleanup_pool_url.as_str())
+        .await
+        .expect("temporary upgrade database should still accept cleanup coverage connection");
     let cleanup_result =
         drop_legacy_upgrade_database(&admin_pool, &target_pool, &database_name).await;
-    if let Err(error) = cleanup_result {
-        panic!("temporary upgrade database should be removed: {error}");
-    }
-    if let Err(panic) = upgrade_result {
-        std::panic::resume_unwind(panic.into_panic());
+    cleanup_pool.close().await;
+    match (upgrade_result, cleanup_result) {
+        (Ok(()), Ok(())) => {}
+        (Ok(()), Err(error)) => panic!("temporary upgrade database should be removed: {error}"),
+        (Err(panic), Ok(())) if panic.is_panic() => std::panic::resume_unwind(panic.into_panic()),
+        (Err(error), Ok(())) => panic!("upgrade task was cancelled: {error}"),
+        (Err(panic), Err(cleanup_error)) if panic.is_panic() => {
+            eprintln!(
+                "temporary upgrade database cleanup failed after upgrade panic: {cleanup_error}"
+            );
+            std::panic::resume_unwind(panic.into_panic());
+        }
+        (Err(error), Err(cleanup_error)) => {
+            panic!(
+                "upgrade task was cancelled ({error}); temporary database cleanup failed: {cleanup_error}"
+            );
+        }
     }
 }
 
