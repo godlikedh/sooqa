@@ -210,7 +210,13 @@ async fn download_admission_refusal_is_durable_and_recovers_without_stage_mutati
         .expect("ingest should remain readable")
         .expect("ingest should remain present");
     assert_eq!(refused_request.status, IngestStatus::Downloading);
-    assert!(refused_request.original_input.get("download").is_none());
+    assert!(
+        refused_request
+            .input_data()
+            .expect("refused ingest should have a valid typed envelope")
+            .download
+            .is_none()
+    );
     assert_eq!(downloader.calls(), 0, "disk refusal must happen before the downloader");
     assert!(!work_root.join("jobs").join(ingest.workspace_id.to_string()).exists());
     let refusal_error: Option<String> =
@@ -251,7 +257,13 @@ async fn download_admission_refusal_is_durable_and_recovers_without_stage_mutati
         .expect("recovered ingest should be readable")
         .expect("recovered ingest should remain present");
     assert_eq!(recovered_request.status, IngestStatus::Downloading);
-    assert!(recovered_request.original_input.get("download").is_some());
+    assert!(
+        recovered_request
+            .input_data()
+            .expect("recovered ingest should have a valid typed envelope")
+            .download
+            .is_some()
+    );
     assert_eq!(downloader.calls(), 1, "admitted retry should reach the downloader once");
 
     fs::remove_dir_all(&work_root).await.expect("synthetic work root should be removable");
@@ -326,7 +338,13 @@ async fn already_advanced_download_skips_admission_and_large_work(pool: sqlx::Pg
         .expect("advanced ingest should remain readable")
         .expect("advanced ingest should remain present");
     assert_eq!(request.status, IngestStatus::Downloading);
-    assert!(request.original_input.get("download").is_some());
+    assert!(
+        request
+            .input_data()
+            .expect("advanced ingest should have a valid typed envelope")
+            .download
+            .is_some()
+    );
     assert_eq!(downloader.calls(), 0, "already-advanced jobs must not start large work");
     assert!(!work_root.join("jobs").join(ingest.workspace_id.to_string()).exists());
 
