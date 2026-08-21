@@ -258,7 +258,7 @@ impl JobRepository {
             "#,
         )
         .bind(lease.job_id)
-        .bind(&lease.worker_id)
+        .bind(&lease.lease_owner)
         .bind(lease.lease_token)
         .bind(run_at)
         .bind(error_class)
