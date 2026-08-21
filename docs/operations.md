@@ -263,7 +263,10 @@ attempt reports the specific media-byte `HTTP Error 403`, the worker starts one
 more high-quality attempt with fresh extractor state; if that also receives the
 same error, it makes one clean attempt with the bounded combined progressive
 selection `best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]`.
-The winning selection is recorded as `input_json.download.selected_format`.
+The winning selection is recorded as `input_json.download.selected_format` in
+the version-1 ingest envelope. The envelope is canonical for new writes, while
+the scalar ingest columns remain authoritative for request identity and
+publication intent.
 Private, removed, account-required, unsupported-surface, and other extractor
 failures stay terminal, while a failed progressive attempt returns to the existing bounded
 job retry policy. Every attempt has its own directory and failed or partial

@@ -183,6 +183,26 @@ bounded JSON input metadata; it is decoded into typed Rust structs at the
 handler boundary. Storage completion/failure is applied by `media_id`, and
 attach/reset/mark-unknown reconcile the linked ingest rows.
 
+### Versioned ingest data
+
+`ingests.input_json` is a versioned `IngestData` envelope owned by
+`sooqa-inbox`. New rows use version `1` with a typed `source` object and
+optional `inspection`, `download`, `probe`, `probed_media_kind`,
+`normalization`, `finalization`, and duplicate-decision fields. Adapter-specific
+metadata and unknown future fields are retained only in bounded opaque
+extensions. Worker and persistence code reads and writes these fields through
+the envelope API; it does not mutate stage keys directly.
+
+The scalar ingest columns are authoritative for request identity, source URL,
+captured publication intent, workflow state, and errors. The envelope is the
+durable source snapshot and stage-artifact record. Request hashes continue to
+use the pre-envelope submission shape, so idempotent replays remain compatible.
+Rows written by the current five-table schema are forward-read and upgraded in
+memory; the next fenced stage transition persists the canonical version-1
+shape. A malformed or unsupported envelope is rejected with a bounded
+`invalid ingest input envelope` diagnostic and never panics. The discarded
+pre-reset schema has no compatibility reader.
+
 Telegram file messages follow the same durable boundary: the polling server
 validates the administrator and advertised size, persists the Telegram file
 metadata, and acknowledges only after the ingest transaction commits. It does

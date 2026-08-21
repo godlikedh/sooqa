@@ -1,6 +1,8 @@
 //! Ingest request and source submission boundaries for sooqa.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -10,6 +12,412 @@ use uuid::Uuid;
 const MAX_IDEMPOTENCY_KEY_LENGTH: usize = 255;
 /// Must remain aligned with the Publisher's Telegram caption contract.
 pub const MAX_REQUESTED_POST_CAPTION_LENGTH: usize = 1_024;
+
+/// The only serialized ingest-data format written by the current code.
+///
+/// `input_json` is deliberately kept as one column, but its shape is owned by
+/// this module rather than by individual persistence and worker call sites.
+pub const INGEST_DATA_VERSION: u16 = 1;
+const MAX_INGEST_DATA_BYTES: usize = 256 * 1024;
+const DUPLICATE_DECISION_MARKER_KEY: &str = "_sooqa_duplicate_decision_v1";
+
+/// A bounded opaque value retained only for adapter metadata and unknown
+/// fields from a newer envelope. Pipeline state itself is represented by the
+/// typed fields below.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OpaqueIngestValue(Value);
+
+impl OpaqueIngestValue {
+    pub fn new(value: Value) -> Self {
+        Self(value)
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+
+    pub fn into_value(self) -> Value {
+        self.0
+    }
+}
+
+/// Typed source-side fields captured at ingest creation. The database
+/// columns remain authoritative for request identity and publication intent;
+/// these fields preserve the original adapter input for provenance and
+/// reconstruction.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IngestSourceData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_action: Option<RequestedAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_publish_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_post_caption: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_update_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_chat_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_message_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_user_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_file_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_file_unique_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telegram_workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_kind: Option<SourceMediaKind>,
+    /// Adapter-specific source fields not needed by the core pipeline.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<String, OpaqueIngestValue>,
+}
+
+/// Probe JSON is produced by the media boundary, so the inbox crate keeps it
+/// opaque at the serialization boundary while exposing typed decoding to the
+/// worker. This prevents persistence code from depending on ffprobe's crate.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IngestProbe(Value);
+
+impl IngestProbe {
+    pub fn from_value(value: Value) -> Self {
+        Self(value)
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+
+    pub fn decode<T: for<'de> Deserialize<'de>>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_value(self.0.clone())
+    }
+
+    pub fn media_kind(&self) -> Option<SourceMediaKind> {
+        let container = self.0.get("container_format").and_then(Value::as_str);
+        let codecs = self
+            .0
+            .get("streams")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|stream| stream.get("kind").and_then(Value::as_str) == Some("video"))
+            .filter_map(|stream| stream.get("codec").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let container = container.map(str::to_ascii_lowercase);
+        let is_gif = container.as_deref().is_some_and(|value| value.contains("gif"))
+            || codecs.iter().any(|value| value.to_ascii_lowercase().contains("gif"));
+        if is_gif {
+            return Some(SourceMediaKind::Animation);
+        }
+        let is_image_container = container.as_deref().is_some_and(|value| {
+            ["image2", "png", "jpeg", "jpg", "webp", "avif", "mjpeg"]
+                .iter()
+                .any(|format| value.contains(format))
+        });
+        let is_image_codec = codecs
+            .iter()
+            .any(|value| ["png", "webp"].iter().any(|format| value.eq_ignore_ascii_case(format)))
+            || (container.is_none()
+                && codecs.iter().any(|value| value.eq_ignore_ascii_case("mjpeg")));
+        if is_image_container || is_image_codec {
+            return Some(SourceMediaKind::Image);
+        }
+        let streams = self.0.get("streams").and_then(Value::as_array);
+        if streams.is_some_and(|streams| {
+            streams.iter().any(|stream| stream.get("kind").and_then(Value::as_str) == Some("video"))
+        }) {
+            return Some(SourceMediaKind::Video);
+        }
+        if streams.is_some_and(|streams| {
+            streams.iter().any(|stream| stream.get("kind").and_then(Value::as_str) == Some("audio"))
+        }) {
+            return Some(SourceMediaKind::Audio);
+        }
+        None
+    }
+
+    pub fn image_format(&self) -> Option<&str> {
+        self.0.get("container_format").and_then(Value::as_str).or_else(|| {
+            self.0.get("streams").and_then(Value::as_array).and_then(|streams| {
+                streams.iter().find_map(|stream| {
+                    (stream.get("kind").and_then(Value::as_str) == Some("video"))
+                        .then(|| stream.get("codec").and_then(Value::as_str))
+                        .flatten()
+                })
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DuplicateDecisionData {
+    pub version: u8,
+    pub kind: String,
+    pub media_id: Uuid,
+}
+
+/// Versioned durable ingest protocol. The shape is intentionally a plain
+/// struct: no generic event framework or speculative stage registry is
+/// needed for the five-table MVP.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IngestData {
+    pub version: u16,
+    pub source: IngestSourceData,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspection: Option<SourceInspection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download: Option<SourceDownload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<IngestProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probed_media_kind: Option<SourceMediaKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalization: Option<AssetNormalization>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization: Option<IngestFinalization>,
+    #[serde(
+        rename = "_sooqa_duplicate_decision_v1",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub duplicate_decision: Option<DuplicateDecisionData>,
+    /// Forward-compatible envelope fields are retained but never interpreted
+    /// by the current worker.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extensions: BTreeMap<String, OpaqueIngestValue>,
+}
+
+#[derive(Debug, Error)]
+pub enum IngestDataError {
+    #[error("ingest data must be a JSON object")]
+    NotAnObject,
+    #[error("ingest data has an invalid version")]
+    InvalidVersion,
+    #[error("ingest data version {0} is not supported")]
+    UnsupportedVersion(u64),
+    #[error("ingest data is malformed: {0}")]
+    Malformed(String),
+    #[error("ingest data exceeds the {0}-byte limit")]
+    TooLarge(usize),
+}
+
+impl IngestData {
+    pub fn new(source: IngestSourceData) -> Self {
+        Self {
+            version: INGEST_DATA_VERSION,
+            source,
+            inspection: None,
+            download: None,
+            probe: None,
+            probed_media_kind: None,
+            normalization: None,
+            finalization: None,
+            duplicate_decision: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    /// Decode either the current canonical envelope or the pre-envelope
+    /// object written by the five-table schema. Legacy data is upgraded in
+    /// memory; callers persist the canonical serialization on their next
+    /// state transition.
+    pub fn decode(value: &Value) -> Result<Self, IngestDataError> {
+        let encoded = serde_json::to_vec(value)
+            .map_err(|error| IngestDataError::Malformed(error.to_string()))?;
+        if encoded.len() > MAX_INGEST_DATA_BYTES {
+            return Err(IngestDataError::TooLarge(MAX_INGEST_DATA_BYTES));
+        }
+        let object = value.as_object().ok_or(IngestDataError::NotAnObject)?;
+        if let Some(version) = object.get("version") {
+            let version = version.as_u64().ok_or(IngestDataError::InvalidVersion)?;
+            if version != u64::from(INGEST_DATA_VERSION) {
+                return Err(IngestDataError::UnsupportedVersion(version));
+            }
+            let data = match serde_json::from_value::<Self>(value.clone()) {
+                Ok(data) => data,
+                Err(error)
+                    if object.get("inspection").is_some_and(Value::is_object)
+                        && error.to_string().contains("missing field") =>
+                {
+                    let inspection = object.get("inspection").expect("checked above");
+                    let mut without_inspection = object.clone();
+                    without_inspection.remove("inspection");
+                    let mut data =
+                        serde_json::from_value::<Self>(Value::Object(without_inspection))
+                            .map_err(|error| IngestDataError::Malformed(error.to_string()))?;
+                    data.inspection = Some(decode_legacy_inspection(inspection, &data.source)?);
+                    data
+                }
+                Err(error) => return Err(IngestDataError::Malformed(error.to_string())),
+            };
+            return data.validate();
+        }
+
+        Self::decode_legacy(object)
+    }
+
+    fn decode_legacy(object: &serde_json::Map<String, Value>) -> Result<Self, IngestDataError> {
+        let (source_value, stage_values) = if let Some(source) = object.get("source") {
+            let mut stages = object.clone();
+            stages.remove("source");
+            match source {
+                Value::Object(source) => (source.clone(), stages),
+                // A few early five-table fixtures used `source` as the URL
+                // field. Keep that bounded shape readable as the canonical
+                // typed URL source.
+                Value::String(source) => (
+                    serde_json::Map::from_iter([("url".to_owned(), Value::String(source.clone()))]),
+                    stages,
+                ),
+                _ => {
+                    return Err(IngestDataError::Malformed(
+                        "legacy source field must be an object or URL string".to_owned(),
+                    ));
+                }
+            }
+        } else {
+            let mut source = object.clone();
+            for key in [
+                "inspection",
+                "download",
+                "probe",
+                "probed_media_kind",
+                "normalization",
+                "finalization",
+                DUPLICATE_DECISION_MARKER_KEY,
+            ] {
+                source.remove(key);
+            }
+            (source, object.clone())
+        };
+        let source = serde_json::from_value::<IngestSourceData>(Value::Object(source_value))
+            .map_err(|error| IngestDataError::Malformed(format!("legacy source: {error}")))?;
+        let mut data = Self::new(source);
+        data.inspection = stage_values
+            .get("inspection")
+            .map(|value| decode_legacy_inspection(value, &data.source))
+            .transpose()?;
+        data.download = decode_optional_stage(&stage_values, "download")?;
+        data.probe = decode_optional_stage(&stage_values, "probe")?;
+        data.probed_media_kind = decode_optional_stage(&stage_values, "probed_media_kind")?;
+        data.normalization = decode_optional_stage(&stage_values, "normalization")?;
+        data.finalization = decode_optional_stage(&stage_values, "finalization")?;
+        data.duplicate_decision =
+            decode_optional_stage(&stage_values, DUPLICATE_DECISION_MARKER_KEY)?;
+        data.validate()
+    }
+
+    fn validate(self) -> Result<Self, IngestDataError> {
+        if self.version != INGEST_DATA_VERSION {
+            return Err(IngestDataError::UnsupportedVersion(u64::from(self.version)));
+        }
+        if self.probe.as_ref().is_some_and(|probe| !probe.as_value().is_object()) {
+            return Err(IngestDataError::Malformed("probe must be a JSON object".to_owned()));
+        }
+        Ok(self)
+    }
+
+    pub fn encode(&self) -> Result<Value, IngestDataError> {
+        let value = serde_json::to_value(self)
+            .map_err(|error| IngestDataError::Malformed(error.to_string()))?;
+        let size = serde_json::to_vec(&value)
+            .map_err(|error| IngestDataError::Malformed(error.to_string()))?
+            .len();
+        if size > MAX_INGEST_DATA_BYTES {
+            return Err(IngestDataError::TooLarge(MAX_INGEST_DATA_BYTES));
+        }
+        Ok(value)
+    }
+
+    pub fn source_url(&self) -> Option<&str> {
+        self.source.url.as_deref()
+    }
+
+    pub fn media_kind(&self) -> Option<SourceMediaKind> {
+        self.probed_media_kind.or_else(|| {
+            self.download.as_ref().map(|download| download.media_kind).or(self.source.media_kind)
+        })
+    }
+
+    pub fn mime_type(&self) -> Option<&str> {
+        self.download
+            .as_ref()
+            .and_then(|download| download.mime_type.as_deref())
+            .or(self.source.mime_type.as_deref())
+    }
+}
+
+fn decode_optional_stage<T: for<'de> Deserialize<'de>>(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<T>, IngestDataError> {
+    object
+        .get(key)
+        .map(|value| {
+            serde_json::from_value(value.clone())
+                .map_err(|error| IngestDataError::Malformed(format!("{key}: {error}")))
+        })
+        .transpose()
+}
+
+fn decode_legacy_inspection(
+    value: &Value,
+    source: &IngestSourceData,
+) -> Result<SourceInspection, IngestDataError> {
+    match serde_json::from_value(value.clone()) {
+        Ok(inspection) => Ok(inspection),
+        Err(error) if value.is_object() && error.to_string().contains("missing field") => {
+            let object = value.as_object().expect("object checked above");
+            Ok(SourceInspection {
+                adapter: object
+                    .get("adapter")
+                    .and_then(Value::as_str)
+                    .unwrap_or("legacy")
+                    .to_owned(),
+                source_url: object
+                    .get("source_url")
+                    .and_then(Value::as_str)
+                    .or(source.url.as_deref())
+                    .unwrap_or_default()
+                    .to_owned(),
+                resolved_url: object.get("resolved_url").and_then(Value::as_str).map(str::to_owned),
+                media_kind: object
+                    .get("media_kind")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or(SourceMediaKind::Unknown),
+                mime_type: object.get("mime_type").and_then(Value::as_str).map(str::to_owned),
+                content_length_bytes: object.get("content_length_bytes").and_then(Value::as_u64),
+                title: object.get("title").and_then(Value::as_str).map(str::to_owned),
+                metadata: object.get("metadata").cloned().unwrap_or_else(|| json!({})),
+            })
+        }
+        Err(error) => Err(IngestDataError::Malformed(format!("inspection: {error}"))),
+    }
+}
 
 /// Durable source metadata produced by an inspection adapter.
 ///
@@ -450,6 +858,8 @@ impl IngestSubmission {
             return Err(IngestValidationError::EmptyUrl("Telegram source reference"));
         }
         let idempotency_key = normalize_idempotency_key(input.idempotency_key)?;
+        IngestData::decode(&input.original_input)
+            .map_err(|error| IngestValidationError::InvalidInputEnvelope(error.to_string()))?;
         Ok(Self {
             kind: IngestKind::TelegramMessage,
             submitted_via: input.submitted_via,
@@ -563,13 +973,16 @@ pub struct IngestPage {
 impl Ingest {
     pub fn from_submission(id: Uuid, submission: &IngestSubmission) -> Self {
         let now = time::OffsetDateTime::now_utc();
+        let original_input = IngestData::decode(&submission.original_input)
+            .and_then(|data| data.encode())
+            .expect("validated ingest submission must produce an ingest envelope");
         Self {
             id,
             workspace_id: id,
             kind: submission.kind,
             status: IngestStatus::Received,
             submitted_via: submission.submitted_via,
-            original_input: submission.original_input(),
+            original_input,
             source_url: submission.normalized_url.clone(),
             page_url: submission.page_url.clone(),
             page_title: submission.page_title.clone(),
@@ -599,6 +1012,18 @@ impl Ingest {
         self.status = target;
         Ok(())
     }
+
+    /// Decode the durable stage data through the single envelope boundary.
+    /// Legacy rows are upgraded in memory and become canonical on the next
+    /// state mutation.
+    pub fn input_data(&self) -> Result<IngestData, IngestDataError> {
+        IngestData::decode(&self.original_input)
+    }
+
+    pub fn set_input_data(&mut self, data: IngestData) -> Result<(), IngestDataError> {
+        self.original_input = data.encode()?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Error)]
@@ -624,6 +1049,8 @@ pub enum IngestValidationError {
     EmptyIdempotencyKey,
     #[error("idempotency key must be at most {MAX_IDEMPOTENCY_KEY_LENGTH} characters")]
     IdempotencyKeyTooLong,
+    #[error("invalid ingest input envelope: {0}")]
+    InvalidInputEnvelope(String),
     #[error("supplied tags must not contain empty values")]
     EmptyTag,
     #[error("requested action is invalid")]
@@ -1073,5 +1500,101 @@ mod tests {
         request.transition_to(IngestStatus::Cancelled).expect("request should be cancellable");
 
         assert!(request.transition_to(IngestStatus::Queued).is_err());
+    }
+
+    #[test]
+    fn new_submissions_write_the_versioned_envelope_without_changing_request_hash() {
+        let value = submission("https://example.com/clip.mp4");
+        let legacy_input = value.original_input.clone();
+        let hash = value.request_hash();
+        let request = Ingest::from_submission(Uuid::now_v7(), &value);
+
+        assert_eq!(request.original_input["version"], INGEST_DATA_VERSION);
+        assert_eq!(request.original_input["source"]["url"], "https://example.com/clip.mp4");
+        assert_eq!(
+            request.input_data().unwrap().source_url(),
+            Some("https://example.com/clip.mp4")
+        );
+        assert_eq!(value.original_input, legacy_input);
+        assert_eq!(value.request_hash(), hash);
+    }
+
+    #[test]
+    fn current_legacy_stage_rows_upgrade_to_typed_data() {
+        let legacy = json!({
+            "url": "https://example.com/clip.mp4",
+            "page_title": "legacy title",
+            "inspection": {
+                "adapter": "direct_http",
+                "source_url": "https://example.com/clip.mp4",
+                "resolved_url": null,
+                "media_kind": "video",
+                "mime_type": "video/mp4",
+                "content_length_bytes": 12,
+                "title": null,
+                "metadata": {}
+            },
+            "download": {
+                "bytes": 12,
+                "mime_type": "video/mp4",
+                "media_kind": "video"
+            },
+            "probed_media_kind": "video"
+        });
+        let data = IngestData::decode(&legacy).expect("legacy row should decode");
+        assert_eq!(data.version, INGEST_DATA_VERSION);
+        assert_eq!(data.source_url(), Some("https://example.com/clip.mp4"));
+        assert_eq!(data.inspection.as_ref().unwrap().adapter, "direct_http");
+        assert_eq!(data.download.as_ref().unwrap().bytes, 12);
+        assert_eq!(data.media_kind(), Some(SourceMediaKind::Video));
+
+        let canonical = data.encode().unwrap();
+        assert_eq!(canonical["version"], INGEST_DATA_VERSION);
+        assert!(canonical.get("inspection").is_some());
+        assert!(canonical.get("download").is_some());
+        assert!(canonical.get("url").is_none());
+        assert!(canonical["source"].get("inspection").is_none());
+        assert_eq!(IngestData::decode(&canonical).unwrap().inspection, data.inspection);
+    }
+
+    #[test]
+    fn telegram_and_decision_rows_are_forward_readable() {
+        let media_id = Uuid::now_v7();
+        let legacy = json!({
+            "source_type": "telegram",
+            "telegram_workspace_id": Uuid::now_v7(),
+            "telegram_file_id": "file-id",
+            "telegram_file_unique_id": "unique-id",
+            "file_size": 42,
+            "mime_type": "video/mp4",
+            "file_name": "clip.mp4",
+            "media_kind": "video",
+            "_sooqa_duplicate_decision_v1": {
+                "version": 1,
+                "kind": "accepted",
+                "media_id": media_id
+            }
+        });
+        let data = IngestData::decode(&legacy).expect("Telegram row should decode");
+        assert_eq!(data.source.telegram_file_id.as_deref(), Some("file-id"));
+        assert_eq!(data.source.file_size, Some(42));
+        assert_eq!(data.duplicate_decision.unwrap().media_id, media_id);
+    }
+
+    #[test]
+    fn corrupt_and_unsupported_envelopes_fail_boundedly() {
+        assert!(matches!(
+            IngestData::decode(&json!({"version": 2, "source": {}})),
+            Err(IngestDataError::UnsupportedVersion(2))
+        ));
+        assert!(matches!(
+            IngestData::decode(&json!({"version": 1, "source": "not-an-object"})),
+            Err(IngestDataError::Malformed(_))
+        ));
+        assert!(matches!(
+            IngestData::decode(&json!({"version": 1, "source": {}, "probe": "broken"})),
+            Err(IngestDataError::Malformed(_))
+        ));
+        assert!(matches!(IngestData::decode(&json!(null)), Err(IngestDataError::NotAnObject)));
     }
 }

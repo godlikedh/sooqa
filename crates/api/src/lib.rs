@@ -342,6 +342,9 @@ fn map_validation_error(error: IngestValidationError, headers: &HeaderMap) -> Ap
             "requested_post_caption_invalid",
             "The requested public post text contains a disallowed control character",
         ),
+        IngestValidationError::InvalidInputEnvelope(_) => {
+            ("invalid_ingest_input", "The submitted media metadata is invalid")
+        }
     };
     ApiError::bad_request(code, message, headers)
 }

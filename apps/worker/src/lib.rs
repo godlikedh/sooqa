@@ -767,10 +767,13 @@ async fn ensure_telegram_source(
     request: &sooqa_inbox::Ingest,
     telegram_source: Option<&dyn TelegramSourceDownloader>,
 ) -> Result<(), HandlerFailure> {
-    let file_id = request
-        .original_input
-        .get("telegram_file_id")
-        .and_then(serde_json::Value::as_str)
+    let input_data = request
+        .input_data()
+        .map_err(|error| HandlerFailure::permanent("invalid_ingest_state", error.to_string()))?;
+    let file_id = input_data
+        .source
+        .telegram_file_id
+        .as_deref()
         .filter(|file_id| !file_id.is_empty())
         .ok_or_else(|| {
             HandlerFailure::permanent(
@@ -862,8 +865,20 @@ async fn normalize_asset(
         Ok(AssetNormalizationStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
     };
-    let probe = match request.original_input.get("probe").cloned() {
-        Some(probe) => match serde_json::from_value::<MediaProbe>(probe) {
+    let input_data = match request.input_data() {
+        Ok(input_data) => input_data,
+        Err(error) => {
+            return fail_normalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent("invalid_ingest_state", error.to_string()),
+            )
+            .await;
+        }
+    };
+    let probe = match input_data.probe {
+        Some(probe) => match probe.decode::<MediaProbe>() {
             Ok(probe) => probe,
             Err(error) => {
                 return fail_normalization(
@@ -1532,12 +1547,7 @@ async fn normalize_exact_asset(
 }
 
 fn source_mime_type(request: &sooqa_inbox::Ingest) -> Option<String> {
-    let value = if request.kind == IngestKind::Url {
-        request.original_input.get("download").and_then(|value| value.get("mime_type"))
-    } else {
-        request.original_input.get("mime_type")
-    };
-    value.and_then(serde_json::Value::as_str).map(ToOwned::to_owned)
+    request.input_data().ok()?.mime_type().map(ToOwned::to_owned)
 }
 
 fn normalization_error_is_retryable(error: &NormalizationExecutionError) -> bool {
@@ -1549,17 +1559,7 @@ fn normalization_error_is_retryable(error: &NormalizationExecutionError) -> bool
 }
 
 fn request_media_kind(request: &sooqa_inbox::Ingest) -> Option<SourceMediaKind> {
-    if let Some(value) = request.original_input.get("probed_media_kind")
-        && let Ok(media_kind) = serde_json::from_value(value.clone())
-    {
-        return Some(media_kind);
-    }
-    let value = if request.kind == IngestKind::Url {
-        request.original_input.get("download")?.get("media_kind")?
-    } else {
-        request.original_input.get("media_kind")?
-    };
-    serde_json::from_value(value.clone()).ok()
+    request.input_data().ok()?.media_kind()
 }
 
 fn probe_media_kind(probe: &MediaProbe) -> Option<SourceMediaKind> {
@@ -1717,22 +1717,20 @@ async fn finalize_ingest(
         Ok(IngestFinalizationStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
     };
-    let normalization = match request.original_input.get("normalization").cloned() {
-        Some(value) => match serde_json::from_value::<AssetNormalization>(value) {
-            Ok(normalization) => normalization,
-            Err(error) => {
-                return fail_finalization(
-                    inbox,
-                    ingest_request_id,
-                    &job_attempt,
-                    HandlerFailure::permanent(
-                        "invalid_ingest_state",
-                        format!("stored normalization metadata could not be decoded: {error}"),
-                    ),
-                )
-                .await;
-            }
-        },
+    let input_data = match request.input_data() {
+        Ok(input_data) => input_data,
+        Err(error) => {
+            return fail_finalization(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent("invalid_ingest_state", error.to_string()),
+            )
+            .await;
+        }
+    };
+    let normalization = match input_data.normalization {
+        Some(normalization) => normalization,
         None => {
             return fail_finalization(
                 inbox,
@@ -1839,22 +1837,20 @@ async fn compute_fingerprint(
         Ok(IngestFingerprintStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
     };
-    let normalization = match request.original_input.get("normalization").cloned() {
-        Some(value) => match serde_json::from_value::<AssetNormalization>(value) {
-            Ok(normalization) => normalization,
-            Err(error) => {
-                return fail_fingerprint(
-                    inbox,
-                    ingest_request_id,
-                    &job_attempt,
-                    HandlerFailure::permanent(
-                        "invalid_ingest_state",
-                        format!("stored normalization metadata could not be decoded: {error}"),
-                    ),
-                )
-                .await;
-            }
-        },
+    let input_data = match request.input_data() {
+        Ok(input_data) => input_data,
+        Err(error) => {
+            return fail_fingerprint(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent("invalid_ingest_state", error.to_string()),
+            )
+            .await;
+        }
+    };
+    let normalization = match input_data.normalization {
+        Some(normalization) => normalization,
         None => {
             return fail_fingerprint(
                 inbox,
@@ -2284,21 +2280,23 @@ fn ytdlp_provenance_for_request(request: &sooqa_inbox::Ingest) -> Option<YtDlpPr
     if request.kind != IngestKind::Url {
         return None;
     }
-    let inspection = request.original_input.get("inspection")?;
-    if inspection.get("adapter").and_then(serde_json::Value::as_str) != Some("yt_dlp") {
+    let input_data = request.input_data().ok()?;
+    let inspection = input_data.inspection.as_ref()?;
+    if inspection.adapter != "yt_dlp" {
         return None;
     }
-    let metadata = inspection.get("metadata")?;
+    let metadata = &inspection.metadata;
+    let canonical_url = inspection
+        .resolved_url
+        .as_deref()
+        .or_else(|| metadata.get("webpage_url").and_then(serde_json::Value::as_str));
     Some(YtDlpProvenance {
         platform: bounded_provenance_string(metadata.get("platform"), 64),
         content_id: bounded_provenance_string(metadata.get("id"), 256),
         extractor: bounded_provenance_string(metadata.get("extractor"), 128),
         uploader: bounded_provenance_string(metadata.get("uploader"), 4 * 1024),
         title: bounded_provenance_string(metadata.get("title"), 4 * 1024),
-        canonical_url: bounded_provenance_string(
-            inspection.get("resolved_url").or_else(|| metadata.get("webpage_url")),
-            2 * 1024,
-        ),
+        canonical_url: bounded_provenance_text(canonical_url, 2 * 1024),
     })
 }
 
@@ -2313,20 +2311,20 @@ fn bounded_provenance_string(
     Some(value.to_owned())
 }
 
+fn bounded_provenance_text(value: Option<&str>, max_bytes: usize) -> Option<String> {
+    let value = value?;
+    if value.len() > max_bytes || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
 fn original_source_url(request: &sooqa_inbox::Ingest) -> String {
     request
-        .original_input
-        .get("url")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            request
-                .original_input
-                .get("source")
-                .and_then(|value| value.get("url"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .unwrap_or(&request.source_url)
-        .to_owned()
+        .input_data()
+        .ok()
+        .and_then(|data| data.source_url().map(ToOwned::to_owned))
+        .unwrap_or_else(|| request.source_url.clone())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -2362,40 +2360,31 @@ struct SourceProvenance {
 }
 
 fn source_provenance_for_request(request: &sooqa_inbox::Ingest) -> serde_json::Value {
-    let input = &request.original_input;
-    let download = input.get("download");
+    let input_data = request.input_data().ok();
+    let download = input_data.as_ref().and_then(|data| data.download.as_ref());
     let media_kind = request_media_kind(request);
-    let mime_type = if request.kind == IngestKind::Url {
-        download
-            .and_then(|value| value.get("mime_type"))
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned)
-    } else {
-        input.get("mime_type").and_then(serde_json::Value::as_str).map(ToOwned::to_owned)
-    };
-    let source_size_bytes = if request.kind == IngestKind::Url {
-        download.and_then(|value| value.get("bytes")).and_then(serde_json::Value::as_u64)
-    } else {
-        input.get("file_size").and_then(serde_json::Value::as_u64)
-    };
-    let two_ch_mirror = input
-        .get("inspection")
-        .and_then(|value| value.get("metadata"))
-        .and_then(|value| value.get("two_ch_mirror"))
+    let mime_type = download
+        .and_then(|download| download.mime_type.clone())
+        .or_else(|| input_data.as_ref().and_then(|data| data.source.mime_type.clone()));
+    let source_size_bytes = download
+        .map(|download| download.bytes)
+        .or_else(|| input_data.as_ref().and_then(|data| data.source.file_size));
+    let two_ch_mirror = input_data
+        .as_ref()
+        .and_then(|data| data.inspection.as_ref())
+        .and_then(|inspection| inspection.metadata.get("two_ch_mirror"))
         .cloned();
     let ytdlp = ytdlp_provenance_for_request(request);
+    let source = input_data.as_ref().map(|data| &data.source);
     let provenance = SourceProvenance {
         page_url: request.page_url.clone(),
         media_kind,
         mime_type,
         source_size_bytes,
-        telegram_update_id: input.get("telegram_update_id").and_then(serde_json::Value::as_i64),
-        telegram_chat_id: input.get("telegram_chat_id").and_then(serde_json::Value::as_i64),
-        telegram_message_id: input.get("telegram_message_id").and_then(serde_json::Value::as_i64),
-        telegram_file_unique_id: input
-            .get("telegram_file_unique_id")
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned),
+        telegram_update_id: source.and_then(|source| source.telegram_update_id),
+        telegram_chat_id: source.and_then(|source| source.telegram_chat_id),
+        telegram_message_id: source.and_then(|source| source.telegram_message_id),
+        telegram_file_unique_id: source.and_then(|source| source.telegram_file_unique_id.clone()),
         two_ch_mirror,
         platform: ytdlp.as_ref().and_then(|metadata| metadata.platform.clone()),
         platform_content_id: ytdlp.as_ref().and_then(|metadata| metadata.content_id.clone()),
@@ -4112,15 +4101,24 @@ mod tests {
         input.page_url = Some("https://2ch.life/b/res/123".to_owned());
         let submission = IngestSubmission::try_new(input).expect("submission should validate");
         let mut request = Ingest::from_submission(Uuid::new_v4(), &submission);
-        request.original_input["inspection"] = serde_json::json!({
-            "metadata": {
+        let mut input_data = request.input_data().expect("envelope should decode");
+        input_data.inspection = Some(sooqa_inbox::SourceInspection {
+            adapter: "two_ch".to_owned(),
+            source_url: "https://2ch.life/b/src/clip.webm".to_owned(),
+            resolved_url: Some("https://2ch.org/b/src/clip.webm".to_owned()),
+            media_kind: SourceMediaKind::Video,
+            mime_type: Some("video/webm".to_owned()),
+            content_length_bytes: None,
+            title: None,
+            metadata: serde_json::json!({
                 "two_ch_mirror": {
                     "submitted_host": "2ch.life",
                     "selected_host": "2ch.org",
                     "selected_url": "https://2ch.org/b/src/clip.webm"
                 }
-            }
+            }),
         });
+        request.set_input_data(input_data).expect("envelope should encode");
 
         let metadata = source_provenance_for_request(&request);
         assert_eq!(metadata["page_url"], "https://2ch.life/b/res/123");
@@ -4153,18 +4151,25 @@ mod tests {
         ))
         .expect("submission should validate");
         let mut request = Ingest::from_submission(Uuid::new_v4(), &submission);
-        request.original_input["inspection"] = serde_json::json!({
-            "adapter": "yt_dlp",
-            "resolved_url": "https://www.tiktok.com/@creator/video/123456",
-            "metadata": {
+        let mut input_data = request.input_data().expect("envelope should decode");
+        input_data.inspection = Some(sooqa_inbox::SourceInspection {
+            adapter: "yt_dlp".to_owned(),
+            source_url: "https://vm.tiktok.com/ZMshare/".to_owned(),
+            resolved_url: Some("https://www.tiktok.com/@creator/video/123456".to_owned()),
+            media_kind: SourceMediaKind::Video,
+            mime_type: Some("video/mp4".to_owned()),
+            content_length_bytes: None,
+            title: None,
+            metadata: serde_json::json!({
                 "platform": "tiktok",
                 "id": "123456",
                 "extractor": "TikTok",
                 "uploader": "creator",
                 "title": "A public clip",
                 "webpage_url": "https://www.tiktok.com/@creator/video/123456"
-            }
+            }),
         });
+        request.set_input_data(input_data).expect("envelope should encode");
 
         let source = source_record_for_request(&request);
         assert_eq!(source.original_url.as_deref(), Some("https://vm.tiktok.com/ZMshare/"));

@@ -228,6 +228,12 @@ ingests, while reset opens them in a new storage generation. Marking an upload
 unknown also fails linked active ingests explicitly instead of leaving them
 waiting forever. Independently scheduled work such as
 `materialize_publication`, `publish_post`, and maintenance remains separate.
+The `ingests.input_json` column uses the versioned `IngestData` envelope owned
+by Inbox: source snapshots and stage artifacts are typed, while the scalar
+ingest columns remain authoritative for request identity, publication intent,
+workflow state, and errors. Current five-table rows are forward-read and
+canonicalized on their next fenced transition; malformed or unsupported
+envelopes fail with a bounded diagnostic.
 Materialization is database-only: it locks the completed ingest, ready media,
 and captured target snapshot, then commits the intended post and its
 fixed-dedupe publication job without network I/O.
