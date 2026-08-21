@@ -32,4 +32,3 @@ async-trait.workspace = true
 image.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
-sooqa-test-support = { path = "../../crates/test-support" }

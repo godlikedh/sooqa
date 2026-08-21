@@ -1,7 +1,36 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+use async_trait::async_trait;
 use sooqa_inbox::{SourceInspection, SourceMediaKind};
-use sooqa_media::{SourceDownloader, SourceInput};
-use sooqa_test_support::FakeSourceDownloader;
+use sooqa_media::{DownloadError, SourceDownloader, SourceInput};
 use uuid::Uuid;
+
+#[derive(Clone)]
+struct FakeSourceDownloader {
+    outcome: Arc<SourceInspection>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl FakeSourceDownloader {
+    fn successful(inspection: SourceInspection) -> Self {
+        Self { outcome: Arc::new(inspection), calls: Arc::new(AtomicUsize::new(0)) }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl SourceDownloader for FakeSourceDownloader {
+    async fn inspect(&self, _source: &SourceInput) -> Result<SourceInspection, DownloadError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(self.outcome.as_ref().clone())
+    }
+}
 
 #[tokio::test]
 async fn source_inspection_adapter_remains_independent_of_persistence() {
