@@ -3274,25 +3274,29 @@ impl Worker {
                 Ok(HandlerRunOutcome::Completed(result))
             }
             result = &mut heartbeat_task => {
-                let result = result.map_err(map_heartbeat_join_error)?;
-                match result {
-                    Ok(()) => Err(WorkerError::HeartbeatTask(
+                let heartbeat_error = match result {
+                    Ok(Ok(())) => WorkerError::HeartbeatTask(
                         "heartbeat loop stopped while the handler was active".to_owned(),
-                    )),
-                    Err(error) if cancellable => {
-                        cancellation.cancel();
-                        let result = (&mut handler_future).await;
-                        let result = match result {
-                            Ok(()) => Err(HandlerFailure::permanent(
-                                "heartbeat_lost",
-                                "worker heartbeat stopped while the upload was active",
-                            )),
-                            Err(failure) => Err(failure),
-                        };
-                        let _ = error;
-                        Ok(HandlerRunOutcome::Completed(result))
-                    }
-                    Err(error) => Err(WorkerError::Repository(error)),
+                    ),
+                    Ok(Err(error)) => WorkerError::Repository(error),
+                    Err(error) => map_heartbeat_join_error(error),
+                };
+                if cancellable {
+                    cancellation.cancel();
+                    let result = (&mut handler_future).await;
+                    let result = match result {
+                        Ok(()) => Err(HandlerFailure::permanent(
+                            "heartbeat_lost",
+                            "worker heartbeat stopped while the upload was active",
+                        )),
+                        Err(failure) => Err(failure),
+                    };
+                    Ok(HandlerRunOutcome::HeartbeatFailed {
+                        result,
+                        error: heartbeat_error,
+                    })
+                } else {
+                    Err(heartbeat_error)
                 }
             }
         }
@@ -3371,6 +3375,7 @@ pub enum WorkerError {
 enum HandlerRunOutcome {
     Completed(Result<(), HandlerFailure>),
     ShutdownCompleted(Result<(), HandlerFailure>),
+    HeartbeatFailed { result: Result<(), HandlerFailure>, error: WorkerError },
     Shutdown,
 }
 

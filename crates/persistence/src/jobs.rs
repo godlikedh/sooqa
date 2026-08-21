@@ -408,14 +408,6 @@ impl JobRepository {
                              FROM media
                              WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
                                AND media.storage_state = 'pending_storage'
-                               AND media.storage_token IS NOT NULL
-                         ) THEN max_attempts
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
-                               AND media.storage_state = 'pending_storage'
                                AND media.storage_token IS NULL
                          ) THEN GREATEST(attempt_count - 1, 0)
                     ELSE attempt_count
@@ -509,7 +501,10 @@ impl JobRepository {
                     .await?;
                 }
             }
-            if job.state == "failed" && job.attempt_count >= job.max_attempts {
+            if job.state == "failed"
+                && (job.attempt_count >= job.max_attempts
+                    || job.kind == JobType::UploadStorageAsset.as_str())
+            {
                 reconcile_exhausted_job(&mut transaction, job).await?;
             }
         }

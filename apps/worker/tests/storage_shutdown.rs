@@ -433,7 +433,7 @@ async fn stale_active_storage_reservation_reconciles_unknown_after_grace(pool: s
             .fetch_one(database.pool())
             .await
             .unwrap(),
-        5
+        1
     );
     tokio::fs::remove_dir_all(fixture.root).await.unwrap();
 }
@@ -536,12 +536,15 @@ async fn heartbeat_loss_before_storage_dispatch_releases_and_requeues_final_atte
         0
     );
     continue_release.notify_one();
-    shutdown_sender.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(8), worker_task)
+    let _ = shutdown_sender.send(());
+    let worker_result = tokio::time::timeout(Duration::from_secs(8), worker_task)
         .await
         .expect("worker should stop after safe heartbeat cancellation")
-        .expect("worker task should join")
-        .expect("safe heartbeat cancellation should not fail the worker");
+        .expect("worker task should join");
+    assert!(
+        worker_result.is_err(),
+        "the heartbeat supervisor error should surface after the safe requeue"
+    );
 
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1")
