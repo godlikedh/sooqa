@@ -1,4 +1,4 @@
-use crate::library::LibraryRepositoryError;
+use crate::library::{LibraryRepositoryError, VideoIdentityPreparation, VideoIdentitySession};
 use crate::publisher::select_enabled_channel_candidates;
 use crate::{
     WORKSPACE_CLEANUP_RETENTION,
@@ -15,9 +15,9 @@ use sooqa_inbox::{
 use sooqa_jobs::{JobLease, NewJob};
 use sooqa_library::{
     MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, MediaIngest,
-    VideoDuplicateClassification, VideoDuplicateEvidence, VideoIdentityOutcome,
+    VideoDuplicateClassification, VideoDuplicateEvidence, VideoFingerprintInput,
+    VideoIdentityDecision, VideoIdentityOutcome,
 };
-use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint};
 use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -51,6 +51,13 @@ pub struct DuplicatePendingIngest {
 pub struct AcceptDuplicateResult {
     pub ingest: Ingest,
     pub replayed: bool,
+}
+
+/// The short preparation transaction has completed and the global identity
+/// session remains held while the worker performs CPU alignment.
+pub enum IngestVideoIdentityStart {
+    AlreadyAdvanced(Ingest),
+    Ready { ingest: Ingest, preparation: VideoIdentityPreparation, session: VideoIdentitySession },
 }
 
 impl InboxRepository {
@@ -864,15 +871,98 @@ impl InboxRepository {
         Ok(start)
     }
 
-    pub async fn finalize_video_identity(
+    pub async fn begin_video_identity(
         &self,
         id: Uuid,
         attempt: &JobLease,
+        ingest: &MediaIngest,
+        fingerprint: Option<&VideoFingerprintInput>,
+    ) -> Result<IngestVideoIdentityStart, InboxRepositoryError> {
+        let mut session = VideoIdentitySession::acquire(&self.pool).await?;
+        let result = async {
+            let mut transaction = session.begin().await?;
+            let request = load_request(&mut transaction, id).await?;
+            if request.status != IngestStatus::Fingerprinting
+                || !lock_current_job_attempt(&mut transaction, attempt).await?
+            {
+                transaction.commit().await?;
+                return Ok(Err(request));
+            }
+            let preparation =
+                crate::library::LibraryRepository::prepare_video_identity_in_transaction(
+                    &mut transaction,
+                    ingest,
+                    fingerprint,
+                    request.force_save,
+                )
+                .await?;
+            transaction.commit().await?;
+            Ok(Ok((request, preparation)))
+        }
+        .await;
+        match result {
+            Ok(Ok((ingest, preparation))) => {
+                Ok(IngestVideoIdentityStart::Ready { ingest, preparation, session })
+            }
+            Ok(Err(request)) => {
+                session.release().await?;
+                Ok(IngestVideoIdentityStart::AlreadyAdvanced(request))
+            }
+            Err(error) => {
+                let _ = session.release().await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn abort_video_identity(
+        &self,
+        session: VideoIdentitySession,
+    ) -> Result<(), InboxRepositoryError> {
+        session.release().await?;
+        Ok(())
+    }
+
+    pub async fn complete_video_identity(
+        &self,
+        id: Uuid,
+        attempt: &JobLease,
+        session: VideoIdentitySession,
         ingest: MediaIngest,
-        fingerprint: Option<&VideoSequenceFingerprint>,
-        config: SequenceAlignmentConfig,
+        fingerprint: Option<&VideoFingerprintInput>,
+        decision: &VideoIdentityDecision,
     ) -> Result<Ingest, InboxRepositoryError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut session = session;
+        let result = self
+            .complete_video_identity_while_locked(
+                id,
+                attempt,
+                &mut session,
+                &ingest,
+                fingerprint,
+                decision,
+            )
+            .await;
+        let release = session.release().await;
+        match result {
+            Err(error) => Err(error),
+            Ok(request) => {
+                release?;
+                Ok(request)
+            }
+        }
+    }
+
+    async fn complete_video_identity_while_locked(
+        &self,
+        id: Uuid,
+        attempt: &JobLease,
+        session: &mut VideoIdentitySession,
+        ingest: &MediaIngest,
+        fingerprint: Option<&VideoFingerprintInput>,
+        decision: &VideoIdentityDecision,
+    ) -> Result<Ingest, InboxRepositoryError> {
+        let mut transaction = session.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
         if request.status != IngestStatus::Fingerprinting
             || !lock_current_job_attempt(&mut transaction, attempt).await?
@@ -881,11 +971,11 @@ impl InboxRepository {
             return Ok(request);
         }
 
-        let outcome = crate::library::LibraryRepository::resolve_video_identity_in_transaction(
+        let outcome = crate::library::LibraryRepository::persist_video_identity_in_transaction(
             &mut transaction,
-            &ingest,
+            ingest,
             fingerprint,
-            config,
+            decision,
             request.force_save,
         )
         .await?;

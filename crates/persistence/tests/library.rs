@@ -4,9 +4,9 @@ use sooqa_library::{
     CaptionSyncCompletion, CaptionSyncState, MediaIngest, MediaKind, MediaMetadata,
     MediaSearchQuery, MediaSourceInput, MediaUpdate, NewMedia, SourceKind, StorageUploadAttachment,
     StorageUploadReservation, StorageUploadReservationRequest, StorageUploadStore,
-    VideoIdentityOutcome,
+    VideoFingerprintInput,
 };
-use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint, VideoSequenceSample};
+use sooqa_media::{VideoSequenceFingerprint, VideoSequenceSample};
 use sooqa_persistence::{Database, LibraryRepositoryError};
 use uuid::Uuid;
 
@@ -54,6 +54,15 @@ fn exact_ingest(kind: MediaKind, sha256: Vec<u8>, source: &str) -> MediaIngest {
     ingest.media.kind = kind;
     ingest.metadata.kind = kind;
     ingest
+}
+
+fn fingerprint_input(fingerprint: &VideoSequenceFingerprint) -> VideoFingerprintInput {
+    VideoFingerprintInput::try_new(
+        fingerprint.version.as_str(),
+        fingerprint.encode().unwrap(),
+        fingerprint.search_tokens(),
+    )
+    .unwrap()
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -344,10 +353,20 @@ async fn video_fingerprint_shortlist_uses_tokens_state_and_version_bounds(pool: 
 
     let fingerprint = test_sequence(0x1234_5678_9abc_def0);
     let tokens = fingerprint.search_tokens();
-    repository.record_video_sequence_fingerprint(incoming.media.id, &fingerprint).await.unwrap();
-    repository.record_video_sequence_fingerprint(pending.media.id, &fingerprint).await.unwrap();
-    repository.record_video_sequence_fingerprint(ready.media.id, &fingerprint).await.unwrap();
-    repository.record_video_sequence_fingerprint(unknown.media.id, &fingerprint).await.unwrap();
+    let fingerprint_input = fingerprint_input(&fingerprint);
+    repository
+        .record_video_sequence_fingerprint(incoming.media.id, &fingerprint_input)
+        .await
+        .unwrap();
+    repository
+        .record_video_sequence_fingerprint(pending.media.id, &fingerprint_input)
+        .await
+        .unwrap();
+    repository.record_video_sequence_fingerprint(ready.media.id, &fingerprint_input).await.unwrap();
+    repository
+        .record_video_sequence_fingerprint(unknown.media.id, &fingerprint_input)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = -100123, telegram_storage_message_id = 501, telegram_file_id = 'ready-501' WHERE id = $1",
     )
@@ -408,7 +427,7 @@ async fn video_fingerprint_shortlist_is_capped_at_twenty(pool: sqlx::PgPool) {
             .await
             .unwrap();
         repository
-            .record_video_sequence_fingerprint(candidate.media.id, &fingerprint)
+            .record_video_sequence_fingerprint(candidate.media.id, &fingerprint_input(&fingerprint))
             .await
             .unwrap();
         media_ids.push(candidate.media.id);
@@ -420,176 +439,6 @@ async fn video_fingerprint_shortlist_is_capped_at_twenty(pool: sqlx::PgPool) {
         .unwrap();
     assert_eq!(candidates.len(), 20);
     assert!(candidates.iter().all(|candidate| candidate.shared_token_count >= 8));
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires PostgreSQL"]
-async fn video_identity_reuses_exact_sha_and_stores_fingerprint_before_storage(pool: sqlx::PgPool) {
-    let database = Database::from_pool(pool);
-    let repository = database.library();
-    let fingerprint = test_sequence(0x1111_2222_3333_4444);
-    let first = repository
-        .resolve_video_identity(
-            ingest(vec![41_u8; 32], "https://example.test/exact-first"),
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
-            false,
-        )
-        .await
-        .unwrap();
-    let media_id = match first {
-        VideoIdentityOutcome::NewMedia { media_id } => media_id,
-        other => panic!("expected a new media reservation, got {other:?}"),
-    };
-    let second = repository
-        .resolve_video_identity(
-            ingest(vec![41_u8; 32], "https://example.test/exact-second"),
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(second, VideoIdentityOutcome::ExactDuplicate { media_id });
-    let (storage_state, fingerprint_version, fingerprint_data, tokens) = sqlx::query_as::<
-        _,
-        (String, Option<String>, Option<Vec<u8>>, Option<Vec<i64>>),
-    >(
-        "SELECT storage_state, fingerprint_version, fingerprint_data, fingerprint_search_tokens FROM media WHERE id = $1",
-    )
-    .bind(media_id)
-    .fetch_one(database.pool())
-    .await
-    .unwrap();
-    assert_eq!(storage_state, "pending_storage");
-    assert_eq!(fingerprint_version, Some("video_sequence_v1".to_owned()));
-    assert_eq!(VideoSequenceFingerprint::decode(&fingerprint_data.unwrap()).unwrap(), fingerprint);
-    assert_eq!(tokens.unwrap(), fingerprint.search_tokens());
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM media WHERE canonical_sha256 = $1")
-            .bind(vec![41_u8; 32])
-            .fetch_one(database.pool())
-            .await
-            .unwrap(),
-        1
-    );
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires PostgreSQL"]
-async fn strong_video_match_stops_before_media_insertion_and_force_save_bypasses_it(
-    pool: sqlx::PgPool,
-) {
-    let database = Database::from_pool(pool);
-    let repository = database.library();
-    let fingerprint = test_sequence(0x5555_6666_7777_8888);
-    let first = repository
-        .resolve_video_identity(
-            ingest(vec![42_u8; 32], "https://example.test/perceptual-first"),
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
-            false,
-        )
-        .await
-        .unwrap();
-    let first_id = match first {
-        VideoIdentityOutcome::NewMedia { media_id } => media_id,
-        other => panic!("expected a new media reservation, got {other:?}"),
-    };
-    let pending = repository
-        .resolve_video_identity(
-            ingest(vec![43_u8; 32], "https://example.test/perceptual-second"),
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
-            false,
-        )
-        .await
-        .unwrap();
-    let pending_id = match pending {
-        VideoIdentityOutcome::DuplicatePending { evidence } => {
-            assert!(!evidence.matches.is_empty());
-            assert!(evidence.matches.len() <= 3);
-            assert!(serde_json::to_vec(&evidence).unwrap().len() <= 16 * 1024);
-            evidence.matches[0].media_id
-        }
-        other => panic!("expected duplicate_pending, got {other:?}"),
-    };
-    assert_eq!(pending_id, first_id);
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM media WHERE canonical_sha256 = $1")
-            .bind(vec![43_u8; 32])
-            .fetch_one(database.pool())
-            .await
-            .unwrap(),
-        0
-    );
-
-    let forced = repository
-        .resolve_video_identity(
-            ingest(vec![43_u8; 32], "https://example.test/perceptual-second"),
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
-            true,
-        )
-        .await
-        .unwrap();
-    let forced_id = match forced {
-        VideoIdentityOutcome::NewMedia { media_id } => media_id,
-        other => panic!("expected force-save to create a new reservation, got {other:?}"),
-    };
-    assert_ne!(forced_id, first_id);
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires PostgreSQL"]
-async fn concurrent_equivalent_videos_share_the_identity_barrier(pool: sqlx::PgPool) {
-    let database = Database::from_pool(pool);
-    let repository = database.library();
-    let fingerprint = test_sequence(0x9999_aaaa_bbbb_cccc);
-    let left = ingest(vec![51_u8; 32], "https://example.test/concurrent-left");
-    let right = ingest(vec![52_u8; 32], "https://example.test/concurrent-right");
-    let (left, right) = tokio::join!(
-        repository.resolve_video_identity(
-            left,
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
-            false,
-        ),
-        repository.resolve_video_identity(
-            right,
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
-            false,
-        )
-    );
-    let left = left.unwrap();
-    let right = right.unwrap();
-    let outcomes = [left, right];
-    let new_ids = outcomes
-        .iter()
-        .filter_map(|outcome| match outcome {
-            VideoIdentityOutcome::NewMedia { media_id } => Some(*media_id),
-            VideoIdentityOutcome::ExactDuplicate { .. }
-            | VideoIdentityOutcome::DuplicatePending { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(new_ids.len(), 1, "equivalent videos must reserve at most one media row");
-    assert!(
-        outcomes
-            .iter()
-            .any(|outcome| { matches!(outcome, VideoIdentityOutcome::DuplicatePending { .. }) })
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM media WHERE canonical_sha256 IN ($1, $2)",
-        )
-        .bind(vec![51_u8; 32])
-        .bind(vec![52_u8; 32])
-        .fetch_one(database.pool())
-        .await
-        .unwrap(),
-        1
-    );
 }
 
 fn test_sequence(seed: u64) -> VideoSequenceFingerprint {

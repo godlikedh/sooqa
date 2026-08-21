@@ -17,6 +17,7 @@ use sooqa_inbox::{
 use sooqa_jobs::{JobType, NewJob};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
+    VideoFingerprintInput,
 };
 use sooqa_media::{
     CommandError, DownloadError, DownloadLimits, DownloadedSource, ExternalCommand,
@@ -28,7 +29,8 @@ use sooqa_telegram::{
     StorageUploadProvider, StorageUploadRequest, StorageUploadResult, TelegramStorageApi,
 };
 use sooqa_worker::{
-    TelegramSourceDownloader, cleanup_workspace_handler, compute_fingerprint_handler,
+    IdentityAlignmentHook, TelegramSourceDownloader, cleanup_workspace_handler,
+    compute_fingerprint_handler, compute_fingerprint_handler_with_alignment_hook,
     download_source_handler, inspect_source_handler, probe_asset_handler_with_telegram_source,
     upload_storage_asset_handler,
 };
@@ -506,18 +508,23 @@ async fn composed_identity_worker_has_bounded_storage_effects(pool: sqlx::PgPool
     .unwrap();
     let strong_candidate = database
         .library()
-        .resolve_video_identity(
-            video_media_ingest(vec![0x31; 32], "https://example.test/strong-candidate"),
-            &candidate_fingerprint,
-            sooqa_media::SequenceAlignmentConfig::default(),
-            false,
+        .resolve_media(video_media_ingest(vec![0x31; 32], "https://example.test/strong-candidate"))
+        .await
+        .unwrap();
+    let strong_candidate_id = strong_candidate.media.id;
+    database
+        .library()
+        .record_video_sequence_fingerprint(
+            strong_candidate_id,
+            &VideoFingerprintInput::try_new(
+                candidate_fingerprint.version.as_str(),
+                candidate_fingerprint.encode().unwrap(),
+                candidate_fingerprint.search_tokens(),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
-    let strong_candidate_id = match strong_candidate {
-        sooqa_library::VideoIdentityOutcome::NewMedia { media_id } => media_id,
-        other => panic!("expected candidate media, got {other:?}"),
-    };
     mark_media_ready(&database, strong_candidate_id).await;
 
     let strong =
@@ -540,6 +547,55 @@ async fn composed_identity_worker_has_bounded_storage_effects(pool: sqlx::PgPool
     assert_eq!(strong_request.status, IngestStatus::DuplicatePending);
     assert!(strong_request.media_id.is_none());
     assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    let force_save = prepare_fingerprint_request(
+        &database,
+        &work_root,
+        "force-save-strong",
+        b"force-save-bytes",
+    )
+    .await;
+    sqlx::query("UPDATE ingests SET force_save = true WHERE id = $1")
+        .bind(force_save.ingest_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let force_save_id = force_save.ingest_id;
+    run_fingerprint(
+        &database,
+        &work_root,
+        force_save,
+        FrameExtractor::with_runner(
+            "fake-ffmpeg",
+            Duration::from_secs(5),
+            64 * 1024,
+            Arc::new(IdentityFrameRunner { variant: 0, calls: Arc::new(AtomicUsize::new(0)) }),
+        ),
+    )
+    .await;
+    let force_save_request = database.inbox().find(force_save_id).await.unwrap().unwrap();
+    assert_eq!(force_save_request.status, IngestStatus::Storing);
+    let force_save_media_id =
+        force_save_request.media_id.expect("force-save should reserve a distinct media row");
+    assert_ne!(force_save_media_id, strong_candidate_id);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1")
+            .bind(force_save_media_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "pending_storage"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' = $1",
+        )
+        .bind(force_save_media_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        1
+    );
 
     let no_match_runner = IdentityFrameRunner { variant: 1, calls: Arc::new(AtomicUsize::new(0)) };
     let no_match =
@@ -566,21 +622,251 @@ async fn composed_identity_worker_has_bounded_storage_effects(pool: sqlx::PgPool
     let provider =
         StorageUploadProvider::new(storage_api.clone(), database.library(), -100123).unwrap();
     let upload_handler = upload_storage_asset_handler(database.inbox(), provider.clone());
-    let upload_job = database
-        .jobs()
-        .claim_next("storage-worker", Duration::from_secs(30), &[JobType::UploadStorageAsset])
-        .await
-        .unwrap()
-        .expect("no-match should enqueue one storage job");
-    upload_handler(upload_job).await.unwrap();
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let mut force_save_upload_seen = false;
+    let mut no_match_upload_seen = false;
+    for _ in 0..2 {
+        let upload_job = database
+            .jobs()
+            .claim_next("storage-worker", Duration::from_secs(30), &[JobType::UploadStorageAsset])
+            .await
+            .unwrap()
+            .expect("force-save and no-match should each enqueue one storage job");
+        let upload_media_id = match &upload_job.command {
+            sooqa_jobs::JobCommand::UploadStorageAsset(payload) => payload.media_id,
+            command => panic!("expected storage upload command, got {command:?}"),
+        };
+        upload_handler(upload_job).await.unwrap();
+        if upload_media_id == force_save_media_id {
+            force_save_upload_seen = true;
+        } else if upload_media_id == media_id {
+            no_match_upload_seen = true;
+        } else {
+            panic!("unexpected storage upload media {upload_media_id}");
+        }
+    }
+    assert!(force_save_upload_seen);
+    assert!(no_match_upload_seen);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
     provider.upload(sooqa_telegram::StorageUploadInput { media_id, generation: 0 }).await.unwrap();
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
     assert_eq!(
         database.inbox().find(no_match_id).await.unwrap().unwrap().status,
         IngestStatus::Completed
     );
 
+    fs::remove_dir_all(&work_root).await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn identity_alignment_is_outside_transactions_and_on_blocking_pool(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let work_root =
+        std::env::temp_dir().join(format!("sooqa-worker-identity-boundary-{}", Uuid::new_v4()));
+    let request =
+        prepare_fingerprint_request(&database, &work_root, "boundary", b"boundary-bytes").await;
+    let job = database
+        .jobs()
+        .claim_next(
+            "identity-boundary-worker",
+            Duration::from_secs(30),
+            &[JobType::ComputeFingerprint],
+        )
+        .await
+        .unwrap()
+        .expect("fingerprint job should be claimable");
+
+    let (entered_parent_sender, entered_parent_receiver) = std::sync::mpsc::channel();
+    let (entered_harness_sender, entered_harness_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));
+    let hook_release_receiver = Arc::clone(&release_receiver);
+    let (progress_sender, progress_receiver) = std::sync::mpsc::channel();
+    let (check_sender, check_receiver) = std::sync::mpsc::channel();
+    let (done_sender, done_receiver) = std::sync::mpsc::channel();
+    let harness_database = database.clone();
+    let harness_work_root = work_root.clone();
+    let harness_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(async move {
+            let hook: IdentityAlignmentHook = Arc::new(move || {
+                entered_parent_sender.send(()).expect("boundary test should still be listening");
+                entered_harness_sender
+                    .send(())
+                    .expect("boundary harness should still be listening");
+                hook_release_receiver
+                    .lock()
+                    .expect("boundary test mutex should not be poisoned")
+                    .recv()
+                    .expect("boundary test should release alignment");
+            });
+            let handler = compute_fingerprint_handler_with_alignment_hook(
+                harness_database.inbox(),
+                harness_database.library(),
+                harness_work_root,
+                FrameExtractor::with_runner(
+                    "fake-ffmpeg",
+                    Duration::from_secs(5),
+                    64 * 1024,
+                    Arc::new(IdentityFrameRunner {
+                        variant: 0,
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }),
+                ),
+                Some(hook),
+            );
+            let task = tokio::spawn(handler(job));
+            tokio::task::spawn_blocking(move || {
+                entered_harness_receiver.recv().expect("alignment should reach the boundary hook")
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+
+            // This task is scheduled only after the hook has entered and is
+            // waiting. A current-thread runtime can make progress here only
+            // when alignment is offloaded from the async runtime.
+            tokio::spawn(async move {
+                progress_sender.send(()).expect("progress receiver should be listening");
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            tokio::task::spawn_blocking(move || {
+                check_receiver.recv().expect("parent should finish its SQL check")
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            release_sender.send(()).expect("alignment hook should be released");
+            task.await.map_err(|error| error.to_string())?.map_err(|error| format!("{error:?}"))
+        });
+        done_sender.send(result).expect("boundary harness should report its result");
+    });
+
+    tokio::task::spawn_blocking(move || {
+        entered_parent_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("alignment should enter within the boundary timeout");
+    })
+    .await
+    .unwrap();
+
+    let progressed = tokio::task::spawn_blocking(move || {
+        progress_receiver.recv_timeout(Duration::from_secs(5)).is_ok()
+    })
+    .await
+    .unwrap();
+    assert!(progressed, "independent async work must progress while alignment waits");
+
+    let idle_transactions = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(idle_transactions, 0, "alignment must not retain a SQL transaction");
+    check_sender.send(()).expect("boundary harness should continue after its SQL check");
+
+    let result = tokio::task::spawn_blocking(move || {
+        done_receiver.recv_timeout(Duration::from_secs(5)).expect("boundary harness should finish")
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+    harness_thread.join().expect("boundary harness thread should join");
+    assert_eq!(
+        database.inbox().find(request.ingest_id).await.unwrap().unwrap().status,
+        IngestStatus::Storing
+    );
+    fs::remove_dir_all(&work_root).await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn concurrent_equivalent_workers_keep_one_serialized_identity_outcome(pool: sqlx::PgPool) {
+    let first_database = Database::from_pool(pool.clone());
+    let second_database = Database::from_pool(pool);
+    let work_root =
+        std::env::temp_dir().join(format!("sooqa-worker-identity-concurrent-{}", Uuid::new_v4()));
+    let first = prepare_fingerprint_request(
+        &first_database,
+        &work_root,
+        "concurrent-first",
+        b"first-bytes",
+    )
+    .await;
+    let second = prepare_fingerprint_request(
+        &second_database,
+        &work_root,
+        "concurrent-second",
+        b"second-bytes",
+    )
+    .await;
+    let first_job = first_database
+        .jobs()
+        .claim_next("identity-worker-a", Duration::from_secs(30), &[JobType::ComputeFingerprint])
+        .await
+        .unwrap()
+        .expect("first fingerprint job should be claimable");
+    let second_job = second_database
+        .jobs()
+        .claim_next("identity-worker-b", Duration::from_secs(30), &[JobType::ComputeFingerprint])
+        .await
+        .unwrap()
+        .expect("second fingerprint job should be claimable");
+    let first_handler = compute_fingerprint_handler(
+        first_database.inbox(),
+        first_database.library(),
+        work_root.clone(),
+        FrameExtractor::with_runner(
+            "fake-ffmpeg",
+            Duration::from_secs(5),
+            64 * 1024,
+            Arc::new(IdentityFrameRunner { variant: 0, calls: Arc::new(AtomicUsize::new(0)) }),
+        ),
+    );
+    let second_handler = compute_fingerprint_handler(
+        second_database.inbox(),
+        second_database.library(),
+        work_root.clone(),
+        FrameExtractor::with_runner(
+            "fake-ffmpeg",
+            Duration::from_secs(5),
+            64 * 1024,
+            Arc::new(IdentityFrameRunner { variant: 0, calls: Arc::new(AtomicUsize::new(0)) }),
+        ),
+    );
+    let (first_result, second_result) =
+        tokio::join!(first_handler(first_job), second_handler(second_job));
+    first_result.unwrap();
+    second_result.unwrap();
+
+    let first_state = first_database.inbox().find(first.ingest_id).await.unwrap().unwrap().status;
+    let second_state =
+        second_database.inbox().find(second.ingest_id).await.unwrap().unwrap().status;
+    assert!(matches!(
+        (first_state, second_state),
+        (IngestStatus::Storing, IngestStatus::DuplicatePending)
+            | (IngestStatus::DuplicatePending, IngestStatus::Storing)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media WHERE canonical_sha256 IN ($1, $2)"
+        )
+        .bind(hex_bytes(&first.normalization.sha256))
+        .bind(hex_bytes(&second.normalization.sha256))
+        .fetch_one(first_database.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset'",
+        )
+        .fetch_one(first_database.pool())
+        .await
+        .unwrap(),
+        1
+    );
     fs::remove_dir_all(&work_root).await.unwrap();
 }
 

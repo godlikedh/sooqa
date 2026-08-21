@@ -10,11 +10,14 @@ pub use cleanup::WORKSPACE_CLEANUP_RETENTION;
 pub use inbox::{
     AcceptDuplicateResult, AssetNormalizationStart, AssetProbeStart, CreateIngestResult,
     DuplicateCandidate, DuplicatePendingIngest, ForceSaveResult, InboxRepository,
-    InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart, SourceDownloadStart,
-    SourceInspectionStart, WorkspaceCleanupStart,
+    InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart,
+    IngestVideoIdentityStart, SourceDownloadStart, SourceInspectionStart, WorkspaceCleanupStart,
 };
 pub use jobs::{JobRepository, JobRepositoryError};
-pub use library::{LibraryRepository, LibraryRepositoryError, VideoFingerprintCandidate};
+pub use library::{
+    LibraryRepository, LibraryRepositoryError, VideoFingerprintCandidate, VideoIdentityPreparation,
+    VideoIdentitySession,
+};
 pub use publisher::{
     CreatePostResult, PublishLease, PublisherRepository, PublisherRepositoryError,
 };

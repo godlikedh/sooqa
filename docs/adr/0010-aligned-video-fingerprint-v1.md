@@ -128,18 +128,32 @@ cannot qualify as a full duplicate merely because its local frames align.
 
 ### Identity transaction and force-save
 
-Video fingerprint extraction and all ffmpeg/file work happen before the final
-identity transaction. The worker may perform a read-only exact-SHA preflight to
-skip extraction, but it does not merge metadata or reserve media there. The
-finalizer locks the ingest row and the current `JobLease`, rejects an expired
-or recovered lease, acquires one transaction-scoped advisory lock, rechecks
-canonical SHA, runs the bounded shortlist/alignment decision, and then either
-reuses the existing media row, persists bounded `duplicate_pending` evidence,
-or inserts one `pending_storage` reservation with the fingerprint blob and
-tokens. Media/evidence/storage-queue mutations and the winning job success are
-one transaction; an expired finalizer therefore rolls back all of them. The
-lock does not cover download, ffmpeg, filesystem, HTTP, or Telegram work. A
-single stable lock key is intentional: equivalent re-encodes with different
+Video fingerprint extraction and all ffmpeg/file work happen before identity
+coordination. The worker may perform a read-only exact-SHA preflight to skip
+extraction, but it does not merge metadata or reserve media there. The
+finalizer acquires one session-level advisory lock on a dedicated PostgreSQL
+connection, then commits a short preparation transaction that revalidates the
+ingest and current `JobLease`, rechecks canonical SHA, and reads the bounded
+shortlist. The transaction is closed before the worker decodes candidate blobs
+and runs alignment on Tokio's blocking/CPU pool. The session lock stays held
+while that CPU work runs, preserving one globally serialized identity
+decision without retaining a transaction or row locks.
+
+After alignment, a short final transaction on the same locked connection
+revalidates the ingest/job lease and canonical SHA, then either reuses the
+existing media row, persists bounded `duplicate_pending` evidence, or inserts
+one `pending_storage` reservation with the fingerprint blob and tokens.
+Media/evidence/storage-queue mutations and the winning job success remain one
+transaction; an expired or recovered finalizer therefore commits none of
+them. The session lock is released only after that transaction commits, and
+the dedicated connection is closed if the worker is cancelled before release.
+The lock does not cover download, ffmpeg, filesystem, HTTP, or Telegram work.
+The worker/media boundary validates the v1 binary envelope and derives the
+bounded, sorted token projection before the library DTO accepts the opaque
+bytes. Persistence only enforces generic DTO bounds while querying and
+persisting that representation; it does not decode candidates or execute the
+alignment algorithm.
+A single stable lock key is intentional: equivalent re-encodes with different
 SHAs must observe the first in-progress reservation before either can enqueue
 a storage upload. The canonical SHA unique constraint remains the final
 byte-identity barrier.

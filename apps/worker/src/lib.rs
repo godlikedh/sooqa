@@ -19,21 +19,24 @@ use sooqa_inbox::{
 use sooqa_jobs::{Job, JobCommand, JobLease, JobStatus, JobType};
 use sooqa_library::{
     MAX_MEDIA_PREVIEW_BYTES, MediaIngest, MediaKind, MediaMetadata, MediaPreviewInput,
-    MediaSourceInput, NewMedia, SourceKind, StorageUploadStore,
+    MediaSourceInput, NewMedia, SourceKind, StorageUploadStore, VideoDuplicateClassification,
+    VideoDuplicateEvidence, VideoDuplicateMatch, VideoFingerprintCandidate, VideoFingerprintInput,
+    VideoIdentityDecision,
 };
 use sooqa_media::{
     ArtifactPublicationError, CANONICAL_VIDEO_PROFILE_VERSION, DownloadError, DownloadLimits,
     DownloadedSource, FfmpegExecutor, FfprobeAdapter, FrameExtractionError, FrameExtractor,
     ImageNormalizer, MediaProbe, MediaStreamKind, MediaWorkspace, NormalizationExecutionError,
-    NormalizationPlanner, SequenceAlignmentConfig, SourceDownloader, SourceInput, WorkspaceArea,
-    WorkspaceError, decode_first_preview_frame, encode_bounded_preview, publish_artifact,
-    sha256_file, validate_bounded_preview_for_mime,
+    NormalizationPlanner, SequenceAlignmentConfig, SequenceClassification, SourceDownloader,
+    SourceInput, VideoSequenceFingerprint, WorkspaceArea, WorkspaceError, align_video_sequences,
+    decode_first_preview_frame, encode_bounded_preview, publish_artifact, sha256_file,
+    validate_bounded_preview_for_mime,
 };
 use sooqa_persistence::{
     AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
-    IngestFinalizationStart, IngestFingerprintStart, JobRepository, JobRepositoryError,
-    LibraryRepository, LibraryRepositoryError, SourceDownloadStart, SourceInspectionStart,
-    WorkspaceCleanupStart,
+    IngestFinalizationStart, IngestFingerprintStart, IngestVideoIdentityStart, JobRepository,
+    JobRepositoryError, LibraryRepository, LibraryRepositoryError, SourceDownloadStart,
+    SourceInspectionStart, WorkspaceCleanupStart,
 };
 use sooqa_telegram::StorageUploadError;
 use sooqa_telegram::{
@@ -74,6 +77,7 @@ impl HandlerCancellation {
         self.storage_upload.clone()
     }
 }
+pub type IdentityAlignmentHook = Arc<dyn Fn() + Send + Sync>;
 
 pub fn media_processing_components(
     ffmpeg_executable: impl Into<PathBuf>,
@@ -563,15 +567,39 @@ pub fn compute_fingerprint_handler(
     work_root: impl Into<PathBuf>,
     extractor: FrameExtractor,
 ) -> HandlerFn {
+    compute_fingerprint_handler_with_alignment_hook(inbox, library, work_root, extractor, None)
+}
+
+/// Build the fingerprint handler with an optional synchronous test probe that
+/// runs inside the blocking alignment closure.  Production callers should use
+/// [`compute_fingerprint_handler`]; the probe keeps transaction-boundary and
+/// thread-placement integration tests deterministic without changing the
+/// identity algorithm.
+pub fn compute_fingerprint_handler_with_alignment_hook(
+    inbox: InboxRepository,
+    library: LibraryRepository,
+    work_root: impl Into<PathBuf>,
+    extractor: FrameExtractor,
+    alignment_hook: Option<IdentityAlignmentHook>,
+) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
         let library = library.clone();
         let work_root = work_root.clone();
         let extractor = extractor.clone();
-        Box::pin(
-            async move { compute_fingerprint(&inbox, &library, &work_root, &extractor, job).await },
-        )
+        let alignment_hook = alignment_hook.clone();
+        Box::pin(async move {
+            compute_fingerprint(
+                &inbox,
+                &library,
+                &work_root,
+                &extractor,
+                alignment_hook.as_ref(),
+                job,
+            )
+            .await
+        })
     })
 }
 
@@ -1815,6 +1843,7 @@ async fn compute_fingerprint(
     library: &LibraryRepository,
     work_root: &Path,
     extractor: &FrameExtractor,
+    alignment_hook: Option<&IdentityAlignmentHook>,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
@@ -1996,17 +2025,173 @@ async fn compute_fingerprint(
         Some(extraction.fingerprint)
     };
 
-    inbox
-        .finalize_video_identity(
+    let fingerprint_input = match fingerprint.as_ref() {
+        Some(fingerprint) => Some(
+            VideoFingerprintInput::try_new(
+                fingerprint.version.as_str(),
+                fingerprint.encode().map_err(|error| {
+                    HandlerFailure::permanent("fingerprint_failed", error.to_string())
+                })?,
+                fingerprint.search_tokens(),
+            )
+            .map_err(|error| HandlerFailure::permanent("fingerprint_failed", error.to_string()))?,
+        ),
+        None => None,
+    };
+    let start = match inbox
+        .begin_video_identity(
             ingest_request_id,
             &job_attempt,
+            &media_ingest,
+            fingerprint_input.as_ref(),
+        )
+        .await
+    {
+        Ok(start) => start,
+        Err(error) => return Err(map_inbox_error(error)),
+    };
+    let IngestVideoIdentityStart::Ready { ingest, preparation, session } = start else {
+        return Ok(());
+    };
+
+    let decision = if preparation.exact_media_id.is_some() || ingest.force_save {
+        VideoIdentityDecision::NoMatch
+    } else {
+        let Some(fingerprint) = fingerprint else {
+            inbox.abort_video_identity(session).await.map_err(map_inbox_error)?;
+            return Err(HandlerFailure::permanent(
+                "invalid_ingest_state",
+                "video identity preparation requires a sequence fingerprint",
+            ));
+        };
+        let candidates = preparation.candidates;
+        let alignment_hook = alignment_hook.cloned();
+        let alignment = match tokio::task::spawn_blocking(move || {
+            if let Some(hook) = alignment_hook {
+                hook();
+            }
+            align_video_identity(&fingerprint, &candidates, SequenceAlignmentConfig::default())
+        })
+        .await
+        {
+            Ok(alignment) => alignment,
+            Err(error) => {
+                inbox.abort_video_identity(session).await.map_err(map_inbox_error)?;
+                return Err(HandlerFailure::permanent(
+                    "identity_alignment_failed",
+                    format!("video identity alignment task failed: {error}"),
+                ));
+            }
+        };
+        match alignment {
+            Ok(decision) => decision,
+            Err(message) => {
+                inbox.abort_video_identity(session).await.map_err(map_inbox_error)?;
+                return Err(HandlerFailure::permanent("identity_alignment_failed", message));
+            }
+        }
+    };
+
+    inbox
+        .complete_video_identity(
+            ingest_request_id,
+            &job_attempt,
+            session,
             media_ingest,
-            fingerprint.as_ref(),
-            SequenceAlignmentConfig::default(),
+            fingerprint_input.as_ref(),
+            &decision,
         )
         .await
         .map_err(map_inbox_error)?;
     Ok(())
+}
+
+fn align_video_identity(
+    incoming: &VideoSequenceFingerprint,
+    candidates: &[VideoFingerprintCandidate],
+    config: SequenceAlignmentConfig,
+) -> Result<VideoIdentityDecision, String> {
+    let mut matches = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let stored =
+                VideoSequenceFingerprint::decode(&candidate.fingerprint_data).map_err(|error| {
+                    format!(
+                        "media {} has an invalid stored fingerprint: {error}",
+                        candidate.media_id
+                    )
+                });
+            let stored = match stored {
+                Ok(stored) => stored,
+                Err(error) => return Some(Err(error)),
+            };
+            let alignment =
+                align_video_sequences(incoming, &stored, config).map_err(|error| error.to_string());
+            match alignment {
+                Ok(alignment) => duplicate_match(candidate, alignment).map(Ok),
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    matches.sort_by(|left, right| {
+        classification_rank(right.classification)
+            .cmp(&classification_rank(left.classification))
+            .then_with(|| right.score_bps.cmp(&left.score_bps))
+            .then_with(|| right.shared_token_count.cmp(&left.shared_token_count))
+            .then_with(|| left.media_id.cmp(&right.media_id))
+    });
+    if matches
+        .iter()
+        .any(|item| item.classification == VideoDuplicateClassification::StrongDuplicate)
+    {
+        matches.truncate(sooqa_library::MAX_VIDEO_DUPLICATE_MATCHES);
+        return Ok(VideoIdentityDecision::DuplicatePending {
+            evidence: VideoDuplicateEvidence {
+                algorithm_version: incoming.version.as_str().to_owned(),
+                matches,
+            },
+        });
+    }
+    Ok(VideoIdentityDecision::NoMatch)
+}
+
+fn duplicate_match(
+    candidate: &VideoFingerprintCandidate,
+    alignment: sooqa_media::SequenceAlignment,
+) -> Option<VideoDuplicateMatch> {
+    let classification = match alignment.classification {
+        SequenceClassification::StrongDuplicate => VideoDuplicateClassification::StrongDuplicate,
+        SequenceClassification::PartialMatch => VideoDuplicateClassification::PartialMatch,
+        SequenceClassification::NotDuplicate => return None,
+    };
+    let evidence = alignment.evidence;
+    Some(VideoDuplicateMatch {
+        media_id: candidate.media_id,
+        fingerprint_version: candidate.fingerprint_version.clone(),
+        classification,
+        aligned_offset_ms: evidence.aligned_offset_ms,
+        informative_matched_samples: evidence.informative_matched_samples,
+        incoming_coverage_bps: evidence.incoming_coverage_bps,
+        candidate_coverage_bps: evidence.candidate_coverage_bps,
+        median_distance_bps: evidence.median_distance_bps,
+        high_percentile_distance_bps: evidence.high_percentile_distance_bps,
+        longest_temporally_consistent_run: evidence.longest_temporally_consistent_run,
+        unmatched_incoming_prefix: evidence.unmatched_incoming_prefix,
+        unmatched_incoming_suffix: evidence.unmatched_incoming_suffix,
+        unmatched_candidate_prefix: evidence.unmatched_candidate_prefix,
+        unmatched_candidate_suffix: evidence.unmatched_candidate_suffix,
+        gap_count: evidence.gap_count,
+        score_bps: evidence.score_bps,
+        shared_token_count: candidate.shared_token_count,
+        token_overlap_bps: candidate.overlap_bps,
+    })
+}
+
+fn classification_rank(classification: VideoDuplicateClassification) -> u8 {
+    match classification {
+        VideoDuplicateClassification::StrongDuplicate => 2,
+        VideoDuplicateClassification::PartialMatch => 1,
+    }
 }
 
 fn map_fingerprint_error(job: &Job, error: FrameExtractionError) -> HandlerFailure {
@@ -3538,6 +3723,39 @@ mod tests {
         assert!(!failure.retryable);
         assert_eq!(failure.class, "invalid_ingest_state");
         assert!(failure.message.contains("version 99"));
+    }
+
+    #[test]
+    fn malformed_stored_fingerprint_is_rejected_before_alignment() {
+        let incoming = VideoSequenceFingerprint::new(
+            500,
+            500,
+            vec![sooqa_media::VideoSequenceSample {
+                phash: 1,
+                dhash: 2,
+                mean_luma: 100,
+                mean_chroma_u: 0,
+                mean_chroma_v: 0,
+                information_bps: 8_000,
+                transition_bps: 0,
+            }],
+        )
+        .unwrap();
+        let candidate = VideoFingerprintCandidate {
+            media_id: Uuid::new_v4(),
+            width: None,
+            height: None,
+            audio_codec: None,
+            fingerprint_version: "video_sequence_v1".to_owned(),
+            fingerprint_data: vec![0; 1],
+            search_tokens: Vec::new(),
+            shared_token_count: 8,
+            overlap_bps: 1_000,
+        };
+        let error =
+            align_video_identity(&incoming, &[candidate], SequenceAlignmentConfig::default())
+                .expect_err("malformed candidate bytes must fail closed");
+        assert!(error.contains("invalid stored fingerprint"));
     }
 
     #[test]

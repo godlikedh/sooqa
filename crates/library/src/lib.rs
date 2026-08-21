@@ -373,6 +373,97 @@ pub struct VideoFingerprintCandidate {
     pub overlap_bps: i64,
 }
 
+/// The persisted representation of a freshly computed video sequence
+/// fingerprint.  The media crate owns producing and consuming this data;
+/// persistence only stores the opaque bytes and retrieval tokens.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct VideoFingerprintInput {
+    version: String,
+    data: Vec<u8>,
+    search_tokens: Vec<i64>,
+}
+
+pub const MAX_VIDEO_FINGERPRINT_VERSION_BYTES: usize = 64;
+pub const MAX_VIDEO_FINGERPRINT_DATA_BYTES: usize = 64 * 1024;
+pub const MAX_VIDEO_FINGERPRINT_TOKENS: usize = 1_024;
+
+#[derive(Debug, Clone, Eq, PartialEq, Error)]
+pub enum VideoFingerprintInputError {
+    #[error("fingerprint version must not be empty")]
+    EmptyVersion,
+    #[error("fingerprint version exceeds the {max}-byte limit")]
+    VersionTooLong { max: usize },
+    #[error("fingerprint data must not be empty")]
+    EmptyData,
+    #[error("fingerprint data exceeds the {max}-byte limit")]
+    DataTooLarge { max: usize },
+    #[error("fingerprint search tokens exceed the {max}-token limit")]
+    TooManyTokens { max: usize },
+    #[error("fingerprint search tokens are invalid: {0}")]
+    InvalidSearchTokens(&'static str),
+}
+
+impl VideoFingerprintInput {
+    /// Construct a bounded opaque representation. The media crate remains the
+    /// authority for encoding and validating the versioned fingerprint bytes;
+    /// this DTO only protects the persistence boundary from unbounded or
+    /// malformed projection data.
+    pub fn try_new(
+        version: impl Into<String>,
+        data: Vec<u8>,
+        search_tokens: Vec<i64>,
+    ) -> Result<Self, VideoFingerprintInputError> {
+        let input = Self { version: version.into(), data, search_tokens };
+        input.validate()?;
+        Ok(input)
+    }
+
+    pub fn validate(&self) -> Result<(), VideoFingerprintInputError> {
+        if self.version.trim().is_empty() {
+            return Err(VideoFingerprintInputError::EmptyVersion);
+        }
+        if self.version.len() > MAX_VIDEO_FINGERPRINT_VERSION_BYTES {
+            return Err(VideoFingerprintInputError::VersionTooLong {
+                max: MAX_VIDEO_FINGERPRINT_VERSION_BYTES,
+            });
+        }
+        if self.data.is_empty() {
+            return Err(VideoFingerprintInputError::EmptyData);
+        }
+        if self.data.len() > MAX_VIDEO_FINGERPRINT_DATA_BYTES {
+            return Err(VideoFingerprintInputError::DataTooLarge {
+                max: MAX_VIDEO_FINGERPRINT_DATA_BYTES,
+            });
+        }
+        if self.search_tokens.len() > MAX_VIDEO_FINGERPRINT_TOKENS {
+            return Err(VideoFingerprintInputError::TooManyTokens {
+                max: MAX_VIDEO_FINGERPRINT_TOKENS,
+            });
+        }
+        if self.search_tokens.iter().any(|token| *token <= 0) {
+            return Err(VideoFingerprintInputError::InvalidSearchTokens("tokens must be positive"));
+        }
+        if self.search_tokens.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(VideoFingerprintInputError::InvalidSearchTokens(
+                "tokens must be sorted and deduplicated",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn search_tokens(&self) -> &[i64] {
+        &self.search_tokens
+    }
+}
+
 /// Bounded evidence retained when the video identity gate needs an explicit
 /// human decision. It deliberately contains scalar alignment results only;
 /// authoritative fingerprint bytes remain on `media`.
@@ -420,6 +511,15 @@ pub const MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES: usize = 16 * 1024;
 pub enum VideoIdentityOutcome {
     ExactDuplicate { media_id: Uuid },
     NewMedia { media_id: Uuid },
+    DuplicatePending { evidence: VideoDuplicateEvidence },
+}
+
+/// The worker's CPU-side identity result.  Persistence turns this decision
+/// into a durable outcome while rechecking the canonical SHA and current
+/// rows in the final transaction.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum VideoIdentityDecision {
+    NoMatch,
     DuplicatePending { evidence: VideoDuplicateEvidence },
 }
 
@@ -581,5 +681,56 @@ mod tests {
             normalize_tag("   ").expect_err("empty tag must fail"),
             TagValidationError::Empty
         );
+    }
+
+    #[test]
+    fn video_fingerprint_input_bounds_and_projection_invariants_are_rejected() {
+        let valid =
+            || VideoFingerprintInput::try_new("video_sequence_v1", vec![1, 2, 3], vec![11, 22]);
+        assert!(valid().is_ok());
+        assert_eq!(
+            VideoFingerprintInput::try_new(" ", vec![1], vec![]),
+            Err(VideoFingerprintInputError::EmptyVersion)
+        );
+        assert!(matches!(
+            VideoFingerprintInput::try_new(
+                "v".repeat(MAX_VIDEO_FINGERPRINT_VERSION_BYTES + 1),
+                vec![1],
+                vec![]
+            ),
+            Err(VideoFingerprintInputError::VersionTooLong { .. })
+        ));
+        assert_eq!(
+            VideoFingerprintInput::try_new("v1", vec![], vec![]),
+            Err(VideoFingerprintInputError::EmptyData)
+        );
+        assert!(matches!(
+            VideoFingerprintInput::try_new(
+                "v1",
+                vec![0; MAX_VIDEO_FINGERPRINT_DATA_BYTES + 1],
+                vec![]
+            ),
+            Err(VideoFingerprintInputError::DataTooLarge { .. })
+        ));
+        assert!(matches!(
+            VideoFingerprintInput::try_new(
+                "v1",
+                vec![1],
+                vec![1; MAX_VIDEO_FINGERPRINT_TOKENS + 1]
+            ),
+            Err(VideoFingerprintInputError::TooManyTokens { .. })
+        ));
+        assert!(matches!(
+            VideoFingerprintInput::try_new("v1", vec![1], vec![11, 11]),
+            Err(VideoFingerprintInputError::InvalidSearchTokens(_))
+        ));
+        assert!(matches!(
+            VideoFingerprintInput::try_new("v1", vec![1], vec![22, 11]),
+            Err(VideoFingerprintInputError::InvalidSearchTokens(_))
+        ));
+        assert!(matches!(
+            VideoFingerprintInput::try_new("v1", vec![1], vec![0]),
+            Err(VideoFingerprintInputError::InvalidSearchTokens(_))
+        ));
     }
 }
