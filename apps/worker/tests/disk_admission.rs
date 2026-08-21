@@ -9,10 +9,10 @@ use std::{
 
 use async_trait::async_trait;
 use sooqa_inbox::{
-    IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection, SourceMediaKind,
-    SubmittedVia,
+    IngestStatus, IngestSubmission, IngestSubmissionInput, SourceDownload, SourceInspection,
+    SourceMediaKind, SubmittedVia,
 };
-use sooqa_jobs::JobType;
+use sooqa_jobs::{JobType, NewJob};
 use sooqa_media::{DownloadError, DownloadLimits, DownloadedSource, SourceDownloader, SourceInput};
 use sooqa_persistence::Database;
 use sooqa_worker::{
@@ -115,17 +115,15 @@ async fn run_download_worker_until(
     .expect("worker should stop cleanly");
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires an ephemeral PostgreSQL test database"]
-async fn download_admission_refusal_is_durable_and_recovers_without_stage_mutation(
-    pool: sqlx::PgPool,
-) {
-    let database = Database::from_pool(pool);
+async fn prepare_download_job(
+    database: &Database,
+    key_prefix: &str,
+) -> (sooqa_inbox::Ingest, SourceInspection, Uuid) {
     let ingest = database
         .inbox()
         .create_ingest(
             IngestSubmission::try_new(IngestSubmissionInput::new(
-                format!("https://example.test/disk-admission-{}", Uuid::new_v4()),
+                format!("https://example.test/{key_prefix}-{}", Uuid::new_v4()),
                 SubmittedVia::Api,
             ))
             .expect("synthetic URL should validate"),
@@ -133,7 +131,6 @@ async fn download_admission_refusal_is_durable_and_recovers_without_stage_mutati
         .await
         .expect("synthetic ingest should be durable")
         .ingest;
-
     let inspection = SourceInspection {
         adapter: "synthetic".to_owned(),
         source_url: ingest.source_url.clone(),
@@ -161,7 +158,6 @@ async fn download_admission_refusal_is_durable_and_recovers_without_stage_mutati
         .complete_source_inspection(ingest.id, &inspect_lease, inspection.clone())
         .await
         .expect("synthetic inspection should enqueue download");
-
     let download_job_id: Uuid = sqlx::query_scalar(
         "SELECT id FROM queue.jobs WHERE kind = 'download_source' AND payload->>'ingest_id' = $1",
     )
@@ -169,6 +165,17 @@ async fn download_admission_refusal_is_durable_and_recovers_without_stage_mutati
     .fetch_one(database.pool())
     .await
     .expect("download job should be durable");
+    (ingest, inspection, download_job_id)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires an ephemeral PostgreSQL test database"]
+async fn download_admission_refusal_is_durable_and_recovers_without_stage_mutation(
+    pool: sqlx::PgPool,
+) {
+    let database = Database::from_pool(pool);
+    let (ingest, _inspection, download_job_id) =
+        prepare_download_job(&database, "disk-admission").await;
     sqlx::query("UPDATE queue.jobs SET max_attempts = 1 WHERE id = $1")
         .bind(download_job_id)
         .execute(database.pool())
@@ -207,7 +214,7 @@ async fn download_admission_refusal_is_durable_and_recovers_without_stage_mutati
     assert_eq!(downloader.calls(), 0, "disk refusal must happen before the downloader");
     assert!(!work_root.join("jobs").join(ingest.workspace_id.to_string()).exists());
     let refusal_error: Option<String> =
-        sqlx::query_scalar("SELECT last_error_class FROM queue.jobs WHERE id = $1")
+        sqlx::query_scalar("SELECT error_class FROM queue.jobs WHERE id = $1")
             .bind(download_job_id)
             .fetch_one(database.pool())
             .await
@@ -246,6 +253,82 @@ async fn download_admission_refusal_is_durable_and_recovers_without_stage_mutati
     assert_eq!(recovered_request.status, IngestStatus::Downloading);
     assert!(recovered_request.original_input.get("download").is_some());
     assert_eq!(downloader.calls(), 1, "admitted retry should reach the downloader once");
+
+    fs::remove_dir_all(&work_root).await.expect("synthetic work root should be removable");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires an ephemeral PostgreSQL test database"]
+async fn already_advanced_download_skips_admission_and_large_work(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let (ingest, inspection, initial_job_id) =
+        prepare_download_job(&database, "already-advanced").await;
+    let initial_job = database
+        .jobs()
+        .claim_next("already-advanced-setup", Duration::from_secs(30), &[JobType::DownloadSource])
+        .await
+        .expect("initial download job should claim")
+        .expect("initial download job should exist");
+    assert_eq!(initial_job.id, initial_job_id);
+    let initial_lease = initial_job.lease().expect("initial claim should be fenced");
+    database
+        .inbox()
+        .begin_source_download(ingest.id, &initial_lease)
+        .await
+        .expect("initial download stage should begin");
+    database
+        .inbox()
+        .complete_source_download(
+            ingest.id,
+            &initial_lease,
+            SourceDownload {
+                bytes: 18,
+                mime_type: Some("video/mp4".to_owned()),
+                media_kind: SourceMediaKind::Video,
+                selected_format: None,
+            },
+        )
+        .await
+        .expect("synthetic download should advance the durable input");
+
+    let duplicate = database
+        .jobs()
+        .enqueue(
+            NewJob::download_source(ingest.id, inspection)
+                .dedupe_key(format!("already-advanced:{}", Uuid::new_v4())),
+        )
+        .await
+        .expect("duplicate download job should be durable");
+    let work_root = std::env::temp_dir().join(format!("sooqa-already-advanced-{}", Uuid::new_v4()));
+    fs::create_dir_all(&work_root).await.expect("synthetic work root should be writable");
+    let downloader = CountingDownloader::default();
+    let handler = download_source_handler_with_admission(
+        database.inbox(),
+        &work_root,
+        Arc::new(downloader.clone()),
+        DownloadLimits { max_bytes: 1, max_redirects: 0, timeout: Duration::from_secs(1) },
+        WorkspaceAdmission::new(u64::MAX),
+    );
+    run_download_worker_until(
+        &database,
+        handler,
+        duplicate.id,
+        "succeeded",
+        1,
+        "already-advanced-worker",
+    )
+    .await;
+
+    let request = database
+        .inbox()
+        .find(ingest.id)
+        .await
+        .expect("advanced ingest should remain readable")
+        .expect("advanced ingest should remain present");
+    assert_eq!(request.status, IngestStatus::Downloading);
+    assert!(request.original_input.get("download").is_some());
+    assert_eq!(downloader.calls(), 0, "already-advanced jobs must not start large work");
+    assert!(!work_root.join("jobs").join(ingest.workspace_id.to_string()).exists());
 
     fs::remove_dir_all(&work_root).await.expect("synthetic work root should be removable");
 }

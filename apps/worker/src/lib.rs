@@ -1032,6 +1032,11 @@ fn probe_stage_may_run(status: IngestStatus) -> bool {
     )
 }
 
+fn download_stage_may_run(request: &sooqa_inbox::Ingest) -> bool {
+    matches!(request.status, IngestStatus::Downloading | IngestStatus::FailedRetryable)
+        && request.original_input.get("download").is_none()
+}
+
 fn normalization_stage_may_run(status: IngestStatus) -> bool {
     matches!(status, IngestStatus::Normalizing | IngestStatus::FailedRetryable)
 }
@@ -3376,12 +3381,18 @@ async fn download_source(
         )
     })?;
 
-    // yt-dlp may use two recovery attempts and a progressive fallback. Its
-    // aggregate attempt directory is bounded to three source budgets, so URL
-    // admission reserves that worst case even when direct HTTP was selected
-    // for this particular inspection.
-    let required_bytes = limits.max_bytes.saturating_mul(3);
-    admission.admit(work_root, required_bytes)?;
+    // A duplicate or stale download job can be claimed after the ingest has
+    // already advanced. Read the durable stage before admission so such a job
+    // can be fenced by begin_source_download without being held forever by a
+    // low-space deferral. yt-dlp may use two recovery attempts and a
+    // progressive fallback; its aggregate attempt directory is bounded to
+    // three source budgets, so URL admission reserves that worst case even
+    // when direct HTTP was selected for this particular inspection.
+    let current_request = load_ingest_for_admission(inbox, ingest_request_id).await?;
+    if download_stage_may_run(&current_request) {
+        let required_bytes = limits.max_bytes.saturating_mul(3);
+        admission.admit(work_root, required_bytes)?;
+    }
 
     match inbox.begin_source_download(ingest_request_id, &job_attempt).await {
         Ok(SourceDownloadStart::Ready(_)) => {}
