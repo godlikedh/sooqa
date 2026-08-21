@@ -1,10 +1,16 @@
 # Development
 
-Use the pinned Rust toolchain (1.97.1). The normal gate is:
+Use the pinned Rust toolchain (1.97.1). The authoritative local quality
+command is `just check`:
 
 ```bash
 just check
 ```
+
+It runs both Node.js suites through `tools/test-javascript.sh` as part of the
+test phase. The CI `check` job is the pull-request quality gate and invokes
+that same script with Node.js 22, so userscript and admin asset failures are
+required checks in both environments.
 
 It runs formatting, future-incompatibility reporting, Clippy with warnings
 denied, and non-ignored workspace tests. Before a PR, also run:
