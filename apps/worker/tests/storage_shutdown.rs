@@ -69,6 +69,8 @@ struct ReservationGateStore {
     inner: LibraryRepository,
     reserved: Arc<Notify>,
     release: Arc<Notify>,
+    release_completed: Option<Arc<Notify>>,
+    continue_release: Option<Arc<Notify>>,
 }
 
 #[async_trait]
@@ -138,7 +140,16 @@ impl StorageUploadStore for ReservationGateStore {
         media_id: Uuid,
         owner_token: Uuid,
     ) -> Result<(), Self::Error> {
-        self.inner.release_storage_upload(media_id, owner_token).await
+        let result = self.inner.release_storage_upload(media_id, owner_token).await;
+        if result.is_ok() {
+            if let Some(signal) = &self.release_completed {
+                signal.notify_one();
+            }
+            if let Some(signal) = &self.continue_release {
+                signal.notified().await;
+            }
+        }
+        result
     }
 
     async fn mark_storage_upload_unknown(
@@ -291,6 +302,8 @@ async fn worker_shutdown_before_storage_dispatch_releases_and_requeues(pool: sql
         inner: database.library(),
         reserved: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
+        release_completed: None,
+        continue_release: None,
     };
     let reserved = Arc::clone(&gate.reserved);
     let release = Arc::clone(&gate.release);
@@ -382,6 +395,51 @@ async fn worker_shutdown_before_storage_dispatch_releases_and_requeues(pool: sql
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
+async fn stale_active_storage_reservation_reconciles_unknown_after_grace(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let fixture = seed_storage_upload(&database).await;
+    let library = database.library();
+    let reservation = StorageUploadStore::reserve_storage_upload(
+        &library,
+        StorageUploadReservationRequest { media_id: fixture.media_id, generation: 0 },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(reservation, StorageUploadReservation::Reserved { .. }));
+    let claimed = database
+        .jobs()
+        .claim_next("stale-storage-worker", Duration::from_secs(30), &[JobType::UploadStorageAsset])
+        .await
+        .unwrap()
+        .expect("storage job should be claimable");
+    sqlx::query("UPDATE media SET storage_started_at = now() - interval '2 minutes' WHERE id = $1")
+        .bind(fixture.media_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(claimed.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(database.jobs().recover_stale_leases().await.unwrap(), 1);
+    assert_storage_unknown(&database, &fixture).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT attempt_count FROM queue.jobs WHERE id = $1")
+            .bind(fixture.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        5
+    );
+    tokio::fs::remove_dir_all(fixture.root).await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn heartbeat_loss_before_storage_dispatch_releases_and_requeues_final_attempt(
     pool: sqlx::PgPool,
 ) {
@@ -397,13 +455,19 @@ async fn heartbeat_loss_before_storage_dispatch_releases_and_requeues_final_atte
         release_request: Arc::new(Notify::new()),
         calls: Arc::new(AtomicUsize::new(0)),
     };
-    let gate = ReservationGateStore {
+    let mut gate = ReservationGateStore {
         inner: database.library(),
         reserved: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
+        release_completed: None,
+        continue_release: None,
     };
     let reserved = Arc::clone(&gate.reserved);
     let release = Arc::clone(&gate.release);
+    let release_completed = Arc::new(Notify::new());
+    let continue_release = Arc::new(Notify::new());
+    gate.release_completed = Some(Arc::clone(&release_completed));
+    gate.continue_release = Some(Arc::clone(&continue_release));
     let cancelled = Arc::new(Notify::new());
     let cancelled_signal = Arc::clone(&cancelled);
     let provider = StorageUploadProvider::new(api.clone(), gate, -100123)
@@ -446,10 +510,32 @@ async fn heartbeat_loss_before_storage_dispatch_releases_and_requeues_final_atte
     .execute(database.pool())
     .await
     .unwrap();
+    assert_eq!(database.jobs().recover_stale_leases().await.unwrap(), 0);
     tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
         .await
         .expect("heartbeat loss should cancel the upload before dispatch");
     release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), release_completed.notified())
+        .await
+        .expect("safe cancellation should release the storage reservation");
+    assert_eq!(database.jobs().recover_stale_leases().await.unwrap(), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(fixture.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "queued"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT attempt_count FROM queue.jobs WHERE id = $1")
+            .bind(fixture.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    continue_release.notify_one();
     shutdown_sender.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(8), worker_task)
         .await

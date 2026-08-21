@@ -69,7 +69,9 @@ stop after the request may have escaped, including a lost upload heartbeat,
 clears the reservation token, records `storage_unknown`, fails linked active
 ingests, and settles the upload job as failed. Reconcile that media row with
 the storage commands below before starting a new generation; do not manually
-retry the queued job or delete its media row.
+retry the queued job or delete its media row. Lease recovery gives a recent
+active reservation a short cancellation-drain grace and restores a settled
+pre-dispatch claim to the retryable queue without consuming an attempt.
 
 ## Admin API
 

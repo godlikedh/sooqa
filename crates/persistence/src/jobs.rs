@@ -264,9 +264,25 @@ impl JobRepository {
         .bind(error_class)
         .bind(error_message)
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or(JobRepositoryError::LeaseLost)?;
-        row.into_job()
+        .await?;
+        if let Some(row) = row {
+            return row.into_job();
+        }
+        let already_requeued = sqlx::query_as::<_, JobRow>(
+            r#"
+            SELECT id, kind, payload, state, priority, run_at, attempt_count,
+                   max_attempts, lease_token, lease_owner, lease_expires_at,
+                   last_heartbeat_at, error_class, error_message, dedupe_key,
+                   created_at, updated_at, completed_at
+            FROM queue.jobs
+            WHERE id = $1 AND state = 'queued' AND error_class = $2
+            "#,
+        )
+        .bind(lease.job_id)
+        .bind(error_class)
+        .fetch_optional(&self.pool)
+        .await?;
+        already_requeued.map(JobRow::into_job).transpose()?.ok_or(JobRepositoryError::LeaseLost)
     }
 
     pub async fn defer_lease(
@@ -364,16 +380,87 @@ impl JobRepository {
                              SELECT 1
                              FROM media
                              WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                               AND media.storage_state = 'pending_storage'
+                               AND media.storage_token IS NULL
+                         ) THEN 'queued'
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                               AND media.storage_state = 'pending_storage'
+                               AND media.storage_token IS NOT NULL
+                         ) THEN 'failed'
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
                                AND media.storage_state IN ('storage_unknown', 'missing')
                          ) THEN 'failed'
                     WHEN attempt_count >= max_attempts THEN 'failed'
                     ELSE 'queued'
                 END,
+                attempt_count = CASE
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                               AND media.storage_state = 'pending_storage'
+                               AND media.storage_token IS NOT NULL
+                         ) THEN max_attempts
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                               AND media.storage_state = 'pending_storage'
+                               AND media.storage_token IS NULL
+                         ) THEN GREATEST(attempt_count - 1, 0)
+                    ELSE attempt_count
+                END,
                 run_at = now(), lease_token = NULL, lease_owner = NULL,
                 lease_expires_at = NULL, last_heartbeat_at = NULL,
-                error_class = COALESCE(error_class, 'lease_expired'),
-                error_message = COALESCE(error_message, 'job lease expired'),
+                error_class = CASE
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                               AND media.storage_state = 'pending_storage'
+                               AND media.storage_token IS NULL
+                         ) THEN 'storage_upload_cancelled'
+                    ELSE COALESCE(error_class, 'lease_expired')
+                END,
+                error_message = CASE
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                               AND media.storage_state = 'pending_storage'
+                               AND media.storage_token IS NULL
+                         ) THEN 'storage upload was safely cancelled before Telegram dispatch'
+                    ELSE COALESCE(error_message, 'job lease expired')
+                END,
                 completed_at = CASE
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                               AND media.storage_state = 'pending_storage'
+                               AND media.storage_token IS NULL
+                         ) THEN NULL
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                               AND media.storage_state = 'pending_storage'
+                               AND media.storage_token IS NOT NULL
+                         ) THEN now()
                     WHEN attempt_count >= max_attempts
                          OR (
                              kind = 'upload_storage_asset'
@@ -388,6 +475,17 @@ impl JobRepository {
                 END,
                 updated_at = now()
             WHERE state = 'running' AND kind <> 'publish_post' AND lease_expires_at <= now()
+              AND NOT (
+                  kind = 'upload_storage_asset'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM media
+                      WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                        AND media.storage_state = 'pending_storage'
+                        AND media.storage_token IS NOT NULL
+                        AND media.storage_started_at > now() - interval '1 minute'
+                  )
+              )
             RETURNING kind, payload, state, attempt_count, max_attempts
             "#,
         )
