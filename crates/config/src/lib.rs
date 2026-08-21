@@ -13,6 +13,15 @@ use thiserror::Error;
 const DEFAULT_SERVER_LISTEN_ADDRESS: &str = "0.0.0.0:8080";
 const DEFAULT_WORKER_POLL_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_WORKER_LEASE_DURATION_SECONDS: u64 = 60;
+const DEFAULT_JOB_RETENTION_ENABLED: bool = true;
+const DEFAULT_JOB_RETENTION_SUCCEEDED_SECONDS: u64 = 30 * 24 * 60 * 60;
+const DEFAULT_JOB_RETENTION_CANCELLED_SECONDS: u64 = 90 * 24 * 60 * 60;
+const DEFAULT_JOB_RETENTION_FAILED_SECONDS: u64 = 365 * 24 * 60 * 60;
+const DEFAULT_JOB_RETENTION_BATCH_SIZE: usize = 128;
+const DEFAULT_JOB_RETENTION_SCAN_SIZE: usize = 1024;
+const MAX_JOB_RETENTION_HORIZON_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
+const MAX_JOB_RETENTION_BATCH_SIZE: usize = 10_000;
+const MAX_JOB_RETENTION_SCAN_SIZE: usize = 100_000;
 const DEFAULT_COMPANION_LISTEN_ADDRESS: &str = "127.0.0.1:47831";
 const DEFAULT_COMPANION_BACKEND_URL: &str = "http://127.0.0.1:8080";
 const DEFAULT_COMPANION_REQUEST_BODY_LIMIT_BYTES: usize = 64 * 1024;
@@ -240,6 +249,17 @@ pub struct DatabaseConfig {
 pub struct WorkerConfig {
     pub poll_interval_seconds: u64,
     pub lease_duration_seconds: u64,
+    pub job_retention: JobRetentionConfig,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct JobRetentionConfig {
+    pub enabled: bool,
+    pub succeeded_seconds: u64,
+    pub cancelled_seconds: u64,
+    pub failed_seconds: u64,
+    pub batch_size: usize,
+    pub scan_size: usize,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -389,6 +409,38 @@ impl AppConfig {
                     .worker
                     .lease_duration_seconds
                     .unwrap_or(DEFAULT_WORKER_LEASE_DURATION_SECONDS),
+                job_retention: JobRetentionConfig {
+                    enabled: raw
+                        .worker
+                        .job_retention
+                        .enabled
+                        .unwrap_or(DEFAULT_JOB_RETENTION_ENABLED),
+                    succeeded_seconds: raw
+                        .worker
+                        .job_retention
+                        .succeeded_seconds
+                        .unwrap_or(DEFAULT_JOB_RETENTION_SUCCEEDED_SECONDS),
+                    cancelled_seconds: raw
+                        .worker
+                        .job_retention
+                        .cancelled_seconds
+                        .unwrap_or(DEFAULT_JOB_RETENTION_CANCELLED_SECONDS),
+                    failed_seconds: raw
+                        .worker
+                        .job_retention
+                        .failed_seconds
+                        .unwrap_or(DEFAULT_JOB_RETENTION_FAILED_SECONDS),
+                    batch_size: raw
+                        .worker
+                        .job_retention
+                        .batch_size
+                        .unwrap_or(DEFAULT_JOB_RETENTION_BATCH_SIZE),
+                    scan_size: raw
+                        .worker
+                        .job_retention
+                        .scan_size
+                        .unwrap_or(DEFAULT_JOB_RETENTION_SCAN_SIZE),
+                },
             },
             media: MediaConfig {
                 work_root: raw
@@ -524,7 +576,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.work_free_space_reserve_bytes={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.ytdlp_allowed_hosts={} media.ytdlp_pot_provider_url={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} media.inline_video.target_max_bytes={} media.inline_video.preferred_crf={} media.inline_video.maximum_crf={} media.inline_video.minimum_short_edge={} companion.listen_address={} companion.request_body_limit_bytes={} companion.request_timeout_seconds={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} worker.job_retention.enabled={} worker.job_retention.succeeded_seconds={} worker.job_retention.cancelled_seconds={} worker.job_retention.failed_seconds={} worker.job_retention.batch_size={} worker.job_retention.scan_size={} media.work_root={} media.work_free_space_reserve_bytes={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.ytdlp_allowed_hosts={} media.ytdlp_pot_provider_url={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} media.inline_video.target_max_bytes={} media.inline_video.preferred_crf={} media.inline_video.maximum_crf={} media.inline_video.minimum_short_edge={} companion.listen_address={} companion.request_body_limit_bytes={} companion.request_timeout_seconds={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -532,6 +584,12 @@ impl AppConfig {
             self.server.listen_address,
             self.worker.poll_interval_seconds,
             self.worker.lease_duration_seconds,
+            self.worker.job_retention.enabled,
+            self.worker.job_retention.succeeded_seconds,
+            self.worker.job_retention.cancelled_seconds,
+            self.worker.job_retention.failed_seconds,
+            self.worker.job_retention.batch_size,
+            self.worker.job_retention.scan_size,
             self.media.work_root.display(),
             self.media.work_free_space_reserve_bytes,
             self.media.ffmpeg_path.display(),
@@ -650,6 +708,7 @@ impl WorkerConfig {
         {
             self.lease_duration_seconds = value;
         }
+        self.job_retention.apply_environment(get)?;
         Ok(())
     }
 
@@ -664,6 +723,75 @@ impl WorkerConfig {
             return Err(ConfigError::InvalidValue {
                 name: "worker.lease_duration_seconds".to_owned(),
                 reason: "must be greater than zero",
+            });
+        }
+        self.job_retention.validate()
+    }
+}
+
+impl JobRetentionConfig {
+    fn apply_environment<F>(&mut self, get: &mut F) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    {
+        if let Some(value) = optional_env_value::<_, bool>(
+            get,
+            "SOOQA_WORKER_JOB_RETENTION_ENABLED",
+            "expected true or false",
+        )? {
+            self.enabled = value;
+        }
+        if let Some(value) =
+            optional_duration_seconds(get, "SOOQA_WORKER_JOB_RETENTION_SUCCEEDED_SECONDS")?
+        {
+            self.succeeded_seconds = value;
+        }
+        if let Some(value) =
+            optional_duration_seconds(get, "SOOQA_WORKER_JOB_RETENTION_CANCELLED_SECONDS")?
+        {
+            self.cancelled_seconds = value;
+        }
+        if let Some(value) =
+            optional_duration_seconds(get, "SOOQA_WORKER_JOB_RETENTION_FAILED_SECONDS")?
+        {
+            self.failed_seconds = value;
+        }
+        if let Some(value) =
+            optional_positive_integer::<_, usize>(get, "SOOQA_WORKER_JOB_RETENTION_BATCH_SIZE")?
+        {
+            self.batch_size = value;
+        }
+        if let Some(value) =
+            optional_positive_integer::<_, usize>(get, "SOOQA_WORKER_JOB_RETENTION_SCAN_SIZE")?
+        {
+            self.scan_size = value;
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (name, value) in [
+            ("worker.job_retention.succeeded_seconds", self.succeeded_seconds),
+            ("worker.job_retention.cancelled_seconds", self.cancelled_seconds),
+            ("worker.job_retention.failed_seconds", self.failed_seconds),
+        ] {
+            if value == 0 || value > MAX_JOB_RETENTION_HORIZON_SECONDS {
+                return Err(ConfigError::InvalidValue {
+                    name: name.to_owned(),
+                    reason: "must be greater than zero and at most ten years",
+                });
+            }
+        }
+        if self.batch_size == 0 || self.batch_size > MAX_JOB_RETENTION_BATCH_SIZE {
+            return Err(ConfigError::InvalidValue {
+                name: "worker.job_retention.batch_size".to_owned(),
+                reason: "must be greater than zero and at most 10000",
+            });
+        }
+        if self.scan_size < self.batch_size || self.scan_size > MAX_JOB_RETENTION_SCAN_SIZE {
+            return Err(ConfigError::InvalidValue {
+                name: "worker.job_retention.scan_size".to_owned(),
+                reason: "must be at least batch_size and at most 100000",
             });
         }
         Ok(())
@@ -1160,6 +1288,18 @@ struct RawServerConfig {
 struct RawWorkerConfig {
     poll_interval_seconds: Option<u64>,
     lease_duration_seconds: Option<u64>,
+    job_retention: RawJobRetentionConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawJobRetentionConfig {
+    enabled: Option<bool>,
+    succeeded_seconds: Option<u64>,
+    cancelled_seconds: Option<u64>,
+    failed_seconds: Option<u64>,
+    batch_size: Option<usize>,
+    scan_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1542,6 +1682,43 @@ mod tests {
             let config =
                 AppConfig::from_toml_str(role, None, "").expect("defaults should parse").validate();
             assert!(config.is_ok());
+        }
+    }
+
+    #[test]
+    fn job_retention_defaults_are_conservative_and_bounded() {
+        let config =
+            AppConfig::from_toml_str(AppRole::Worker, None, "").expect("defaults should parse");
+        assert!(config.worker.job_retention.enabled);
+        assert_eq!(config.worker.job_retention.succeeded_seconds, 30 * 24 * 60 * 60);
+        assert_eq!(config.worker.job_retention.cancelled_seconds, 90 * 24 * 60 * 60);
+        assert_eq!(config.worker.job_retention.failed_seconds, 365 * 24 * 60 * 60);
+        assert_eq!(config.worker.job_retention.batch_size, 128);
+        assert_eq!(config.worker.job_retention.scan_size, 1024);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn job_retention_rejects_unbounded_or_unordered_limits() {
+        let fixtures = [
+            (
+                "[worker.job_retention]\nsucceeded_seconds = 0",
+                "worker.job_retention.succeeded_seconds",
+            ),
+            ("[worker.job_retention]\nbatch_size = 0", "worker.job_retention.batch_size"),
+            (
+                "[worker.job_retention]\nbatch_size = 128\nscan_size = 127",
+                "worker.job_retention.scan_size",
+            ),
+            ("[worker.job_retention]\nscan_size = 100001", "worker.job_retention.scan_size"),
+        ];
+        for (contents, name) in fixtures {
+            let config = AppConfig::from_toml_str(AppRole::Worker, None, contents)
+                .expect("TOML should parse");
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::InvalidValue { name: actual, .. }) if actual == name
+            ));
         }
     }
 

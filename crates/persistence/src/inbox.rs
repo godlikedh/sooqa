@@ -1485,6 +1485,43 @@ impl InboxRepository {
     }
 }
 
+/// Decide whether a terminal ingest-stage job can be replayed without
+/// reopening the ingest.  The ingest row is locked before the queue row by
+/// retention, matching all ingest transition/re-enqueue paths.
+pub(crate) async fn terminal_job_retention_eligible(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job: &Job,
+) -> Result<bool, sqlx::Error> {
+    let ingest_id = match &job.command {
+        JobCommand::InspectSource(payload) => payload.ingest_id,
+        JobCommand::DownloadSource(payload) => payload.ingest_id,
+        JobCommand::ProbeAsset(payload)
+        | JobCommand::NormalizeAsset(payload)
+        | JobCommand::ComputeFingerprint(payload)
+        | JobCommand::FinalizeIngest(payload) => payload.ingest_id,
+        _ => return Ok(false),
+    };
+    let Some(state) =
+        sqlx::query_scalar::<_, String>("SELECT state FROM ingests WHERE id = $1 FOR UPDATE")
+            .bind(ingest_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+    else {
+        return Ok(false);
+    };
+    if !matches!(state.as_str(), "completed" | "failed_terminal" | "cancelled") {
+        return Ok(false);
+    }
+    let has_live_ingest_job = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM queue.jobs WHERE id <> $1 AND state IN ('queued', 'running') AND kind <> 'cleanup_workspace' AND payload->>'ingest_id' = $2)",
+    )
+    .bind(job.id)
+    .bind(ingest_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(!has_live_ingest_job)
+}
+
 #[derive(Debug, Clone)]
 pub enum SourceInspectionStart {
     Ready(Ingest),

@@ -5,6 +5,7 @@ mod inbox;
 mod jobs;
 mod library;
 mod publisher;
+mod retention;
 mod settlement;
 
 pub use cleanup::WORKSPACE_CLEANUP_RETENTION;
@@ -21,6 +22,9 @@ pub use library::{
 };
 pub use publisher::{
     CreatePostResult, PublishLease, PublisherRepository, PublisherRepositoryError,
+};
+pub use retention::{
+    JobRetentionCursor, JobRetentionError, JobRetentionPolicy, JobRetentionRun, JobRetentionStats,
 };
 pub use sooqa_inbox::{IngestListItem, IngestPage};
 pub use sooqa_publisher::{PostListItem, PostPage};

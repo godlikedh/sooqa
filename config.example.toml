@@ -7,6 +7,17 @@ request_timeout_seconds = 30
 poll_interval_seconds = 5
 lease_duration_seconds = 60
 
+# Terminal technical jobs are pruned by the existing periodic worker
+# maintenance loop. Unknown storage/publication effects and active jobs are
+# never eligible. Set enabled = false to retain terminal queue history.
+[worker.job_retention]
+enabled = true
+succeeded_seconds = 2592000 # 30 days
+cancelled_seconds = 7776000 # 90 days
+failed_seconds = 31536000 # 365 days
+batch_size = 128
+scan_size = 1024
+
 [media]
 work_root = "/var/lib/sooqa/work"
 # Free bytes kept available on the shared work volume. Large download,

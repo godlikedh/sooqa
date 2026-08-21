@@ -1,4 +1,4 @@
-use sooqa_jobs::{Job, JobCommand, JobLease, NewJob};
+use sooqa_jobs::{Job, JobCommand, JobLease, JobStatus, NewJob};
 use sqlx::{PgPool, Postgres, Transaction};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -70,6 +70,61 @@ pub(crate) async fn protected_workspace_ids(pool: &PgPool) -> Result<Vec<Uuid>, 
     // not only active pipeline states, so a storage reset cannot reopen bytes
     // between the snapshot and deletion.
     sqlx::query_scalar("SELECT DISTINCT workspace_id FROM ingests").fetch_all(pool).await
+}
+
+/// A cleanup replay is safe only for the generation it names.  A force-save
+/// changes the ingest workspace ID, so an old job cannot touch the current
+/// workspace.  For the current generation, the filesystem hand-off is known
+/// complete only after the media path has been cleared and storage is in a
+/// resolved state.
+pub(crate) async fn terminal_job_retention_eligible(
+    transaction: &mut Transaction<'_, Postgres>,
+    job: &Job,
+) -> Result<bool, sqlx::Error> {
+    let JobCommand::CleanupWorkspace(payload) = &job.command else {
+        return Ok(false);
+    };
+    let Some((current_workspace_id, state, media_id)) =
+        sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(
+            "SELECT workspace_id, state, media_id FROM ingests WHERE id = $1 FOR UPDATE",
+        )
+        .bind(payload.ingest_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if current_workspace_id != payload.workspace_id {
+        // The payload names an orphaned generation.  It cannot refer to the
+        // current workspace after force-save changed the generation fence;
+        // replaying its filesystem removal cannot corrupt current state.
+        return Ok(true);
+    }
+    // Clearing local_work_path is the hand-off before the filesystem call,
+    // so a failed/cancelled current-generation cleanup is not proof that the
+    // directory was removed.  Preserve the only durable retry signal.
+    if job.status != JobStatus::Succeeded {
+        return Ok(false);
+    }
+    if !matches!(
+        state.as_str(),
+        "completed" | "duplicate_pending" | "failed_terminal" | "cancelled" | "storing"
+    ) {
+        return Ok(false);
+    }
+    let Some(media_id) = media_id else {
+        return Ok(true);
+    };
+    let Some((storage_state, local_work_path)) = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT storage_state, local_work_path FROM media WHERE id = $1 FOR UPDATE",
+    )
+    .bind(media_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    else {
+        return Ok(false);
+    };
+    Ok(matches!(storage_state.as_str(), "ready" | "missing") && local_work_path.is_none())
 }
 
 /// Cleanup has no additional durable domain transition after its handler has
