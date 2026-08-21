@@ -86,7 +86,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
     .merge(sooqa_server::admin_router());
 
     tracing::info!(role = %config.role, "sooqa server started");
-    let server = sooqa_server::serve(listener, app, sooqa_runtime::shutdown_signal());
+    let (telegram_shutdown, telegram_shutdown_receiver) = tokio::sync::watch::channel(false);
+    let mut telegram_task = None;
     if let Some(token) =
         config.secrets.telegram_bot_token.as_ref().filter(|token| token.is_configured())
     {
@@ -104,13 +105,41 @@ async fn run() -> Result<(), Box<dyn Error>> {
         ))?
         .with_source_download_max_bytes(config.telegram.source_download_max_bytes);
         tracing::info!(api_base_url = %config.telegram.api_base_url, "Telegram bot polling enabled");
-        tokio::select! {
-            result = server => result?,
-            result = telegram.run() => result?,
-        }
-    } else {
-        server.await?;
+        telegram_task = Some(tokio::spawn(telegram.run_with_shutdown(async move {
+            let mut receiver = telegram_shutdown_receiver;
+            if !*receiver.borrow() {
+                let _ = receiver.changed().await;
+            }
+        })));
     }
+
+    let shutdown_sender = telegram_shutdown.clone();
+    let server = sooqa_server::serve(listener, app, async move {
+        sooqa_runtime::shutdown_signal().await;
+        let _ = shutdown_sender.send(true);
+    });
+    let server_result = server.await;
+    // This also handles an unexpected HTTP server error: the Telegram task is
+    // subordinate and must not keep the process alive after its owner exits.
+    let _ = telegram_shutdown.send(true);
+    if let Some(task) = telegram_task {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(
+                target: "sooqa.telegram",
+                status = "terminally_misconfigured",
+                ?error,
+                "Telegram supervisor stopped while the HTTP server remained available"
+            ),
+            Err(error) => tracing::error!(
+                target: "sooqa.telegram",
+                status = "supervisor_failed",
+                ?error,
+                "Telegram supervisor task stopped unexpectedly"
+            ),
+        }
+    }
+    server_result?;
     tracing::info!(role = %config.role, "sooqa server stopped");
 
     Ok(())

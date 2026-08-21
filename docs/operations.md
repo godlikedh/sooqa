@@ -45,6 +45,24 @@ If the final lease expires, recovery marks the owning ingest terminal instead
 of leaving it in an intermediate state. Inspect the row and its lease token
 when diagnosing a crash.
 
+The HTTP server owns the server process lifetime. Telegram polling runs as a
+supervised task with bounded exponential backoff, so a Telegram outage or a
+temporary failure during webhook cleanup does not remove `/health/live` or the
+admin API. Polling resumes automatically after the upstream recovers. A
+Telegram token, storage-channel permission, or other static remote permission
+failure is reported as `status=terminally_misconfigured` and requires operator
+action; it does not make the HTTP server exit. On SIGINT/SIGTERM the server
+signals the polling task, then drains HTTP requests before stopping.
+
+The worker performs its Telegram storage-chat preflight in the background and
+starts claiming non-storage jobs immediately. A temporary preflight outage is
+reported as `status=degraded`; upload and caption-sync jobs retain their normal
+durable retry/terminal policy. Watch structured logs with
+`target=sooqa.telegram` and the `status` values `degraded`, `retrying`,
+`recovered`, `ready`, and `terminally_misconfigured` when diagnosing Telegram
+availability. Successful liveness only means the HTTP process is serving; it
+is not a Telegram-readiness signal.
+
 ## Admin API
 
 Use the configured bearer token to inspect the bounded operational slices:

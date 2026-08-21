@@ -171,7 +171,58 @@ pub enum StorageUploadError {
 
 impl StorageUploadError {
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::InProgress { .. } | Self::Persistence(_) | Self::Api(_))
+        match self {
+            Self::InProgress { .. } | Self::Persistence(_) => true,
+            Self::Api(source) => source
+                .downcast_ref::<StorageUploadApiError>()
+                .is_none_or(StorageUploadApiError::is_retryable),
+            Self::InvalidStorageChatId
+            | Self::MediaMissing(_)
+            | Self::MediaMissingSha256(_)
+            | Self::WorkspaceReclaimed(_)
+            | Self::InvalidSha256Length { .. }
+            | Self::LocalFileUnavailable { .. }
+            | Self::LocalFileOutsideWorkRoot { .. }
+            | Self::StorageOutputLimitExceeded { .. }
+            | Self::TelegramUploadLimitExceeded { .. }
+            | Self::Hash(_)
+            | Self::HashMismatch { .. }
+            | Self::InvalidVideoMetadata { .. }
+            | Self::InvalidVideoThumbnail { .. }
+            | Self::ThumbnailStaging { .. }
+            | Self::ReconciliationRequired(_)
+            | Self::StaleGeneration { .. }
+            | Self::AmbiguousApi(_)
+            | Self::AmbiguousPersistence(_) => false,
+        }
+    }
+
+    /// A failed remote permission/token check is actionable configuration
+    /// state, not a transient storage outage.  The worker still starts, but
+    /// this classification keeps the preflight signal explicit in logs.
+    pub fn is_terminal_configuration(&self) -> bool {
+        matches!(
+            self,
+            Self::Api(source)
+                if source
+                    .downcast_ref::<StorageUploadApiError>()
+                    .is_some_and(|error| !error.is_retryable())
+        )
+    }
+}
+
+impl StorageUploadApiError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Api(
+                teloxide::RequestError::Api(teloxide::errors::ApiError::Unknown(_))
+                    | teloxide::RequestError::Network(_)
+                    | teloxide::RequestError::InvalidJson { .. }
+                    | teloxide::RequestError::Io(_)
+                    | teloxide::RequestError::RetryAfter(_)
+            )
+        )
     }
 }
 
@@ -1385,6 +1436,15 @@ mod tests {
 
         assert!(<TeloxideApi as TelegramStorageApi>::is_ambiguous_error(&unknown));
         assert!(!<TeloxideApi as TelegramStorageApi>::is_ambiguous_error(&rejected));
+    }
+
+    #[test]
+    fn storage_permission_failures_are_terminal_for_job_retries() {
+        let permission =
+            StorageUploadError::Api(Box::new(StorageUploadApiError::StorageBotNotAdministrator));
+
+        assert!(!permission.is_retryable());
+        assert!(permission.is_terminal_configuration());
     }
 
     #[test]

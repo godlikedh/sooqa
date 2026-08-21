@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    fmt::Display,
     fs,
     future::Future,
     path::{Path, PathBuf},
@@ -50,7 +51,7 @@ use tokio::{
     task::JoinError,
     time::sleep,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFailure>> + Send + 'static>>;
@@ -74,6 +75,69 @@ pub fn media_processing_components(
 #[async_trait]
 pub trait TelegramSourceDownloader: Send + Sync {
     async fn download_file(&self, file_id: &str, destination: &Path) -> Result<(), HandlerFailure>;
+}
+
+/// A best-effort startup probe for optional Telegram storage.  It is
+/// intentionally separate from [`Worker::run`]: a remote outage must not
+/// prevent non-storage jobs from being claimed, and storage jobs continue to
+/// use their durable handler retry policy.
+#[async_trait]
+pub trait StoragePreflight: Send + 'static {
+    type Error: Display + Send + Sync + 'static;
+
+    async fn verify_storage_chat(&self) -> Result<(), Self::Error>;
+
+    fn is_terminal_configuration(error: &Self::Error) -> bool;
+}
+
+#[async_trait]
+impl<A, S> StoragePreflight for StorageUploadProvider<A, S>
+where
+    A: sooqa_telegram::TelegramStorageApi,
+    S: StorageUploadStore,
+{
+    type Error = StorageUploadError;
+
+    async fn verify_storage_chat(&self) -> Result<(), Self::Error> {
+        StorageUploadProvider::verify_storage_chat(self).await
+    }
+
+    fn is_terminal_configuration(error: &Self::Error) -> bool {
+        error.is_terminal_configuration()
+    }
+}
+
+pub fn spawn_storage_preflight<P>(preflight: P, storage_chat_id: i64) -> tokio::task::JoinHandle<()>
+where
+    P: StoragePreflight,
+{
+    tokio::spawn(async move {
+        match preflight.verify_storage_chat().await {
+            Ok(()) => info!(
+                target: "sooqa.telegram",
+                status = "ready",
+                phase = "worker_storage_preflight",
+                storage_chat_id,
+                "Telegram storage chat preflight passed"
+            ),
+            Err(error) if P::is_terminal_configuration(&error) => error!(
+                target: "sooqa.telegram",
+                status = "terminally_misconfigured",
+                phase = "worker_storage_preflight",
+                storage_chat_id,
+                error = %error,
+                "Telegram storage preflight found invalid remote permissions or authentication; storage jobs remain enabled"
+            ),
+            Err(error) => warn!(
+                target: "sooqa.telegram",
+                status = "degraded",
+                phase = "worker_storage_preflight",
+                storage_chat_id,
+                error = %error,
+                "Telegram storage preflight unavailable; storage jobs will use normal retry policy"
+            ),
+        }
+    })
 }
 
 #[async_trait]
