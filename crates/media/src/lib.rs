@@ -15,6 +15,7 @@ use uuid::Uuid;
 mod command;
 mod diagnostics;
 mod direct_http;
+mod disk;
 mod execute;
 mod ffprobe;
 mod fingerprint;
@@ -34,6 +35,7 @@ pub use command::{
 };
 pub use diagnostics::{BinaryCheck, BinaryDiagnostic, diagnose_binaries};
 pub use direct_http::{DirectHttpDownloader, HostResolver, ResolvedAddress};
+pub use disk::{DiskAdmissionError, DiskSpace, check_disk_space};
 pub use execute::{
     FfmpegExecutor, FfmpegProgress, FfmpegProgressState, NormalizationExecutionError,
     NormalizationResult, ProgressError, parse_ffmpeg_progress,

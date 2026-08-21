@@ -162,6 +162,16 @@ separate:
   media can finish without an unbounded subprocess;
 - `SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES` bounds URL/link source staging and
   may be larger than 2 GB because normalization can reduce the source;
+- `SOOQA_MEDIA_WORK_FREE_SPACE_RESERVE_BYTES` keeps a minimum of 16 GiB free on
+  the filesystem containing `media.work_root` by default. Before a URL
+  download, Telegram-source reconstruction, normalization, or video
+  fingerprint extraction starts, the worker checks the reserve plus that
+  operation's bounded worst-case temporary output. A low-space check defers
+  the queue job for one minute and logs `work_disk_low`; it does not fail the
+  ingest, remove a workspace, or touch Telegram storage state. URL admission
+  uses three source budgets because yt-dlp permits two recovery attempts and a
+  progressive fallback. The reserve is an admission guard, not a promise that
+  an undersized host volume can hold an arbitrary backlog;
 - `SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES` bounds Telegram-source staging;
 - `SOOQA_TELEGRAM_LOCAL_FILE_ROOT` optionally enables worker-side copying of
   absolute paths returned by a local Bot API server. The root must be absolute;
@@ -306,6 +316,58 @@ the sequence extractor; animation preview production makes only one bounded
 first-frame decode attempt. No preview path triggers a second full video
 decode, an ffmpeg process per sample, an original-media retention rule, or an
 automatic backfill.
+
+### Work-volume sizing and graceful stop
+
+The home defaults are bounded for two worker replicas. The important peak
+budgets are:
+
+| Artifact or phase | One-worker bound | Two-worker planning bound |
+| --- | ---: | ---: |
+| URL/yt-dlp source attempt directory | 24 GiB (three 8 GiB source budgets) | 48 GiB |
+| Canonical normalized output | 1.9 GB | 3.8 GB |
+| Normalization fallback plus current candidate | 3.8 GB | 7.6 GB |
+| Fingerprint frame sequence | 4 GiB | 8 GiB |
+| Telegram-local Bot API data | separate `home-telegram-bot-api-data` volume | same |
+
+These are upper bounds for one active phase per worker; existing workspaces and
+the configured reserve must be added when sizing the shared
+`home-sooqa-work` volume. A practical two-worker starting point is at least
+64 GiB for transient media work plus 16 GiB reserve, with more space for a
+backlog or retained one-day cleanup window. The worker never deletes an active
+workspace to recover space. Check the current volume before scaling:
+
+```bash
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml config
+docker system df
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml up -d --scale worker=2
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml ps worker
+```
+
+Each worker replica has finite Compose defaults of 2 CPUs, 4 GiB memory, and a
+45-second stop grace period. They can be overridden in `deploy/home/.env` only
+with finite values appropriate for the host. The grace period lets the worker
+observe SIGTERM, stop claiming new work, cancel ffmpeg/download subprocesses,
+reap their process groups, and let the storage handler persist a safe
+pre-dispatch retry or post-dispatch unknown result. Storage uploads are never
+converted to a known failure merely because the container is stopping. The
+repository tests cover cancellation cleanup for ffmpeg, direct HTTP, yt-dlp,
+and Telegram upload thumbnail staging; use CI or synthetic local fixtures for
+these checks, never the live deployment.
+
+For resource-limit diagnostics, inspect the worker's bounded container state
+and logs rather than retrying blindly:
+
+```bash
+docker inspect --format '{{.Name}} OOMKilled={{.State.OOMKilled}} Exit={{.State.ExitCode}}' \
+  $(docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml ps -q worker)
+docker compose --env-file deploy/home/.env -f deploy/home/docker-compose.yml logs --since=15m worker
+```
+
+An `OOMKilled=true` result indicates the configured memory limit was reached;
+increase the host capacity or lower concurrent work before raising the limit.
+An application `work_disk_low` warning indicates that the job was deferred and
+will be retried after the next admission check.
 
 After a storage message exists, the revision-fenced media metadata command
 replaces the complete description and tag set in one transaction and enqueues

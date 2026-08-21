@@ -24,13 +24,13 @@ use sooqa_library::{
     VideoIdentityDecision,
 };
 use sooqa_media::{
-    ArtifactPublicationError, CANONICAL_VIDEO_PROFILE_VERSION, DownloadError, DownloadLimits,
-    DownloadedSource, FfmpegExecutor, FfprobeAdapter, FrameExtractionError, FrameExtractor,
-    ImageNormalizer, MediaProbe, MediaStreamKind, MediaWorkspace, NormalizationExecutionError,
-    NormalizationPlanner, SequenceAlignmentConfig, SequenceClassification, SourceDownloader,
-    SourceInput, VideoSequenceFingerprint, WorkspaceArea, WorkspaceError, align_video_sequences,
-    decode_first_preview_frame, encode_bounded_preview, publish_artifact, sha256_file,
-    validate_bounded_preview_for_mime,
+    ArtifactPublicationError, CANONICAL_VIDEO_PROFILE_VERSION, DiskAdmissionError, DownloadError,
+    DownloadLimits, DownloadedSource, FfmpegExecutor, FfprobeAdapter, FrameExtractionError,
+    FrameExtractor, ImageNormalizer, MediaProbe, MediaStreamKind, MediaWorkspace,
+    NormalizationExecutionError, NormalizationPlanner, SequenceAlignmentConfig,
+    SequenceClassification, SourceDownloader, SourceInput, VideoSequenceFingerprint, WorkspaceArea,
+    WorkspaceError, align_video_sequences, check_disk_space, decode_first_preview_frame,
+    encode_bounded_preview, publish_artifact, sha256_file, validate_bounded_preview_for_mime,
 };
 use sooqa_persistence::{
     AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
@@ -78,6 +78,69 @@ impl HandlerCancellation {
     }
 }
 pub type IdentityAlignmentHook = Arc<dyn Fn() + Send + Sync>;
+
+const DISK_ADMISSION_RETRY_DELAY: TimeDuration = TimeDuration::minutes(1);
+const DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Admission policy for operations that may create large workspace artifacts.
+/// The policy is deliberately per operation: the filesystem check observes
+/// bytes already consumed by other workers, while the required amount is the
+/// bounded worst-case additional output for the operation about to start.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct WorkSpaceAdmission {
+    reserve_bytes: u64,
+    enabled: bool,
+}
+
+impl WorkSpaceAdmission {
+    pub const fn disabled() -> Self {
+        Self { reserve_bytes: 0, enabled: false }
+    }
+
+    pub const fn new(reserve_bytes: u64) -> Self {
+        Self { reserve_bytes, enabled: true }
+    }
+
+    pub const fn reserve_bytes(self) -> u64 {
+        self.reserve_bytes
+    }
+
+    fn admit(self, work_root: &Path, required_bytes: u64) -> Result<(), HandlerFailure> {
+        if !self.enabled {
+            return Ok(());
+        }
+        match check_disk_space(work_root, self.reserve_bytes, required_bytes) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                match &error {
+                    DiskAdmissionError::Insufficient {
+                        available_bytes,
+                        reserve_bytes,
+                        required_bytes,
+                        ..
+                    } => warn!(
+                        work_root = %work_root.display(),
+                        available_bytes,
+                        reserve_bytes,
+                        required_bytes,
+                        "work volume is below the configured admission reserve; deferring job"
+                    ),
+                    DiskAdmissionError::Stat { .. } => warn!(
+                        work_root = %work_root.display(),
+                        error = %message,
+                        "work volume free-space check failed; deferring job"
+                    ),
+                }
+                Err(HandlerFailure::defer(
+                    "work_disk_low",
+                    message,
+                    OffsetDateTime::now_utc() + DISK_ADMISSION_RETRY_DELAY,
+                ))
+            }
+        }
+    }
+}
 
 pub fn media_processing_components(
     ffmpeg_executable: impl Into<PathBuf>,
@@ -337,13 +400,29 @@ pub fn download_source_handler(
     downloader: Arc<dyn SourceDownloader>,
     limits: DownloadLimits,
 ) -> HandlerFn {
+    download_source_handler_with_admission(
+        inbox,
+        work_root,
+        downloader,
+        limits,
+        WorkSpaceAdmission::disabled(),
+    )
+}
+
+pub fn download_source_handler_with_admission(
+    inbox: InboxRepository,
+    work_root: impl Into<PathBuf>,
+    downloader: Arc<dyn SourceDownloader>,
+    limits: DownloadLimits,
+    admission: WorkSpaceAdmission,
+) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
         let work_root = work_root.clone();
         let downloader = Arc::clone(&downloader);
         Box::pin(async move {
-            download_source(&inbox, &work_root, downloader.as_ref(), &limits, job).await
+            download_source(&inbox, &work_root, downloader.as_ref(), &limits, admission, job).await
         })
     })
 }
@@ -506,6 +585,24 @@ pub fn probe_asset_handler_with_telegram_source(
     ffprobe: FfprobeAdapter,
     telegram_source: Option<Arc<dyn TelegramSourceDownloader>>,
 ) -> HandlerFn {
+    probe_asset_handler_with_telegram_source_and_admission(
+        inbox,
+        work_root,
+        ffprobe,
+        telegram_source,
+        WorkSpaceAdmission::disabled(),
+        DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
+    )
+}
+
+pub fn probe_asset_handler_with_telegram_source_and_admission(
+    inbox: InboxRepository,
+    work_root: impl Into<std::path::PathBuf>,
+    ffprobe: FfprobeAdapter,
+    telegram_source: Option<Arc<dyn TelegramSourceDownloader>>,
+    admission: WorkSpaceAdmission,
+    telegram_source_max_bytes: u64,
+) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
@@ -513,7 +610,16 @@ pub fn probe_asset_handler_with_telegram_source(
         let ffprobe = ffprobe.clone();
         let telegram_source = telegram_source.clone();
         Box::pin(async move {
-            probe_asset(&inbox, &work_root, &ffprobe, telegram_source.as_deref(), job).await
+            probe_asset(
+                &inbox,
+                &work_root,
+                &ffprobe,
+                telegram_source.as_deref(),
+                admission,
+                telegram_source_max_bytes,
+                job,
+            )
+            .await
         })
     })
 }
@@ -526,23 +632,36 @@ pub fn normalize_asset_handler(
     image_normalizer: ImageNormalizer,
     max_normalized_storage_bytes: u64,
 ) -> HandlerFn {
+    normalize_asset_handler_with_admission(
+        inbox,
+        work_root,
+        planner,
+        executor,
+        image_normalizer,
+        max_normalized_storage_bytes,
+        WorkSpaceAdmission::disabled(),
+    )
+}
+
+pub fn normalize_asset_handler_with_admission(
+    inbox: InboxRepository,
+    work_root: impl Into<PathBuf>,
+    planner: NormalizationPlanner,
+    executor: FfmpegExecutor,
+    image_normalizer: ImageNormalizer,
+    max_normalized_storage_bytes: u64,
+    admission: WorkSpaceAdmission,
+) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
         let work_root = work_root.clone();
         let planner = planner.clone();
         let executor = executor.clone();
+        let limits = NormalizationLimits { max_normalized_storage_bytes, admission };
         Box::pin(async move {
-            normalize_asset(
-                &inbox,
-                &work_root,
-                &planner,
-                &executor,
-                image_normalizer,
-                max_normalized_storage_bytes,
-                job,
-            )
-            .await
+            normalize_asset(&inbox, &work_root, &planner, &executor, image_normalizer, limits, job)
+                .await
         })
     })
 }
@@ -595,6 +714,54 @@ pub fn compute_fingerprint_handler_with_alignment_hook(
                 &library,
                 &work_root,
                 &extractor,
+                WorkSpaceAdmission::disabled(),
+                alignment_hook.as_ref(),
+                job,
+            )
+            .await
+        })
+    })
+}
+
+pub fn compute_fingerprint_handler_with_admission(
+    inbox: InboxRepository,
+    library: LibraryRepository,
+    work_root: impl Into<PathBuf>,
+    extractor: FrameExtractor,
+    admission: WorkSpaceAdmission,
+) -> HandlerFn {
+    compute_fingerprint_handler_with_options(
+        inbox,
+        library,
+        work_root,
+        extractor,
+        admission,
+        None,
+    )
+}
+
+fn compute_fingerprint_handler_with_options(
+    inbox: InboxRepository,
+    library: LibraryRepository,
+    work_root: impl Into<PathBuf>,
+    extractor: FrameExtractor,
+    admission: WorkSpaceAdmission,
+    alignment_hook: Option<IdentityAlignmentHook>,
+) -> HandlerFn {
+    let work_root = work_root.into();
+    Arc::new(move |job| {
+        let inbox = inbox.clone();
+        let library = library.clone();
+        let work_root = work_root.clone();
+        let extractor = extractor.clone();
+        let alignment_hook = alignment_hook.clone();
+        Box::pin(async move {
+            compute_fingerprint(
+                &inbox,
+                &library,
+                &work_root,
+                &extractor,
+                admission,
                 alignment_hook.as_ref(),
                 job,
             )
@@ -662,11 +829,19 @@ async fn cleanup_workspace(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NormalizationLimits {
+    max_normalized_storage_bytes: u64,
+    admission: WorkSpaceAdmission,
+}
+
 async fn probe_asset(
     inbox: &InboxRepository,
     work_root: &std::path::Path,
     ffprobe: &FfprobeAdapter,
     telegram_source: Option<&dyn TelegramSourceDownloader>,
+    admission: WorkSpaceAdmission,
+    telegram_source_max_bytes: u64,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
@@ -716,7 +891,14 @@ async fn probe_asset(
 
     if request.kind == IngestKind::TelegramMessage
         && !source_artifact_exists(&input_path).await?
-        && let Err(failure) = ensure_telegram_source(&workspace, &request, telegram_source).await
+        && let Err(failure) = ensure_telegram_source(
+            &workspace,
+            &request,
+            telegram_source,
+            admission,
+            telegram_source_max_bytes,
+        )
+        .await
     {
         let terminal = !failure.retryable || job.attempt_count >= job.max_attempts;
         let failure = if terminal {
@@ -794,6 +976,8 @@ async fn ensure_telegram_source(
     workspace: &MediaWorkspace,
     request: &sooqa_inbox::Ingest,
     telegram_source: Option<&dyn TelegramSourceDownloader>,
+    admission: WorkSpaceAdmission,
+    max_bytes: u64,
 ) -> Result<(), HandlerFailure> {
     let input_data = request
         .input_data()
@@ -821,6 +1005,7 @@ async fn ensure_telegram_source(
         .path(WorkspaceArea::Source, &format!(".sooqa-telegram-source-{}.tmp", Uuid::new_v4()))
         .map_err(map_workspace_error)?;
     let temporary = DownloadAttemptArtifact::new(temporary_path);
+    admission.admit(workspace.root(), max_bytes)?;
     telegram_source.download_file(file_id, temporary.path()).await?;
     let downloaded = read_source_artifact(workspace, temporary.path(), None).await?;
     if downloaded.bytes == 0 {
@@ -870,9 +1055,10 @@ async fn normalize_asset(
     planner: &NormalizationPlanner,
     executor: &FfmpegExecutor,
     image_normalizer: ImageNormalizer,
-    max_normalized_storage_bytes: u64,
+    limits: NormalizationLimits,
     job: Job,
 ) -> Result<(), HandlerFailure> {
+    let NormalizationLimits { max_normalized_storage_bytes, admission } = limits;
     let ingest_request_id = match &job.command {
         JobCommand::NormalizeAsset(payload) => payload.ingest_id,
         _ => {
@@ -949,6 +1135,12 @@ async fn normalize_asset(
             .await;
         }
     };
+    let required_bytes = if media_kind == SourceMediaKind::Video {
+        max_normalized_storage_bytes.saturating_mul(2)
+    } else {
+        max_normalized_storage_bytes
+    };
+    admission.admit(work_root, required_bytes)?;
     if media_kind == SourceMediaKind::Image {
         return normalize_image_asset(
             inbox,
@@ -1843,6 +2035,7 @@ async fn compute_fingerprint(
     library: &LibraryRepository,
     work_root: &Path,
     extractor: &FrameExtractor,
+    admission: WorkSpaceAdmission,
     alignment_hook: Option<&IdentityAlignmentHook>,
     job: Job,
 ) -> Result<(), HandlerFailure> {
@@ -1861,11 +2054,39 @@ async fn compute_fingerprint(
             "compute_fingerprint handler requires a running job lease",
         )
     })?;
+    let current_request = load_ingest_for_admission(inbox, ingest_request_id).await?;
+    let mut preflight_failure = None;
+    if fingerprint_stage_may_run(current_request.status) {
+        match current_request.input_data() {
+            Ok(input_data) => match input_data.normalization {
+                Some(normalization) if normalization.media_kind == SourceMediaKind::Video => {
+                    admission.admit(work_root, sooqa_media::DEFAULT_MAX_FRAME_SEQUENCE_BYTES)?;
+                }
+                Some(_) => {}
+                None => {
+                    preflight_failure = Some(HandlerFailure::permanent(
+                        "invalid_ingest_state",
+                        "ingest request has no stored normalization metadata",
+                    ));
+                }
+            },
+            Err(error) => {
+                preflight_failure = Some(HandlerFailure::permanent(
+                    "invalid_ingest_state",
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+
     let request = match inbox.begin_ingest_fingerprinting(ingest_request_id, &job_attempt).await {
         Ok(IngestFingerprintStart::Ready(request)) => request,
         Ok(IngestFingerprintStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
     };
+    if let Some(failure) = preflight_failure {
+        return fail_fingerprint(inbox, ingest_request_id, &job_attempt, failure).await;
+    }
     let input_data = match request.input_data() {
         Ok(input_data) => input_data,
         Err(error) => {
@@ -3002,6 +3223,7 @@ async fn download_source(
     work_root: &Path,
     downloader: &dyn SourceDownloader,
     limits: &DownloadLimits,
+    admission: WorkSpaceAdmission,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let (ingest_request_id, inspection) = match &job.command {
@@ -3019,6 +3241,13 @@ async fn download_source(
             "download_source handler requires a running job lease",
         )
     })?;
+
+    // yt-dlp may use two recovery attempts and a progressive fallback. Its
+    // aggregate attempt directory is bounded to three source budgets, so URL
+    // admission reserves that worst case even when direct HTTP was selected
+    // for this particular inspection.
+    let required_bytes = limits.max_bytes.saturating_mul(3);
+    admission.admit(work_root, required_bytes)?;
 
     match inbox.begin_source_download(ingest_request_id, &job_attempt).await {
         Ok(SourceDownloadStart::Ready(_)) => {}

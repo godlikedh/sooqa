@@ -9,6 +9,10 @@ lease_duration_seconds = 60
 
 [media]
 work_root = "/var/lib/sooqa/work"
+# Free bytes kept available on the shared work volume. Large download,
+# normalization, and fingerprint jobs defer until this reserve plus their
+# bounded operation budget is available.
+work_free_space_reserve_bytes = 17179869184
 ffmpeg_path = "ffmpeg"
 ffprobe_path = "ffprobe"
 ytdlp_path = "yt-dlp"
