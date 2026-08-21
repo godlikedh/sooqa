@@ -548,6 +548,55 @@ async fn composed_identity_worker_has_bounded_storage_effects(pool: sqlx::PgPool
     assert!(strong_request.media_id.is_none());
     assert_eq!(calls.load(Ordering::Relaxed), 0);
 
+    let force_save = prepare_fingerprint_request(
+        &database,
+        &work_root,
+        "force-save-strong",
+        b"force-save-bytes",
+    )
+    .await;
+    sqlx::query("UPDATE ingests SET force_save = true WHERE id = $1")
+        .bind(force_save.ingest_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let force_save_id = force_save.ingest_id;
+    run_fingerprint(
+        &database,
+        &work_root,
+        force_save,
+        FrameExtractor::with_runner(
+            "fake-ffmpeg",
+            Duration::from_secs(5),
+            64 * 1024,
+            Arc::new(IdentityFrameRunner { variant: 0, calls: Arc::new(AtomicUsize::new(0)) }),
+        ),
+    )
+    .await;
+    let force_save_request = database.inbox().find(force_save_id).await.unwrap().unwrap();
+    assert_eq!(force_save_request.status, IngestStatus::Storing);
+    let force_save_media_id =
+        force_save_request.media_id.expect("force-save should reserve a distinct media row");
+    assert_ne!(force_save_media_id, strong_candidate_id);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1")
+            .bind(force_save_media_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "pending_storage"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' = $1",
+        )
+        .bind(force_save_media_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        1
+    );
+
     let no_match_runner = IdentityFrameRunner { variant: 1, calls: Arc::new(AtomicUsize::new(0)) };
     let no_match =
         prepare_fingerprint_request(&database, &work_root, "no-match", b"no-match-bytes").await;
@@ -573,16 +622,33 @@ async fn composed_identity_worker_has_bounded_storage_effects(pool: sqlx::PgPool
     let provider =
         StorageUploadProvider::new(storage_api.clone(), database.library(), -100123).unwrap();
     let upload_handler = upload_storage_asset_handler(database.inbox(), provider.clone());
-    let upload_job = database
-        .jobs()
-        .claim_next("storage-worker", Duration::from_secs(30), &[JobType::UploadStorageAsset])
-        .await
-        .unwrap()
-        .expect("no-match should enqueue one storage job");
-    upload_handler(upload_job).await.unwrap();
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let mut force_save_upload_seen = false;
+    let mut no_match_upload_seen = false;
+    for _ in 0..2 {
+        let upload_job = database
+            .jobs()
+            .claim_next("storage-worker", Duration::from_secs(30), &[JobType::UploadStorageAsset])
+            .await
+            .unwrap()
+            .expect("force-save and no-match should each enqueue one storage job");
+        let upload_media_id = match &upload_job.command {
+            sooqa_jobs::JobCommand::UploadStorageAsset(payload) => payload.media_id,
+            command => panic!("expected storage upload command, got {command:?}"),
+        };
+        upload_handler(upload_job).await.unwrap();
+        if upload_media_id == force_save_media_id {
+            force_save_upload_seen = true;
+        } else if upload_media_id == media_id {
+            no_match_upload_seen = true;
+        } else {
+            panic!("unexpected storage upload media {upload_media_id}");
+        }
+    }
+    assert!(force_save_upload_seen);
+    assert!(no_match_upload_seen);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
     provider.upload(sooqa_telegram::StorageUploadInput { media_id, generation: 0 }).await.unwrap();
-    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
     assert_eq!(
         database.inbox().find(no_match_id).await.unwrap().unwrap().status,
         IngestStatus::Completed

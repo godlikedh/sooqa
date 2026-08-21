@@ -13,8 +13,9 @@ use sooqa_library::{
     MediaPreviewMetadata, MediaSearchQuery, MediaSource, MediaSourceInput, MediaStorageState,
     MediaSummary, MediaUpdate, SourceKind, StorageCaptionMetadata, StorageReceipt,
     StorageUploadAttachment, StorageUploadInfo, StorageUploadReservation,
-    StorageUploadReservationRequest, StorageUploadStore, TagValidationError, VideoFingerprintInput,
-    VideoIdentityDecision, VideoIdentityOutcome, normalize_tag,
+    StorageUploadReservationRequest, StorageUploadStore, TagValidationError,
+    VideoDuplicateClassification, VideoFingerprintInput, VideoIdentityDecision,
+    VideoIdentityOutcome, normalize_tag,
 };
 use sqlx::{Connection, FromRow, PgPool, Postgres, Transaction, pool::PoolConnection};
 use thiserror::Error;
@@ -799,19 +800,17 @@ impl LibraryRepository {
 
         let fingerprint = fingerprint.ok_or(LibraryRepositoryError::MissingFingerprint)?;
         validate_video_fingerprint(fingerprint)?;
-        if !force_save && let VideoIdentityDecision::DuplicatePending { evidence } = decision {
-            if evidence.matches.len() > MAX_VIDEO_DUPLICATE_MATCHES {
-                return Err(LibraryRepositoryError::DuplicateEvidenceTooManyMatches {
-                    max: MAX_VIDEO_DUPLICATE_MATCHES,
-                });
+        if let VideoIdentityDecision::DuplicatePending { evidence } = decision {
+            validate_duplicate_evidence(evidence, fingerprint.version())?;
+            if !force_save {
+                let encoded = serde_json::to_vec(evidence)?;
+                if encoded.len() > MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES {
+                    return Err(LibraryRepositoryError::DuplicateEvidenceTooLarge {
+                        max: MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES,
+                    });
+                }
+                return Ok(VideoIdentityOutcome::DuplicatePending { evidence: evidence.clone() });
             }
-            let encoded = serde_json::to_vec(evidence)?;
-            if encoded.len() > MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES {
-                return Err(LibraryRepositoryError::DuplicateEvidenceTooLarge {
-                    max: MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES,
-                });
-            }
-            return Ok(VideoIdentityOutcome::DuplicatePending { evidence: evidence.clone() });
         }
 
         let preview = preview_bindings(ingest.metadata.kind, &ingest.metadata.preview)?;
@@ -1191,6 +1190,62 @@ fn validate_video_fingerprint(
     fingerprint
         .validate()
         .map_err(|error| LibraryRepositoryError::InvalidFingerprint(error.to_string()))
+}
+
+fn validate_duplicate_evidence(
+    evidence: &sooqa_library::VideoDuplicateEvidence,
+    fingerprint_version: &str,
+) -> Result<(), LibraryRepositoryError> {
+    if evidence.matches.is_empty() {
+        return Err(LibraryRepositoryError::DuplicateEvidenceEmpty);
+    }
+    if evidence.matches.len() > MAX_VIDEO_DUPLICATE_MATCHES {
+        return Err(LibraryRepositoryError::DuplicateEvidenceTooManyMatches {
+            max: MAX_VIDEO_DUPLICATE_MATCHES,
+        });
+    }
+    if evidence.algorithm_version != fingerprint_version {
+        return Err(LibraryRepositoryError::DuplicateEvidenceAlgorithmVersionMismatch {
+            expected: fingerprint_version.to_owned(),
+            actual: evidence.algorithm_version.clone(),
+        });
+    }
+    if !evidence
+        .matches
+        .iter()
+        .any(|item| item.classification == VideoDuplicateClassification::StrongDuplicate)
+    {
+        return Err(LibraryRepositoryError::DuplicateEvidenceMissingStrongMatch);
+    }
+    for item in &evidence.matches {
+        if item.fingerprint_version != fingerprint_version {
+            return Err(LibraryRepositoryError::DuplicateEvidenceFingerprintVersionMismatch {
+                expected: fingerprint_version.to_owned(),
+                actual: item.fingerprint_version.clone(),
+            });
+        }
+        for (field, value) in [
+            ("incoming_coverage_bps", i64::from(item.incoming_coverage_bps)),
+            ("candidate_coverage_bps", i64::from(item.candidate_coverage_bps)),
+            ("median_distance_bps", i64::from(item.median_distance_bps)),
+            ("high_percentile_distance_bps", i64::from(item.high_percentile_distance_bps)),
+            ("score_bps", i64::from(item.score_bps)),
+            ("token_overlap_bps", item.token_overlap_bps),
+        ] {
+            if !(0..=10_000).contains(&value) {
+                return Err(LibraryRepositoryError::DuplicateEvidenceInvalidBasisPoints {
+                    field,
+                    value,
+                });
+            }
+        }
+        if item.shared_token_count < 0 {
+            return Err(LibraryRepositoryError::DuplicateEvidenceInvalidSharedTokenCount {
+                value: item.shared_token_count,
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn fetch_video_fingerprint_candidates(
@@ -2008,8 +2063,24 @@ pub enum LibraryRepositoryError {
     InvalidVideoIdentityKind,
     #[error("duplicate evidence exceeds the {max}-byte limit")]
     DuplicateEvidenceTooLarge { max: usize },
+    #[error("duplicate evidence must contain at least one match")]
+    DuplicateEvidenceEmpty,
     #[error("duplicate evidence contains more than {max} matches")]
     DuplicateEvidenceTooManyMatches { max: usize },
+    #[error("duplicate evidence does not contain a strong duplicate match")]
+    DuplicateEvidenceMissingStrongMatch,
+    #[error(
+        "duplicate evidence algorithm version {actual} does not match incoming version {expected}"
+    )]
+    DuplicateEvidenceAlgorithmVersionMismatch { expected: String, actual: String },
+    #[error(
+        "duplicate evidence match fingerprint version {actual} does not match incoming version {expected}"
+    )]
+    DuplicateEvidenceFingerprintVersionMismatch { expected: String, actual: String },
+    #[error("duplicate evidence field {field} has invalid basis points {value}")]
+    DuplicateEvidenceInvalidBasisPoints { field: &'static str, value: i64 },
+    #[error("duplicate evidence shared token count must not be negative: {value}")]
+    DuplicateEvidenceInvalidSharedTokenCount { value: i64 },
     #[error("media {0} was not found")]
     ResourceMissing(Uuid),
     #[error("media {0} was modified by another request")]

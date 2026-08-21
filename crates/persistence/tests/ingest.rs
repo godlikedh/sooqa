@@ -8,6 +8,7 @@ use sooqa_inbox::{
 use sooqa_jobs::{JobCommand, JobStatus, JobType};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
+    VideoDuplicateClassification, VideoDuplicateEvidence, VideoDuplicateMatch,
     VideoFingerprintInput, VideoIdentityDecision,
 };
 use sooqa_media::{VideoSequenceFingerprint, VideoSequenceSample};
@@ -1150,6 +1151,199 @@ async fn stale_video_identity_finalizer_cannot_mutate_after_lease_recovery(pool:
             .unwrap(),
         JobStatus::Succeeded.as_str()
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn video_identity_rejects_untrusted_duplicate_evidence(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/evidence-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ingests SET state = 'fingerprinting' WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
+        .bind(ingest.ingest.id.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    database
+        .jobs()
+        .enqueue(
+            sooqa_jobs::NewJob::compute_fingerprint(ingest.ingest.id)
+                .dedupe_key(format!("test:evidence:{}", ingest.ingest.id)),
+        )
+        .await
+        .unwrap();
+    let job = database
+        .jobs()
+        .claim_next(
+            "evidence-worker",
+            std::time::Duration::from_secs(30),
+            &[JobType::ComputeFingerprint],
+        )
+        .await
+        .unwrap()
+        .expect("fingerprint job should be claimable");
+    let attempt = job.lease().unwrap();
+    let media_ingest = test_video_ingest(ingest.ingest.id, vec![92_u8; 32]);
+    let fingerprint = test_video_sequence(0xabcdef);
+    let fingerprint_input = VideoFingerprintInput::try_new(
+        fingerprint.version.as_str(),
+        fingerprint.encode().unwrap(),
+        fingerprint.search_tokens(),
+    )
+    .unwrap();
+    let version = fingerprint.version.as_str();
+    let candidate_id = Uuid::new_v4();
+    let cases = [
+        (
+            VideoDuplicateEvidence { algorithm_version: version.to_owned(), matches: Vec::new() },
+            "empty evidence",
+            "at least one match",
+        ),
+        (
+            duplicate_evidence_typed(
+                candidate_id,
+                version,
+                version,
+                VideoDuplicateClassification::PartialMatch,
+                9_500,
+            ),
+            "evidence without strong match",
+            "strong duplicate",
+        ),
+        (
+            duplicate_evidence_typed(
+                candidate_id,
+                "other_v1",
+                version,
+                VideoDuplicateClassification::StrongDuplicate,
+                9_500,
+            ),
+            "algorithm version mismatch",
+            "algorithm version",
+        ),
+        (
+            duplicate_evidence_typed(
+                candidate_id,
+                version,
+                "other_v1",
+                VideoDuplicateClassification::StrongDuplicate,
+                9_500,
+            ),
+            "match version mismatch",
+            "match fingerprint version",
+        ),
+        (
+            duplicate_evidence_typed(
+                candidate_id,
+                version,
+                version,
+                VideoDuplicateClassification::StrongDuplicate,
+                10_001,
+            ),
+            "basis point overflow",
+            "basis points",
+        ),
+    ];
+
+    for (evidence, description, expected_error) in cases {
+        let start = database
+            .inbox()
+            .begin_video_identity(
+                ingest.ingest.id,
+                &attempt,
+                &media_ingest,
+                Some(&fingerprint_input),
+            )
+            .await
+            .unwrap();
+        let session = match start {
+            sooqa_persistence::IngestVideoIdentityStart::Ready { session, .. } => session,
+            sooqa_persistence::IngestVideoIdentityStart::AlreadyAdvanced(request) => {
+                panic!(
+                    "identity request unexpectedly advanced while testing {description}: {request:?}"
+                )
+            }
+        };
+        let result = database
+            .inbox()
+            .complete_video_identity(
+                ingest.ingest.id,
+                &attempt,
+                session,
+                media_ingest.clone(),
+                Some(&fingerprint_input),
+                &VideoIdentityDecision::DuplicatePending { evidence },
+            )
+            .await;
+        let error = match result {
+            Err(InboxRepositoryError::Library(error)) => error,
+            other => {
+                panic!("{description} should be rejected by library validation, got {other:?}")
+            }
+        };
+        assert!(
+            error.to_string().contains(expected_error),
+            "{description} returned an unexpected validation error: {error}"
+        );
+    }
+    assert_eq!(
+        database.inbox().find(ingest.ingest.id).await.unwrap().unwrap().status,
+        IngestStatus::Fingerprinting
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM media WHERE canonical_sha256 = $1")
+            .bind(vec![92_u8; 32])
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+fn duplicate_evidence_typed(
+    media_id: Uuid,
+    algorithm_version: &str,
+    fingerprint_version: &str,
+    classification: VideoDuplicateClassification,
+    score_bps: u16,
+) -> VideoDuplicateEvidence {
+    VideoDuplicateEvidence {
+        algorithm_version: algorithm_version.to_owned(),
+        matches: vec![VideoDuplicateMatch {
+            media_id,
+            fingerprint_version: fingerprint_version.to_owned(),
+            classification,
+            aligned_offset_ms: 0,
+            informative_matched_samples: 8,
+            incoming_coverage_bps: 9_000,
+            candidate_coverage_bps: 9_000,
+            median_distance_bps: 100,
+            high_percentile_distance_bps: 200,
+            longest_temporally_consistent_run: 8,
+            unmatched_incoming_prefix: 0,
+            unmatched_incoming_suffix: 0,
+            unmatched_candidate_prefix: 0,
+            unmatched_candidate_suffix: 0,
+            gap_count: 0,
+            score_bps,
+            shared_token_count: 12,
+            token_overlap_bps: 8_000,
+        }],
+    }
 }
 
 fn test_video_ingest(ingest_id: Uuid, sha256: Vec<u8>) -> MediaIngest {
