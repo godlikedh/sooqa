@@ -59,7 +59,7 @@ mod tests {
 
     use async_trait::async_trait;
     use axum::{Router, body::Body, http::Request, routing::get};
-    use sooqa_telegram::{MemoryUpdateStore, TelegramApi, TelegramPollingApi, TelegramRuntime};
+    use sooqa_telegram::{TelegramApi, TelegramPollingApi, TelegramRuntime};
     use thiserror::Error;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -200,16 +200,9 @@ mod tests {
             successful_polls: Arc::new(AtomicUsize::new(0)),
         };
         let successful_polls = Arc::clone(&api.successful_polls);
-        let runtime = TelegramRuntime::new_with_api(
-            api,
-            Duration::from_secs(1),
-            MemoryUpdateStore::default(),
-            [123],
-            None,
-            (),
-        )
-        .with_polling_backoff(Duration::from_millis(1), Duration::from_millis(4))
-        .expect("test backoff should be valid");
+        let runtime = TelegramRuntime::new_with_api(api, Duration::from_secs(1), [123], None, ())
+            .with_polling_backoff(Duration::from_millis(1), Duration::from_millis(4))
+            .expect("test backoff should be valid");
         let (telegram_stop, telegram_shutdown) = oneshot::channel();
         let telegram_task = tokio::spawn(runtime.run_with_shutdown(async move {
             let _ = telegram_shutdown.await;

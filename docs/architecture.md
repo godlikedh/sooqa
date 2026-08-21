@@ -86,9 +86,12 @@ schema; current five-table data is retained by forward-only migrations.
   storage uploads, and publication use separate bounded calls. Telegram file
   acceptance is metadata-only; source bytes are reconstructed by the worker
   from the durable file ID. Publication receives only a ready storage receipt
-  and never receives a local media path. The Telegram adapter remains focused
-  on capture, duplicate decisions, and sending; bounded web-admin slices own
-  publication editing.
+  and never receives a local media path. Polling advances Telegram offsets only
+  after a bounded in-process handler retry succeeds; it has no process-local
+  completed-update receipt map. Durable input/effect keys protect replayed
+  business effects, while response rate limiting remains a separate bounded
+  concern. The Telegram adapter remains focused on capture, duplicate
+  decisions, and sending; bounded web-admin slices own publication editing.
 - `sooqa-persistence` owns migrations and short database transactions.
 - `sooqa-api` owns HTTP routing, one configured bearer secret, limits, and
   stable request-ID errors.

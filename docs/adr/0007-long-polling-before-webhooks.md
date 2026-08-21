@@ -14,16 +14,14 @@ command flow and would make local operation harder to verify.
 ## Decision
 
 Use Telegram long polling for the initial adapter. The server constructs the
-polling client with a configurable Bot API base URL and timeout, deletes an
-existing webhook before polling, and claims each Telegram update ID in a
-process-local lease-aware store before handling it. The store suppresses
-concurrent delivery only for the lifetime of that server process; it is not a
-PostgreSQL receipt ledger. The polling loop advances its Telegram offset only
-after the handler succeeds; failed handlers retain the offset and retry with a
-short backoff. Durable business effects use their owning aggregate's keys,
-especially the Telegram-derived `ingests.input_key`, so a replay after restart
-does not create a second ingest. Teloxide remains behind the project-owned
-`sooqa-telegram` boundary.
+polling client with a configurable Bot API base URL and timeout and deletes an
+existing webhook before polling. The polling loop handles each update directly,
+advances its Telegram offset only after the handler succeeds, and retains the
+offset while a bounded local retry loop handles transient failures. Durable
+business effects use their owning aggregate's keys, especially the
+Telegram-derived `ingests.input_key`, so a replay after restart does not create
+a second ingest. Teloxide remains behind the project-owned `sooqa-telegram`
+boundary.
 
 The runtime makes five handler attempts. If an update still fails, it returns
 an error without advancing the offset so a process supervisor can restart the
@@ -41,10 +39,9 @@ and replay behavior before replacing polling.
 
 - Local and private-network deployments need only outbound access to the Bot
   API.
-- One running server suppresses duplicate concurrent handling, while abandoned
-  in-process claims can be reclaimed after five minutes.
 - A restart may redeliver an update; durable ingest keys prevent duplicate
-  ingest work, but purely conversational replies are not stored as receipts.
+  ingest work, but purely conversational replies are intentionally not stored
+  as receipts and may be sent again.
 - A failed response can be retried, with the usual Telegram ambiguity if the
   network fails after Telegram accepted the request.
 - The adapter owns a small polling loop instead of delegating handler errors to
