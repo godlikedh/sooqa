@@ -14,7 +14,6 @@ members = [
     "crates/telegram",
     "crates/persistence",
     "crates/api",
-    "crates/test-support",
 ]
 
 [workspace.package]
