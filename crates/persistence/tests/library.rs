@@ -441,63 +441,6 @@ async fn video_fingerprint_shortlist_is_capped_at_twenty(pool: sqlx::PgPool) {
     assert!(candidates.iter().all(|candidate| candidate.shared_token_count >= 8));
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires PostgreSQL"]
-async fn video_fingerprint_writes_reject_invalid_input_invariants(pool: sqlx::PgPool) {
-    let database = Database::from_pool(pool);
-    let repository = database.library();
-    let media = repository
-        .resolve_media(ingest(vec![39_u8; 32], "https://example.test/invalid-fingerprint"))
-        .await
-        .unwrap()
-        .media;
-    let valid = fingerprint_input(&test_sequence(0x1234_5678_9abc_def0));
-
-    let mut wrong_version = valid.clone();
-    wrong_version.version = "other_v1".to_owned();
-    assert!(matches!(
-        repository.record_video_sequence_fingerprint(media.id, &wrong_version).await,
-        Err(LibraryRepositoryError::InvalidFingerprint(_))
-    ));
-
-    let mut oversized_data = valid.clone();
-    oversized_data.data.resize(sooqa_library::VIDEO_SEQUENCE_FINGERPRINT_MAX_ENCODED_BYTES + 1, 0);
-    assert!(matches!(
-        repository.record_video_sequence_fingerprint(media.id, &oversized_data).await,
-        Err(LibraryRepositoryError::InvalidFingerprint(_))
-    ));
-
-    let mut oversized_tokens = valid.clone();
-    oversized_tokens
-        .search_tokens
-        .resize(sooqa_library::VIDEO_SEQUENCE_FINGERPRINT_MAX_TOKENS + 1, 1);
-    assert!(matches!(
-        repository.record_video_sequence_fingerprint(media.id, &oversized_tokens).await,
-        Err(LibraryRepositoryError::InvalidFingerprint(_))
-    ));
-
-    let mut duplicate_tokens = valid.clone();
-    duplicate_tokens.search_tokens[1] = duplicate_tokens.search_tokens[0];
-    assert!(matches!(
-        repository.record_video_sequence_fingerprint(media.id, &duplicate_tokens).await,
-        Err(LibraryRepositoryError::InvalidFingerprint(_))
-    ));
-
-    let mut unsorted_tokens = valid.clone();
-    unsorted_tokens.search_tokens.swap(0, 1);
-    assert!(matches!(
-        repository.record_video_sequence_fingerprint(media.id, &unsorted_tokens).await,
-        Err(LibraryRepositoryError::InvalidFingerprint(_))
-    ));
-
-    let mut malformed_data = valid.clone();
-    malformed_data.data[0] = b'X';
-    assert!(matches!(
-        repository.record_video_sequence_fingerprint(media.id, &malformed_data).await,
-        Err(LibraryRepositoryError::InvalidFingerprint(_))
-    ));
-}
-
 fn test_sequence(seed: u64) -> VideoSequenceFingerprint {
     VideoSequenceFingerprint::new(
         5_000,

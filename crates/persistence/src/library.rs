@@ -730,8 +730,8 @@ impl LibraryRepository {
         } else {
             fetch_video_fingerprint_candidates(
                 transaction,
-                fingerprint.version.as_str(),
-                &fingerprint.search_tokens,
+                fingerprint.version(),
+                fingerprint.search_tokens(),
             )
             .await?
             .into_iter()
@@ -832,9 +832,9 @@ impl LibraryRepository {
         )
         .bind(id)
         .bind(sha256)
-        .bind(&fingerprint.version)
-        .bind(&fingerprint.data)
-        .bind(&fingerprint.search_tokens)
+        .bind(fingerprint.version())
+        .bind(fingerprint.data())
+        .bind(fingerprint.search_tokens())
         .bind(&ingest.media.title)
         .bind(&ingest.media.description)
         .bind(&tags)
@@ -940,9 +940,9 @@ impl LibraryRepository {
             "UPDATE media SET fingerprint_version = $2, fingerprint_data = $3, fingerprint_search_tokens = $4, updated_at = now() WHERE id = $1 AND kind = 'video'",
         )
         .bind(media_id)
-        .bind(&fingerprint.version)
-        .bind(&fingerprint.data)
-        .bind(&fingerprint.search_tokens)
+        .bind(fingerprint.version())
+        .bind(fingerprint.data())
+        .bind(fingerprint.search_tokens())
         .execute(&self.pool)
         .await?;
         if updated.rows_affected() != 1 {

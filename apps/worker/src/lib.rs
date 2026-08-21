@@ -3726,6 +3726,39 @@ mod tests {
     }
 
     #[test]
+    fn malformed_stored_fingerprint_is_rejected_before_alignment() {
+        let incoming = VideoSequenceFingerprint::new(
+            500,
+            500,
+            vec![sooqa_media::VideoSequenceSample {
+                phash: 1,
+                dhash: 2,
+                mean_luma: 100,
+                mean_chroma_u: 0,
+                mean_chroma_v: 0,
+                information_bps: 8_000,
+                transition_bps: 0,
+            }],
+        )
+        .unwrap();
+        let candidate = VideoFingerprintCandidate {
+            media_id: Uuid::new_v4(),
+            width: None,
+            height: None,
+            audio_codec: None,
+            fingerprint_version: "video_sequence_v1".to_owned(),
+            fingerprint_data: vec![0; 1],
+            search_tokens: Vec::new(),
+            shared_token_count: 8,
+            overlap_bps: 1_000,
+        };
+        let error =
+            align_video_identity(&incoming, &[candidate], SequenceAlignmentConfig::default())
+                .expect_err("malformed candidate bytes must fail closed");
+        assert!(error.contains("invalid stored fingerprint"));
+    }
+
+    #[test]
     fn worker_rejects_unbounded_timing_values() {
         assert!(matches!(
             validate_timing(Duration::ZERO, Duration::from_secs(1)),

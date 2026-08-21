@@ -184,9 +184,10 @@ the worker's exact/duplicate-pending/no-match decision, successor work, and
 current-job success atomically. The session lock is released only after that
 transaction commits (and the dedicated connection is closed on cancellation),
 so stale or cancelled workers cannot retain a pooled advisory lock.
-The worker/library boundary validates the versioned fingerprint envelope and
-its bounded, sorted, data-derived search-token projection before persistence
-stores it; persistence does not decode candidates or execute alignment.
+The worker/media boundary validates the versioned fingerprint envelope and
+derives its bounded, sorted search-token projection before the library DTO
+accepts the opaque bytes; persistence only enforces the DTO's generic bounds
+and does not decode candidates or execute alignment.
 
 The lock does not cover download, ffmpeg, filesystem, HTTP, or Telegram work.
 Images, animations, and audio skip the video path and use exact SHA
