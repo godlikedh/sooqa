@@ -133,6 +133,88 @@ async fn malformed_storage_payload_does_not_abort_stale_recovery(pool: sqlx::PgP
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
+async fn deferral_consumes_the_final_attempt(pool: sqlx::PgPool) {
+    let repository = Database::from_pool(pool).jobs();
+    repository
+        .enqueue(
+            NewJob::cleanup_workspace(Uuid::new_v4(), Uuid::new_v4())
+                .max_attempts(1)
+                .dedupe_key(format!("defer-test:{}", Uuid::new_v4())),
+        )
+        .await
+        .expect("bounded job should enqueue");
+    let claimed = repository
+        .claim_next("defer-worker", Duration::from_secs(30), &[JobType::CleanupWorkspace])
+        .await
+        .expect("job should claim")
+        .expect("queued job should be available");
+    assert_eq!(claimed.attempt_count, 1);
+
+    let deferred = repository
+        .defer_lease(
+            &claimed.lease().expect("claim should carry a lease"),
+            OffsetDateTime::now_utc(),
+            "work_disk_low",
+            "synthetic reserve is full",
+        )
+        .await
+        .expect("resource deferral should remain durable");
+    assert_eq!(deferred.status, JobStatus::Failed);
+    assert_eq!(deferred.attempt_count, 1);
+    assert!(deferred.completed_at.is_some());
+
+    assert!(
+        repository
+            .claim_next("defer-worker-2", Duration::from_secs(30), &[JobType::CleanupWorkspace])
+            .await
+            .expect("deferred job query should succeed")
+            .is_none()
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn scheduled_deferral_without_consuming_attempt_is_reclaimable(pool: sqlx::PgPool) {
+    let repository = Database::from_pool(pool).jobs();
+    let job = repository
+        .enqueue(
+            NewJob::cleanup_workspace(Uuid::new_v4(), Uuid::new_v4())
+                .max_attempts(1)
+                .dedupe_key(format!("non-consuming-defer-test:{}", Uuid::new_v4())),
+        )
+        .await
+        .expect("bounded job should enqueue");
+    let claimed = repository
+        .claim_next("defer-worker", Duration::from_secs(30), &[JobType::CleanupWorkspace])
+        .await
+        .expect("job should claim")
+        .expect("queued job should be available");
+    assert_eq!(claimed.attempt_count, 1);
+
+    let deferred = repository
+        .defer_lease_without_consuming_attempt(
+            &claimed.lease().expect("claim should carry a lease"),
+            OffsetDateTime::now_utc(),
+            "work_disk_low",
+            "synthetic reserve is full",
+        )
+        .await
+        .expect("resource deferral should remain durable");
+    assert_eq!(deferred.status, JobStatus::Queued);
+    assert_eq!(deferred.attempt_count, 0);
+    assert!(deferred.completed_at.is_none());
+
+    let reclaimed = repository
+        .claim_next("defer-worker-2", Duration::from_secs(30), &[JobType::CleanupWorkspace])
+        .await
+        .expect("deferred job query should succeed")
+        .expect("a max-attempts=1 deferred job should be claimable again");
+    assert_eq!(reclaimed.attempt_count, 1);
+    assert_eq!(reclaimed.id, job.id);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn expired_final_attempt_reconciles_ingest_and_fences_all_mutations(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let ingest = database

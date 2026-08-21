@@ -29,10 +29,10 @@ use sooqa_telegram::{
     StorageUploadProvider, StorageUploadRequest, StorageUploadResult, TelegramStorageApi,
 };
 use sooqa_worker::{
-    IdentityAlignmentHook, TelegramSourceDownloader, cleanup_workspace_handler,
-    compute_fingerprint_handler, compute_fingerprint_handler_with_alignment_hook,
-    download_source_handler, inspect_source_handler, probe_asset_handler_with_telegram_source,
-    upload_storage_asset_handler,
+    IdentityAlignmentHook, TelegramSourceDownloader, WorkspaceAdmission, cleanup_workspace_handler,
+    compute_fingerprint_handler, compute_fingerprint_handler_with_admission,
+    compute_fingerprint_handler_with_alignment_hook, download_source_handler,
+    inspect_source_handler, probe_asset_handler_with_telegram_source, upload_storage_asset_handler,
 };
 use thiserror::Error;
 use tokio::fs;
@@ -870,6 +870,59 @@ async fn concurrent_equivalent_workers_keep_one_serialized_identity_outcome(pool
     fs::remove_dir_all(&work_root).await.unwrap();
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn exact_sha_fingerprint_skips_impossible_disk_admission(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let work_root =
+        std::env::temp_dir().join(format!("sooqa-worker-exact-admission-{}", Uuid::new_v4()));
+    let exact =
+        prepare_fingerprint_request(&database, &work_root, "exact-admission", b"exact-bytes").await;
+    let exact_id = exact.ingest_id;
+    let exact_sha = hex_bytes(&exact.normalization.sha256);
+    let exact_media = database
+        .library()
+        .resolve_media(video_media_ingest(
+            exact_sha,
+            "https://example.test/exact-admission-candidate",
+        ))
+        .await
+        .unwrap();
+    mark_media_ready(&database, exact_media.media.id).await;
+    let extractor_calls = Arc::new(AtomicUsize::new(0));
+    let extractor = FrameExtractor::with_runner(
+        "fake-ffmpeg",
+        Duration::from_secs(5),
+        64 * 1024,
+        Arc::new(IdentityFrameRunner { variant: 0, calls: Arc::clone(&extractor_calls) }),
+    );
+
+    run_fingerprint_with_admission(
+        &database,
+        &work_root,
+        exact,
+        extractor,
+        WorkspaceAdmission::new(u64::MAX),
+    )
+    .await;
+
+    assert_eq!(extractor_calls.load(Ordering::Relaxed), 0);
+    let request = database.inbox().find(exact_id).await.unwrap().unwrap();
+    assert_eq!(request.status, IngestStatus::Completed);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM queue.jobs WHERE kind = 'compute_fingerprint' AND payload->>'ingest_id' = $1",
+        )
+        .bind(exact_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        "succeeded"
+    );
+
+    fs::remove_dir_all(&work_root).await.unwrap();
+}
+
 async fn prepare_fingerprint_request(
     database: &Database,
     work_root: &Path,
@@ -942,11 +995,29 @@ async fn run_fingerprint(
     request: PreparedFingerprintRequest,
     extractor: FrameExtractor,
 ) {
-    let handler = compute_fingerprint_handler(
+    run_fingerprint_with_admission(
+        database,
+        work_root,
+        request,
+        extractor,
+        WorkspaceAdmission::disabled(),
+    )
+    .await;
+}
+
+async fn run_fingerprint_with_admission(
+    database: &Database,
+    work_root: &Path,
+    request: PreparedFingerprintRequest,
+    extractor: FrameExtractor,
+    admission: WorkspaceAdmission,
+) {
+    let handler = compute_fingerprint_handler_with_admission(
         database.inbox(),
         database.library(),
         work_root.to_owned(),
         extractor,
+        admission,
     );
     let job = database
         .jobs()

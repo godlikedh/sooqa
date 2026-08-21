@@ -28,6 +28,7 @@ const MAX_YTDLP_ALLOWED_HOSTS: usize = 32;
 const MAX_YTDLP_ALLOWED_HOST_LENGTH: usize = 253;
 const MAX_YTDLP_POT_PROVIDER_URL_LENGTH: usize = 256;
 const DEFAULT_MEDIA_WORK_ROOT: &str = "/var/lib/sooqa/work";
+const DEFAULT_MEDIA_WORK_FREE_SPACE_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const DEFAULT_MEDIA_PROCESSING_TIMEOUT_SECONDS: u64 = 3_600;
 const MAX_MEDIA_PROCESSING_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
@@ -42,6 +43,7 @@ const DEFAULT_INLINE_VIDEO_PREFERRED_CRF: u8 = 23;
 const DEFAULT_INLINE_VIDEO_MAXIMUM_CRF: u8 = 27;
 const DEFAULT_INLINE_VIDEO_MINIMUM_SHORT_EDGE: u32 = 480;
 const TELEGRAM_LOCAL_MAX_UPLOAD_BYTES: u64 = 2_000_000_000;
+const MAX_MEDIA_WORK_FREE_SPACE_RESERVE_BYTES: u64 = 1 << 50;
 const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_LOG_LEVEL: &str = "info";
 
@@ -243,6 +245,7 @@ pub struct WorkerConfig {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MediaConfig {
     pub work_root: PathBuf,
+    pub work_free_space_reserve_bytes: u64,
     pub ffmpeg_path: PathBuf,
     pub ffprobe_path: PathBuf,
     pub ytdlp_path: PathBuf,
@@ -393,6 +396,10 @@ impl AppConfig {
                     .work_root
                     .unwrap_or_else(|| DEFAULT_MEDIA_WORK_ROOT.to_owned())
                     .into(),
+                work_free_space_reserve_bytes: raw
+                    .media
+                    .work_free_space_reserve_bytes
+                    .unwrap_or(DEFAULT_MEDIA_WORK_FREE_SPACE_RESERVE_BYTES),
                 ffmpeg_path: raw
                     .media
                     .ffmpeg_path
@@ -517,7 +524,7 @@ impl AppConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.ytdlp_allowed_hosts={} media.ytdlp_pot_provider_url={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} media.inline_video.target_max_bytes={} media.inline_video.preferred_crf={} media.inline_video.maximum_crf={} media.inline_video.minimum_short_edge={} companion.listen_address={} companion.request_body_limit_bytes={} companion.request_timeout_seconds={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
+            "role={} config_file={} server.listen_address={} worker.poll_interval_seconds={} worker.lease_duration_seconds={} media.work_root={} media.work_free_space_reserve_bytes={} media.ffmpeg_path={} media.ffprobe_path={} media.ytdlp_path={} media.ytdlp_format={} media.ytdlp_allowed_hosts={} media.ytdlp_pot_provider_url={} media.processing_timeout_seconds={} media.source_download_max_bytes={} media.normalized_storage_max_bytes={} media.inline_video.target_max_bytes={} media.inline_video.preferred_crf={} media.inline_video.maximum_crf={} media.inline_video.minimum_short_edge={} companion.listen_address={} companion.request_body_limit_bytes={} companion.request_timeout_seconds={} database.url_env={} database.max_connections={} telegram.api_base_url={} telegram.admin_user_ids={} telegram.poll_timeout_seconds={} telegram.upload_timeout_seconds={} telegram.source_download_max_bytes={} telegram.storage_chat_id={:?} observability.log_format={} observability.log_level={} secret.database_url={} secret.telegram_bot_token={} secret.api_token={}",
             self.role,
             self.config_path
                 .as_deref()
@@ -526,6 +533,7 @@ impl AppConfig {
             self.worker.poll_interval_seconds,
             self.worker.lease_duration_seconds,
             self.media.work_root.display(),
+            self.media.work_free_space_reserve_bytes,
             self.media.ffmpeg_path.display(),
             self.media.ffprobe_path.display(),
             self.media.ytdlp_path.display(),
@@ -673,6 +681,9 @@ impl MediaConfig {
         if let Some(value) = optional_path(get, "SOOQA_MEDIA_WORK_ROOT")? {
             self.work_root = value;
         }
+        if let Some(value) = optional_byte_size(get, "SOOQA_MEDIA_WORK_FREE_SPACE_RESERVE_BYTES")? {
+            self.work_free_space_reserve_bytes = value;
+        }
         if let Some(value) = optional_path(get, "SOOQA_MEDIA_FFPROBE_PATH")? {
             self.ffprobe_path = value;
         }
@@ -726,6 +737,18 @@ impl MediaConfig {
             return Err(ConfigError::InvalidValue {
                 name: "media.source_download_max_bytes".to_owned(),
                 reason: "must be greater than zero",
+            });
+        }
+        if self.work_free_space_reserve_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.work_free_space_reserve_bytes".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.work_free_space_reserve_bytes > MAX_MEDIA_WORK_FREE_SPACE_RESERVE_BYTES {
+            return Err(ConfigError::InvalidValue {
+                name: "media.work_free_space_reserve_bytes".to_owned(),
+                reason: "must be at most 1 PiB",
             });
         }
         if self.normalized_storage_max_bytes == 0 {
@@ -1143,6 +1166,7 @@ struct RawWorkerConfig {
 #[serde(default)]
 struct RawMediaConfig {
     work_root: Option<String>,
+    work_free_space_reserve_bytes: Option<u64>,
     ffmpeg_path: Option<String>,
     ffprobe_path: Option<String>,
     ytdlp_path: Option<String>,
@@ -1782,6 +1806,10 @@ mod tests {
 
         assert_eq!(config.media.ffmpeg_path, PathBuf::from("ffmpeg"));
         assert_eq!(config.media.work_root, PathBuf::from("/var/lib/sooqa/work"));
+        assert_eq!(
+            config.media.work_free_space_reserve_bytes,
+            DEFAULT_MEDIA_WORK_FREE_SPACE_RESERVE_BYTES
+        );
         assert_eq!(config.media.ffprobe_path, PathBuf::from("/opt/bin/ffprobe"));
         assert_eq!(config.media.ytdlp_path, PathBuf::from("yt-dlp"));
         assert_eq!(config.media.ytdlp_format, "bestvideo*+bestaudio/best");
@@ -1917,6 +1945,10 @@ mod tests {
             Some(PathBuf::from("/var/lib/telegram-bot-api"))
         );
         assert_eq!(config.media.source_download_max_bytes, DEFAULT_SOURCE_DOWNLOAD_MAX_BYTES);
+        assert_eq!(
+            config.media.work_free_space_reserve_bytes,
+            DEFAULT_MEDIA_WORK_FREE_SPACE_RESERVE_BYTES
+        );
         assert_eq!(config.media.normalized_storage_max_bytes, DEFAULT_NORMALIZED_STORAGE_MAX_BYTES);
         assert_eq!(
             config.media.inline_video.target_max_bytes,
@@ -2027,6 +2059,18 @@ mod tests {
         assert!(matches!(
             zero_processing_timeout.validate(),
             Err(ConfigError::InvalidValue { name, .. }) if name == "media.processing_timeout_seconds"
+        ));
+
+        let zero_disk_reserve = AppConfig::from_toml_str(
+            AppRole::Worker,
+            None,
+            "[media]\nwork_free_space_reserve_bytes = 0\n",
+        )
+        .expect("TOML should parse");
+        assert!(matches!(
+            zero_disk_reserve.validate(),
+            Err(ConfigError::InvalidValue { name, .. })
+                if name == "media.work_free_space_reserve_bytes"
         ));
 
         let too_long_processing_timeout = AppConfig::from_toml_str(

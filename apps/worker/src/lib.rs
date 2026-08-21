@@ -24,13 +24,13 @@ use sooqa_library::{
     VideoIdentityDecision,
 };
 use sooqa_media::{
-    ArtifactPublicationError, CANONICAL_VIDEO_PROFILE_VERSION, DownloadError, DownloadLimits,
-    DownloadedSource, FfmpegExecutor, FfprobeAdapter, FrameExtractionError, FrameExtractor,
-    ImageNormalizer, MediaProbe, MediaStreamKind, MediaWorkspace, NormalizationExecutionError,
-    NormalizationPlanner, SequenceAlignmentConfig, SequenceClassification, SourceDownloader,
-    SourceInput, VideoSequenceFingerprint, WorkspaceArea, WorkspaceError, align_video_sequences,
-    decode_first_preview_frame, encode_bounded_preview, publish_artifact, sha256_file,
-    validate_bounded_preview_for_mime,
+    ArtifactPublicationError, CANONICAL_VIDEO_PROFILE_VERSION, DiskAdmissionError, DownloadError,
+    DownloadLimits, DownloadedSource, FfmpegExecutor, FfprobeAdapter, FrameExtractionError,
+    FrameExtractor, ImageNormalizer, MediaProbe, MediaStreamKind, MediaWorkspace,
+    NormalizationExecutionError, NormalizationPlanner, SequenceAlignmentConfig,
+    SequenceClassification, SourceDownloader, SourceInput, VideoSequenceFingerprint, WorkspaceArea,
+    WorkspaceError, align_video_sequences, check_disk_space, decode_first_preview_frame,
+    encode_bounded_preview, publish_artifact, sha256_file, validate_bounded_preview_for_mime,
 };
 use sooqa_persistence::{
     AssetNormalizationStart, AssetProbeStart, InboxRepository, InboxRepositoryError,
@@ -78,6 +78,81 @@ impl HandlerCancellation {
     }
 }
 pub type IdentityAlignmentHook = Arc<dyn Fn() + Send + Sync>;
+
+const DISK_ADMISSION_RETRY_DELAY: TimeDuration = TimeDuration::minutes(1);
+const DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Admission policy for operations that may create large workspace artifacts.
+/// The policy is deliberately per operation: the filesystem check observes
+/// bytes already consumed by other workers, while the operation amount is
+/// expanded to the bounded two-worker worst-case before it is checked.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct WorkspaceAdmission {
+    reserve_bytes: u64,
+    enabled: bool,
+}
+
+impl WorkspaceAdmission {
+    pub const fn disabled() -> Self {
+        Self { reserve_bytes: 0, enabled: false }
+    }
+
+    pub const fn new(reserve_bytes: u64) -> Self {
+        Self { reserve_bytes, enabled: true }
+    }
+
+    pub const fn reserve_bytes(self) -> u64 {
+        self.reserve_bytes
+    }
+
+    fn admit(self, work_root: &Path, required_bytes: u64) -> Result<(), HandlerFailure> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let concurrent_budget = sooqa_media::concurrent_operation_budget(
+            required_bytes,
+            sooqa_media::MAX_CONCURRENT_WORKSPACE_OPERATIONS,
+        );
+        match check_disk_space(work_root, self.reserve_bytes, concurrent_budget) {
+            Ok(_) => Ok(()),
+            Err(error) => Self::defer_for_space_error(work_root, required_bytes, error),
+        }
+    }
+
+    fn defer_for_space_error(
+        work_root: &Path,
+        operation_bytes: u64,
+        error: DiskAdmissionError,
+    ) -> Result<(), HandlerFailure> {
+        let message = error.to_string();
+        match &error {
+            DiskAdmissionError::Insufficient {
+                available_bytes,
+                reserve_bytes,
+                required_bytes,
+                ..
+            } => warn!(
+                work_root = %work_root.display(),
+                available_bytes,
+                reserve_bytes,
+                required_bytes,
+                operation_bytes,
+                concurrent_budget_bytes = required_bytes,
+                "work volume is below the configured two-worker admission reserve; deferring job"
+            ),
+            DiskAdmissionError::Stat { .. } => warn!(
+                work_root = %work_root.display(),
+                error = %message,
+                "work volume free-space check failed; deferring job"
+            ),
+        }
+        Err(HandlerFailure::defer_without_consuming_attempt(
+            "work_disk_low",
+            message,
+            OffsetDateTime::now_utc() + DISK_ADMISSION_RETRY_DELAY,
+        ))
+    }
+}
 
 pub fn media_processing_components(
     ffmpeg_executable: impl Into<PathBuf>,
@@ -201,6 +276,7 @@ pub struct HandlerFailure {
     pub class: String,
     pub message: String,
     pub defer_until: Option<OffsetDateTime>,
+    pub defer_without_consuming_attempt: bool,
     pub retry_without_consuming_attempt: bool,
     pub requires_storage_reconciliation: bool,
 }
@@ -212,6 +288,7 @@ impl HandlerFailure {
             class: class.into(),
             message: message.into(),
             defer_until: None,
+            defer_without_consuming_attempt: false,
             retry_without_consuming_attempt: false,
             requires_storage_reconciliation: false,
         }
@@ -226,6 +303,7 @@ impl HandlerFailure {
             class: class.into(),
             message: message.into(),
             defer_until: None,
+            defer_without_consuming_attempt: false,
             retry_without_consuming_attempt: true,
             requires_storage_reconciliation: false,
         }
@@ -237,6 +315,7 @@ impl HandlerFailure {
             class: class.into(),
             message: message.into(),
             defer_until: None,
+            defer_without_consuming_attempt: false,
             retry_without_consuming_attempt: false,
             requires_storage_reconciliation: false,
         }
@@ -252,6 +331,23 @@ impl HandlerFailure {
             class: class.into(),
             message: message.into(),
             defer_until: Some(defer_until),
+            defer_without_consuming_attempt: false,
+            retry_without_consuming_attempt: false,
+            requires_storage_reconciliation: false,
+        }
+    }
+
+    pub fn defer_without_consuming_attempt(
+        class: impl Into<String>,
+        message: impl Into<String>,
+        defer_until: OffsetDateTime,
+    ) -> Self {
+        Self {
+            retryable: true,
+            class: class.into(),
+            message: message.into(),
+            defer_until: Some(defer_until),
+            defer_without_consuming_attempt: true,
             retry_without_consuming_attempt: false,
             requires_storage_reconciliation: false,
         }
@@ -263,6 +359,7 @@ impl HandlerFailure {
             class: "storage_upload_unknown".to_owned(),
             message: message.into(),
             defer_until: None,
+            defer_without_consuming_attempt: false,
             retry_without_consuming_attempt: false,
             requires_storage_reconciliation: true,
         }
@@ -337,13 +434,29 @@ pub fn download_source_handler(
     downloader: Arc<dyn SourceDownloader>,
     limits: DownloadLimits,
 ) -> HandlerFn {
+    download_source_handler_with_admission(
+        inbox,
+        work_root,
+        downloader,
+        limits,
+        WorkspaceAdmission::disabled(),
+    )
+}
+
+pub fn download_source_handler_with_admission(
+    inbox: InboxRepository,
+    work_root: impl Into<PathBuf>,
+    downloader: Arc<dyn SourceDownloader>,
+    limits: DownloadLimits,
+    admission: WorkspaceAdmission,
+) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
         let work_root = work_root.clone();
         let downloader = Arc::clone(&downloader);
         Box::pin(async move {
-            download_source(&inbox, &work_root, downloader.as_ref(), &limits, job).await
+            download_source(&inbox, &work_root, downloader.as_ref(), &limits, admission, job).await
         })
     })
 }
@@ -506,6 +619,24 @@ pub fn probe_asset_handler_with_telegram_source(
     ffprobe: FfprobeAdapter,
     telegram_source: Option<Arc<dyn TelegramSourceDownloader>>,
 ) -> HandlerFn {
+    probe_asset_handler_with_telegram_source_and_admission(
+        inbox,
+        work_root,
+        ffprobe,
+        telegram_source,
+        WorkspaceAdmission::disabled(),
+        DEFAULT_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES,
+    )
+}
+
+pub fn probe_asset_handler_with_telegram_source_and_admission(
+    inbox: InboxRepository,
+    work_root: impl Into<std::path::PathBuf>,
+    ffprobe: FfprobeAdapter,
+    telegram_source: Option<Arc<dyn TelegramSourceDownloader>>,
+    admission: WorkspaceAdmission,
+    telegram_source_max_bytes: u64,
+) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
@@ -513,7 +644,16 @@ pub fn probe_asset_handler_with_telegram_source(
         let ffprobe = ffprobe.clone();
         let telegram_source = telegram_source.clone();
         Box::pin(async move {
-            probe_asset(&inbox, &work_root, &ffprobe, telegram_source.as_deref(), job).await
+            probe_asset(
+                &inbox,
+                &work_root,
+                &ffprobe,
+                telegram_source.as_deref(),
+                admission,
+                telegram_source_max_bytes,
+                job,
+            )
+            .await
         })
     })
 }
@@ -526,23 +666,36 @@ pub fn normalize_asset_handler(
     image_normalizer: ImageNormalizer,
     max_normalized_storage_bytes: u64,
 ) -> HandlerFn {
+    normalize_asset_handler_with_admission(
+        inbox,
+        work_root,
+        planner,
+        executor,
+        image_normalizer,
+        max_normalized_storage_bytes,
+        WorkspaceAdmission::disabled(),
+    )
+}
+
+pub fn normalize_asset_handler_with_admission(
+    inbox: InboxRepository,
+    work_root: impl Into<PathBuf>,
+    planner: NormalizationPlanner,
+    executor: FfmpegExecutor,
+    image_normalizer: ImageNormalizer,
+    max_normalized_storage_bytes: u64,
+    admission: WorkspaceAdmission,
+) -> HandlerFn {
     let work_root = work_root.into();
     Arc::new(move |job| {
         let inbox = inbox.clone();
         let work_root = work_root.clone();
         let planner = planner.clone();
         let executor = executor.clone();
+        let limits = NormalizationLimits { max_normalized_storage_bytes, admission };
         Box::pin(async move {
-            normalize_asset(
-                &inbox,
-                &work_root,
-                &planner,
-                &executor,
-                image_normalizer,
-                max_normalized_storage_bytes,
-                job,
-            )
-            .await
+            normalize_asset(&inbox, &work_root, &planner, &executor, image_normalizer, limits, job)
+                .await
         })
     })
 }
@@ -567,7 +720,14 @@ pub fn compute_fingerprint_handler(
     work_root: impl Into<PathBuf>,
     extractor: FrameExtractor,
 ) -> HandlerFn {
-    compute_fingerprint_handler_with_alignment_hook(inbox, library, work_root, extractor, None)
+    compute_fingerprint_handler_with_options(
+        inbox,
+        library,
+        work_root,
+        extractor,
+        WorkspaceAdmission::disabled(),
+        None,
+    )
 }
 
 /// Build the fingerprint handler with an optional synchronous test probe that
@@ -595,6 +755,47 @@ pub fn compute_fingerprint_handler_with_alignment_hook(
                 &library,
                 &work_root,
                 &extractor,
+                WorkspaceAdmission::disabled(),
+                alignment_hook.as_ref(),
+                job,
+            )
+            .await
+        })
+    })
+}
+
+pub fn compute_fingerprint_handler_with_admission(
+    inbox: InboxRepository,
+    library: LibraryRepository,
+    work_root: impl Into<PathBuf>,
+    extractor: FrameExtractor,
+    admission: WorkspaceAdmission,
+) -> HandlerFn {
+    compute_fingerprint_handler_with_options(inbox, library, work_root, extractor, admission, None)
+}
+
+fn compute_fingerprint_handler_with_options(
+    inbox: InboxRepository,
+    library: LibraryRepository,
+    work_root: impl Into<PathBuf>,
+    extractor: FrameExtractor,
+    admission: WorkspaceAdmission,
+    alignment_hook: Option<IdentityAlignmentHook>,
+) -> HandlerFn {
+    let work_root = work_root.into();
+    Arc::new(move |job| {
+        let inbox = inbox.clone();
+        let library = library.clone();
+        let work_root = work_root.clone();
+        let extractor = extractor.clone();
+        let alignment_hook = alignment_hook.clone();
+        Box::pin(async move {
+            compute_fingerprint(
+                &inbox,
+                &library,
+                &work_root,
+                &extractor,
+                admission,
                 alignment_hook.as_ref(),
                 job,
             )
@@ -662,11 +863,19 @@ async fn cleanup_workspace(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NormalizationLimits {
+    max_normalized_storage_bytes: u64,
+    admission: WorkspaceAdmission,
+}
+
 async fn probe_asset(
     inbox: &InboxRepository,
     work_root: &std::path::Path,
     ffprobe: &FfprobeAdapter,
     telegram_source: Option<&dyn TelegramSourceDownloader>,
+    admission: WorkspaceAdmission,
+    telegram_source_max_bytes: u64,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let ingest_request_id = match &job.command {
@@ -685,32 +894,86 @@ async fn probe_asset(
         )
     })?;
 
+    // Telegram reconstruction is the only probe path that can create a large
+    // artifact. Inspect the durable request and workspace before the stage
+    // transition so a low-space refusal leaves the ingest untouched.
+    let current_request = load_ingest_for_admission(inbox, ingest_request_id).await?;
+    let mut preflight_workspace = None;
+    let mut preflight_failure = None;
+    if current_request.kind == IngestKind::TelegramMessage
+        && probe_stage_may_run(current_request.status)
+    {
+        match MediaWorkspace::create(work_root, current_request.workspace_id).await {
+            Ok(workspace) => {
+                let result = workspace
+                    .validate()
+                    .and_then(|()| workspace.path(WorkspaceArea::Source, "telegram-input.bin"));
+                match result {
+                    Ok(input_path) => match source_artifact_exists(&input_path).await {
+                        Ok(true) => preflight_workspace = Some((workspace, input_path)),
+                        Ok(false) => {
+                            admission.admit(workspace.root(), telegram_source_max_bytes)?;
+                            preflight_workspace = Some((workspace, input_path));
+                        }
+                        Err(failure) => preflight_failure = Some(failure),
+                    },
+                    Err(error) => preflight_failure = Some(map_workspace_error(error)),
+                }
+            }
+            Err(error) => preflight_failure = Some(map_workspace_error(error)),
+        }
+    }
+
     let request = match inbox.begin_asset_probe(ingest_request_id, &job_attempt).await {
         Ok(AssetProbeStart::Ready(request)) => request,
         Ok(AssetProbeStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
     };
+    if let Some(failure) = preflight_failure {
+        return fail_probe(inbox, ingest_request_id, &job_attempt, failure).await;
+    }
     let (workspace_id, input_name) = if request.kind == IngestKind::Url {
         (request.workspace_id, "source.bin")
     } else {
         (request.workspace_id, "telegram-input.bin")
     };
-    let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
-        Ok(workspace) => workspace,
-        Err(error) => {
-            return fail_probe(inbox, ingest_request_id, &job_attempt, map_workspace_error(error))
+    let (workspace, input_path) = match preflight_workspace {
+        Some(value) => value,
+        None => {
+            let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    return fail_probe(
+                        inbox,
+                        ingest_request_id,
+                        &job_attempt,
+                        map_workspace_error(error),
+                    )
+                    .await;
+                }
+            };
+            if let Err(error) = workspace.validate() {
+                return fail_probe(
+                    inbox,
+                    ingest_request_id,
+                    &job_attempt,
+                    map_workspace_error(error),
+                )
                 .await;
-        }
-    };
-    if let Err(error) = workspace.validate() {
-        return fail_probe(inbox, ingest_request_id, &job_attempt, map_workspace_error(error))
-            .await;
-    }
-    let input_path = match workspace.path(WorkspaceArea::Source, input_name) {
-        Ok(path) => path,
-        Err(error) => {
-            return fail_probe(inbox, ingest_request_id, &job_attempt, map_workspace_error(error))
-                .await;
+            }
+            let input_path = match workspace.path(WorkspaceArea::Source, input_name) {
+                Ok(path) => path,
+                Err(error) => {
+                    return fail_probe(
+                        inbox,
+                        ingest_request_id,
+                        &job_attempt,
+                        map_workspace_error(error),
+                    )
+                    .await;
+                }
+            };
+            (workspace, input_path)
         }
     };
 
@@ -768,6 +1031,40 @@ async fn probe_asset(
 
 fn map_workspace_error(error: WorkspaceError) -> HandlerFailure {
     HandlerFailure::permanent("workspace_error", error.to_string())
+}
+
+async fn load_ingest_for_admission(
+    inbox: &InboxRepository,
+    ingest_request_id: Uuid,
+) -> Result<sooqa_inbox::Ingest, HandlerFailure> {
+    inbox
+        .find(ingest_request_id)
+        .await
+        .map_err(map_inbox_error)?
+        .ok_or_else(|| HandlerFailure::permanent("ingest_missing", "ingest request was not found"))
+}
+
+fn probe_stage_may_run(status: IngestStatus) -> bool {
+    matches!(
+        status,
+        IngestStatus::Queued
+            | IngestStatus::Downloading
+            | IngestStatus::Probing
+            | IngestStatus::FailedRetryable
+    )
+}
+
+fn download_stage_may_run(request: &sooqa_inbox::Ingest) -> bool {
+    matches!(request.status, IngestStatus::Downloading | IngestStatus::FailedRetryable)
+        && request.input_data().map(|data| data.download.is_none()).unwrap_or(false)
+}
+
+fn normalization_stage_may_run(status: IngestStatus) -> bool {
+    matches!(status, IngestStatus::Normalizing | IngestStatus::FailedRetryable)
+}
+
+fn fingerprint_stage_may_run(status: IngestStatus) -> bool {
+    matches!(status, IngestStatus::Fingerprinting | IngestStatus::FailedRetryable)
 }
 
 async fn source_artifact_exists(path: &Path) -> Result<bool, HandlerFailure> {
@@ -870,9 +1167,10 @@ async fn normalize_asset(
     planner: &NormalizationPlanner,
     executor: &FfmpegExecutor,
     image_normalizer: ImageNormalizer,
-    max_normalized_storage_bytes: u64,
+    limits: NormalizationLimits,
     job: Job,
 ) -> Result<(), HandlerFailure> {
+    let NormalizationLimits { max_normalized_storage_bytes, admission } = limits;
     let ingest_request_id = match &job.command {
         JobCommand::NormalizeAsset(payload) => payload.ingest_id,
         _ => {
@@ -888,11 +1186,68 @@ async fn normalize_asset(
             "normalize_asset handler requires a running job lease",
         )
     })?;
+    // Parse the already persisted probe and reserve space before the durable
+    // normalization stage transition. A low-space refusal therefore leaves
+    // the ingest in its current state for a later retry.
+    let current_request = load_ingest_for_admission(inbox, ingest_request_id).await?;
+    let mut preflight_failure = None;
+    if normalization_stage_may_run(current_request.status) {
+        let input_data = match current_request.input_data() {
+            Ok(input_data) => Some(input_data),
+            Err(error) => {
+                preflight_failure =
+                    Some(HandlerFailure::permanent("invalid_ingest_state", error.to_string()));
+                None
+            }
+        };
+        if let Some(input_data) = input_data
+            && !(input_data.normalization.is_some() && !current_request.force_save)
+        {
+            let probe = match input_data.probe {
+                Some(probe) => match probe.decode::<MediaProbe>() {
+                    Ok(probe) => Some(probe),
+                    Err(error) => {
+                        preflight_failure = Some(HandlerFailure::permanent(
+                            "invalid_ingest_state",
+                            format!("stored media probe could not be decoded: {error}"),
+                        ));
+                        None
+                    }
+                },
+                None => {
+                    preflight_failure = Some(HandlerFailure::permanent(
+                        "invalid_ingest_state",
+                        "ingest request has no stored media probe",
+                    ));
+                    None
+                }
+            };
+            if let Some(probe) = probe {
+                let media_kind =
+                    probe_media_kind(&probe).or_else(|| request_media_kind(&current_request));
+                match media_kind {
+                    Some(SourceMediaKind::Video) => admission
+                        .admit(work_root, max_normalized_storage_bytes.saturating_mul(2))?,
+                    Some(_) => admission.admit(work_root, max_normalized_storage_bytes)?,
+                    None => {
+                        preflight_failure = Some(HandlerFailure::permanent(
+                            "invalid_ingest_state",
+                            "ingest request has no stored source media kind",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     let request = match inbox.begin_asset_normalization(ingest_request_id, &job_attempt).await {
         Ok(AssetNormalizationStart::Ready(request)) => request,
         Ok(AssetNormalizationStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
     };
+    if let Some(failure) = preflight_failure {
+        return fail_normalization(inbox, ingest_request_id, &job_attempt, failure).await;
+    }
     let input_data = match request.input_data() {
         Ok(input_data) => input_data,
         Err(error) => {
@@ -1843,6 +2198,7 @@ async fn compute_fingerprint(
     library: &LibraryRepository,
     work_root: &Path,
     extractor: &FrameExtractor,
+    admission: WorkspaceAdmission,
     alignment_hook: Option<&IdentityAlignmentHook>,
     job: Job,
 ) -> Result<(), HandlerFailure> {
@@ -1861,11 +2217,75 @@ async fn compute_fingerprint(
             "compute_fingerprint handler requires a running job lease",
         )
     })?;
+    let current_request = load_ingest_for_admission(inbox, ingest_request_id).await?;
+    let mut preflight_failure = None;
+    let mut preflight_exact_media_exists = None;
+    if fingerprint_stage_may_run(current_request.status) {
+        match current_request.input_data() {
+            Ok(input_data) => match input_data.normalization {
+                Some(normalization) if normalization.media_kind == SourceMediaKind::Video => {
+                    match normalization_to_media_metadata(&normalization) {
+                        Ok(metadata) => {
+                            let media_ingest = MediaIngest {
+                                media: NewMedia {
+                                    kind: MediaKind::Video,
+                                    title: current_request.page_title.clone(),
+                                    description: current_request.supplied_description.clone(),
+                                },
+                                metadata,
+                                source: source_record_for_request(&current_request),
+                                tags: current_request.supplied_tags.clone(),
+                            };
+                            match library.resolve_exact_sha(&media_ingest).await {
+                                Ok(media_id) => {
+                                    let exists = media_id.is_some();
+                                    if !exists {
+                                        if !matches!(normalization.duration_ms, Some(value) if value > 0)
+                                        {
+                                            preflight_failure = Some(HandlerFailure::permanent(
+                                                "invalid_ingest_state",
+                                                "video normalization has no valid canonical duration",
+                                            ));
+                                        } else {
+                                            admission.admit(
+                                                work_root,
+                                                sooqa_media::DEFAULT_MAX_FRAME_SEQUENCE_BYTES,
+                                            )?;
+                                        }
+                                    }
+                                    preflight_exact_media_exists = Some(exists);
+                                }
+                                Err(error) => {
+                                    preflight_failure = Some(map_library_error(error));
+                                }
+                            }
+                        }
+                        Err(failure) => preflight_failure = Some(failure),
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    preflight_failure = Some(HandlerFailure::permanent(
+                        "invalid_ingest_state",
+                        "ingest request has no stored normalization metadata",
+                    ));
+                }
+            },
+            Err(error) => {
+                preflight_failure =
+                    Some(HandlerFailure::permanent("invalid_ingest_state", error.to_string()));
+            }
+        }
+    }
+
     let request = match inbox.begin_ingest_fingerprinting(ingest_request_id, &job_attempt).await {
         Ok(IngestFingerprintStart::Ready(request)) => request,
         Ok(IngestFingerprintStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
     };
+    if let Some(failure) = preflight_failure {
+        return fail_fingerprint(inbox, ingest_request_id, &job_attempt, failure).await;
+    }
     let input_data = match request.input_data() {
         Ok(input_data) => input_data,
         Err(error) => {
@@ -1923,14 +2343,17 @@ async fn compute_fingerprint(
         source: source_record_for_request(&request),
         tags: request.supplied_tags.clone(),
     };
-    let exact_media_exists = match library.resolve_exact_sha(&media_ingest).await {
-        Ok(media_id) => media_id.is_some(),
-        Err(error) => {
+    let exact_media_exists = match preflight_exact_media_exists {
+        Some(exists) => exists,
+        None => {
             return fail_fingerprint(
                 inbox,
                 ingest_request_id,
                 &job_attempt,
-                map_library_error(error),
+                HandlerFailure::permanent(
+                    "invalid_ingest_state",
+                    "fingerprint preflight did not resolve the exact media identity",
+                ),
             )
             .await;
         }
@@ -3002,6 +3425,7 @@ async fn download_source(
     work_root: &Path,
     downloader: &dyn SourceDownloader,
     limits: &DownloadLimits,
+    admission: WorkspaceAdmission,
     job: Job,
 ) -> Result<(), HandlerFailure> {
     let (ingest_request_id, inspection) = match &job.command {
@@ -3019,6 +3443,19 @@ async fn download_source(
             "download_source handler requires a running job lease",
         )
     })?;
+
+    // A duplicate or stale download job can be claimed after the ingest has
+    // already advanced. Read the durable stage before admission so such a job
+    // can be fenced by begin_source_download without being held forever by a
+    // low-space deferral. yt-dlp may use two recovery attempts and a
+    // progressive fallback; its aggregate attempt directory is bounded to
+    // three source budgets, so URL admission reserves that worst case even
+    // when direct HTTP was selected for this particular inspection.
+    let current_request = load_ingest_for_admission(inbox, ingest_request_id).await?;
+    if download_stage_may_run(&current_request) {
+        let required_bytes = limits.max_bytes.saturating_mul(3);
+        admission.admit(work_root, required_bytes)?;
+    }
 
     match inbox.begin_source_download(ingest_request_id, &job_attempt).await {
         Ok(SourceDownloadStart::Ready(_)) => {}
@@ -3519,14 +3956,21 @@ impl Worker {
                 );
             }
             Err(failure) if failure.defer_until.is_some() => {
-                self.repository
-                    .defer_lease(
-                        lease,
-                        failure.defer_until.expect("defer timestamp was checked"),
-                        &failure.class,
-                        &failure.message,
-                    )
-                    .await?;
+                let defer_until = failure.defer_until.expect("defer timestamp was checked");
+                if failure.defer_without_consuming_attempt {
+                    self.repository
+                        .defer_lease_without_consuming_attempt(
+                            lease,
+                            defer_until,
+                            &failure.class,
+                            &failure.message,
+                        )
+                        .await?;
+                } else {
+                    self.repository
+                        .defer_lease(lease, defer_until, &failure.class, &failure.message)
+                        .await?;
+                }
                 info!(worker_id = %self.worker_id, job_id = %job.id, "job deferred until dependent lease expires");
             }
             Err(failure) if failure.retryable => {

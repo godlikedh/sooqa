@@ -169,7 +169,7 @@ impl JobRepository {
     ) -> Result<Job, JobRepositoryError> {
         if self.is_publication_lease(lease).await? {
             return self
-                .settle_publication_lease(lease, run_at, error_class, error_message, false)
+                .settle_publication_lease(lease, run_at, error_class, error_message, false, false)
                 .await;
         }
         let mut transaction = self.pool.begin().await?;
@@ -294,7 +294,7 @@ impl JobRepository {
     ) -> Result<Job, JobRepositoryError> {
         if self.is_publication_lease(lease).await? {
             return self
-                .settle_publication_lease(lease, run_at, error_class, error_message, false)
+                .settle_publication_lease(lease, run_at, error_class, error_message, false, false)
                 .await;
         }
         let row = sqlx::query_as::<_, JobRow>(
@@ -305,6 +305,50 @@ impl JobRepository {
                 lease_expires_at = NULL, last_heartbeat_at = NULL,
                 error_class = $5, error_message = $6,
                 completed_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
+                updated_at = now()
+            WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
+              AND lease_expires_at > now()
+            RETURNING id, kind, payload, state, priority, run_at, attempt_count,
+                      max_attempts, lease_token, lease_owner, lease_expires_at,
+                      last_heartbeat_at, error_class, error_message, dedupe_key,
+                      created_at, updated_at, completed_at
+            "#,
+        )
+        .bind(lease.job_id)
+        .bind(&lease.lease_owner)
+        .bind(lease.lease_token)
+        .bind(run_at)
+        .bind(error_class)
+        .bind(error_message)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(JobRepositoryError::LeaseLost)?;
+        row.into_job()
+    }
+
+    /// Requeues a scheduled deferral without consuming the current attempt.
+    /// This is reserved for admission decisions where the work has not begun
+    /// and capacity may recover without any change to the job's retry budget.
+    pub async fn defer_lease_without_consuming_attempt(
+        &self,
+        lease: &JobLease,
+        run_at: OffsetDateTime,
+        error_class: &str,
+        error_message: &str,
+    ) -> Result<Job, JobRepositoryError> {
+        if self.is_publication_lease(lease).await? {
+            return self
+                .settle_publication_lease(lease, run_at, error_class, error_message, false, true)
+                .await;
+        }
+        let row = sqlx::query_as::<_, JobRow>(
+            r#"
+            UPDATE queue.jobs
+            SET state = 'queued', attempt_count = GREATEST(attempt_count - 1, 0),
+                run_at = $4, lease_token = NULL, lease_owner = NULL,
+                lease_expires_at = NULL, last_heartbeat_at = NULL,
+                error_class = $5, error_message = $6,
+                completed_at = NULL,
                 updated_at = now()
             WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
               AND lease_expires_at > now()
@@ -340,6 +384,7 @@ impl JobRepository {
                     error_class,
                     error_message,
                     true,
+                    false,
                 )
                 .await;
         }
@@ -563,6 +608,7 @@ impl JobRepository {
         error_class: &str,
         error_message: &str,
         force_terminal: bool,
+        non_consuming: bool,
     ) -> Result<Job, JobRepositoryError> {
         let payload = self.publication_payload(lease).await?;
         let post_id = payload_uuid(&payload, "post_id");
@@ -572,7 +618,7 @@ impl JobRepository {
             None => None,
         };
         let job = lock_running_job(&mut transaction, lease).await?;
-        let terminal = force_terminal || job.attempt_count >= job.max_attempts;
+        let terminal = force_terminal || (!non_consuming && job.attempt_count >= job.max_attempts);
         if terminal && let (Some(post), Some(post_id)) = (&post, post_id) {
             settle_terminal_publication_post(
                 &mut transaction,
@@ -592,7 +638,7 @@ impl JobRepository {
             if terminal { job.run_at } else { run_at },
             error_class,
             error_message,
-            terminal,
+            JobUpdateFlags { terminal, non_consuming },
         )
         .await?;
         transaction.commit().await?;
@@ -673,7 +719,7 @@ impl JobRepository {
             OffsetDateTime::now_utc(),
             job.error_class.as_deref().unwrap_or("lease_expired"),
             job.error_message.as_deref().unwrap_or("job lease expired"),
-            terminal,
+            JobUpdateFlags { terminal, non_consuming: false },
         )
         .await?;
         transaction.commit().await?;
@@ -857,6 +903,12 @@ async fn lock_expired_publication_job(
     .await?)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct JobUpdateFlags {
+    terminal: bool,
+    non_consuming: bool,
+}
+
 async fn update_locked_job(
     transaction: &mut Transaction<'_, Postgres>,
     job_id: Uuid,
@@ -864,12 +916,14 @@ async fn update_locked_job(
     run_at: OffsetDateTime,
     error_class: &str,
     error_message: &str,
-    terminal: bool,
+    flags: JobUpdateFlags,
 ) -> Result<JobRow, JobRepositoryError> {
     Ok(sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE queue.jobs
-        SET state = $2, run_at = $3, lease_token = NULL, lease_owner = NULL,
+        SET state = $2,
+            attempt_count = CASE WHEN $7 THEN GREATEST(attempt_count - 1, 0) ELSE attempt_count END,
+            run_at = $3, lease_token = NULL, lease_owner = NULL,
             lease_expires_at = NULL, last_heartbeat_at = NULL,
             error_class = $4, error_message = $5,
             completed_at = CASE WHEN $6 THEN now() ELSE NULL END,
@@ -886,7 +940,8 @@ async fn update_locked_job(
     .bind(run_at)
     .bind(error_class)
     .bind(error_message)
-    .bind(terminal)
+    .bind(flags.terminal)
+    .bind(flags.non_consuming)
     .fetch_one(&mut **transaction)
     .await?)
 }

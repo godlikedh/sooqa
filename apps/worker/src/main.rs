@@ -16,11 +16,12 @@ use uuid::Uuid;
 
 use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
 use sooqa_worker::{
-    HandlerRegistry, TelegramSourceDownloader, Worker, cleanup_workspace_handler,
-    compute_fingerprint_handler, download_source_handler, finalize_ingest_handler,
-    inspect_source_handler, materialize_publication_handler, media_processing_components,
-    normalize_asset_handler, probe_asset_handler_with_telegram_source, publish_post_handler,
-    spawn_storage_preflight, sync_storage_caption_handler,
+    HandlerRegistry, TelegramSourceDownloader, Worker, WorkspaceAdmission,
+    cleanup_workspace_handler, compute_fingerprint_handler_with_admission,
+    download_source_handler_with_admission, finalize_ingest_handler, inspect_source_handler,
+    materialize_publication_handler, media_processing_components,
+    normalize_asset_handler_with_admission, probe_asset_handler_with_telegram_source_and_admission,
+    publish_post_handler, spawn_storage_preflight, sync_storage_caption_handler,
     upload_storage_asset_cancellable_handler,
 };
 
@@ -178,19 +179,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
         telegram_api.clone().map(|api| Arc::new(api) as Arc<dyn TelegramSourceDownloader>);
     let inspect_handler = inspect_source_handler(database.inbox(), Arc::clone(&source_downloader));
     handlers.register(JobType::InspectSource, move |job| inspect_handler(job));
-    let download_handler = download_source_handler(
+    let admission = WorkspaceAdmission::new(config.media.work_free_space_reserve_bytes);
+    let download_handler = download_source_handler_with_admission(
         database.inbox(),
         config.media.work_root.clone(),
         source_downloader,
         download_limits,
+        admission,
     );
     handlers.register(JobType::DownloadSource, move |job| download_handler(job));
     tracing::info!("source download handler enabled");
-    let probe_handler = probe_asset_handler_with_telegram_source(
+    let probe_handler = probe_asset_handler_with_telegram_source_and_admission(
         database.inbox(),
         config.media.work_root.clone(),
         FfprobeAdapter::new(config.media.ffprobe_path.clone(), Duration::from_secs(30)),
         telegram_source,
+        admission,
+        config.telegram.source_download_max_bytes,
     );
     handlers.register(JobType::ProbeAsset, move |job| probe_handler(job));
     tracing::info!("Telegram and upload ingest probe job handler enabled");
@@ -209,21 +214,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
         config.media.ffprobe_path.clone(),
         processing_timeout,
     );
-    let normalize_handler = normalize_asset_handler(
+    let normalize_handler = normalize_asset_handler_with_admission(
         database.inbox(),
         config.media.work_root.clone(),
         normalization_planner,
         normalization_executor,
         ImageNormalizer::new(CanonicalImageProfile::default())?,
         config.media.normalized_storage_max_bytes,
+        admission,
     );
     handlers.register(JobType::NormalizeAsset, move |job| normalize_handler(job));
     tracing::info!("asset normalization handler enabled");
-    let fingerprint_handler = compute_fingerprint_handler(
+    let fingerprint_handler = compute_fingerprint_handler_with_admission(
         database.inbox(),
         database.library(),
         config.media.work_root.clone(),
         frame_extractor,
+        admission,
     );
     handlers.register(JobType::ComputeFingerprint, move |job| fingerprint_handler(job));
     tracing::info!("video fingerprint handler enabled");
