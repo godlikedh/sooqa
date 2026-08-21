@@ -320,12 +320,34 @@ impl JobRepository {
         let recovered = sqlx::query_as::<_, RecoveredJob>(
             r#"
             UPDATE queue.jobs
-            SET state = CASE WHEN attempt_count >= max_attempts THEN 'failed' ELSE 'queued' END,
+            SET state = CASE
+                    WHEN kind = 'upload_storage_asset'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM media
+                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                               AND media.storage_state IN ('storage_unknown', 'missing')
+                         ) THEN 'failed'
+                    WHEN attempt_count >= max_attempts THEN 'failed'
+                    ELSE 'queued'
+                END,
                 run_at = now(), lease_token = NULL, lease_owner = NULL,
                 lease_expires_at = NULL, last_heartbeat_at = NULL,
                 error_class = COALESCE(error_class, 'lease_expired'),
                 error_message = COALESCE(error_message, 'job lease expired'),
-                completed_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
+                completed_at = CASE
+                    WHEN attempt_count >= max_attempts
+                         OR (
+                             kind = 'upload_storage_asset'
+                             AND EXISTS (
+                                 SELECT 1
+                                 FROM media
+                                 WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                                   AND media.storage_state IN ('storage_unknown', 'missing')
+                             )
+                         ) THEN now()
+                    ELSE NULL
+                END,
                 updated_at = now()
             WHERE state = 'running' AND kind <> 'publish_post' AND lease_expires_at <= now()
             RETURNING kind, payload, state, attempt_count, max_attempts

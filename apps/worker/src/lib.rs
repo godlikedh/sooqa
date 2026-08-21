@@ -37,9 +37,9 @@ use sooqa_persistence::{
 };
 use sooqa_telegram::StorageUploadError;
 use sooqa_telegram::{
-    StorageCaptionEditRequest, StorageUploadInput, StorageUploadProvider, TelegramApi,
-    TelegramPublicationApi, TelegramPublicationRequest, TelegramStorageApi,
-    TelegramStorageCaptionApi, storage_caption,
+    StorageCaptionEditRequest, StorageUploadCancellation, StorageUploadInput,
+    StorageUploadProvider, TelegramApi, TelegramPublicationApi, TelegramPublicationRequest,
+    TelegramStorageApi, TelegramStorageCaptionApi, storage_caption,
 };
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -53,6 +53,27 @@ use uuid::Uuid;
 
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFailure>> + Send + 'static>>;
 pub type HandlerFn = Arc<dyn Fn(Job) -> HandlerFuture + Send + Sync>;
+pub type CancellableHandlerFn =
+    Arc<dyn Fn(Job, HandlerCancellation) -> HandlerFuture + Send + Sync>;
+
+#[derive(Clone, Debug)]
+pub struct HandlerCancellation {
+    storage_upload: StorageUploadCancellation,
+}
+
+impl HandlerCancellation {
+    fn new() -> Self {
+        Self { storage_upload: StorageUploadCancellation::new() }
+    }
+
+    fn cancel(&self) {
+        self.storage_upload.cancel();
+    }
+
+    pub fn storage_upload(&self) -> StorageUploadCancellation {
+        self.storage_upload.clone()
+    }
+}
 
 pub fn media_processing_components(
     ffmpeg_executable: impl Into<PathBuf>,
@@ -203,7 +224,13 @@ impl HandlerFailure {
 
 #[derive(Clone, Default)]
 pub struct HandlerRegistry {
-    handlers: HashMap<JobType, HandlerFn>,
+    handlers: HashMap<JobType, HandlerEntry>,
+}
+
+#[derive(Clone)]
+struct HandlerEntry {
+    handler: Option<HandlerFn>,
+    cancellable_handler: Option<CancellableHandlerFn>,
 }
 
 impl HandlerRegistry {
@@ -215,7 +242,20 @@ impl HandlerRegistry {
     where
         F: Fn(Job) -> HandlerFuture + Send + Sync + 'static,
     {
-        self.handlers.insert(job_type, Arc::new(handler));
+        self.handlers.insert(
+            job_type,
+            HandlerEntry { handler: Some(Arc::new(handler)), cancellable_handler: None },
+        );
+    }
+
+    pub fn register_cancellable<F>(&mut self, job_type: JobType, handler: F)
+    where
+        F: Fn(Job, HandlerCancellation) -> HandlerFuture + Send + Sync + 'static,
+    {
+        self.handlers.insert(
+            job_type,
+            HandlerEntry { handler: None, cancellable_handler: Some(Arc::new(handler)) },
+        );
     }
 
     pub fn contains(&self, job_type: JobType) -> bool {
@@ -228,7 +268,7 @@ impl HandlerRegistry {
         job_types
     }
 
-    fn handler(&self, job_type: JobType) -> Option<HandlerFn> {
+    fn handler(&self, job_type: JobType) -> Option<HandlerEntry> {
         self.handlers.get(&job_type).cloned()
     }
 }
@@ -272,7 +312,26 @@ where
     Arc::new(move |job| {
         let inbox = inbox.clone();
         let provider = provider.clone();
-        Box::pin(async move { upload_storage_asset(&inbox, &provider, job).await })
+        Box::pin(async move {
+            upload_storage_asset(&inbox, &provider, job, StorageUploadCancellation::new()).await
+        })
+    })
+}
+
+pub fn upload_storage_asset_cancellable_handler<A, S>(
+    inbox: InboxRepository,
+    provider: StorageUploadProvider<A, S>,
+) -> CancellableHandlerFn
+where
+    A: TelegramStorageApi,
+    S: StorageUploadStore,
+{
+    Arc::new(move |job, cancellation| {
+        let inbox = inbox.clone();
+        let provider = provider.clone();
+        Box::pin(async move {
+            upload_storage_asset(&inbox, &provider, job, cancellation.storage_upload()).await
+        })
     })
 }
 
@@ -2340,6 +2399,7 @@ async fn upload_storage_asset<A, S>(
     inbox: &InboxRepository,
     provider: &StorageUploadProvider<A, S>,
     job: Job,
+    cancellation: StorageUploadCancellation,
 ) -> Result<(), HandlerFailure>
 where
     A: TelegramStorageApi,
@@ -2355,7 +2415,10 @@ where
         }
     };
 
-    match provider.upload(StorageUploadInput { media_id, generation }).await {
+    match provider
+        .upload_with_cancellation(StorageUploadInput { media_id, generation }, cancellation)
+        .await
+    {
         Ok(_) => {
             inbox.complete_storage_for_media(media_id).await.map_err(map_inbox_error)?;
             Ok(())
@@ -2364,6 +2427,12 @@ where
             let message = error.to_string();
             if matches!(&error, StorageUploadError::StaleGeneration { .. }) {
                 return Ok(());
+            }
+            if matches!(&error, StorageUploadError::CancelledBeforeDispatch) {
+                return Err(HandlerFailure::retryable("storage_upload_cancelled", message));
+            }
+            if error.is_ambiguous() {
+                return Err(HandlerFailure::permanent("storage_upload_unknown", message));
             }
             if let StorageUploadError::InProgress { retry_at: Some(retry_at) } = &error
                 && job.attempt_count < job.max_attempts
@@ -3081,6 +3150,14 @@ impl Worker {
                         self.finish_job(&job, &lease, result, &mut counters).await?;
                         false
                     }
+                    HandlerRunOutcome::ShutdownCompleted(result) => {
+                        self.finish_job(&job, &lease, result, &mut counters).await?;
+                        true
+                    }
+                    HandlerRunOutcome::HeartbeatFailed { result, error } => {
+                        self.finish_job(&job, &lease, result, &mut counters).await?;
+                        return Err(error);
+                    }
                     HandlerRunOutcome::Shutdown => {
                         self.repository
                             .retry_lease(
@@ -3120,7 +3197,7 @@ impl Worker {
         &self,
         job: &Job,
         lease: &JobLease,
-        handler: HandlerFn,
+        handler: HandlerEntry,
         shutdown: &mut std::pin::Pin<&mut F>,
     ) -> Result<HandlerRunOutcome, WorkerError>
     where
@@ -3139,11 +3216,24 @@ impl Worker {
             )
             .await
         });
-        let handler_future = handler(job.clone());
+        let cancellation = HandlerCancellation::new();
+        let cancellable = handler.cancellable_handler.is_some();
+        let handler_future = if let Some(handler) = handler.cancellable_handler {
+            handler(job.clone(), cancellation.clone())
+        } else {
+            handler.handler.expect("handler entries always contain a handler")(job.clone())
+        };
         tokio::pin!(handler_future);
 
         tokio::select! {
             _ = shutdown.as_mut() => {
+                if cancellable {
+                    cancellation.cancel();
+                    let _ = stop_heartbeat.send(());
+                    let result = (&mut handler_future).await;
+                    await_heartbeat(&mut heartbeat_task).await?;
+                    return Ok(HandlerRunOutcome::ShutdownCompleted(result));
+                }
                 let _ = stop_heartbeat.send(());
                 await_heartbeat(&mut heartbeat_task).await?;
                 Ok(HandlerRunOutcome::Shutdown)
@@ -3159,6 +3249,19 @@ impl Worker {
                     Ok(()) => Err(WorkerError::HeartbeatTask(
                         "heartbeat loop stopped while the handler was active".to_owned(),
                     )),
+                    Err(error) if cancellable => {
+                        cancellation.cancel();
+                        let result = (&mut handler_future).await;
+                        let result = match result {
+                            Ok(()) => Err(HandlerFailure::permanent(
+                                "heartbeat_lost",
+                                "worker heartbeat stopped while the upload was active",
+                            )),
+                            Err(failure) => Err(failure),
+                        };
+                        let _ = error;
+                        Ok(HandlerRunOutcome::Completed(result))
+                    }
                     Err(error) => Err(WorkerError::Repository(error)),
                 }
             }
@@ -3231,6 +3334,7 @@ pub enum WorkerError {
 
 enum HandlerRunOutcome {
     Completed(Result<(), HandlerFailure>),
+    ShutdownCompleted(Result<(), HandlerFailure>),
     Shutdown,
 }
 

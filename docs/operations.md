@@ -63,6 +63,14 @@ durable retry/terminal policy. Watch structured logs with
 availability. Successful liveness only means the HTTP process is serving; it
 is not a Telegram-readiness signal.
 
+Storage upload shutdown is phase-aware. A stop before the Telegram request can
+escape releases the media reservation and leaves the upload job retryable. A
+stop after the request may have escaped, including a lost upload heartbeat,
+clears the reservation token, records `storage_unknown`, fails linked active
+ingests, and settles the upload job as failed. Reconcile that media row with
+the storage commands below before starting a new generation; do not manually
+retry the queued job or delete its media row.
+
 ## Admin API
 
 Use the configured bearer token to inspect the bounded operational slices:
