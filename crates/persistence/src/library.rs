@@ -702,50 +702,6 @@ impl LibraryRepository {
         Ok(MediaResolutionResult { media, source, media_created })
     }
 
-    /// Persist a worker-computed identity decision while holding the global
-    /// identity session.  This convenience path is useful to callers that do
-    /// not own an ingest/job transition; the composed worker uses the
-    /// InboxRepository preparation/finalization pair so those transitions are
-    /// committed atomically with the media mutation.
-    pub async fn resolve_video_identity(
-        &self,
-        ingest: MediaIngest,
-        fingerprint: &VideoFingerprintInput,
-        decision: &VideoIdentityDecision,
-        force_save: bool,
-    ) -> Result<VideoIdentityOutcome, LibraryRepositoryError> {
-        let mut session = VideoIdentitySession::acquire(&self.pool).await?;
-        let result = async {
-            let mut transaction = session.begin().await?;
-            let _ = Self::prepare_video_identity_in_transaction(
-                &mut transaction,
-                &ingest,
-                Some(fingerprint),
-                force_save,
-            )
-            .await?;
-            let outcome = Self::persist_video_identity_in_transaction(
-                &mut transaction,
-                &ingest,
-                Some(fingerprint),
-                decision,
-                force_save,
-            )
-            .await?;
-            transaction.commit().await?;
-            Ok(outcome)
-        }
-        .await;
-        let release = session.release().await;
-        match result {
-            Err(error) => Err(error),
-            Ok(outcome) => {
-                release?;
-                Ok(outcome)
-            }
-        }
-    }
-
     pub(crate) async fn prepare_video_identity_in_transaction(
         transaction: &mut Transaction<'_, Postgres>,
         ingest: &MediaIngest,
@@ -1232,17 +1188,9 @@ impl LibraryRepository {
 fn validate_video_fingerprint(
     fingerprint: &VideoFingerprintInput,
 ) -> Result<(), LibraryRepositoryError> {
-    if fingerprint.version.trim().is_empty() {
-        return Err(LibraryRepositoryError::InvalidFingerprint(
-            "fingerprint version must not be empty".to_owned(),
-        ));
-    }
-    if fingerprint.data.is_empty() {
-        return Err(LibraryRepositoryError::InvalidFingerprint(
-            "fingerprint data must not be empty".to_owned(),
-        ));
-    }
-    Ok(())
+    fingerprint
+        .validate()
+        .map_err(|error| LibraryRepositoryError::InvalidFingerprint(error.to_string()))
 }
 
 async fn fetch_video_fingerprint_candidates(

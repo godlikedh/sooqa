@@ -148,6 +148,10 @@ transaction; an expired or recovered finalizer therefore commits none of
 them. The session lock is released only after that transaction commits, and
 the dedicated connection is closed if the worker is cancelled before release.
 The lock does not cover download, ffmpeg, filesystem, HTTP, or Telegram work.
+The worker/library boundary validates the v1 binary envelope and the bounded,
+sorted, data-derived token projection before persistence stores it. Persistence
+only queries and persists that representation; it does not decode candidates
+or execute the alignment algorithm.
 A single stable lock key is intentional: equivalent re-encodes with different
 SHAs must observe the first in-progress reservation before either can enqueue
 a storage upload. The canonical SHA unique constraint remains the final

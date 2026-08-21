@@ -383,6 +383,199 @@ pub struct VideoFingerprintInput {
     pub search_tokens: Vec<i64>,
 }
 
+pub const VIDEO_SEQUENCE_FINGERPRINT_V1: &str = "video_sequence_v1";
+pub const VIDEO_SEQUENCE_FINGERPRINT_MAX_SAMPLES: usize = 2_048;
+pub const VIDEO_SEQUENCE_FINGERPRINT_MAX_TOKENS: usize = 1_024;
+pub const VIDEO_SEQUENCE_FINGERPRINT_MAX_ENCODED_BYTES: usize =
+    24 + VIDEO_SEQUENCE_FINGERPRINT_MAX_SAMPLES * 23;
+
+const VIDEO_SEQUENCE_FINGERPRINT_MAGIC: [u8; 4] = *b"SQVS";
+const VIDEO_SEQUENCE_FINGERPRINT_CODEC_V1: u16 = 1;
+const VIDEO_SEQUENCE_FINGERPRINT_INTERVAL_MS: u64 = 500;
+const VIDEO_SEQUENCE_FINGERPRINT_MAX_ANCHORS: usize = 128;
+const VIDEO_SEQUENCE_FINGERPRINT_INFO_THRESHOLD_BPS: u16 = 1_000;
+const VIDEO_SEQUENCE_FINGERPRINT_MAX_SCORE_BPS: u16 = 10_000;
+const VIDEO_SEQUENCE_FINGERPRINT_HEADER_BYTES: usize = 24;
+const VIDEO_SEQUENCE_FINGERPRINT_SAMPLE_BYTES: usize = 23;
+
+#[derive(Debug, Clone, Eq, PartialEq, Error)]
+pub enum VideoFingerprintInputError {
+    #[error("unsupported fingerprint version: {0}")]
+    UnsupportedVersion(String),
+    #[error("fingerprint data must not be empty")]
+    EmptyData,
+    #[error("fingerprint data exceeds the {max}-byte limit")]
+    DataTooLarge { max: usize },
+    #[error("fingerprint data is invalid: {0}")]
+    InvalidData(&'static str),
+    #[error("fingerprint search tokens exceed the {max}-token limit")]
+    TooManyTokens { max: usize },
+    #[error("fingerprint search tokens are invalid: {0}")]
+    InvalidSearchTokens(&'static str),
+}
+
+impl VideoFingerprintInput {
+    /// Construct the persistence representation after checking the v1 codec
+    /// envelope and the derived-token invariants.  Persistence repeats
+    /// `validate` on public write paths because the fields remain readable for
+    /// SQL/query boundaries and callers can construct values directly.
+    pub fn try_new(
+        version: impl Into<String>,
+        data: Vec<u8>,
+        search_tokens: Vec<i64>,
+    ) -> Result<Self, VideoFingerprintInputError> {
+        let input = Self { version: version.into(), data, search_tokens };
+        input.validate()?;
+        Ok(input)
+    }
+
+    pub fn validate(&self) -> Result<(), VideoFingerprintInputError> {
+        if self.version != VIDEO_SEQUENCE_FINGERPRINT_V1 {
+            return Err(VideoFingerprintInputError::UnsupportedVersion(self.version.clone()));
+        }
+        if self.data.is_empty() {
+            return Err(VideoFingerprintInputError::EmptyData);
+        }
+        if self.data.len() > VIDEO_SEQUENCE_FINGERPRINT_MAX_ENCODED_BYTES {
+            return Err(VideoFingerprintInputError::DataTooLarge {
+                max: VIDEO_SEQUENCE_FINGERPRINT_MAX_ENCODED_BYTES,
+            });
+        }
+        if self.search_tokens.len() > VIDEO_SEQUENCE_FINGERPRINT_MAX_TOKENS {
+            return Err(VideoFingerprintInputError::TooManyTokens {
+                max: VIDEO_SEQUENCE_FINGERPRINT_MAX_TOKENS,
+            });
+        }
+        if self.search_tokens.iter().any(|token| *token <= 0) {
+            return Err(VideoFingerprintInputError::InvalidSearchTokens("tokens must be positive"));
+        }
+        if self.search_tokens.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(VideoFingerprintInputError::InvalidSearchTokens(
+                "tokens must be sorted and deduplicated",
+            ));
+        }
+
+        let data = self.data.as_slice();
+        if data.len() < VIDEO_SEQUENCE_FINGERPRINT_HEADER_BYTES {
+            return Err(VideoFingerprintInputError::InvalidData("truncated header"));
+        }
+        if data[..4] != VIDEO_SEQUENCE_FINGERPRINT_MAGIC {
+            return Err(VideoFingerprintInputError::InvalidData("invalid magic"));
+        }
+        if read_u16(data, 4) != VIDEO_SEQUENCE_FINGERPRINT_CODEC_V1 {
+            return Err(VideoFingerprintInputError::InvalidData("unsupported codec version"));
+        }
+        let sample_count = usize::from(read_u16(data, 6));
+        if sample_count == 0 || sample_count > VIDEO_SEQUENCE_FINGERPRINT_MAX_SAMPLES {
+            return Err(VideoFingerprintInputError::InvalidData("invalid sample count"));
+        }
+        let duration_ms = read_u64(data, 8);
+        if duration_ms == 0 {
+            return Err(VideoFingerprintInputError::InvalidData("duration must be positive"));
+        }
+        let interval_ms = u64::from(read_u32(data, 16));
+        if interval_ms == 0 {
+            return Err(VideoFingerprintInputError::InvalidData("interval must be positive"));
+        }
+        if read_u32(data, 20) != 0 {
+            return Err(VideoFingerprintInputError::InvalidData("reserved header is non-zero"));
+        }
+        let expected_interval_ms = VIDEO_SEQUENCE_FINGERPRINT_INTERVAL_MS
+            .max(duration_ms.div_ceil(VIDEO_SEQUENCE_FINGERPRINT_MAX_SAMPLES as u64));
+        if interval_ms != expected_interval_ms {
+            return Err(VideoFingerprintInputError::InvalidData("timestamp grid is invalid"));
+        }
+        let expected_sample_count = usize::try_from(duration_ms.div_ceil(interval_ms))
+            .map_err(|_| VideoFingerprintInputError::InvalidData("timestamp grid is invalid"))?;
+        if sample_count != expected_sample_count {
+            return Err(VideoFingerprintInputError::InvalidData("timestamp grid is invalid"));
+        }
+        let last_timestamp = interval_ms
+            .checked_mul((sample_count - 1) as u64)
+            .ok_or(VideoFingerprintInputError::InvalidData("timestamp grid is invalid"))?;
+        if last_timestamp >= duration_ms {
+            return Err(VideoFingerprintInputError::InvalidData("timestamp grid is invalid"));
+        }
+        let expected_len = VIDEO_SEQUENCE_FINGERPRINT_HEADER_BYTES
+            .checked_add(sample_count * VIDEO_SEQUENCE_FINGERPRINT_SAMPLE_BYTES)
+            .ok_or(VideoFingerprintInputError::DataTooLarge {
+                max: VIDEO_SEQUENCE_FINGERPRINT_MAX_ENCODED_BYTES,
+            })?;
+        if data.len() != expected_len {
+            return Err(VideoFingerprintInputError::InvalidData("encoded length is invalid"));
+        }
+
+        let mut anchors = Vec::new();
+        for index in 0..sample_count {
+            let offset = VIDEO_SEQUENCE_FINGERPRINT_HEADER_BYTES
+                + index * VIDEO_SEQUENCE_FINGERPRINT_SAMPLE_BYTES;
+            let information_bps = read_u16(data, offset + 19);
+            let transition_bps = read_u16(data, offset + 21);
+            if information_bps > VIDEO_SEQUENCE_FINGERPRINT_MAX_SCORE_BPS
+                || transition_bps > VIDEO_SEQUENCE_FINGERPRINT_MAX_SCORE_BPS
+            {
+                return Err(VideoFingerprintInputError::InvalidData("sample score is invalid"));
+            }
+            if index == 0 && transition_bps != 0 {
+                return Err(VideoFingerprintInputError::InvalidData(
+                    "first transition score must be zero",
+                ));
+            }
+            if information_bps >= VIDEO_SEQUENCE_FINGERPRINT_INFO_THRESHOLD_BPS {
+                let rank = u32::from(information_bps)
+                    .saturating_mul(3)
+                    .saturating_add(u32::from(transition_bps));
+                anchors.push((index, rank));
+            }
+        }
+        anchors.sort_by(|(left_index, left_rank), (right_index, right_rank)| {
+            right_rank.cmp(left_rank).then_with(|| left_index.cmp(right_index))
+        });
+        anchors.truncate(VIDEO_SEQUENCE_FINGERPRINT_MAX_ANCHORS);
+        anchors.sort_unstable_by_key(|(index, _)| *index);
+
+        let mut derived_tokens = Vec::with_capacity(anchors.len().saturating_mul(8));
+        for (index, _) in anchors {
+            let offset = VIDEO_SEQUENCE_FINGERPRINT_HEADER_BYTES
+                + index * VIDEO_SEQUENCE_FINGERPRINT_SAMPLE_BYTES;
+            append_fingerprint_hash_tokens(&mut derived_tokens, 1, read_u64(data, offset));
+            append_fingerprint_hash_tokens(&mut derived_tokens, 2, read_u64(data, offset + 8));
+        }
+        derived_tokens.sort_unstable();
+        derived_tokens.dedup();
+        derived_tokens.truncate(VIDEO_SEQUENCE_FINGERPRINT_MAX_TOKENS);
+        if self.search_tokens != derived_tokens {
+            return Err(VideoFingerprintInputError::InvalidSearchTokens(
+                "tokens do not match the fingerprint data",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn read_u16(data: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([data[offset], data[offset + 1]])
+}
+
+fn read_u32(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(data[offset..offset + 4].try_into().expect("fixed fingerprint header"))
+}
+
+fn read_u64(data: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(data[offset..offset + 8].try_into().expect("fixed fingerprint sample"))
+}
+
+fn append_fingerprint_hash_tokens(tokens: &mut Vec<i64>, hash_kind: u8, hash: u64) {
+    for band in 0..4_u8 {
+        let value = ((hash >> (u32::from(band) * 16)) & 0xffff) as u16;
+        let token = (1_i64 << 56)
+            | (i64::from(hash_kind) << 48)
+            | (i64::from(band) << 40)
+            | i64::from(value);
+        tokens.push(token);
+    }
+}
+
 /// Bounded evidence retained when the video identity gate needs an explicit
 /// human decision. It deliberately contains scalar alignment results only;
 /// authoritative fingerprint bytes remain on `media`.

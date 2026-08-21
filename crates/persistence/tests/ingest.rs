@@ -1038,11 +1038,12 @@ async fn stale_video_identity_finalizer_cannot_mutate_after_lease_recovery(pool:
     .unwrap();
     database.jobs().recover_stale_leases().await.unwrap();
 
-    let fingerprint_input = VideoFingerprintInput {
-        version: fingerprint.version.as_str().to_owned(),
-        data: fingerprint.encode().unwrap(),
-        search_tokens: fingerprint.search_tokens(),
-    };
+    let fingerprint_input = VideoFingerprintInput::try_new(
+        fingerprint.version.as_str(),
+        fingerprint.encode().unwrap(),
+        fingerprint.search_tokens(),
+    )
+    .unwrap();
     let stale_result = database
         .inbox()
         .begin_video_identity(

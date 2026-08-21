@@ -2026,13 +2026,16 @@ async fn compute_fingerprint(
     };
 
     let fingerprint_input = match fingerprint.as_ref() {
-        Some(fingerprint) => Some(VideoFingerprintInput {
-            version: fingerprint.version.as_str().to_owned(),
-            data: fingerprint.encode().map_err(|error| {
-                HandlerFailure::permanent("fingerprint_failed", error.to_string())
-            })?,
-            search_tokens: fingerprint.search_tokens(),
-        }),
+        Some(fingerprint) => Some(
+            VideoFingerprintInput::try_new(
+                fingerprint.version.as_str(),
+                fingerprint.encode().map_err(|error| {
+                    HandlerFailure::permanent("fingerprint_failed", error.to_string())
+                })?,
+                fingerprint.search_tokens(),
+            )
+            .map_err(|error| HandlerFailure::permanent("fingerprint_failed", error.to_string()))?,
+        ),
         None => None,
     };
     let start = match inbox

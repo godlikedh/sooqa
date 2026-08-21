@@ -17,7 +17,7 @@ use sooqa_inbox::{
 use sooqa_jobs::{JobType, NewJob};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
-    VideoFingerprintInput, VideoIdentityDecision,
+    VideoFingerprintInput,
 };
 use sooqa_media::{
     CommandError, DownloadError, DownloadLimits, DownloadedSource, ExternalCommand,
@@ -508,22 +508,23 @@ async fn composed_identity_worker_has_bounded_storage_effects(pool: sqlx::PgPool
     .unwrap();
     let strong_candidate = database
         .library()
-        .resolve_video_identity(
-            video_media_ingest(vec![0x31; 32], "https://example.test/strong-candidate"),
-            &VideoFingerprintInput {
-                version: candidate_fingerprint.version.as_str().to_owned(),
-                data: candidate_fingerprint.encode().unwrap(),
-                search_tokens: candidate_fingerprint.search_tokens(),
-            },
-            &VideoIdentityDecision::NoMatch,
-            false,
+        .resolve_media(video_media_ingest(vec![0x31; 32], "https://example.test/strong-candidate"))
+        .await
+        .unwrap();
+    let strong_candidate_id = strong_candidate.media.id;
+    database
+        .library()
+        .record_video_sequence_fingerprint(
+            strong_candidate_id,
+            &VideoFingerprintInput::try_new(
+                candidate_fingerprint.version.as_str(),
+                candidate_fingerprint.encode().unwrap(),
+                candidate_fingerprint.search_tokens(),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
-    let strong_candidate_id = match strong_candidate {
-        sooqa_library::VideoIdentityOutcome::NewMedia { media_id } => media_id,
-        other => panic!("expected candidate media, got {other:?}"),
-    };
     mark_media_ready(&database, strong_candidate_id).await;
 
     let strong =
@@ -609,39 +610,85 @@ async fn identity_alignment_is_outside_transactions_and_on_blocking_pool(pool: s
         .unwrap()
         .expect("fingerprint job should be claimable");
 
-    let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+    let (entered_parent_sender, entered_parent_receiver) = std::sync::mpsc::channel();
+    let (entered_harness_sender, entered_harness_receiver) = std::sync::mpsc::channel();
     let (release_sender, release_receiver) = std::sync::mpsc::channel();
     let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));
     let hook_release_receiver = Arc::clone(&release_receiver);
-    let hook: IdentityAlignmentHook = Arc::new(move || {
-        entered_sender
-            .send(std::thread::current().id())
-            .expect("boundary test should still be listening");
-        hook_release_receiver
-            .lock()
-            .expect("boundary test mutex should not be poisoned")
-            .recv()
-            .expect("boundary test should release alignment");
+    let (progress_sender, progress_receiver) = std::sync::mpsc::channel();
+    let (check_sender, check_receiver) = std::sync::mpsc::channel();
+    let (done_sender, done_receiver) = std::sync::mpsc::channel();
+    let harness_database = database.clone();
+    let harness_work_root = work_root.clone();
+    let harness_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(async move {
+            let hook: IdentityAlignmentHook = Arc::new(move || {
+                entered_parent_sender.send(()).expect("boundary test should still be listening");
+                entered_harness_sender
+                    .send(())
+                    .expect("boundary harness should still be listening");
+                hook_release_receiver
+                    .lock()
+                    .expect("boundary test mutex should not be poisoned")
+                    .recv()
+                    .expect("boundary test should release alignment");
+            });
+            let handler = compute_fingerprint_handler_with_alignment_hook(
+                harness_database.inbox(),
+                harness_database.library(),
+                harness_work_root,
+                FrameExtractor::with_runner(
+                    "fake-ffmpeg",
+                    Duration::from_secs(5),
+                    64 * 1024,
+                    Arc::new(IdentityFrameRunner {
+                        variant: 0,
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }),
+                ),
+                Some(hook),
+            );
+            let task = tokio::spawn(handler(job));
+            tokio::task::spawn_blocking(move || {
+                entered_harness_receiver.recv().expect("alignment should reach the boundary hook")
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+
+            // This task is scheduled only after the hook has entered and is
+            // waiting. A current-thread runtime can make progress here only
+            // when alignment is offloaded from the async runtime.
+            tokio::spawn(async move {
+                progress_sender.send(()).expect("progress receiver should be listening");
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            tokio::task::spawn_blocking(move || {
+                check_receiver.recv().expect("parent should finish its SQL check")
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            release_sender.send(()).expect("alignment hook should be released");
+            task.await.map_err(|error| error.to_string())?.map_err(|error| format!("{error:?}"))
+        });
+        done_sender.send(result).expect("boundary harness should report its result");
     });
-    let handler = compute_fingerprint_handler_with_alignment_hook(
-        database.inbox(),
-        database.library(),
-        work_root.clone(),
-        FrameExtractor::with_runner(
-            "fake-ffmpeg",
-            Duration::from_secs(5),
-            64 * 1024,
-            Arc::new(IdentityFrameRunner { variant: 0, calls: Arc::new(AtomicUsize::new(0)) }),
-        ),
-        Some(hook),
-    );
-    let caller_thread = std::thread::current().id();
-    let task = tokio::spawn(handler(job));
-    let alignment_thread = tokio::task::spawn_blocking(move || {
-        entered_receiver.recv().expect("alignment should reach the boundary hook")
+
+    tokio::task::spawn_blocking(move || {
+        entered_parent_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("alignment should enter within the boundary timeout");
     })
     .await
     .unwrap();
+
+    let progressed = tokio::task::spawn_blocking(move || {
+        progress_receiver.recv_timeout(Duration::from_secs(5)).is_ok()
+    })
+    .await
+    .unwrap();
+    assert!(progressed, "independent async work must progress while alignment waits");
 
     let idle_transactions = sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction'",
@@ -650,10 +697,15 @@ async fn identity_alignment_is_outside_transactions_and_on_blocking_pool(pool: s
     .await
     .unwrap();
     assert_eq!(idle_transactions, 0, "alignment must not retain a SQL transaction");
-    assert_ne!(alignment_thread, caller_thread, "alignment must run off the async worker thread");
+    check_sender.send(()).expect("boundary harness should continue after its SQL check");
 
-    release_sender.send(()).unwrap();
-    task.await.unwrap().unwrap();
+    let result = tokio::task::spawn_blocking(move || {
+        done_receiver.recv_timeout(Duration::from_secs(5)).expect("boundary harness should finish")
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+    harness_thread.join().expect("boundary harness thread should join");
     assert_eq!(
         database.inbox().find(request.ingest_id).await.unwrap().unwrap().status,
         IngestStatus::Storing
