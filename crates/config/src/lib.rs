@@ -2,7 +2,7 @@
 
 use std::{
     env, fmt, fs,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -559,425 +559,198 @@ impl AppConfig {
     }
 
     fn apply_environment(&mut self) -> Result<(), ConfigError> {
-        if let Some(value) = optional_env_string("SOOQA_SERVER_LISTEN_ADDRESS")? {
-            self.server.listen_address = value;
-        }
-        if let Some(value) = optional_env_string("SOOQA_WORKER_POLL_INTERVAL_SECONDS")? {
-            self.worker.poll_interval_seconds =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_WORKER_POLL_INTERVAL_SECONDS".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_WORKER_LEASE_DURATION_SECONDS")? {
-            self.worker.lease_duration_seconds =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_WORKER_LEASE_DURATION_SECONDS".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_MEDIA_FFMPEG_PATH")? {
-            self.media.ffmpeg_path = PathBuf::from(value);
-        }
-        if let Some(value) = optional_env_string("SOOQA_MEDIA_WORK_ROOT")? {
-            self.media.work_root = PathBuf::from(value);
-        }
-        if let Some(value) = optional_env_string("SOOQA_MEDIA_FFPROBE_PATH")? {
-            self.media.ffprobe_path = PathBuf::from(value);
-        }
-        if let Some(value) = optional_env_string("SOOQA_MEDIA_YTDLP_PATH")? {
-            self.media.ytdlp_path = PathBuf::from(value);
-        }
-        if let Some(value) = optional_env_string("SOOQA_MEDIA_YTDLP_FORMAT")? {
-            self.media.ytdlp_format = value;
-        }
-        if let Some(value) = optional_env_string("SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS")? {
-            let values = if value.trim().is_empty() {
-                Vec::new()
-            } else {
-                value.split(',').map(str::to_owned).collect()
-            };
-            self.media.ytdlp_allowed_hosts =
-                parse_ytdlp_allowed_hosts("SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS", values)?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL")? {
-            self.media.ytdlp_pot_provider_url =
-                parse_ytdlp_pot_provider_url("SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL", value)?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_MEDIA_PROCESSING_TIMEOUT_SECONDS")? {
-            self.media.processing_timeout_seconds =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_MEDIA_PROCESSING_TIMEOUT_SECONDS".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES")? {
-            self.media.source_download_max_bytes =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES")? {
-            self.media.normalized_storage_max_bytes =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
-        }
-        self.apply_inline_video_environment(&mut optional_env_string)?;
-        if let Some(value) = optional_env_string("SOOQA_COMPANION_LISTEN_ADDRESS")? {
-            self.companion.listen_address = value;
-        }
-        if let Some(value) = optional_env_string("SOOQA_COMPANION_BACKEND_URL")? {
-            self.companion.backend_url = value;
-        }
-        if let Some(value) = optional_env_string("SOOQA_COMPANION_LOCAL_TOKEN")? {
-            self.companion.local_token = SecretString::new(value);
-        }
-        if let Some(value) = optional_env_string("SOOQA_COMPANION_BACKEND_TOKEN")? {
-            self.companion.backend_token = SecretString::new(value);
-        }
-        if let Some(value) = optional_env_string("SOOQA_COMPANION_REQUEST_BODY_LIMIT_BYTES")? {
-            self.companion.request_body_limit_bytes =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_COMPANION_REQUEST_BODY_LIMIT_BYTES".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_COMPANION_REQUEST_TIMEOUT_SECONDS")? {
-            self.companion.request_timeout_seconds =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_COMPANION_REQUEST_TIMEOUT_SECONDS".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_OBSERVABILITY_LOG_FORMAT")? {
-            self.observability.log_format = parse_log_format(&value)?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_OBSERVABILITY_LOG_LEVEL")? {
-            self.observability.log_level = normalize_log_level(&value)?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_DATABASE_URL")? {
-            self.secrets.database_url = Some(SecretString::new(value));
-        } else if let Some(value) = optional_env_string(&self.database.url_env)? {
-            self.secrets.database_url = Some(SecretString::new(value));
-        }
-        if let Some(value) = optional_env_string("SOOQA_DATABASE_MAX_CONNECTIONS")? {
-            self.database.max_connections =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_DATABASE_MAX_CONNECTIONS".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_BOT_TOKEN")? {
-            self.secrets.telegram_bot_token = Some(SecretString::new(value));
-        }
-        if let Some(value) = optional_env_string("SOOQA_API_TOKEN")? {
-            self.secrets.api_token = Some(SecretString::new(value));
-        }
-        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_API_BASE_URL")? {
-            self.telegram.api_base_url = value;
-        }
-        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_ADMIN_USER_IDS")? {
-            self.telegram.admin_user_ids =
-                parse_admin_user_ids("SOOQA_TELEGRAM_ADMIN_USER_IDS", &value)?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_POLL_TIMEOUT_SECONDS")? {
-            self.telegram.poll_timeout_seconds =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_TELEGRAM_POLL_TIMEOUT_SECONDS".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_UPLOAD_TIMEOUT_SECONDS")? {
-            self.telegram.upload_timeout_seconds =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_TELEGRAM_UPLOAD_TIMEOUT_SECONDS".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES")? {
-            self.telegram.source_download_max_bytes =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
-        }
-        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_LOCAL_FILE_ROOT")? {
-            self.telegram.local_file_root =
-                if value.is_empty() { None } else { Some(PathBuf::from(value)) };
-        }
-        if let Some(value) = optional_env_string("SOOQA_TELEGRAM_STORAGE_CHAT_ID")? {
-            self.telegram.storage_chat_id =
-                Some(value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_TELEGRAM_STORAGE_CHAT_ID".to_owned(),
-                    reason: "expected a negative Telegram chat ID",
-                })?);
-        }
+        let mut get = optional_env_string;
+        self.server.apply_environment(&mut get)?;
+        self.worker.apply_environment(&mut get)?;
+        self.media.apply_environment(&mut get)?;
+        self.companion.apply_environment(&mut get)?;
+        self.observability.apply_environment(&mut get)?;
+        self.secrets.apply_environment(&mut get, &self.database.url_env)?;
+        self.database.apply_environment(&mut get)?;
+        self.telegram.apply_environment(&mut get)?;
         Ok(())
     }
 
-    fn apply_inline_video_environment<F>(&mut self, mut get: F) -> Result<(), ConfigError>
+    #[cfg(test)]
+    fn apply_inline_video_environment<F>(&mut self, get: F) -> Result<(), ConfigError>
     where
         F: FnMut(&str) -> Result<Option<String>, ConfigError>,
     {
-        if let Some(value) = get("SOOQA_MEDIA_INLINE_VIDEO_TARGET_MAX_BYTES")? {
-            self.media.inline_video.target_max_bytes =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_MEDIA_INLINE_VIDEO_TARGET_MAX_BYTES".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
+        let mut get = get;
+        self.media.inline_video.apply_environment(&mut get)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        match self.role {
+            AppRole::Server => {
+                self.server.validate()?;
+                self.database.validate()?;
+                self.telegram.validate(&self.secrets)?;
+            }
+            AppRole::Worker => {
+                self.worker.validate()?;
+                self.database.validate()?;
+                self.media.validate()?;
+                self.telegram.validate(&self.secrets)?;
+            }
+            AppRole::Companion => self.companion.validate()?,
         }
-        if let Some(value) = get("SOOQA_MEDIA_INLINE_VIDEO_PREFERRED_CRF")? {
-            self.media.inline_video.preferred_crf =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_MEDIA_INLINE_VIDEO_PREFERRED_CRF".to_owned(),
-                    reason: "expected an integer between 0 and 51",
-                })?;
-        }
-        if let Some(value) = get("SOOQA_MEDIA_INLINE_VIDEO_MAXIMUM_CRF")? {
-            self.media.inline_video.maximum_crf =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_MEDIA_INLINE_VIDEO_MAXIMUM_CRF".to_owned(),
-                    reason: "expected an integer between 0 and 51",
-                })?;
-        }
-        if let Some(value) = get("SOOQA_MEDIA_INLINE_VIDEO_MINIMUM_SHORT_EDGE")? {
-            self.media.inline_video.minimum_short_edge =
-                value.parse().map_err(|_| ConfigError::InvalidValue {
-                    name: "SOOQA_MEDIA_INLINE_VIDEO_MINIMUM_SHORT_EDGE".to_owned(),
-                    reason: "expected a positive integer",
-                })?;
+        Ok(())
+    }
+}
+
+impl ServerConfig {
+    fn apply_environment<F>(&mut self, get: &mut F) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    {
+        if let Some(value) =
+            optional_socket_address(get, "SOOQA_SERVER_LISTEN_ADDRESS", "server.listen_address")?
+        {
+            self.listen_address = value;
         }
         Ok(())
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        parse_socket_address("server.listen_address", &self.server.listen_address)?;
-        let companion_address =
-            parse_socket_address("companion.listen_address", &self.companion.listen_address)?;
-        if !companion_address.ip().is_loopback() {
-            return Err(ConfigError::InvalidValue {
-                name: "companion.listen_address".to_owned(),
-                reason: "must use a loopback address",
-            });
-        }
-        let companion_backend_url = url::Url::parse(&self.companion.backend_url).map_err(|_| {
-            ConfigError::InvalidValue {
-                name: "companion.backend_url".to_owned(),
-                reason: "must be a valid HTTP(S) URL",
-            }
-        })?;
-        if !is_safe_companion_backend_url(&companion_backend_url) {
-            return Err(ConfigError::InvalidValue {
-                name: "companion.backend_url".to_owned(),
-                reason: "must be an HTTP(S) URL without credentials, query, or fragment; HTTP URLs must use a private host",
-            });
-        }
-        if self.role == AppRole::Companion {
-            if !self.companion.local_token.is_configured() {
-                return Err(ConfigError::MissingSecret("Companion local token"));
-            }
-            if !self.companion.backend_token.is_configured() {
-                return Err(ConfigError::MissingSecret("Companion backend token"));
-            }
-            if self.companion.local_token.expose_secret()
-                == self.companion.backend_token.expose_secret()
-            {
-                return Err(ConfigError::InvalidValue {
-                    name: "companion.local_token".to_owned(),
-                    reason: "must be distinct from the backend token",
-                });
-            }
-            if self.companion.request_body_limit_bytes == 0
-                || self.companion.request_body_limit_bytes > MAX_COMPANION_REQUEST_BODY_LIMIT_BYTES
-            {
-                return Err(ConfigError::InvalidValue {
-                    name: "companion.request_body_limit_bytes".to_owned(),
-                    reason: "must be greater than zero and at most 1 MiB",
-                });
-            }
-            if self.companion.request_timeout_seconds == 0
-                || self.companion.request_timeout_seconds > MAX_COMPANION_REQUEST_TIMEOUT_SECONDS
-            {
-                return Err(ConfigError::InvalidValue {
-                    name: "companion.request_timeout_seconds".to_owned(),
-                    reason: "must be greater than zero and at most 60 seconds",
-                });
-            }
-        }
-        if self.worker.poll_interval_seconds == 0 {
-            return Err(ConfigError::InvalidValue {
-                name: "worker.poll_interval_seconds".to_owned(),
-                reason: "must be greater than zero",
-            });
-        }
-        if self.worker.lease_duration_seconds == 0 {
-            return Err(ConfigError::InvalidValue {
-                name: "worker.lease_duration_seconds".to_owned(),
-                reason: "must be greater than zero",
-            });
-        }
-        if self.server.request_body_limit_bytes == 0 {
+        parse_socket_address("server.listen_address", &self.listen_address)?;
+        if self.request_body_limit_bytes == 0 {
             return Err(ConfigError::InvalidValue {
                 name: "server.request_body_limit_bytes".to_owned(),
                 reason: "must be greater than zero",
             });
         }
-        if self.server.request_timeout_seconds == 0 {
+        if self.request_timeout_seconds == 0 {
             return Err(ConfigError::InvalidValue {
                 name: "server.request_timeout_seconds".to_owned(),
                 reason: "must be greater than zero",
             });
         }
-        if self.database.max_connections == 0 {
+        Ok(())
+    }
+}
+
+impl WorkerConfig {
+    fn apply_environment<F>(&mut self, get: &mut F) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    {
+        if let Some(value) = optional_duration_seconds(get, "SOOQA_WORKER_POLL_INTERVAL_SECONDS")? {
+            self.poll_interval_seconds = value;
+        }
+        if let Some(value) = optional_duration_seconds(get, "SOOQA_WORKER_LEASE_DURATION_SECONDS")?
+        {
+            self.lease_duration_seconds = value;
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.poll_interval_seconds == 0 {
             return Err(ConfigError::InvalidValue {
-                name: "database.max_connections".to_owned(),
+                name: "worker.poll_interval_seconds".to_owned(),
                 reason: "must be greater than zero",
             });
         }
-        let api_base_url = url::Url::parse(&self.telegram.api_base_url).map_err(|_| {
-            ConfigError::InvalidValue {
-                name: "telegram.api_base_url".to_owned(),
-                reason: "must be a valid HTTP(S) URL",
-            }
-        })?;
-        if !is_safe_telegram_api_base_url(&api_base_url) {
+        if self.lease_duration_seconds == 0 {
             return Err(ConfigError::InvalidValue {
-                name: "telegram.api_base_url".to_owned(),
-                reason: "must be an HTTP(S) URL without credentials; HTTP URLs must use a private host",
-            });
-        }
-        if self.telegram.poll_timeout_seconds == 0 {
-            return Err(ConfigError::InvalidValue {
-                name: "telegram.poll_timeout_seconds".to_owned(),
+                name: "worker.lease_duration_seconds".to_owned(),
                 reason: "must be greater than zero",
             });
         }
-        if self.telegram.upload_timeout_seconds == 0 {
-            return Err(ConfigError::InvalidValue {
-                name: "telegram.upload_timeout_seconds".to_owned(),
-                reason: "must be greater than zero",
-            });
+        Ok(())
+    }
+}
+
+impl MediaConfig {
+    fn apply_environment<F>(&mut self, get: &mut F) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    {
+        if let Some(value) = optional_path(get, "SOOQA_MEDIA_FFMPEG_PATH")? {
+            self.ffmpeg_path = value;
         }
-        if self.telegram.upload_timeout_seconds > MAX_TELEGRAM_UPLOAD_TIMEOUT_SECONDS {
-            return Err(ConfigError::InvalidValue {
-                name: "telegram.upload_timeout_seconds".to_owned(),
-                reason: "must be at most 24 hours",
-            });
+        if let Some(value) = optional_path(get, "SOOQA_MEDIA_WORK_ROOT")? {
+            self.work_root = value;
         }
-        if self.media.processing_timeout_seconds == 0 {
+        if let Some(value) = optional_path(get, "SOOQA_MEDIA_FFPROBE_PATH")? {
+            self.ffprobe_path = value;
+        }
+        if let Some(value) = optional_path(get, "SOOQA_MEDIA_YTDLP_PATH")? {
+            self.ytdlp_path = value;
+        }
+        if let Some(value) = get("SOOQA_MEDIA_YTDLP_FORMAT")? {
+            self.ytdlp_format = value;
+        }
+        if let Some(value) = get("SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS")? {
+            let values = if value.trim().is_empty() {
+                Vec::new()
+            } else {
+                value.split(',').map(str::to_owned).collect()
+            };
+            self.ytdlp_allowed_hosts =
+                parse_ytdlp_allowed_hosts("SOOQA_MEDIA_YTDLP_ALLOWED_HOSTS", values)?;
+        }
+        if let Some(value) = get("SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL")? {
+            self.ytdlp_pot_provider_url =
+                parse_ytdlp_pot_provider_url("SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL", value)?;
+        }
+        if let Some(value) =
+            optional_duration_seconds(get, "SOOQA_MEDIA_PROCESSING_TIMEOUT_SECONDS")?
+        {
+            self.processing_timeout_seconds = value;
+        }
+        if let Some(value) = optional_byte_size(get, "SOOQA_MEDIA_SOURCE_DOWNLOAD_MAX_BYTES")? {
+            self.source_download_max_bytes = value;
+        }
+        if let Some(value) = optional_byte_size(get, "SOOQA_MEDIA_NORMALIZED_STORAGE_MAX_BYTES")? {
+            self.normalized_storage_max_bytes = value;
+        }
+        self.inline_video.apply_environment(get)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.processing_timeout_seconds == 0 {
             return Err(ConfigError::InvalidValue {
                 name: "media.processing_timeout_seconds".to_owned(),
                 reason: "must be greater than zero",
             });
         }
-        if self.media.processing_timeout_seconds > MAX_MEDIA_PROCESSING_TIMEOUT_SECONDS {
+        if self.processing_timeout_seconds > MAX_MEDIA_PROCESSING_TIMEOUT_SECONDS {
             return Err(ConfigError::InvalidValue {
                 name: "media.processing_timeout_seconds".to_owned(),
                 reason: "must be at most 24 hours",
             });
         }
-        if self.telegram.source_download_max_bytes == 0 {
-            return Err(ConfigError::InvalidValue {
-                name: "telegram.source_download_max_bytes".to_owned(),
-                reason: "must be greater than zero",
-            });
-        }
-        if self.telegram.local_file_root.as_ref().is_some_and(|path| !path.is_absolute()) {
-            return Err(ConfigError::InvalidValue {
-                name: "telegram.local_file_root".to_owned(),
-                reason: "must be an absolute path",
-            });
-        }
-        if self.media.source_download_max_bytes == 0 {
+        if self.source_download_max_bytes == 0 {
             return Err(ConfigError::InvalidValue {
                 name: "media.source_download_max_bytes".to_owned(),
                 reason: "must be greater than zero",
             });
         }
-        if self.media.normalized_storage_max_bytes == 0 {
+        if self.normalized_storage_max_bytes == 0 {
             return Err(ConfigError::InvalidValue {
                 name: "media.normalized_storage_max_bytes".to_owned(),
                 reason: "must be greater than zero",
             });
         }
-        if self.media.normalized_storage_max_bytes >= TELEGRAM_LOCAL_MAX_UPLOAD_BYTES {
+        if self.normalized_storage_max_bytes >= TELEGRAM_LOCAL_MAX_UPLOAD_BYTES {
             return Err(ConfigError::InvalidValue {
                 name: "media.normalized_storage_max_bytes".to_owned(),
                 reason: "must be below Telegram's 2000 MB local upload limit",
             });
         }
-        if self.media.inline_video.target_max_bytes == 0 {
-            return Err(ConfigError::InvalidValue {
-                name: "media.inline_video.target_max_bytes".to_owned(),
-                reason: "must be greater than zero",
-            });
-        }
-        if self.media.inline_video.preferred_crf > 51 {
-            return Err(ConfigError::InvalidValue {
-                name: "media.inline_video.preferred_crf".to_owned(),
-                reason: "must be between 0 and 51",
-            });
-        }
-        if self.media.inline_video.maximum_crf > 51 {
-            return Err(ConfigError::InvalidValue {
-                name: "media.inline_video.maximum_crf".to_owned(),
-                reason: "must be between 0 and 51",
-            });
-        }
-        if self.media.inline_video.preferred_crf > self.media.inline_video.maximum_crf {
-            return Err(ConfigError::InvalidValue {
-                name: "media.inline_video".to_owned(),
-                reason: "preferred_crf must not exceed maximum_crf",
-            });
-        }
-        if self.media.inline_video.minimum_short_edge == 0 {
-            return Err(ConfigError::InvalidValue {
-                name: "media.inline_video.minimum_short_edge".to_owned(),
-                reason: "must be greater than zero",
-            });
-        }
-        if self.media.inline_video.minimum_short_edge > 1080 {
-            return Err(ConfigError::InvalidValue {
-                name: "media.inline_video.minimum_short_edge".to_owned(),
-                reason: "must be at most the canonical 1080p short-edge limit",
-            });
-        }
-        parse_ytdlp_allowed_hosts(
-            "media.ytdlp_allowed_hosts",
-            self.media.ytdlp_allowed_hosts.clone(),
-        )?;
+        self.inline_video.validate()?;
+        parse_ytdlp_allowed_hosts("media.ytdlp_allowed_hosts", self.ytdlp_allowed_hosts.clone())?;
         parse_ytdlp_pot_provider_url(
             "media.ytdlp_pot_provider_url",
-            self.media.ytdlp_pot_provider_url.clone(),
+            self.ytdlp_pot_provider_url.clone(),
         )?;
-        if self.telegram.storage_chat_id.is_some_and(|id| id >= 0) {
-            return Err(ConfigError::InvalidValue {
-                name: "telegram.storage_chat_id".to_owned(),
-                reason: "must be a negative Telegram channel or group ID",
-            });
-        }
-        if self.secrets.telegram_bot_token.as_ref().is_some_and(SecretString::is_configured)
-            && self.telegram.admin_user_ids.is_empty()
-        {
-            return Err(ConfigError::InvalidValue {
-                name: "telegram.admin_user_ids".to_owned(),
-                reason: "must configure at least one administrator when a bot token is set",
-            });
-        }
-        if self.telegram.admin_user_ids.iter().any(|id| *id <= 0) {
-            return Err(ConfigError::InvalidValue {
-                name: "telegram.admin_user_ids".to_owned(),
-                reason: "must contain positive Telegram user IDs",
-            });
-        }
         for (name, path) in [
-            ("media.work_root", &self.media.work_root),
-            ("media.ffmpeg_path", &self.media.ffmpeg_path),
-            ("media.ffprobe_path", &self.media.ffprobe_path),
-            ("media.ytdlp_path", &self.media.ytdlp_path),
+            ("media.work_root", &self.work_root),
+            ("media.ffmpeg_path", &self.ffmpeg_path),
+            ("media.ffprobe_path", &self.ffprobe_path),
+            ("media.ytdlp_path", &self.ytdlp_path),
         ] {
             if path.as_os_str().is_empty() {
                 return Err(ConfigError::InvalidValue {
@@ -986,19 +759,334 @@ impl AppConfig {
                 });
             }
         }
-        if self.media.ytdlp_format.trim().is_empty() {
+        if self.ytdlp_format.trim().is_empty() {
             return Err(ConfigError::InvalidValue {
                 name: "media.ytdlp_format".to_owned(),
                 reason: "must not be empty",
             });
         }
-        if self.media.ytdlp_format.starts_with('-')
-            || self.media.ytdlp_format.chars().any(char::is_control)
-        {
+        if self.ytdlp_format.starts_with('-') || self.ytdlp_format.chars().any(char::is_control) {
             return Err(ConfigError::InvalidValue {
                 name: "media.ytdlp_format".to_owned(),
                 reason: "must not start with an option prefix or contain control characters",
             });
+        }
+        Ok(())
+    }
+}
+
+impl InlineVideoConfig {
+    fn apply_environment<F>(&mut self, get: &mut F) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    {
+        if let Some(value) = optional_byte_size(get, "SOOQA_MEDIA_INLINE_VIDEO_TARGET_MAX_BYTES")? {
+            self.target_max_bytes = value;
+        }
+        if let Some(value) = optional_env_value::<_, u8>(
+            get,
+            "SOOQA_MEDIA_INLINE_VIDEO_PREFERRED_CRF",
+            "expected an integer between 0 and 51",
+        )? {
+            self.preferred_crf = value;
+        }
+        if let Some(value) = optional_env_value::<_, u8>(
+            get,
+            "SOOQA_MEDIA_INLINE_VIDEO_MAXIMUM_CRF",
+            "expected an integer between 0 and 51",
+        )? {
+            self.maximum_crf = value;
+        }
+        if let Some(value) =
+            optional_positive_integer(get, "SOOQA_MEDIA_INLINE_VIDEO_MINIMUM_SHORT_EDGE")?
+        {
+            self.minimum_short_edge = value;
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.target_max_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video.target_max_bytes".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.preferred_crf > 51 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video.preferred_crf".to_owned(),
+                reason: "must be between 0 and 51",
+            });
+        }
+        if self.maximum_crf > 51 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video.maximum_crf".to_owned(),
+                reason: "must be between 0 and 51",
+            });
+        }
+        if self.preferred_crf > self.maximum_crf {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video".to_owned(),
+                reason: "preferred_crf must not exceed maximum_crf",
+            });
+        }
+        if self.minimum_short_edge == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video.minimum_short_edge".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.minimum_short_edge > 1080 {
+            return Err(ConfigError::InvalidValue {
+                name: "media.inline_video.minimum_short_edge".to_owned(),
+                reason: "must be at most the canonical 1080p short-edge limit",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl CompanionConfig {
+    fn apply_environment<F>(&mut self, get: &mut F) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    {
+        if let Some(value) = optional_socket_address(
+            get,
+            "SOOQA_COMPANION_LISTEN_ADDRESS",
+            "companion.listen_address",
+        )? {
+            self.listen_address = value;
+        }
+        if let Some(value) = get("SOOQA_COMPANION_BACKEND_URL")? {
+            self.backend_url = value;
+        }
+        if let Some(value) = get("SOOQA_COMPANION_LOCAL_TOKEN")? {
+            self.local_token = SecretString::new(value);
+        }
+        if let Some(value) = get("SOOQA_COMPANION_BACKEND_TOKEN")? {
+            self.backend_token = SecretString::new(value);
+        }
+        if let Some(value) = optional_byte_size(get, "SOOQA_COMPANION_REQUEST_BODY_LIMIT_BYTES")? {
+            self.request_body_limit_bytes = value;
+        }
+        if let Some(value) =
+            optional_duration_seconds(get, "SOOQA_COMPANION_REQUEST_TIMEOUT_SECONDS")?
+        {
+            self.request_timeout_seconds = value;
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let address = parse_socket_address("companion.listen_address", &self.listen_address)?;
+        if !address.ip().is_loopback() {
+            return Err(ConfigError::InvalidValue {
+                name: "companion.listen_address".to_owned(),
+                reason: "must use a loopback address",
+            });
+        }
+        let backend_url =
+            url::Url::parse(&self.backend_url).map_err(|_| ConfigError::InvalidValue {
+                name: "companion.backend_url".to_owned(),
+                reason: "must be a valid HTTP(S) URL",
+            })?;
+        if !is_safe_internal_http_url(&backend_url, InternalUrlPathPolicy::Any) {
+            return Err(ConfigError::InvalidValue {
+                name: "companion.backend_url".to_owned(),
+                reason: "must be an HTTP(S) URL without credentials, query, or fragment; HTTP URLs must use a private host",
+            });
+        }
+        if !self.local_token.is_configured() {
+            return Err(ConfigError::MissingSecret("Companion local token"));
+        }
+        if !self.backend_token.is_configured() {
+            return Err(ConfigError::MissingSecret("Companion backend token"));
+        }
+        if self.local_token.expose_secret() == self.backend_token.expose_secret() {
+            return Err(ConfigError::InvalidValue {
+                name: "companion.local_token".to_owned(),
+                reason: "must be distinct from the backend token",
+            });
+        }
+        if self.request_body_limit_bytes == 0
+            || self.request_body_limit_bytes > MAX_COMPANION_REQUEST_BODY_LIMIT_BYTES
+        {
+            return Err(ConfigError::InvalidValue {
+                name: "companion.request_body_limit_bytes".to_owned(),
+                reason: "must be greater than zero and at most 1 MiB",
+            });
+        }
+        if self.request_timeout_seconds == 0
+            || self.request_timeout_seconds > MAX_COMPANION_REQUEST_TIMEOUT_SECONDS
+        {
+            return Err(ConfigError::InvalidValue {
+                name: "companion.request_timeout_seconds".to_owned(),
+                reason: "must be greater than zero and at most 60 seconds",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl DatabaseConfig {
+    fn apply_environment<F>(&mut self, get: &mut F) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    {
+        if let Some(value) = optional_positive_integer(get, "SOOQA_DATABASE_MAX_CONNECTIONS")? {
+            self.max_connections = value;
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_connections == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "database.max_connections".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl TelegramConfig {
+    fn apply_environment<F>(&mut self, get: &mut F) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    {
+        if let Some(value) = get("SOOQA_TELEGRAM_API_BASE_URL")? {
+            self.api_base_url = value;
+        }
+        if let Some(value) = get("SOOQA_TELEGRAM_ADMIN_USER_IDS")? {
+            self.admin_user_ids = parse_admin_user_ids("SOOQA_TELEGRAM_ADMIN_USER_IDS", &value)?;
+        }
+        if let Some(value) = optional_duration_seconds(get, "SOOQA_TELEGRAM_POLL_TIMEOUT_SECONDS")?
+        {
+            self.poll_timeout_seconds = value;
+        }
+        if let Some(value) =
+            optional_duration_seconds(get, "SOOQA_TELEGRAM_UPLOAD_TIMEOUT_SECONDS")?
+        {
+            self.upload_timeout_seconds = value;
+        }
+        if let Some(value) = optional_byte_size(get, "SOOQA_TELEGRAM_SOURCE_DOWNLOAD_MAX_BYTES")? {
+            self.source_download_max_bytes = value;
+        }
+        if let Some(value) = optional_path(get, "SOOQA_TELEGRAM_LOCAL_FILE_ROOT")? {
+            self.local_file_root = if value.as_os_str().is_empty() { None } else { Some(value) };
+        }
+        if let Some(value) = optional_env_value::<_, i64>(
+            get,
+            "SOOQA_TELEGRAM_STORAGE_CHAT_ID",
+            "expected a negative Telegram chat ID",
+        )? {
+            self.storage_chat_id = Some(value);
+        }
+        Ok(())
+    }
+
+    fn validate(&self, secrets: &SecretConfig) -> Result<(), ConfigError> {
+        let api_base_url =
+            url::Url::parse(&self.api_base_url).map_err(|_| ConfigError::InvalidValue {
+                name: "telegram.api_base_url".to_owned(),
+                reason: "must be a valid HTTP(S) URL",
+            })?;
+        if !is_safe_internal_http_url(&api_base_url, InternalUrlPathPolicy::Any) {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.api_base_url".to_owned(),
+                reason: "must be an HTTP(S) URL without credentials; HTTP URLs must use a private host",
+            });
+        }
+        if self.poll_timeout_seconds == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.poll_timeout_seconds".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.upload_timeout_seconds == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.upload_timeout_seconds".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.upload_timeout_seconds > MAX_TELEGRAM_UPLOAD_TIMEOUT_SECONDS {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.upload_timeout_seconds".to_owned(),
+                reason: "must be at most 24 hours",
+            });
+        }
+        if self.source_download_max_bytes == 0 {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.source_download_max_bytes".to_owned(),
+                reason: "must be greater than zero",
+            });
+        }
+        if self.local_file_root.as_ref().is_some_and(|path| !path.is_absolute()) {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.local_file_root".to_owned(),
+                reason: "must be an absolute path",
+            });
+        }
+        if self.storage_chat_id.is_some_and(|id| id >= 0) {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.storage_chat_id".to_owned(),
+                reason: "must be a negative Telegram channel or group ID",
+            });
+        }
+        if secrets.telegram_bot_token.as_ref().is_some_and(SecretString::is_configured)
+            && self.admin_user_ids.is_empty()
+        {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.admin_user_ids".to_owned(),
+                reason: "must configure at least one administrator when a bot token is set",
+            });
+        }
+        if self.admin_user_ids.iter().any(|id| *id <= 0) {
+            return Err(ConfigError::InvalidValue {
+                name: "telegram.admin_user_ids".to_owned(),
+                reason: "must contain positive Telegram user IDs",
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ObservabilityConfig {
+    fn apply_environment<F>(&mut self, get: &mut F) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    {
+        if let Some(value) = get("SOOQA_OBSERVABILITY_LOG_FORMAT")? {
+            self.log_format = parse_log_format(&value)?;
+        }
+        if let Some(value) = get("SOOQA_OBSERVABILITY_LOG_LEVEL")? {
+            self.log_level = normalize_log_level(&value)?;
+        }
+        Ok(())
+    }
+}
+
+impl SecretConfig {
+    fn apply_environment<F>(
+        &mut self,
+        get: &mut F,
+        database_url_env: &str,
+    ) -> Result<(), ConfigError>
+    where
+        F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    {
+        if let Some(value) = get("SOOQA_DATABASE_URL")? {
+            self.database_url = Some(SecretString::new(value));
+        } else if let Some(value) = get(database_url_env)? {
+            self.database_url = Some(SecretString::new(value));
+        }
+        if let Some(value) = get("SOOQA_TELEGRAM_BOT_TOKEN")? {
+            self.telegram_bot_token = Some(SecretString::new(value));
+        }
+        if let Some(value) = get("SOOQA_API_TOKEN")? {
+            self.api_token = Some(SecretString::new(value));
         }
         Ok(())
     }
@@ -1123,7 +1211,8 @@ pub enum ConfigError {
 }
 
 fn optional_env_path(name: &str) -> Result<Option<PathBuf>, ConfigError> {
-    Ok(optional_env_string(name)?.map(PathBuf::from))
+    let mut get = optional_env_string;
+    optional_path(&mut get, name)
 }
 
 fn optional_env_string(name: &str) -> Result<Option<String>, ConfigError> {
@@ -1134,6 +1223,66 @@ fn optional_env_string(name: &str) -> Result<Option<String>, ConfigError> {
             .map_err(|_| ConfigError::InvalidEnvironmentEncoding { name: name.to_owned() }),
         None => Ok(None),
     }
+}
+
+fn optional_env_value<F, T>(
+    get: &mut F,
+    name: &str,
+    reason: &'static str,
+) -> Result<Option<T>, ConfigError>
+where
+    F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    T: FromStr,
+{
+    get(name)?.map_or(Ok(None), |value| {
+        value
+            .parse()
+            .map(Some)
+            .map_err(|_| ConfigError::InvalidValue { name: name.to_owned(), reason })
+    })
+}
+
+fn optional_positive_integer<F, T>(get: &mut F, name: &str) -> Result<Option<T>, ConfigError>
+where
+    F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    T: FromStr,
+{
+    optional_env_value(get, name, "expected a positive integer")
+}
+
+fn optional_byte_size<F, T>(get: &mut F, name: &str) -> Result<Option<T>, ConfigError>
+where
+    F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    T: FromStr,
+{
+    optional_env_value(get, name, "expected a positive integer")
+}
+
+fn optional_duration_seconds<F, T>(get: &mut F, name: &str) -> Result<Option<T>, ConfigError>
+where
+    F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+    T: FromStr,
+{
+    optional_env_value(get, name, "expected a positive integer")
+}
+
+fn optional_path<F>(get: &mut F, name: &str) -> Result<Option<PathBuf>, ConfigError>
+where
+    F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+{
+    Ok(get(name)?.map(PathBuf::from))
+}
+
+fn optional_socket_address<F>(
+    get: &mut F,
+    name: &str,
+    config_name: &str,
+) -> Result<Option<String>, ConfigError>
+where
+    F: FnMut(&str) -> Result<Option<String>, ConfigError>,
+{
+    get(name)?
+        .map_or(Ok(None), |value| parse_socket_address(config_name, &value).map(|_| Some(value)))
 }
 
 fn parse_ytdlp_allowed_hosts(name: &str, values: Vec<String>) -> Result<Vec<String>, ConfigError> {
@@ -1260,7 +1409,7 @@ fn parse_ytdlp_pot_provider_url(name: &str, value: String) -> Result<String, Con
         name: name.to_owned(),
         reason: "must be a valid HTTP(S) provider URL",
     })?;
-    if !is_safe_ytdlp_pot_provider_url(&parsed) {
+    if !is_safe_internal_http_url(&parsed, InternalUrlPathPolicy::OriginOnly) {
         return Err(ConfigError::InvalidValue {
             name: name.to_owned(),
             reason: "must be an HTTP(S) provider origin without credentials, path, query, or fragment; HTTP hosts must be private",
@@ -1289,48 +1438,20 @@ fn parse_socket_address(name: &str, value: &str) -> Result<SocketAddr, ConfigErr
     })
 }
 
-fn is_safe_telegram_api_base_url(url: &url::Url) -> bool {
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return false;
-    }
-    if url.scheme() == "https" {
-        return true;
-    }
-
-    let Some(host) = url.host_str() else { return false };
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(address)) => {
-            !address.is_unspecified()
-                && (address.is_loopback() || address.is_private() || address.is_link_local())
-        }
-        Ok(IpAddr::V6(address)) => {
-            !address.is_unspecified()
-                && (address.is_loopback()
-                    || address.is_unique_local()
-                    || address.is_unicast_link_local())
-        }
-        Err(_) => {
-            host.eq_ignore_ascii_case("localhost")
-                || !host.contains('.')
-                || host.ends_with(".local")
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InternalUrlPathPolicy {
+    Any,
+    OriginOnly,
 }
 
-fn is_safe_ytdlp_pot_provider_url(url: &url::Url) -> bool {
+fn is_safe_internal_http_url(url: &url::Url, path_policy: InternalUrlPathPolicy) -> bool {
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || !matches!(url.path(), "" | "/")
+        || (path_policy == InternalUrlPathPolicy::OriginOnly && !matches!(url.path(), "" | "/"))
     {
         return false;
     }
@@ -1338,57 +1459,23 @@ fn is_safe_ytdlp_pot_provider_url(url: &url::Url) -> bool {
         return true;
     }
 
-    let Some(host) = url.host_str() else { return false };
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(address)) => {
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => {
             !address.is_unspecified()
                 && (address.is_loopback() || address.is_private() || address.is_link_local())
         }
-        Ok(IpAddr::V6(address)) => {
+        Some(url::Host::Ipv6(address)) => {
             !address.is_unspecified()
                 && (address.is_loopback()
                     || address.is_unique_local()
                     || address.is_unicast_link_local())
         }
-        Err(_) => {
+        Some(url::Host::Domain(host)) => {
             host.eq_ignore_ascii_case("localhost")
                 || !host.contains('.')
                 || host.ends_with(".local")
         }
-    }
-}
-
-fn is_safe_companion_backend_url(url: &url::Url) -> bool {
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return false;
-    }
-    if url.scheme() == "https" {
-        return true;
-    }
-
-    let Some(host) = url.host_str() else { return false };
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(address)) => {
-            !address.is_unspecified()
-                && (address.is_loopback() || address.is_private() || address.is_link_local())
-        }
-        Ok(IpAddr::V6(address)) => {
-            !address.is_unspecified()
-                && (address.is_loopback()
-                    || address.is_unique_local()
-                    || address.is_unicast_link_local())
-        }
-        Err(_) => {
-            host.eq_ignore_ascii_case("localhost")
-                || !host.contains('.')
-                || host.ends_with(".local")
-        }
+        None => false,
     }
 }
 
@@ -1431,6 +1518,97 @@ mod tests {
             let config =
                 AppConfig::from_toml_str(role, None, "").expect("defaults should parse").validate();
             assert!(config.is_ok());
+        }
+    }
+
+    #[test]
+    fn internal_url_safety_policy_is_table_driven() {
+        let cases = [
+            ("https://example.test", true, true),
+            ("https://example.test/path", true, false),
+            ("http://127.0.0.1:8080", true, true),
+            ("http://10.0.0.4:8080", true, true),
+            ("http://172.16.4.2:8080", true, true),
+            ("http://192.168.4.2:8080", true, true),
+            ("http://169.254.4.2:8080", true, true),
+            ("http://localhost:8080", true, true),
+            ("http://pot-provider:4416", true, true),
+            ("http://service.local:8080/path", true, false),
+            ("http://[::1]:8080", true, true),
+            ("http://[fc00::1]:8080", true, true),
+            ("http://[fe80::1]:8080", true, true),
+            ("http://0.0.0.0:8080", false, false),
+            ("http://8.8.8.8:8080", false, false),
+            ("http://[::]:8080", false, false),
+            ("http://[2001:db8::1]:8080", false, false),
+            ("http://example.test:8080", false, false),
+            ("https://user:password@example.test", false, false),
+            ("https://example.test?token=secret", false, false),
+            ("https://example.test#fragment", false, false),
+            ("ftp://example.test", false, false),
+        ];
+
+        for (value, any_path, origin_only) in cases {
+            let parsed = url::Url::parse(value).expect("fixture URL should parse");
+            assert_eq!(
+                is_safe_internal_http_url(&parsed, InternalUrlPathPolicy::Any),
+                any_path,
+                "unexpected any-path result for {value}"
+            );
+            assert_eq!(
+                is_safe_internal_http_url(&parsed, InternalUrlPathPolicy::OriginOnly),
+                origin_only,
+                "unexpected origin-only result for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_validation_ignores_unused_sections() {
+        let fixtures = [
+            (
+                AppRole::Server,
+                "[companion]\nbackend_url = \"http://public.example\"\n[media]\nsource_download_max_bytes = 0\n[worker]\npoll_interval_seconds = 0\n",
+            ),
+            (
+                AppRole::Worker,
+                "[server]\nlisten_address = \"not-a-socket\"\n[companion]\nbackend_url = \"http://public.example\"\n",
+            ),
+            (
+                AppRole::Companion,
+                "[server]\nlisten_address = \"not-a-socket\"\n[worker]\npoll_interval_seconds = 0\n[media]\nsource_download_max_bytes = 0\n[telegram]\napi_base_url = \"http://public.example\"\n[companion]\nlocal_token = \"local\"\nbackend_token = \"backend\"\n",
+            ),
+        ];
+
+        for (role, contents) in fixtures {
+            let config = AppConfig::from_toml_str(role, None, contents).expect("TOML should parse");
+            assert!(config.validate().is_ok(), "{role} should validate its own sections");
+        }
+    }
+
+    #[test]
+    fn companion_role_requirements_are_table_driven() {
+        let cases = [
+            ("", "", "required secret is not configured: Companion local token"),
+            ("local", "", "required secret is not configured: Companion backend token"),
+            (
+                "local",
+                "local",
+                "invalid value for companion.local_token: must be distinct from the backend token",
+            ),
+            ("local", "backend", "ok"),
+        ];
+
+        for (local, backend, expected) in cases {
+            let contents =
+                format!("[companion]\nlocal_token = \"{local}\"\nbackend_token = \"{backend}\"\n");
+            let config = AppConfig::from_toml_str(AppRole::Companion, None, &contents)
+                .expect("TOML should parse");
+            match (expected, config.validate()) {
+                ("ok", Ok(())) => {}
+                (expected, Err(error)) => assert_eq!(error.to_string(), expected),
+                (expected, Ok(())) => panic!("expected {expected}, validation succeeded"),
+            }
         }
     }
 
