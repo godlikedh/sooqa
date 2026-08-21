@@ -294,6 +294,50 @@ impl JobRepository {
     ) -> Result<Job, JobRepositoryError> {
         if self.is_publication_lease(lease).await? {
             return self
+                .settle_publication_lease(lease, run_at, error_class, error_message, false, false)
+                .await;
+        }
+        let row = sqlx::query_as::<_, JobRow>(
+            r#"
+            UPDATE queue.jobs
+            SET state = CASE WHEN attempt_count >= max_attempts THEN 'failed' ELSE 'queued' END,
+                run_at = $4, lease_token = NULL, lease_owner = NULL,
+                lease_expires_at = NULL, last_heartbeat_at = NULL,
+                error_class = $5, error_message = $6,
+                completed_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
+                updated_at = now()
+            WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
+              AND lease_expires_at > now()
+            RETURNING id, kind, payload, state, priority, run_at, attempt_count,
+                      max_attempts, lease_token, lease_owner, lease_expires_at,
+                      last_heartbeat_at, error_class, error_message, dedupe_key,
+                      created_at, updated_at, completed_at
+            "#,
+        )
+        .bind(lease.job_id)
+        .bind(&lease.lease_owner)
+        .bind(lease.lease_token)
+        .bind(run_at)
+        .bind(error_class)
+        .bind(error_message)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(JobRepositoryError::LeaseLost)?;
+        row.into_job()
+    }
+
+    /// Requeues a scheduled deferral without consuming the current attempt.
+    /// This is reserved for admission decisions where the work has not begun
+    /// and capacity may recover without any change to the job's retry budget.
+    pub async fn defer_lease_without_consuming_attempt(
+        &self,
+        lease: &JobLease,
+        run_at: OffsetDateTime,
+        error_class: &str,
+        error_message: &str,
+    ) -> Result<Job, JobRepositoryError> {
+        if self.is_publication_lease(lease).await? {
+            return self
                 .settle_publication_lease(lease, run_at, error_class, error_message, false, true)
                 .await;
         }

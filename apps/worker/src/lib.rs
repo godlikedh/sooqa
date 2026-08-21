@@ -146,7 +146,7 @@ impl WorkspaceAdmission {
                 "work volume free-space check failed; deferring job"
             ),
         }
-        Err(HandlerFailure::defer(
+        Err(HandlerFailure::defer_without_consuming_attempt(
             "work_disk_low",
             message,
             OffsetDateTime::now_utc() + DISK_ADMISSION_RETRY_DELAY,
@@ -276,6 +276,7 @@ pub struct HandlerFailure {
     pub class: String,
     pub message: String,
     pub defer_until: Option<OffsetDateTime>,
+    pub defer_without_consuming_attempt: bool,
     pub retry_without_consuming_attempt: bool,
     pub requires_storage_reconciliation: bool,
 }
@@ -287,6 +288,7 @@ impl HandlerFailure {
             class: class.into(),
             message: message.into(),
             defer_until: None,
+            defer_without_consuming_attempt: false,
             retry_without_consuming_attempt: false,
             requires_storage_reconciliation: false,
         }
@@ -301,6 +303,7 @@ impl HandlerFailure {
             class: class.into(),
             message: message.into(),
             defer_until: None,
+            defer_without_consuming_attempt: false,
             retry_without_consuming_attempt: true,
             requires_storage_reconciliation: false,
         }
@@ -312,6 +315,7 @@ impl HandlerFailure {
             class: class.into(),
             message: message.into(),
             defer_until: None,
+            defer_without_consuming_attempt: false,
             retry_without_consuming_attempt: false,
             requires_storage_reconciliation: false,
         }
@@ -327,6 +331,23 @@ impl HandlerFailure {
             class: class.into(),
             message: message.into(),
             defer_until: Some(defer_until),
+            defer_without_consuming_attempt: false,
+            retry_without_consuming_attempt: false,
+            requires_storage_reconciliation: false,
+        }
+    }
+
+    pub fn defer_without_consuming_attempt(
+        class: impl Into<String>,
+        message: impl Into<String>,
+        defer_until: OffsetDateTime,
+    ) -> Self {
+        Self {
+            retryable: true,
+            class: class.into(),
+            message: message.into(),
+            defer_until: Some(defer_until),
+            defer_without_consuming_attempt: true,
             retry_without_consuming_attempt: false,
             requires_storage_reconciliation: false,
         }
@@ -338,6 +359,7 @@ impl HandlerFailure {
             class: "storage_upload_unknown".to_owned(),
             message: message.into(),
             defer_until: None,
+            defer_without_consuming_attempt: false,
             retry_without_consuming_attempt: false,
             requires_storage_reconciliation: true,
         }
@@ -2197,11 +2219,49 @@ async fn compute_fingerprint(
     })?;
     let current_request = load_ingest_for_admission(inbox, ingest_request_id).await?;
     let mut preflight_failure = None;
+    let mut preflight_exact_media_exists = None;
     if fingerprint_stage_may_run(current_request.status) {
         match current_request.input_data() {
             Ok(input_data) => match input_data.normalization {
                 Some(normalization) if normalization.media_kind == SourceMediaKind::Video => {
-                    admission.admit(work_root, sooqa_media::DEFAULT_MAX_FRAME_SEQUENCE_BYTES)?;
+                    match normalization_to_media_metadata(&normalization) {
+                        Ok(metadata) => {
+                            let media_ingest = MediaIngest {
+                                media: NewMedia {
+                                    kind: MediaKind::Video,
+                                    title: current_request.page_title.clone(),
+                                    description: current_request.supplied_description.clone(),
+                                },
+                                metadata,
+                                source: source_record_for_request(&current_request),
+                                tags: current_request.supplied_tags.clone(),
+                            };
+                            match library.resolve_exact_sha(&media_ingest).await {
+                                Ok(media_id) => {
+                                    let exists = media_id.is_some();
+                                    if !exists {
+                                        if !matches!(normalization.duration_ms, Some(value) if value > 0)
+                                        {
+                                            preflight_failure = Some(HandlerFailure::permanent(
+                                                "invalid_ingest_state",
+                                                "video normalization has no valid canonical duration",
+                                            ));
+                                        } else {
+                                            admission.admit(
+                                                work_root,
+                                                sooqa_media::DEFAULT_MAX_FRAME_SEQUENCE_BYTES,
+                                            )?;
+                                        }
+                                    }
+                                    preflight_exact_media_exists = Some(exists);
+                                }
+                                Err(error) => {
+                                    preflight_failure = Some(map_library_error(error));
+                                }
+                            }
+                        }
+                        Err(failure) => preflight_failure = Some(failure),
+                    }
                 }
                 Some(_) => {}
                 None => {
@@ -2283,14 +2343,17 @@ async fn compute_fingerprint(
         source: source_record_for_request(&request),
         tags: request.supplied_tags.clone(),
     };
-    let exact_media_exists = match library.resolve_exact_sha(&media_ingest).await {
-        Ok(media_id) => media_id.is_some(),
-        Err(error) => {
+    let exact_media_exists = match preflight_exact_media_exists {
+        Some(exists) => exists,
+        None => {
             return fail_fingerprint(
                 inbox,
                 ingest_request_id,
                 &job_attempt,
-                map_library_error(error),
+                HandlerFailure::permanent(
+                    "invalid_ingest_state",
+                    "fingerprint preflight did not resolve the exact media identity",
+                ),
             )
             .await;
         }
@@ -3893,14 +3956,21 @@ impl Worker {
                 );
             }
             Err(failure) if failure.defer_until.is_some() => {
-                self.repository
-                    .defer_lease(
-                        lease,
-                        failure.defer_until.expect("defer timestamp was checked"),
-                        &failure.class,
-                        &failure.message,
-                    )
-                    .await?;
+                let defer_until = failure.defer_until.expect("defer timestamp was checked");
+                if failure.defer_without_consuming_attempt {
+                    self.repository
+                        .defer_lease_without_consuming_attempt(
+                            lease,
+                            defer_until,
+                            &failure.class,
+                            &failure.message,
+                        )
+                        .await?;
+                } else {
+                    self.repository
+                        .defer_lease(lease, defer_until, &failure.class, &failure.message)
+                        .await?;
+                }
                 info!(worker_id = %self.worker_id, job_id = %job.id, "job deferred until dependent lease expires");
             }
             Err(failure) if failure.retryable => {

@@ -378,6 +378,44 @@ async fn explicitly_safe_telegram_failure_is_retried_without_duplicate_send(pool
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
+async fn scheduled_publication_deferral_without_consuming_attempt_stays_queued(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let (job, created) = due_job(&database, Some("caption")).await;
+    sqlx::query("UPDATE queue.jobs SET max_attempts = 1 WHERE id = $1")
+        .bind(job.id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let deferred = database
+        .jobs()
+        .defer_lease_without_consuming_attempt(
+            &job.lease().expect("claimed publication should have a lease"),
+            OffsetDateTime::now_utc(),
+            "work_disk_low",
+            "synthetic reserve is full",
+        )
+        .await
+        .unwrap();
+    assert_eq!(deferred.status, sooqa_jobs::JobStatus::Queued);
+    assert_eq!(deferred.attempt_count, 0);
+    assert!(deferred.completed_at.is_none());
+
+    let post = database.publisher().find_post(created.id).await.unwrap().unwrap();
+    assert_eq!(post.state, PostState::Queued);
+
+    let reclaimed = database
+        .jobs()
+        .claim_next("publication-defer-recovery", Duration::from_secs(60), &[JobType::PublishPost])
+        .await
+        .unwrap()
+        .expect("deferred publication should be claimable again");
+    assert_eq!(reclaimed.id, job.id);
+    assert_eq!(reclaimed.attempt_count, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn recovered_publication_reconciles_sending_before_any_second_send(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let (job, created) = due_job(&database, Some("caption")).await;
