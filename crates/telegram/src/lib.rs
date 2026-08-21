@@ -1816,7 +1816,7 @@ impl PollBackoff {
     }
 
     fn next(&mut self, suggested: Option<Duration>) -> Duration {
-        let delay = suggested.unwrap_or(self.next_delay).min(self.max_delay);
+        let delay = self.next_delay.max(suggested.unwrap_or_default());
         self.next_delay =
             self.next_delay.checked_mul(2).unwrap_or(self.max_delay).min(self.max_delay);
         delay
@@ -1901,6 +1901,44 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn polling_backoff_honors_local_growth_and_retry_after_minimums() {
+        let cases = vec![
+            (
+                "local exponential growth and cap",
+                Duration::from_secs(1),
+                Duration::from_secs(4),
+                vec![None, None, None, None],
+                vec![1, 2, 4, 4],
+            ),
+            (
+                "short retry-after cannot bypass local backoff",
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                vec![Some(Duration::from_secs(1)), Some(Duration::from_secs(1)), None],
+                vec![4, 8, 8],
+            ),
+            (
+                "long retry-after remains the minimum",
+                Duration::from_secs(1),
+                Duration::from_secs(4),
+                vec![Some(Duration::from_secs(120)), None],
+                vec![120, 2],
+            ),
+        ];
+
+        for (name, initial, maximum, suggestions, expected_seconds) in cases {
+            let mut backoff = PollBackoff::new(initial, maximum);
+            for (suggestion, expected_seconds) in suggestions.into_iter().zip(expected_seconds) {
+                assert_eq!(
+                    backoff.next(suggestion),
+                    Duration::from_secs(expected_seconds),
+                    "{name}"
+                );
+            }
+        }
+    }
 
     #[derive(Clone, Default)]
     struct MockApi {
