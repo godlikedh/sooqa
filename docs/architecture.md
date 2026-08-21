@@ -128,7 +128,8 @@ sequenceDiagram
     Worker->>Ingests: fenced state transition + next job
     alt video
         Worker->>Media: extract video_sequence_v1 outside transaction
-        Worker->>Media: advisory-locked SHA/shortlist/alignment decision
+        Worker->>Media: advisory-locked SHA/shortlist decision
+        Worker->>Worker: blocking-pool decode/alignment while session lock is held
         alt exact or new identity
             Media-->>Worker: existing or new media id
         else strong perceptual match
@@ -170,18 +171,29 @@ stable conflict; repeating the winning decision is idempotent.
 The worker keeps source inspection, download, probe, normalization,
 fingerprinting, and exact finalization as separate typed jobs. Each stage
 updates `ingests` and enqueues its successor in a short transaction. Video
-identity finalization takes one transaction-scoped advisory lock, rechecks the
-canonical SHA, asks PostgreSQL for at most twenty plausible fingerprint
-candidates, and runs bounded Rust alignment before inserting media. The lock
-does not cover download, ffmpeg, filesystem, HTTP, or Telegram work. Images,
-animations, and audio skip the video path and use exact SHA resolution. No
-storage job is enqueued for `duplicate_pending`; force-save sets the durable
-override, reconstructs URL/Telegram source artifacts when necessary, and then
-resumes normalization/fingerprinting. Network and subprocess work never runs
-while an identity transaction is open. Stage metadata is
-bounded JSON input metadata; it is decoded into typed Rust structs at the
-handler boundary. Storage completion/failure is applied by `media_id`, and
-attach/reset/mark-unknown reconcile the linked ingest rows.
+identity finalization acquires one session-level advisory lock on a dedicated
+PostgreSQL connection. A short preparation transaction on that connection
+revalidates the running ingest/job lease, rechecks the canonical SHA, and asks
+PostgreSQL for at most twenty plausible fingerprint candidates; it commits
+before the worker decodes candidates and runs bounded Rust alignment on
+Tokio's blocking/CPU pool. The same session lock remains held during that
+CPU phase, so equivalent decisions stay globally serialized without holding
+an SQL transaction or row locks. A short final transaction on the locked
+connection revalidates the ingest/job lease and canonical SHA, then persists
+the worker's exact/duplicate-pending/no-match decision, successor work, and
+current-job success atomically. The session lock is released only after that
+transaction commits (and the dedicated connection is closed on cancellation),
+so stale or cancelled workers cannot retain a pooled advisory lock.
+
+The lock does not cover download, ffmpeg, filesystem, HTTP, or Telegram work.
+Images, animations, and audio skip the video path and use exact SHA
+resolution. No storage job is enqueued for `duplicate_pending`; force-save
+sets the durable override, reconstructs URL/Telegram source artifacts when
+necessary, and then resumes normalization/fingerprinting. Network and
+subprocess work never runs while an identity transaction is open. Stage
+metadata is bounded JSON input metadata; it is decoded into typed Rust
+structs at the handler boundary. Storage completion/failure is applied by
+`media_id`, and attach/reset/mark-unknown reconcile the linked ingest rows.
 
 ### Versioned ingest data
 

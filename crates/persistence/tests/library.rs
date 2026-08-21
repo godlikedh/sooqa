@@ -4,9 +4,10 @@ use sooqa_library::{
     CaptionSyncCompletion, CaptionSyncState, MediaIngest, MediaKind, MediaMetadata,
     MediaSearchQuery, MediaSourceInput, MediaUpdate, NewMedia, SourceKind, StorageUploadAttachment,
     StorageUploadReservation, StorageUploadReservationRequest, StorageUploadStore,
+    VideoDuplicateEvidence, VideoDuplicateMatch, VideoFingerprintInput, VideoIdentityDecision,
     VideoIdentityOutcome,
 };
-use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint, VideoSequenceSample};
+use sooqa_media::{VideoSequenceFingerprint, VideoSequenceSample};
 use sooqa_persistence::{Database, LibraryRepositoryError};
 use uuid::Uuid;
 
@@ -54,6 +55,42 @@ fn exact_ingest(kind: MediaKind, sha256: Vec<u8>, source: &str) -> MediaIngest {
     ingest.media.kind = kind;
     ingest.metadata.kind = kind;
     ingest
+}
+
+fn fingerprint_input(fingerprint: &VideoSequenceFingerprint) -> VideoFingerprintInput {
+    VideoFingerprintInput {
+        version: fingerprint.version.as_str().to_owned(),
+        data: fingerprint.encode().unwrap(),
+        search_tokens: fingerprint.search_tokens(),
+    }
+}
+
+fn duplicate_decision(media_id: Uuid, version: &str) -> VideoIdentityDecision {
+    VideoIdentityDecision::DuplicatePending {
+        evidence: VideoDuplicateEvidence {
+            algorithm_version: version.to_owned(),
+            matches: vec![VideoDuplicateMatch {
+                media_id,
+                fingerprint_version: version.to_owned(),
+                classification: sooqa_library::VideoDuplicateClassification::StrongDuplicate,
+                aligned_offset_ms: 0,
+                informative_matched_samples: 8,
+                incoming_coverage_bps: 9_000,
+                candidate_coverage_bps: 9_000,
+                median_distance_bps: 100,
+                high_percentile_distance_bps: 200,
+                longest_temporally_consistent_run: 8,
+                unmatched_incoming_prefix: 0,
+                unmatched_incoming_suffix: 0,
+                unmatched_candidate_prefix: 0,
+                unmatched_candidate_suffix: 0,
+                gap_count: 0,
+                score_bps: 9_500,
+                shared_token_count: 12,
+                token_overlap_bps: 8_000,
+            }],
+        },
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -344,10 +381,20 @@ async fn video_fingerprint_shortlist_uses_tokens_state_and_version_bounds(pool: 
 
     let fingerprint = test_sequence(0x1234_5678_9abc_def0);
     let tokens = fingerprint.search_tokens();
-    repository.record_video_sequence_fingerprint(incoming.media.id, &fingerprint).await.unwrap();
-    repository.record_video_sequence_fingerprint(pending.media.id, &fingerprint).await.unwrap();
-    repository.record_video_sequence_fingerprint(ready.media.id, &fingerprint).await.unwrap();
-    repository.record_video_sequence_fingerprint(unknown.media.id, &fingerprint).await.unwrap();
+    let fingerprint_input = fingerprint_input(&fingerprint);
+    repository
+        .record_video_sequence_fingerprint(incoming.media.id, &fingerprint_input)
+        .await
+        .unwrap();
+    repository
+        .record_video_sequence_fingerprint(pending.media.id, &fingerprint_input)
+        .await
+        .unwrap();
+    repository.record_video_sequence_fingerprint(ready.media.id, &fingerprint_input).await.unwrap();
+    repository
+        .record_video_sequence_fingerprint(unknown.media.id, &fingerprint_input)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = -100123, telegram_storage_message_id = 501, telegram_file_id = 'ready-501' WHERE id = $1",
     )
@@ -408,7 +455,7 @@ async fn video_fingerprint_shortlist_is_capped_at_twenty(pool: sqlx::PgPool) {
             .await
             .unwrap();
         repository
-            .record_video_sequence_fingerprint(candidate.media.id, &fingerprint)
+            .record_video_sequence_fingerprint(candidate.media.id, &fingerprint_input(&fingerprint))
             .await
             .unwrap();
         media_ids.push(candidate.media.id);
@@ -428,11 +475,12 @@ async fn video_identity_reuses_exact_sha_and_stores_fingerprint_before_storage(p
     let database = Database::from_pool(pool);
     let repository = database.library();
     let fingerprint = test_sequence(0x1111_2222_3333_4444);
+    let fingerprint_input = fingerprint_input(&fingerprint);
     let first = repository
         .resolve_video_identity(
             ingest(vec![41_u8; 32], "https://example.test/exact-first"),
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
+            &fingerprint_input,
+            &VideoIdentityDecision::NoMatch,
             false,
         )
         .await
@@ -444,8 +492,8 @@ async fn video_identity_reuses_exact_sha_and_stores_fingerprint_before_storage(p
     let second = repository
         .resolve_video_identity(
             ingest(vec![41_u8; 32], "https://example.test/exact-second"),
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
+            &fingerprint_input,
+            &VideoIdentityDecision::NoMatch,
             false,
         )
         .await
@@ -483,11 +531,12 @@ async fn strong_video_match_stops_before_media_insertion_and_force_save_bypasses
     let database = Database::from_pool(pool);
     let repository = database.library();
     let fingerprint = test_sequence(0x5555_6666_7777_8888);
+    let fingerprint_input = fingerprint_input(&fingerprint);
     let first = repository
         .resolve_video_identity(
             ingest(vec![42_u8; 32], "https://example.test/perceptual-first"),
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
+            &fingerprint_input,
+            &VideoIdentityDecision::NoMatch,
             false,
         )
         .await
@@ -499,8 +548,8 @@ async fn strong_video_match_stops_before_media_insertion_and_force_save_bypasses
     let pending = repository
         .resolve_video_identity(
             ingest(vec![43_u8; 32], "https://example.test/perceptual-second"),
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
+            &fingerprint_input,
+            &duplicate_decision(first_id, fingerprint.version.as_str()),
             false,
         )
         .await
@@ -527,8 +576,8 @@ async fn strong_video_match_stops_before_media_insertion_and_force_save_bypasses
     let forced = repository
         .resolve_video_identity(
             ingest(vec![43_u8; 32], "https://example.test/perceptual-second"),
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
+            &fingerprint_input,
+            &VideoIdentityDecision::NoMatch,
             true,
         )
         .await
@@ -546,21 +595,18 @@ async fn concurrent_equivalent_videos_share_the_identity_barrier(pool: sqlx::PgP
     let database = Database::from_pool(pool);
     let repository = database.library();
     let fingerprint = test_sequence(0x9999_aaaa_bbbb_cccc);
+    let fingerprint_input = fingerprint_input(&fingerprint);
+    let pending_decision = duplicate_decision(Uuid::new_v4(), fingerprint.version.as_str());
     let left = ingest(vec![51_u8; 32], "https://example.test/concurrent-left");
     let right = ingest(vec![52_u8; 32], "https://example.test/concurrent-right");
     let (left, right) = tokio::join!(
         repository.resolve_video_identity(
             left,
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
+            &fingerprint_input,
+            &VideoIdentityDecision::NoMatch,
             false,
         ),
-        repository.resolve_video_identity(
-            right,
-            &fingerprint,
-            SequenceAlignmentConfig::default(),
-            false,
-        )
+        repository.resolve_video_identity(right, &fingerprint_input, &pending_decision, false,)
     );
     let left = left.unwrap();
     let right = right.unwrap();

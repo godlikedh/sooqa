@@ -8,8 +8,9 @@ use sooqa_inbox::{
 use sooqa_jobs::{JobCommand, JobStatus, JobType};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
+    VideoFingerprintInput, VideoIdentityDecision,
 };
-use sooqa_media::{SequenceAlignmentConfig, VideoSequenceFingerprint, VideoSequenceSample};
+use sooqa_media::{VideoSequenceFingerprint, VideoSequenceSample};
 use sooqa_persistence::{Database, InboxRepositoryError, SourceInspectionStart};
 use sooqa_publisher::NewChannel;
 use time::OffsetDateTime;
@@ -1037,17 +1038,28 @@ async fn stale_video_identity_finalizer_cannot_mutate_after_lease_recovery(pool:
     .unwrap();
     database.jobs().recover_stale_leases().await.unwrap();
 
+    let fingerprint_input = VideoFingerprintInput {
+        version: fingerprint.version.as_str().to_owned(),
+        data: fingerprint.encode().unwrap(),
+        search_tokens: fingerprint.search_tokens(),
+    };
     let stale_result = database
         .inbox()
-        .finalize_video_identity(
+        .begin_video_identity(
             ingest.ingest.id,
             &stale_attempt,
-            media_ingest.clone(),
-            Some(&fingerprint),
-            SequenceAlignmentConfig::default(),
+            &media_ingest,
+            Some(&fingerprint_input),
         )
         .await
         .unwrap();
+    let stale_result = match stale_result {
+        sooqa_persistence::IngestVideoIdentityStart::AlreadyAdvanced(request) => request,
+        sooqa_persistence::IngestVideoIdentityStart::Ready { session, .. } => {
+            database.inbox().abort_video_identity(session).await.unwrap();
+            panic!("stale finalizer unexpectedly acquired the identity session")
+        }
+    };
     assert_eq!(stale_result.status, IngestStatus::Fingerprinting);
     assert!(stale_result.media_id.is_none());
     assert!(stale_result.duplicate_evidence.is_none());
@@ -1081,14 +1093,31 @@ async fn stale_video_identity_finalizer_cannot_mutate_after_lease_recovery(pool:
         .unwrap()
         .expect("recovered fingerprint job should be claimable");
     let winner_attempt = winner.lease().unwrap();
-    let completed = database
+    let start = database
         .inbox()
-        .finalize_video_identity(
+        .begin_video_identity(
             ingest.ingest.id,
             &winner_attempt,
+            &media_ingest,
+            Some(&fingerprint_input),
+        )
+        .await
+        .unwrap();
+    let session = match start {
+        sooqa_persistence::IngestVideoIdentityStart::Ready { session, .. } => session,
+        sooqa_persistence::IngestVideoIdentityStart::AlreadyAdvanced(request) => {
+            panic!("winner finalizer did not acquire fingerprinting ingest: {request:?}")
+        }
+    };
+    let completed = database
+        .inbox()
+        .complete_video_identity(
+            ingest.ingest.id,
+            &winner_attempt,
+            session,
             media_ingest,
-            Some(&fingerprint),
-            SequenceAlignmentConfig::default(),
+            Some(&fingerprint_input),
+            &VideoIdentityDecision::NoMatch,
         )
         .await
         .unwrap();

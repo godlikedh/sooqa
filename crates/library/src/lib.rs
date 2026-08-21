@@ -373,6 +373,16 @@ pub struct VideoFingerprintCandidate {
     pub overlap_bps: i64,
 }
 
+/// The persisted representation of a freshly computed video sequence
+/// fingerprint.  The media crate owns producing and consuming this data;
+/// persistence only stores the opaque bytes and retrieval tokens.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct VideoFingerprintInput {
+    pub version: String,
+    pub data: Vec<u8>,
+    pub search_tokens: Vec<i64>,
+}
+
 /// Bounded evidence retained when the video identity gate needs an explicit
 /// human decision. It deliberately contains scalar alignment results only;
 /// authoritative fingerprint bytes remain on `media`.
@@ -420,6 +430,15 @@ pub const MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES: usize = 16 * 1024;
 pub enum VideoIdentityOutcome {
     ExactDuplicate { media_id: Uuid },
     NewMedia { media_id: Uuid },
+    DuplicatePending { evidence: VideoDuplicateEvidence },
+}
+
+/// The worker's CPU-side identity result.  Persistence turns this decision
+/// into a durable outcome while rechecking the canonical SHA and current
+/// rows in the final transaction.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum VideoIdentityDecision {
+    NoMatch,
     DuplicatePending { evidence: VideoDuplicateEvidence },
 }
 
