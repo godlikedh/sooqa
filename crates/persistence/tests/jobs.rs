@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use serde_json::json;
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
 use sooqa_jobs::{JobStatus, JobType, NewJob};
 use sooqa_persistence::Database;
@@ -72,6 +73,61 @@ async fn claim_retry_and_fencing_use_the_queue_jobs_row(pool: sqlx::PgPool) {
             .await
             .expect("exhausted job query should succeed")
             .is_none()
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn malformed_storage_payload_does_not_abort_stale_recovery(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let malformed_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO queue.jobs (kind, payload, state, attempt_count, lease_token, lease_owner, lease_expires_at, last_heartbeat_at, dedupe_key) VALUES ('upload_storage_asset', $1, 'running', 1, $2, 'malformed-worker', now() - interval '1 second', now() - interval '1 second', $3) RETURNING id",
+    )
+    .bind(json!({ "media_id": "not-a-uuid" }))
+    .bind(Uuid::new_v4())
+    .bind(format!("malformed-storage:{}", Uuid::new_v4()))
+    .fetch_one(database.pool())
+    .await
+    .expect("malformed storage job should insert");
+    let valid = database
+        .jobs()
+        .enqueue(
+            NewJob::cleanup_workspace(Uuid::new_v4(), Uuid::new_v4())
+                .dedupe_key(format!("valid-stale:{}", Uuid::new_v4())),
+        )
+        .await
+        .expect("valid job should enqueue");
+    let valid_claim = database
+        .jobs()
+        .claim_next("valid-worker", Duration::from_secs(30), &[JobType::CleanupWorkspace])
+        .await
+        .unwrap()
+        .expect("valid job should claim");
+    assert_eq!(valid.id, valid_claim.id);
+    sqlx::query(
+        "UPDATE queue.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(valid.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(database.jobs().recover_stale_leases().await.unwrap(), 2);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(malformed_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "queued"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(valid.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "queued"
     );
 }
 

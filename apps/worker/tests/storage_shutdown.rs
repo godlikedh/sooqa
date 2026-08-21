@@ -2,7 +2,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -31,6 +31,7 @@ struct ControllableTelegram {
     request_started: Arc<Notify>,
     release_request: Arc<Notify>,
     calls: Arc<AtomicUsize>,
+    ambiguous: bool,
 }
 
 #[derive(Debug, Error)]
@@ -47,6 +48,9 @@ impl TelegramStorageApi for ControllableTelegram {
     ) -> Result<StorageUploadResult, Self::Error> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.request_started.notify_one();
+        if self.ambiguous {
+            return Err(ControllableTelegramError);
+        }
         self.release_request.notified().await;
         Ok(StorageUploadResult {
             storage_message_id: 42,
@@ -60,7 +64,7 @@ impl TelegramStorageApi for ControllableTelegram {
     }
 
     fn is_ambiguous_error(_error: &Self::Error) -> bool {
-        false
+        true
     }
 }
 
@@ -71,6 +75,8 @@ struct ReservationGateStore {
     release: Arc<Notify>,
     release_completed: Option<Arc<Notify>>,
     continue_release: Option<Arc<Notify>>,
+    fail_unknown_once: Option<Arc<AtomicBool>>,
+    unknown_failed: Option<Arc<Notify>>,
 }
 
 #[async_trait]
@@ -157,6 +163,16 @@ impl StorageUploadStore for ReservationGateStore {
         media_id: Uuid,
         owner_token: Uuid,
     ) -> Result<(), Self::Error> {
+        if self
+            .fail_unknown_once
+            .as_ref()
+            .is_some_and(|failure| failure.swap(false, Ordering::AcqRel))
+        {
+            if let Some(signal) = &self.unknown_failed {
+                signal.notify_one();
+            }
+            return Err(LibraryRepositoryError::StorageUploadLeaseLost(media_id));
+        }
         StorageUploadStore::mark_storage_upload_unknown(&self.inner, media_id, owner_token).await
     }
 }
@@ -297,6 +313,7 @@ async fn worker_shutdown_before_storage_dispatch_releases_and_requeues(pool: sql
         request_started: Arc::new(Notify::new()),
         release_request: Arc::new(Notify::new()),
         calls: Arc::new(AtomicUsize::new(0)),
+        ambiguous: false,
     };
     let gate = ReservationGateStore {
         inner: database.library(),
@@ -304,6 +321,8 @@ async fn worker_shutdown_before_storage_dispatch_releases_and_requeues(pool: sql
         release: Arc::new(Notify::new()),
         release_completed: None,
         continue_release: None,
+        fail_unknown_once: None,
+        unknown_failed: None,
     };
     let reserved = Arc::clone(&gate.reserved);
     let release = Arc::clone(&gate.release);
@@ -440,6 +459,95 @@ async fn stale_active_storage_reservation_reconciles_unknown_after_grace(pool: s
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
+async fn failed_unknown_mark_stays_running_until_stale_recovery_without_resend(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let fixture = seed_storage_upload(&database).await;
+    let request_started = Arc::new(Notify::new());
+    let unknown_failed = Arc::new(Notify::new());
+    let fail_unknown_once = Arc::new(AtomicBool::new(true));
+    let api = ControllableTelegram {
+        request_started: Arc::clone(&request_started),
+        release_request: Arc::new(Notify::new()),
+        calls: Arc::new(AtomicUsize::new(0)),
+        ambiguous: true,
+    };
+    let gate = ReservationGateStore {
+        inner: database.library(),
+        reserved: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        release_completed: None,
+        continue_release: None,
+        fail_unknown_once: Some(Arc::clone(&fail_unknown_once)),
+        unknown_failed: Some(Arc::clone(&unknown_failed)),
+    };
+    gate.release.notify_one();
+    let provider = StorageUploadProvider::new(api.clone(), gate, -100123)
+        .unwrap()
+        .with_work_root(fixture.root.clone());
+    let mut registry = HandlerRegistry::new();
+    let handler = upload_storage_asset_cancellable_handler(database.inbox(), provider);
+    registry.register_cancellable(JobType::UploadStorageAsset, move |job, cancellation| {
+        handler(job, cancellation)
+    });
+    let worker = Worker::new(
+        database.jobs(),
+        registry,
+        "storage-unknown-mark-failure",
+        Duration::from_millis(10),
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let worker_task = tokio::spawn(async move {
+        worker
+            .run(async move {
+                let _ = shutdown_receiver.await;
+            })
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), request_started.notified())
+        .await
+        .expect("Telegram upload should be dispatched");
+    tokio::time::timeout(Duration::from_secs(5), unknown_failed.notified())
+        .await
+        .expect("marking storage unknown should fail deterministically");
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(fixture.job_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "running"
+    );
+    sqlx::query("UPDATE media SET storage_started_at = now() - interval '2 minutes' WHERE id = $1")
+        .bind(fixture.media_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE queue.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(fixture.job_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(database.jobs().recover_stale_leases().await.unwrap(), 1);
+    assert_storage_unknown(&database, &fixture).await;
+    assert_eq!(api.calls.load(Ordering::Relaxed), 1);
+    let _ = shutdown_sender.send(());
+    tokio::time::timeout(Duration::from_secs(8), worker_task)
+        .await
+        .expect("worker should stop after stale reconciliation")
+        .expect("worker task should join")
+        .expect("stale reconciliation should not crash the worker");
+    tokio::fs::remove_dir_all(fixture.root).await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn heartbeat_loss_before_storage_dispatch_releases_and_requeues_final_attempt(
     pool: sqlx::PgPool,
 ) {
@@ -454,6 +562,7 @@ async fn heartbeat_loss_before_storage_dispatch_releases_and_requeues_final_atte
         request_started: Arc::new(Notify::new()),
         release_request: Arc::new(Notify::new()),
         calls: Arc::new(AtomicUsize::new(0)),
+        ambiguous: false,
     };
     let mut gate = ReservationGateStore {
         inner: database.library(),
@@ -461,6 +570,8 @@ async fn heartbeat_loss_before_storage_dispatch_releases_and_requeues_final_atte
         release: Arc::new(Notify::new()),
         release_completed: None,
         continue_release: None,
+        fail_unknown_once: None,
+        unknown_failed: None,
     };
     let reserved = Arc::clone(&gate.reserved);
     let release = Arc::clone(&gate.release);
@@ -595,6 +706,7 @@ async fn worker_shutdown_after_storage_dispatch_marks_unknown(pool: sqlx::PgPool
         request_started: Arc::new(Notify::new()),
         release_request: Arc::new(Notify::new()),
         calls: Arc::new(AtomicUsize::new(0)),
+        ambiguous: false,
     };
     let provider = StorageUploadProvider::new(api.clone(), database.library(), -100123)
         .unwrap()
@@ -660,6 +772,7 @@ async fn heartbeat_loss_during_storage_dispatch_marks_unknown(pool: sqlx::PgPool
         request_started: Arc::new(Notify::new()),
         release_request: Arc::new(Notify::new()),
         calls: Arc::new(AtomicUsize::new(0)),
+        ambiguous: false,
     };
     let provider = StorageUploadProvider::new(api.clone(), database.library(), -100123)
         .unwrap()

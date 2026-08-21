@@ -198,6 +198,7 @@ pub struct HandlerFailure {
     pub message: String,
     pub defer_until: Option<OffsetDateTime>,
     pub retry_without_consuming_attempt: bool,
+    pub requires_storage_reconciliation: bool,
 }
 
 impl HandlerFailure {
@@ -208,6 +209,7 @@ impl HandlerFailure {
             message: message.into(),
             defer_until: None,
             retry_without_consuming_attempt: false,
+            requires_storage_reconciliation: false,
         }
     }
 
@@ -221,6 +223,7 @@ impl HandlerFailure {
             message: message.into(),
             defer_until: None,
             retry_without_consuming_attempt: true,
+            requires_storage_reconciliation: false,
         }
     }
 
@@ -231,6 +234,7 @@ impl HandlerFailure {
             message: message.into(),
             defer_until: None,
             retry_without_consuming_attempt: false,
+            requires_storage_reconciliation: false,
         }
     }
 
@@ -245,6 +249,18 @@ impl HandlerFailure {
             message: message.into(),
             defer_until: Some(defer_until),
             retry_without_consuming_attempt: false,
+            requires_storage_reconciliation: false,
+        }
+    }
+
+    pub fn storage_reconciliation_required(message: impl Into<String>) -> Self {
+        Self {
+            retryable: false,
+            class: "storage_upload_unknown".to_owned(),
+            message: message.into(),
+            defer_until: None,
+            retry_without_consuming_attempt: false,
+            requires_storage_reconciliation: true,
         }
     }
 }
@@ -2461,6 +2477,9 @@ where
                     message,
                 ));
             }
+            if matches!(&error, StorageUploadError::AmbiguousPersistence(_)) {
+                return Err(HandlerFailure::storage_reconciliation_required(message));
+            }
             if error.is_ambiguous() {
                 return Err(HandlerFailure::permanent("storage_upload_unknown", message));
             }
@@ -3314,6 +3333,13 @@ impl Worker {
                 self.repository.complete_lease(lease).await?;
                 counters.succeeded += 1;
                 info!(worker_id = %self.worker_id, job_id = %job.id, "job completed");
+            }
+            Err(failure) if failure.requires_storage_reconciliation => {
+                warn!(
+                    worker_id = %self.worker_id,
+                    job_id = %job.id,
+                    "storage result remains unresolved; leaving the leased job for stale reconciliation"
+                );
             }
             Err(failure) if failure.defer_until.is_some() => {
                 self.repository

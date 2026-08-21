@@ -379,7 +379,7 @@ impl JobRepository {
                          AND EXISTS (
                              SELECT 1
                              FROM media
-                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
                                AND media.storage_state = 'pending_storage'
                                AND media.storage_token IS NULL
                          ) THEN 'queued'
@@ -387,7 +387,7 @@ impl JobRepository {
                          AND EXISTS (
                              SELECT 1
                              FROM media
-                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
                                AND media.storage_state = 'pending_storage'
                                AND media.storage_token IS NOT NULL
                          ) THEN 'failed'
@@ -395,7 +395,7 @@ impl JobRepository {
                          AND EXISTS (
                              SELECT 1
                              FROM media
-                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
                                AND media.storage_state IN ('storage_unknown', 'missing')
                          ) THEN 'failed'
                     WHEN attempt_count >= max_attempts THEN 'failed'
@@ -406,7 +406,7 @@ impl JobRepository {
                          AND EXISTS (
                              SELECT 1
                              FROM media
-                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
                                AND media.storage_state = 'pending_storage'
                                AND media.storage_token IS NULL
                          ) THEN GREATEST(attempt_count - 1, 0)
@@ -419,7 +419,7 @@ impl JobRepository {
                          AND EXISTS (
                              SELECT 1
                              FROM media
-                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
                                AND media.storage_state = 'pending_storage'
                                AND media.storage_token IS NULL
                          ) THEN 'storage_upload_cancelled'
@@ -430,7 +430,7 @@ impl JobRepository {
                          AND EXISTS (
                              SELECT 1
                              FROM media
-                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
                                AND media.storage_state = 'pending_storage'
                                AND media.storage_token IS NULL
                          ) THEN 'storage upload was safely cancelled before Telegram dispatch'
@@ -441,7 +441,7 @@ impl JobRepository {
                          AND EXISTS (
                              SELECT 1
                              FROM media
-                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
                                AND media.storage_state = 'pending_storage'
                                AND media.storage_token IS NULL
                          ) THEN NULL
@@ -449,7 +449,7 @@ impl JobRepository {
                          AND EXISTS (
                              SELECT 1
                              FROM media
-                             WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                             WHERE media.id::text = queue.jobs.payload->>'media_id'
                                AND media.storage_state = 'pending_storage'
                                AND media.storage_token IS NOT NULL
                          ) THEN now()
@@ -459,7 +459,7 @@ impl JobRepository {
                              AND EXISTS (
                                  SELECT 1
                                  FROM media
-                                 WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                                 WHERE media.id::text = queue.jobs.payload->>'media_id'
                                    AND media.storage_state IN ('storage_unknown', 'missing')
                              )
                          ) THEN now()
@@ -472,7 +472,7 @@ impl JobRepository {
                   AND EXISTS (
                       SELECT 1
                       FROM media
-                      WHERE media.id = (queue.jobs.payload->>'media_id')::uuid
+                      WHERE media.id::text = queue.jobs.payload->>'media_id'
                         AND media.storage_state = 'pending_storage'
                         AND media.storage_token IS NOT NULL
                         AND media.storage_started_at > now() - interval '1 minute'
