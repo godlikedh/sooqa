@@ -233,6 +233,18 @@ an expired storage upload becomes `storage_unknown` unless the media row is
 already `ready`. `run_at` is the retry and scheduling clock; there is no
 separate retry-wait state.
 
+Storage uploads use cooperative, phase-aware cancellation. If shutdown or a
+lost worker heartbeat is observed after reservation but before the Telegram
+request can escape, the reservation is released and the upload job remains
+retryable. Once the request may have reached Telegram, cancellation clears the
+reservation token, marks the media `storage_unknown`, and fails linked active
+ingests in the same persistence boundary; the queue job is settled as failed
+so it cannot blindly resend an unresolved upload. Lease recovery applies the
+same conservative rule to an expired upload claim: a recent active storage
+reservation gets a short drain grace, a settled `pending_storage` claim with
+no token is requeued without consuming an attempt, and an older active
+reservation becomes `storage_unknown`.
+
 ## Media and storage
 
 `media` is the normalized business item, not a parent with child assets. Its

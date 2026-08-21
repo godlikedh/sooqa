@@ -1052,6 +1052,7 @@ impl LibraryRepository {
         .execute(&mut *transaction)
         .await?;
         mark_linked_ingests_storage_unknown(&mut transaction, id).await?;
+        settle_queued_storage_upload_jobs(&mut transaction, id).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -1473,6 +1474,7 @@ impl StorageUploadStore for LibraryRepository {
             return Err(LibraryRepositoryError::StorageUploadLeaseLost(media_id));
         }
         mark_linked_ingests_storage_unknown(&mut transaction, media_id).await?;
+        settle_queued_storage_upload_jobs(&mut transaction, media_id).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -1486,6 +1488,19 @@ async fn mark_linked_ingests_storage_unknown(
         "UPDATE ingests SET state = 'failed_terminal', error_code = 'storage_unknown', error_message = 'media storage requires explicit reconciliation', completed_at = now(), updated_at = now() WHERE media_id = $1 AND (state NOT IN ('cancelled', 'failed_terminal') OR error_code IN ('storage_upload', 'storage_unknown'))",
     )
     .bind(media_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn settle_queued_storage_upload_jobs(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    media_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE queue.jobs SET state = 'failed', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL, last_heartbeat_at = NULL, error_class = 'storage_upload_unknown', error_message = 'media storage requires explicit reconciliation', completed_at = now(), updated_at = now() WHERE kind = 'upload_storage_asset' AND state = 'queued' AND payload->>'media_id' = $1",
+    )
+    .bind(media_id.to_string())
     .execute(&mut **transaction)
     .await?;
     Ok(())

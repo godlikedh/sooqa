@@ -1,5 +1,9 @@
 use std::{
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -21,11 +25,56 @@ use teloxide::{
 };
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::TeloxideApi;
 
 pub const TELEGRAM_STORAGE_PROVIDER: &str = "telegram";
+
+/// Cooperative cancellation for an active storage upload.
+///
+/// The worker drains a cancelled upload so this adapter can release a safe
+/// reservation or persist an ambiguous result before the queue lease is
+/// settled.
+#[derive(Clone, Debug)]
+pub struct StorageUploadCancellation {
+    cancelled: Arc<AtomicBool>,
+    signal: Arc<watch::Sender<bool>>,
+}
+
+impl StorageUploadCancellation {
+    pub fn new() -> Self {
+        let (signal, _) = watch::channel(false);
+        Self { cancelled: Arc::new(AtomicBool::new(false)), signal: Arc::new(signal) }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.signal.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let mut signal = self.signal.subscribe();
+        if *signal.borrow() || self.is_cancelled() {
+            return;
+        }
+        let _ = signal.changed().await;
+    }
+}
+
+impl Default for StorageUploadCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StorageUploadInput {
@@ -159,6 +208,12 @@ pub enum StorageUploadError {
         "storage upload generation {requested_generation} is stale; current generation is {current_generation}"
     )]
     StaleGeneration { requested_generation: i32, current_generation: i32 },
+    #[error("storage upload was cancelled before Telegram dispatch")]
+    CancelledBeforeDispatch,
+    #[error(
+        "storage upload was cancelled after Telegram dispatch; storage requires reconciliation"
+    )]
+    CancelledAfterDispatch,
     #[error("storage persistence failed: {0}")]
     Persistence(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Telegram storage API failed: {0}")]
@@ -193,7 +248,9 @@ impl StorageUploadError {
             | Self::ReconciliationRequired(_)
             | Self::StaleGeneration { .. }
             | Self::AmbiguousApi(_)
-            | Self::AmbiguousPersistence(_) => false,
+            | Self::AmbiguousPersistence(_)
+            | Self::CancelledAfterDispatch => false,
+            Self::CancelledBeforeDispatch => true,
         }
     }
 
@@ -222,6 +279,15 @@ impl StorageUploadApiError {
                     | teloxide::RequestError::Io(_)
                     | teloxide::RequestError::RetryAfter(_)
             )
+        )
+    }
+}
+
+impl StorageUploadError {
+    pub fn is_ambiguous(&self) -> bool {
+        matches!(
+            self,
+            Self::AmbiguousApi(_) | Self::AmbiguousPersistence(_) | Self::CancelledAfterDispatch
         )
     }
 }
@@ -270,6 +336,14 @@ where
     pub async fn upload(
         &self,
         input: StorageUploadInput,
+    ) -> Result<StorageUploadOutcome, StorageUploadError> {
+        self.upload_with_cancellation(input, StorageUploadCancellation::new()).await
+    }
+
+    pub async fn upload_with_cancellation(
+        &self,
+        input: StorageUploadInput,
+        cancellation: StorageUploadCancellation,
     ) -> Result<StorageUploadOutcome, StorageUploadError> {
         let media = self
             .store
@@ -422,6 +496,14 @@ where
             None => None,
         };
 
+        if cancellation.is_cancelled() {
+            self.store
+                .release_storage_upload(media_id, owner_token)
+                .await
+                .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
+            return Err(StorageUploadError::CancelledBeforeDispatch);
+        }
+
         let request = StorageUploadRequest {
             storage_chat_id: self.storage_chat_id,
             media_kind: media.kind,
@@ -433,11 +515,41 @@ where
             thumbnail_path,
         };
         let thumbnail_cleanup = StagedThumbnailCleanup(request.thumbnail_path.clone());
-        let mut upload = Box::pin(self.api.upload_media(request));
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let upload_api = self.api.clone();
+        let mut upload = Box::pin({
+            let dispatched = Arc::clone(&dispatched);
+            async move {
+                dispatched.store(true, Ordering::Release);
+                upload_api.upload_media(request).await
+            }
+        });
         let mut renewal = tokio::time::interval(STORAGE_UPLOAD_RENEW_INTERVAL);
         renewal.tick().await;
         let uploaded = loop {
             tokio::select! {
+                _ = cancellation.cancelled() => {
+                    if dispatched.load(Ordering::Acquire) {
+                        if let Err(error) = self
+                            .store
+                            .mark_storage_upload_unknown(media_id, owner_token)
+                            .await
+                        {
+                            remove_staged_thumbnail(&thumbnail_cleanup.0).await;
+                            return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
+                        }
+                        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
+                        return Err(StorageUploadError::CancelledAfterDispatch);
+                    }
+                    if let Err(error) =
+                        self.store.release_storage_upload(media_id, owner_token).await
+                    {
+                        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
+                        return Err(StorageUploadError::Persistence(Box::new(error)));
+                    }
+                    remove_staged_thumbnail(&thumbnail_cleanup.0).await;
+                    return Err(StorageUploadError::CancelledBeforeDispatch);
+                }
                 result = &mut upload => break result,
                 _ = renewal.tick() => {
                     if let Err(error) = self
@@ -485,32 +597,51 @@ where
             }
         };
 
-        let object = match self
-            .store
-            .complete_storage_upload(
-                input.media_id,
-                owner_token,
-                sooqa_library::StorageUploadAttachment {
-                    storage_chat_id: self.storage_chat_id,
-                    storage_message_id: uploaded.storage_message_id,
-                    telegram_file_id: Some(uploaded.telegram_file_id),
-                    telegram_file_unique_id: Some(uploaded.telegram_file_unique_id),
-                    caption_metadata: Some(caption_metadata),
-                },
-            )
-            .await
-        {
-            Ok(object) => object,
-            Err(error) => {
-                if let Err(mark_error) =
-                    self.store.mark_storage_upload_unknown(media_id, owner_token).await
-                {
-                    remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                    return Err(StorageUploadError::AmbiguousPersistence(Box::new(mark_error)));
-                }
+        if cancellation.is_cancelled() {
+            if let Err(error) = self.store.mark_storage_upload_unknown(media_id, owner_token).await
+            {
                 remove_staged_thumbnail(&thumbnail_cleanup.0).await;
                 return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
             }
+            remove_staged_thumbnail(&thumbnail_cleanup.0).await;
+            return Err(StorageUploadError::CancelledAfterDispatch);
+        }
+
+        let attachment = sooqa_library::StorageUploadAttachment {
+            storage_chat_id: self.storage_chat_id,
+            storage_message_id: uploaded.storage_message_id,
+            telegram_file_id: Some(uploaded.telegram_file_id),
+            telegram_file_unique_id: Some(uploaded.telegram_file_unique_id),
+            caption_metadata: Some(caption_metadata),
+        };
+        let mut completion =
+            Box::pin(self.store.complete_storage_upload(input.media_id, owner_token, attachment));
+        let object = tokio::select! {
+            _ = cancellation.cancelled() => {
+                if let Err(error) = self
+                    .store
+                    .mark_storage_upload_unknown(media_id, owner_token)
+                    .await
+                {
+                    remove_staged_thumbnail(&thumbnail_cleanup.0).await;
+                    return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
+                }
+                remove_staged_thumbnail(&thumbnail_cleanup.0).await;
+                return Err(StorageUploadError::CancelledAfterDispatch);
+            }
+            result = &mut completion => match result {
+                Ok(object) => object,
+                Err(error) => {
+                    if let Err(mark_error) =
+                        self.store.mark_storage_upload_unknown(media_id, owner_token).await
+                    {
+                        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
+                        return Err(StorageUploadError::AmbiguousPersistence(Box::new(mark_error)));
+                    }
+                    remove_staged_thumbnail(&thumbnail_cleanup.0).await;
+                    return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
+                }
+            },
         };
         Ok(StorageUploadOutcome::Uploaded(object))
     }
@@ -861,6 +992,7 @@ mod tests {
     use sha2::Digest;
     use sooqa_library::{Media, MediaStorageState, StorageReceipt};
     use time::OffsetDateTime;
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -909,6 +1041,38 @@ mod tests {
 
         fn max_upload_bytes(&self) -> Option<u64> {
             *self.upload_limit.lock().expect("mock mutex should not be poisoned")
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingApi {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl TelegramStorageApi for BlockingApi {
+        type Error = MockError;
+
+        fn is_ambiguous_error(error: &Self::Error) -> bool {
+            error.ambiguous
+        }
+
+        async fn upload_media(
+            &self,
+            _request: StorageUploadRequest,
+        ) -> Result<StorageUploadResult, Self::Error> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(StorageUploadResult {
+                storage_message_id: 42,
+                telegram_file_id: "file-id".to_owned(),
+                telegram_file_unique_id: "unique-id".to_owned(),
+            })
+        }
+
+        async fn verify_storage_chat(&self, _chat_id: i64) -> Result<(), Self::Error> {
+            Ok(())
         }
     }
 
@@ -1292,6 +1456,65 @@ mod tests {
 
         assert!(provider.upload(input()).await.is_err());
         assert!(*store.released.lock().unwrap());
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_dispatch_releases_reservation_for_retry() {
+        let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let digest = sha256_file(&path).await.expect("fixture should hash");
+        let api = MockApi::default();
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
+        let provider = StorageUploadProvider::new(api.clone(), store.clone(), -100123)
+            .expect("storage chat ID should be valid");
+        let cancellation = StorageUploadCancellation::new();
+        cancellation.cancel();
+
+        assert!(matches!(
+            provider.upload_with_cancellation(input(), cancellation).await,
+            Err(StorageUploadError::CancelledBeforeDispatch)
+        ));
+        assert!(*store.released.lock().unwrap());
+        assert!(!*store.unknown.lock().unwrap());
+        assert!(api.requests.lock().unwrap().is_empty());
+        tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_dispatch_marks_storage_unknown() {
+        let path = std::env::temp_dir().join(format!("sooqa-storage-{}.mp4", Uuid::new_v4()));
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let digest = sha256_file(&path).await.expect("fixture should hash");
+        let api =
+            BlockingApi { started: Arc::new(Notify::new()), release: Arc::new(Notify::new()) };
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
+        let provider = StorageUploadProvider::new(api.clone(), store.clone(), -100123)
+            .expect("storage chat ID should be valid");
+        let cancellation = StorageUploadCancellation::new();
+        let upload = tokio::spawn({
+            let provider = provider.clone();
+            let cancellation = cancellation.clone();
+            async move { provider.upload_with_cancellation(input(), cancellation).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), api.started.notified())
+            .await
+            .expect("mock API should observe the upload");
+        cancellation.cancel();
+
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), upload)
+                .await
+                .expect("cancelled upload should settle")
+                .expect("upload task should join"),
+            Err(StorageUploadError::CancelledAfterDispatch)
+        ));
+        assert!(*store.unknown.lock().unwrap());
+        assert!(!*store.released.lock().unwrap());
         tokio::fs::remove_file(path).await.expect("fixture should be removed");
     }
 

@@ -20,7 +20,8 @@ use sooqa_worker::{
     compute_fingerprint_handler, download_source_handler, finalize_ingest_handler,
     inspect_source_handler, materialize_publication_handler, media_processing_components,
     normalize_asset_handler, probe_asset_handler_with_telegram_source, publish_post_handler,
-    spawn_storage_preflight, sync_storage_caption_handler, upload_storage_asset_handler,
+    spawn_storage_preflight, sync_storage_caption_handler,
+    upload_storage_asset_cancellable_handler,
 };
 
 #[tokio::main]
@@ -258,8 +259,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
             // while the queue loop starts immediately.
             storage_preflight_tasks
                 .push(spawn_storage_preflight(provider.clone(), storage_chat_id));
-            let storage_handler = upload_storage_asset_handler(database.inbox(), provider);
-            handlers.register(JobType::UploadStorageAsset, move |job| storage_handler(job));
+            let storage_handler =
+                upload_storage_asset_cancellable_handler(database.inbox(), provider);
+            handlers.register_cancellable(JobType::UploadStorageAsset, move |job, cancellation| {
+                storage_handler(job, cancellation)
+            });
             let caption_handler = sync_storage_caption_handler(database.library(), caption_api);
             handlers.register(JobType::SyncStorageCaption, move |job| caption_handler(job));
             tracing::info!(storage_chat_id, "Telegram storage upload job handler enabled");
