@@ -6,11 +6,11 @@ use crate::{
         enqueue_workspace_cleanup, enqueue_workspace_cleanup_for_media, lock_workspace_fence,
     },
 };
-use serde_json::json;
 use sooqa_inbox::{
-    AssetNormalization, Ingest, IngestCursor, IngestFinalization, IngestKind, IngestListItem,
-    IngestPage, IngestStateError, IngestStatus, IngestSubmission, RequestedAction, SourceDownload,
-    SourceInspection, SourceMediaKind, SubmittedVia,
+    AssetNormalization, Ingest, IngestCursor, IngestData, IngestDataError, IngestFinalization,
+    IngestKind, IngestListItem, IngestPage, IngestProbe, IngestStateError, IngestStatus,
+    IngestSubmission, RequestedAction, SourceDownload, SourceInspection, SourceMediaKind,
+    SubmittedVia,
 };
 use sooqa_jobs::{JobLease, NewJob};
 use sooqa_library::{
@@ -22,8 +22,6 @@ use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-const DUPLICATE_DECISION_MARKER_KEY: &str = "_sooqa_duplicate_decision_v1";
 
 #[derive(Clone)]
 pub struct InboxRepository {
@@ -101,14 +99,17 @@ impl InboxRepository {
         }
 
         let request_id = Uuid::now_v7();
-        let mut request = Ingest::from_submission(request_id, &submission);
+        let mut request = Ingest::from_submission(request_id, &submission)
+            .map_err(InboxRepositoryError::InputEnvelope)?;
         request
             .transition_to(IngestStatus::Queued)
             .expect("received ingest requests must be queueable");
         request.workspace_id = request
-            .original_input
-            .get("telegram_workspace_id")
-            .and_then(serde_json::Value::as_str)
+            .input_data()
+            .map_err(InboxRepositoryError::InputEnvelope)?
+            .source
+            .telegram_workspace_id
+            .as_deref()
             .and_then(|value| Uuid::parse_str(value).ok())
             .unwrap_or(request.id);
 
@@ -285,8 +286,16 @@ impl InboxRepository {
         // Inspect the durable decision before looking at the current pipeline
         // state. Storage may fail after a successful accept, and the original
         // command must remain replay-safe while that downstream state changes.
-        if request.original_input.get(DUPLICATE_DECISION_MARKER_KEY).is_some() {
-            let accepted_media_id = accepted_duplicate_media_id(&request.original_input);
+        let input_data = request.input_data().map_err(InboxRepositoryError::InputEnvelope)?;
+        if input_data.duplicate_decision.is_some() {
+            let accepted_media_id = input_data
+                .duplicate_decision
+                .as_ref()
+                .filter(|decision| {
+                    decision.version == 1
+                        && decision.kind == sooqa_inbox::DuplicateDecisionKind::Accepted
+                })
+                .map(|decision| decision.media_id);
             if !request.force_save
                 && accepted_media_id.is_some()
                 && request.media_id == accepted_media_id
@@ -361,7 +370,13 @@ impl InboxRepository {
         .await?;
 
         request.media_id = Some(media_id);
-        set_accepted_duplicate_marker(&mut request.original_input, media_id);
+        let mut input_data = request.input_data().map_err(InboxRepositoryError::InputEnvelope)?;
+        input_data.duplicate_decision = Some(sooqa_inbox::DuplicateDecisionData {
+            version: 1,
+            kind: sooqa_inbox::DuplicateDecisionKind::Accepted,
+            media_id,
+        });
+        request.set_input_data(input_data).map_err(InboxRepositoryError::InputEnvelope)?;
         // Persist the decision marker together with the state transition before
         // clearing the evidence. It is the durable idempotency fence for a
         // successful duplicate-accept command.
@@ -528,7 +543,11 @@ impl InboxRepository {
     ) -> Result<SourceDownloadStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
-        let start = if request.original_input.get("download").is_some()
+        let start = if request
+            .input_data()
+            .map_err(InboxRepositoryError::InputEnvelope)?
+            .download
+            .is_some()
             || !lock_current_job_attempt(&mut transaction, attempt).await?
         {
             SourceDownloadStart::AlreadyAdvanced(request)
@@ -568,27 +587,17 @@ impl InboxRepository {
             transaction.commit().await?;
             return Ok(request);
         }
-        let declared_media_kind = request_media_kind(&request);
-        let detected_media_kind = probed_media_kind(&probe);
+        let mut input_data = request.input_data().map_err(InboxRepositoryError::InputEnvelope)?;
+        let probe = IngestProbe::from_value(probe);
+        let declared_media_kind = request_media_kind(&request)?;
+        let detected_media_kind = probe.media_kind();
         let media_kind = detected_media_kind.or(declared_media_kind);
         let probed_format = probed_image_format(&probe);
         let unsupported_image_format = media_kind == Some(SourceMediaKind::Image)
-            && !request_image_format_is_supported(&request, &probe);
-        if let Some(object) = request.original_input.as_object_mut() {
-            object.insert("probe".to_owned(), probe);
-            if let Some(media_kind) = detected_media_kind {
-                object.insert(
-                    "probed_media_kind".to_owned(),
-                    serde_json::to_value(media_kind).expect("source media kind is serializable"),
-                );
-            }
-        } else {
-            request.original_input = json!({
-                "source": request.original_input,
-                "probe": probe,
-                "probed_media_kind": detected_media_kind,
-            });
-        }
+            && !request_image_format_is_supported(&request, &probe)?;
+        input_data.probe = Some(probe);
+        input_data.probed_media_kind = detected_media_kind;
+        request.set_input_data(input_data).map_err(InboxRepositoryError::InputEnvelope)?;
         request.updated_at = OffsetDateTime::now_utc();
         sqlx::query("UPDATE ingests SET input_json = $2, updated_at = $3 WHERE id = $1")
             .bind(request.id)
@@ -661,8 +670,12 @@ impl InboxRepository {
     ) -> Result<AssetNormalizationStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
-        let start = if (request.original_input.get("normalization").is_some()
-            && !request.force_save)
+        let has_normalization = request
+            .input_data()
+            .map_err(InboxRepositoryError::InputEnvelope)?
+            .normalization
+            .is_some();
+        let start = if (has_normalization && !request.force_save)
             || !lock_current_job_attempt(&mut transaction, attempt).await?
         {
             AssetNormalizationStart::AlreadyAdvanced(request)
@@ -696,30 +709,24 @@ impl InboxRepository {
     ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
+        let has_normalization = request
+            .input_data()
+            .map_err(InboxRepositoryError::InputEnvelope)?
+            .normalization
+            .is_some();
         if request.status != IngestStatus::Normalizing
-            || (request.original_input.get("normalization").is_some() && !request.force_save)
+            || (has_normalization && !request.force_save)
             || !lock_current_job_attempt(&mut transaction, attempt).await?
         {
             transaction.commit().await?;
             return Ok(request);
         }
 
-        let normalization =
-            serde_json::to_value(normalization).expect("asset normalization is serializable");
-        if let Some(object) = request.original_input.as_object_mut() {
-            object.insert("normalization".to_owned(), normalization);
-        } else {
-            request.original_input =
-                json!({ "source": request.original_input, "normalization": normalization });
-        }
-        sqlx::query("UPDATE ingests SET input_json = $2, updated_at = $3 WHERE id = $1")
-            .bind(request.id)
-            .bind(&request.original_input)
-            .bind(OffsetDateTime::now_utc())
-            .execute(&mut *transaction)
-            .await?;
+        let mut input_data = request.input_data().map_err(InboxRepositoryError::InputEnvelope)?;
+        input_data.normalization = Some(normalization);
+        request.set_input_data(input_data).map_err(InboxRepositoryError::InputEnvelope)?;
 
-        let is_video = normalized_media_kind(&request) == Some(SourceMediaKind::Video);
+        let is_video = normalized_media_kind(&request)? == Some(SourceMediaKind::Video);
         request.transition_to(if is_video {
             IngestStatus::Fingerprinting
         } else {
@@ -798,40 +805,31 @@ impl InboxRepository {
     ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
+        let has_finalization = request
+            .input_data()
+            .map_err(InboxRepositoryError::InputEnvelope)?
+            .finalization
+            .is_some();
         if request.status != IngestStatus::Storing
-            || request.original_input.get("finalization").is_some()
+            || has_finalization
             || !lock_current_job_attempt(&mut transaction, attempt).await?
         {
             transaction.commit().await?;
             return Ok(request);
         }
 
-        if normalized_media_kind(&request) == Some(SourceMediaKind::Video) {
+        if normalized_media_kind(&request)? == Some(SourceMediaKind::Video) {
             return Err(InboxRepositoryError::VideoFinalizationNotAllowed);
         }
 
         let media_id = finalization.media_id;
         request.media_id = Some(media_id);
-        let finalization =
-            serde_json::to_value(finalization).expect("ingest finalization is serializable");
-        if let Some(object) = request.original_input.as_object_mut() {
-            object.insert("finalization".to_owned(), finalization);
-        } else {
-            request.original_input =
-                json!({ "source": request.original_input, "finalization": finalization });
-        }
+        let mut input_data = request.input_data().map_err(InboxRepositoryError::InputEnvelope)?;
+        input_data.finalization = Some(finalization);
+        request.set_input_data(input_data).map_err(InboxRepositoryError::InputEnvelope)?;
         request.error_code = None;
         request.error_message = None;
         request.updated_at = OffsetDateTime::now_utc();
-        sqlx::query(
-            "UPDATE ingests SET input_json = $2, media_id = $3, updated_at = $4 WHERE id = $1",
-        )
-        .bind(request.id)
-        .bind(&request.original_input)
-        .bind(request.media_id)
-        .bind(request.updated_at)
-        .execute(&mut *transaction)
-        .await?;
         advance_after_media_processing(&mut transaction, &mut request, media_id).await?;
         succeed_current_job_attempt(&mut transaction, attempt).await?;
         transaction.commit().await?;
@@ -941,7 +939,7 @@ impl InboxRepository {
                 request.force_save = true;
                 request.workspace_id = Uuid::now_v7();
                 request.duplicate_evidence = None;
-                clear_pipeline_artifacts(&mut request);
+                clear_pipeline_artifacts(&mut request)?;
                 request.transition_to(IngestStatus::Queued)?;
                 request.error_code = None;
                 request.error_message = None;
@@ -1199,15 +1197,9 @@ impl InboxRepository {
             return Ok(request);
         }
 
-        let inspection_value = serde_json::to_value(&inspection)?;
-        if let Some(object) = request.original_input.as_object_mut() {
-            object.insert("inspection".to_owned(), inspection_value);
-        } else {
-            request.original_input = json!({
-                "source": request.original_input,
-                "inspection": inspection_value,
-            });
-        }
+        let mut input_data = request.input_data().map_err(InboxRepositoryError::InputEnvelope)?;
+        input_data.inspection = Some(inspection.clone());
+        request.set_input_data(input_data).map_err(InboxRepositoryError::InputEnvelope)?;
         request.transition_to(IngestStatus::Downloading)?;
         request.error_code = None;
         request.error_message = None;
@@ -1242,21 +1234,19 @@ impl InboxRepository {
     ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
+        let has_download =
+            request.input_data().map_err(InboxRepositoryError::InputEnvelope)?.download.is_some();
         if request.status != IngestStatus::Downloading
-            || request.original_input.get("download").is_some()
+            || has_download
             || !lock_current_job_attempt(&mut transaction, attempt).await?
         {
             transaction.commit().await?;
             return Ok(request);
         }
 
-        let download = serde_json::to_value(download).expect("source download is serializable");
-        if let Some(object) = request.original_input.as_object_mut() {
-            object.insert("download".to_owned(), download);
-        } else {
-            request.original_input =
-                json!({ "source": request.original_input, "download": download });
-        }
+        let mut input_data = request.input_data().map_err(InboxRepositoryError::InputEnvelope)?;
+        input_data.download = Some(download);
+        request.set_input_data(input_data).map_err(InboxRepositoryError::InputEnvelope)?;
         request.error_code = None;
         request.error_message = None;
         request.updated_at = OffsetDateTime::now_utc();
@@ -1358,7 +1348,9 @@ impl InboxRepository {
 
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
-        if guard.ignore_completed_download && request.original_input.get("download").is_some() {
+        if guard.ignore_completed_download
+            && request.input_data().map_err(InboxRepositoryError::InputEnvelope)?.download.is_some()
+        {
             transaction.commit().await?;
             return Ok(request);
         }
@@ -1689,50 +1681,37 @@ fn stage_dedupe_key(request: &Ingest, initial_key: &str) -> String {
     if request.force_save { format!("{initial_key}:force_save") } else { initial_key.to_owned() }
 }
 
-fn clear_pipeline_artifacts(request: &mut Ingest) {
-    if let Some(object) = request.original_input.as_object_mut() {
-        for key in [
-            "inspection",
-            "download",
-            "probe",
-            "probed_media_kind",
-            "normalization",
-            "finalization",
-        ] {
-            object.remove(key);
-        }
-    }
+fn clear_pipeline_artifacts(request: &mut Ingest) -> Result<(), InboxRepositoryError> {
+    let mut data = request.input_data().map_err(InboxRepositoryError::InputEnvelope)?;
+    data.inspection = None;
+    data.download = None;
+    data.probe = None;
+    data.probed_media_kind = None;
+    data.normalization = None;
+    data.finalization = None;
+    request.set_input_data(data).map_err(InboxRepositoryError::InputEnvelope)
 }
 
-fn request_media_kind(request: &Ingest) -> Option<SourceMediaKind> {
-    if let Some(value) = request.original_input.get("probed_media_kind")
-        && let Ok(media_kind) = serde_json::from_value(value.clone())
-    {
-        return Some(media_kind);
-    }
-    let value = if request.kind == IngestKind::Url {
-        request.original_input.get("download")?.get("media_kind")?
-    } else {
-        request.original_input.get("media_kind")?
-    };
-    serde_json::from_value(value.clone()).ok()
+fn request_media_kind(request: &Ingest) -> Result<Option<SourceMediaKind>, InboxRepositoryError> {
+    Ok(request.input_data().map_err(InboxRepositoryError::InputEnvelope)?.media_kind())
 }
 
-fn normalized_media_kind(request: &Ingest) -> Option<SourceMediaKind> {
-    request
-        .original_input
-        .get("normalization")
-        .and_then(|value| value.get("media_kind"))
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
+fn normalized_media_kind(
+    request: &Ingest,
+) -> Result<Option<SourceMediaKind>, InboxRepositoryError> {
+    Ok(request
+        .input_data()
+        .map_err(InboxRepositoryError::InputEnvelope)?
+        .normalization
+        .map(|normalization| normalization.media_kind))
 }
 
-fn request_mime_type(request: &Ingest) -> Option<&str> {
-    let value = if request.kind == IngestKind::Url {
-        request.original_input.get("download")?.get("mime_type")?
-    } else {
-        request.original_input.get("mime_type")?
-    };
-    value.as_str()
+fn request_mime_type(request: &Ingest) -> Result<Option<String>, InboxRepositoryError> {
+    Ok(request
+        .input_data()
+        .map_err(InboxRepositoryError::InputEnvelope)?
+        .mime_type()
+        .map(str::to_owned))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1743,28 +1722,30 @@ enum ImageFormatKind {
     Unknown,
 }
 
-fn request_file_name(request: &Ingest) -> Option<&str> {
-    if request.kind == IngestKind::Url {
-        None
-    } else {
-        request.original_input.get("file_name")?.as_str()
-    }
+fn request_file_name(request: &Ingest) -> Result<Option<String>, InboxRepositoryError> {
+    Ok(request.input_data().map_err(InboxRepositoryError::InputEnvelope)?.source.file_name)
 }
 
-fn request_image_format_is_supported(request: &Ingest, probe: &serde_json::Value) -> bool {
-    let declared = request_mime_type(request)
+fn request_image_format_is_supported(
+    request: &Ingest,
+    probe: &IngestProbe,
+) -> Result<bool, InboxRepositoryError> {
+    let mime_type = request_mime_type(request)?;
+    let file_name = request_file_name(request)?;
+    let declared = mime_type
+        .as_deref()
         .map(image_format_from_mime)
         .filter(|format| *format != ImageFormatKind::Unknown)
-        .or_else(|| request_file_name(request).map(image_format_from_file_name))
+        .or_else(|| file_name.as_deref().map(image_format_from_file_name))
         .unwrap_or(ImageFormatKind::Unknown);
     let probed = probed_image_format(probe);
-    match probed {
+    Ok(match probed {
         ImageFormatKind::Jpeg | ImageFormatKind::Png => true,
         ImageFormatKind::Unsupported => false,
         ImageFormatKind::Unknown => {
             matches!(declared, ImageFormatKind::Jpeg | ImageFormatKind::Png)
         }
-    }
+    })
 }
 
 fn image_format_from_mime(mime_type: &str) -> ImageFormatKind {
@@ -1789,16 +1770,8 @@ fn image_format_from_file_name(file_name: &str) -> ImageFormatKind {
     }
 }
 
-fn probed_image_format(probe: &serde_json::Value) -> ImageFormatKind {
-    let container = probe.get("container_format").and_then(serde_json::Value::as_str);
-    let codec = probe.get("streams").and_then(serde_json::Value::as_array).and_then(|streams| {
-        streams.iter().find_map(|stream| {
-            (stream.get("kind").and_then(serde_json::Value::as_str) == Some("video"))
-                .then(|| stream.get("codec").and_then(serde_json::Value::as_str))
-                .flatten()
-        })
-    });
-    for value in [container, codec].into_iter().flatten() {
+fn probed_image_format(probe: &IngestProbe) -> ImageFormatKind {
+    if let Some(value) = probe.image_format() {
         let value = value.to_ascii_lowercase();
         let kind = if value.contains("jpeg") || value.contains("mjpeg") {
             ImageFormatKind::Jpeg
@@ -1816,54 +1789,6 @@ fn probed_image_format(probe: &serde_json::Value) -> ImageFormatKind {
     ImageFormatKind::Unknown
 }
 
-fn probed_media_kind(probe: &serde_json::Value) -> Option<SourceMediaKind> {
-    let container = probe.get("container_format").and_then(serde_json::Value::as_str);
-    let codecs = probe
-        .get("streams")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|stream| stream.get("kind").and_then(serde_json::Value::as_str) == Some("video"))
-        .filter_map(|stream| stream.get("codec").and_then(serde_json::Value::as_str));
-    let codecs = codecs.collect::<Vec<_>>();
-    let container = container.map(str::to_ascii_lowercase);
-    let is_gif = container.as_deref().is_some_and(|value| value.contains("gif"))
-        || codecs.iter().any(|value| value.to_ascii_lowercase().contains("gif"));
-    if is_gif {
-        return Some(SourceMediaKind::Animation);
-    }
-
-    let is_image_container = container.as_deref().is_some_and(|value| {
-        ["image2", "png", "jpeg", "jpg", "webp", "avif", "mjpeg"]
-            .iter()
-            .any(|format| value.contains(format))
-    });
-    let is_image_codec = codecs
-        .iter()
-        .any(|value| ["png", "webp"].iter().any(|format| value.eq_ignore_ascii_case(format)))
-        || (container.is_none() && codecs.iter().any(|value| value.eq_ignore_ascii_case("mjpeg")));
-    if is_image_container || is_image_codec {
-        return Some(SourceMediaKind::Image);
-    }
-
-    let streams = probe.get("streams").and_then(serde_json::Value::as_array);
-    if streams.is_some_and(|streams| {
-        streams
-            .iter()
-            .any(|stream| stream.get("kind").and_then(serde_json::Value::as_str) == Some("video"))
-    }) {
-        return Some(SourceMediaKind::Video);
-    }
-    if streams.is_some_and(|streams| {
-        streams
-            .iter()
-            .any(|stream| stream.get("kind").and_then(serde_json::Value::as_str) == Some("audio"))
-    }) {
-        return Some(SourceMediaKind::Audio);
-    }
-    None
-}
-
 fn merge_duplicate_tags(existing: &[String], incoming: &[String]) -> Vec<String> {
     let mut tags = existing.to_vec();
     for tag in incoming {
@@ -1872,37 +1797,6 @@ fn merge_duplicate_tags(existing: &[String], incoming: &[String]) -> Vec<String>
         }
     }
     tags
-}
-
-fn accepted_duplicate_media_id(input: &serde_json::Value) -> Option<Uuid> {
-    input
-        .get(DUPLICATE_DECISION_MARKER_KEY)?
-        .get("version")
-        .and_then(serde_json::Value::as_u64)
-        .filter(|version| *version == 1)?;
-    input
-        .get(DUPLICATE_DECISION_MARKER_KEY)?
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .filter(|kind| *kind == "accepted")
-        .and_then(|_| input.get(DUPLICATE_DECISION_MARKER_KEY)?.get("media_id"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-}
-
-fn set_accepted_duplicate_marker(input: &mut serde_json::Value, media_id: Uuid) {
-    if let Some(object) = input.as_object_mut() {
-        object.insert(
-            DUPLICATE_DECISION_MARKER_KEY.to_owned(),
-            json!({"version": 1, "kind": "accepted", "media_id": media_id}),
-        );
-    } else {
-        let source = input.clone();
-        *input = json!({
-            "source": source,
-            DUPLICATE_DECISION_MARKER_KEY: {"version": 1, "kind": "accepted", "media_id": media_id},
-        });
-    }
 }
 
 async fn load_request(
@@ -2031,6 +1925,9 @@ struct DuplicateMediaStorageRow {
 
 impl IngestRow {
     fn into_ingest(self) -> Result<Ingest, InboxRepositoryError> {
+        let input_data =
+            IngestData::decode(&self.input_json).map_err(InboxRepositoryError::InputEnvelope)?;
+        let canonical_input = input_data.encode().map_err(InboxRepositoryError::InputEnvelope)?;
         Ok(Ingest {
             id: self.id,
             workspace_id: self.workspace_id,
@@ -2040,7 +1937,7 @@ impl IngestRow {
                 .map_err(InboxRepositoryError::UnknownIngestStatus)?,
             submitted_via: SubmittedVia::try_from(self.submitted_via.as_str())
                 .map_err(InboxRepositoryError::UnknownSubmittedVia)?,
-            original_input: self.input_json,
+            original_input: canonical_input,
             source_url: self.source_url.ok_or(InboxRepositoryError::MissingSourceUrl(self.id))?,
             page_url: self.page_url,
             page_title: self.page_title,
@@ -2145,6 +2042,8 @@ pub enum InboxRepositoryError {
     UnknownSubmittedVia(String),
     #[error("unknown requested action in database: {0}")]
     UnknownRequestedAction(String),
+    #[error("invalid ingest input envelope: {0}")]
+    InputEnvelope(IngestDataError),
     #[error("requested publish time must be in the future")]
     RequestedPublishAtNotFuture,
     #[error("no enabled publication channel is configured")]

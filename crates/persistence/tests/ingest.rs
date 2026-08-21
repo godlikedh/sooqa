@@ -286,15 +286,31 @@ async fn publication_intent_requires_and_snapshots_one_enabled_channel(pool: sql
 #[ignore = "requires PostgreSQL"]
 async fn source_inspection_completion_commits_job_success_with_transition(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
+    let source_url = format!("https://example.test/inspect-{}", Uuid::new_v4());
     let ingest = database
         .inbox()
         .create_ingest(
             IngestSubmission::try_new(IngestSubmissionInput::new(
-                format!("https://example.test/inspect-{}", Uuid::new_v4()),
+                source_url.clone(),
                 SubmittedVia::Api,
             ))
             .unwrap(),
         )
+        .await
+        .unwrap();
+    // Simulate a current five-table row before the envelope migration. The
+    // fenced completion below must upgrade it while preserving typed stages.
+    sqlx::query("UPDATE ingests SET input_json = $2 WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .bind(json!({
+            "url": source_url,
+            "probe": {
+                "container_format": "mp4",
+                "streams": [{"kind": "video", "codec": "h264"}]
+            },
+            "probed_media_kind": "video"
+        }))
+        .execute(database.pool())
         .await
         .unwrap();
     sqlx::query(
@@ -345,14 +361,15 @@ async fn source_inspection_completion_commits_job_success_with_transition(pool: 
         .await
         .unwrap();
     assert_eq!(completed.status, IngestStatus::Downloading);
-    let stored_inspection = sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT input_json->'inspection' FROM ingests WHERE id = $1",
-    )
-    .bind(ingest.ingest.id)
-    .fetch_one(database.pool())
-    .await
-    .unwrap();
-    assert_eq!(stored_inspection["metadata"]["two_ch_mirror"]["selected_host"], "2ch.org");
+    let stored_input =
+        sqlx::query_scalar::<_, serde_json::Value>("SELECT input_json FROM ingests WHERE id = $1")
+            .bind(ingest.ingest.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored_input["version"], 1);
+    assert_eq!(stored_input["probe"]["container_format"], "mp4");
+    assert_eq!(stored_input["inspection"]["metadata"]["two_ch_mirror"]["selected_host"], "2ch.org");
 
     let job_state = sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
         .bind(claimed.id)
@@ -387,6 +404,44 @@ async fn source_inspection_completion_commits_job_success_with_transition(pool: 
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
+async fn corrupt_durable_envelope_returns_a_bounded_repository_error(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/corrupt-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ingests SET input_json = $2 WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .bind(json!({
+            "version": 1,
+            "source": {"url": ingest.ingest.source_url},
+            "inspection": {"adapter": "missing-required-fields"}
+        }))
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let result = database.inbox().find(ingest.ingest.id).await;
+    assert!(matches!(
+        result,
+        Err(InboxRepositoryError::InputEnvelope(sooqa_inbox::IngestDataError::Malformed(_)))
+    ));
+    let force_save = database.inbox().force_save(ingest.ingest.id).await;
+    assert!(matches!(
+        force_save,
+        Err(InboxRepositoryError::InputEnvelope(sooqa_inbox::IngestDataError::Malformed(_)))
+    ));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
 async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
     let channel_id = enabled_channel(&database, -1000000000302).await;
@@ -413,14 +468,17 @@ async fn duplicate_pending_force_save_is_durable_and_idempotent(pool: sqlx::PgPo
     .execute(database.pool())
     .await
     .unwrap();
-    sqlx::query("UPDATE ingests SET input_json = input_json || $2 WHERE id = $1")
+    // Keep this deliberately unversioned: partial inspection objects were
+    // readable only in the current pre-envelope legacy format. A malformed
+    // version-1 envelope must instead fail as durable state corruption.
+    sqlx::query(
+        "UPDATE ingests SET input_json = jsonb_build_object('url', input_json->'source'->>'url', 'inspection', $2) WHERE id = $1",
+    )
         .bind(ingest.ingest.id)
         .bind(json!({
-            "inspection": {
-                "metadata": {
-                    "two_ch_mirror": {
-                        "selected_host": "2ch.org"
-                    }
+            "metadata": {
+                "two_ch_mirror": {
+                    "selected_host": "2ch.org"
                 }
             }
         }))
@@ -741,6 +799,24 @@ async fn accepted_pending_storage_decision_replays_after_storage_failures(pool: 
 
     let accepted = database.inbox().accept_duplicate(ingest.ingest.id, media_id).await.unwrap();
     assert_eq!(accepted.ingest.status, IngestStatus::Storing);
+    // A retryable storage settlement must also canonicalize a legacy row.
+    sqlx::query("UPDATE ingests SET input_json = $2 WHERE id = $1")
+        .bind(ingest.ingest.id)
+        .bind(json!({
+            "url": ingest.ingest.source_url,
+            "probe": {
+                "container_format": "mp4",
+                "streams": [{"kind": "video", "codec": "h264"}]
+            },
+            "_sooqa_duplicate_decision_v1": {
+                "version": 1,
+                "kind": "accepted",
+                "media_id": media_id
+            }
+        }))
+        .execute(database.pool())
+        .await
+        .unwrap();
     assert_eq!(
         database
             .inbox()
@@ -758,6 +834,8 @@ async fn accepted_pending_storage_decision_replays_after_storage_failures(pool: 
         database.inbox().accept_duplicate(ingest.ingest.id, media_id).await.unwrap();
     assert!(retryable_replay.replayed);
     assert_eq!(retryable_replay.ingest.status, IngestStatus::FailedRetryable);
+    assert_eq!(retryable_replay.ingest.original_input["version"], 1);
+    assert_eq!(retryable_replay.ingest.original_input["probe"]["container_format"], "mp4");
     assert!(matches!(
         database.inbox().accept_duplicate(ingest.ingest.id, Uuid::now_v7()).await,
         Err(InboxRepositoryError::DuplicateDecisionNotAllowed(IngestStatus::FailedRetryable))

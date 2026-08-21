@@ -342,6 +342,9 @@ fn map_validation_error(error: IngestValidationError, headers: &HeaderMap) -> Ap
             "requested_post_caption_invalid",
             "The requested public post text contains a disallowed control character",
         ),
+        IngestValidationError::InvalidInputEnvelope(_) => {
+            ("invalid_ingest_input", "The submitted media metadata is invalid")
+        }
     };
     ApiError::bad_request(code, message, headers)
 }
@@ -397,6 +400,14 @@ fn map_repository_error(error: InboxRepositoryError, headers: &HeaderMap) -> Api
         ),
         InboxRepositoryError::ResourceMissing(_) => {
             ApiError::not_found("ingest_not_found", "The ingest request was not found", headers)
+        }
+        InboxRepositoryError::InputEnvelope(error) => {
+            error!(error = %error, "durable ingest input envelope is invalid");
+            ApiError::internal_with_code(
+                "invalid_ingest_state",
+                "The durable ingest state is invalid",
+                headers,
+            )
         }
         error => {
             error!(error = %error, "ingest API repository operation failed");
@@ -722,6 +733,10 @@ impl ApiError {
         )
     }
 
+    fn internal_with_code(code: &'static str, message: &'static str, headers: &HeaderMap) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, code, message, headers)
+    }
+
     fn new(
         status: StatusCode,
         code: &'static str,
@@ -823,5 +838,17 @@ mod tests {
         assert!(body.contains("\"status\":\"ok\""));
         assert!(body.contains("\"version\":\"0.1.0\""));
         assert!(body.contains("\"git_sha\":\"unknown\""));
+    }
+
+    #[test]
+    fn corrupt_durable_input_is_reported_as_invalid_ingest_state() {
+        let error = map_repository_error(
+            InboxRepositoryError::InputEnvelope(sooqa_inbox::IngestDataError::UnsupportedVersion(
+                99,
+            )),
+            &HeaderMap::new(),
+        );
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code, "invalid_ingest_state");
     }
 }

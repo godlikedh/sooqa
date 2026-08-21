@@ -89,8 +89,8 @@ timeout, or cancellation. The aggregate budget is three times the final source
 limit to leave room for split-stream merging. A successful attempt must leave
 exactly one regular final media file. A specific YouTube
 `unable to download video data: HTTP Error 403` failure receives one fresh
-high-quality attempt and then one clean combined-progressive fallback; the bounded
-`input_json.download.selected_format` marker records which format won. Other
+high-quality attempt and then one clean combined-progressive fallback; the bounded,
+versioned `input_json.download.selected_format` marker records which format won. Other
 extractor failures remain terminal, and every failed attempt directory is
 removed. The worker also refuses to enable the adapter if the offline
 plugin/EJS/Deno probes fail, or if the YouTube PO-token health/version check
