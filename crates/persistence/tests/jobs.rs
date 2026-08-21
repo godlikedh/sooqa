@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde_json::json;
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
 use sooqa_jobs::{JobStatus, JobType, NewJob};
-use sooqa_persistence::Database;
+use sooqa_persistence::{Database, JobRepositoryError, JobSettlement};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -73,6 +73,57 @@ async fn claim_retry_and_fencing_use_the_queue_jobs_row(pool: sqlx::PgPool) {
             .await
             .expect("exhausted job query should succeed")
             .is_none()
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn settlement_rejects_a_job_with_another_jobs_lease(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let repository = database.jobs();
+    for suffix in ["a", "b"] {
+        repository
+            .enqueue(
+                NewJob::cleanup_workspace(Uuid::new_v4(), Uuid::new_v4())
+                    .dedupe_key(format!("mismatched-settlement-{suffix}-{}", Uuid::new_v4())),
+            )
+            .await
+            .expect("job should enqueue");
+    }
+    let first = repository
+        .claim_next("mismatch-worker-a", Duration::from_secs(30), &[JobType::CleanupWorkspace])
+        .await
+        .expect("first job should claim")
+        .expect("first job should be available");
+    let second = repository
+        .claim_next("mismatch-worker-b", Duration::from_secs(30), &[JobType::CleanupWorkspace])
+        .await
+        .expect("second job should claim")
+        .expect("second job should be available");
+    let error = repository
+        .settle_lease(
+            &first,
+            &second.lease().expect("second job should carry a lease"),
+            JobSettlement::retry(OffsetDateTime::now_utc(), "mismatch", "wrong lease"),
+        )
+        .await
+        .expect_err("a lease from another job must be rejected before dispatch");
+    assert!(matches!(error, JobRepositoryError::LeaseLost));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(first.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("first job state should be readable"),
+        "running"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(second.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("second job state should be readable"),
+        "running"
     );
 }
 

@@ -1,7 +1,9 @@
-use sooqa_jobs::NewJob;
-use sqlx::{Postgres, Transaction};
+use sooqa_jobs::{Job, JobLease, NewJob};
+use sqlx::{PgPool, Postgres, Transaction};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
+
+use crate::{jobs::JobSettlement, settlement};
 
 /// Completed and terminal workspaces remain available for operator recovery
 /// for one day. The cleanup job is still queued immediately; this delay is the
@@ -60,4 +62,30 @@ pub(crate) async fn enqueue_workspace_cleanup_for_media(
         enqueue_workspace_cleanup(transaction, ingest_id, workspace_id, run_at).await?;
     }
     Ok(())
+}
+
+pub(crate) async fn protected_workspace_ids(pool: &PgPool) -> Result<Vec<Uuid>, sqlx::Error> {
+    // Reconciliation runs from a snapshot and deletes after this query
+    // commits. Protect every workspace that is still current for an ingest,
+    // not only active pipeline states, so a storage reset cannot reopen bytes
+    // between the snapshot and deletion.
+    sqlx::query_scalar("SELECT DISTINCT workspace_id FROM ingests").fetch_all(pool).await
+}
+
+/// Cleanup has no additional durable domain transition after its handler has
+/// released the workspace. Keep its queue settlement ownership here so the
+/// central dispatcher remains a family router rather than a policy owner.
+pub(crate) async fn settle_job(
+    pool: &PgPool,
+    lease: &JobLease,
+    settlement: JobSettlement,
+) -> Result<Job, crate::JobRepositoryError> {
+    settlement::settle_queue(pool, lease, settlement).await
+}
+
+pub(crate) async fn recover_job(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> Result<bool, crate::JobRepositoryError> {
+    settlement::recover_queue_only(pool, job_id).await
 }

@@ -1,10 +1,9 @@
-use crate::{WORKSPACE_CLEANUP_RETENTION, cleanup::enqueue_workspace_cleanup};
 use std::time::Duration;
 
 use sooqa_jobs::{
     Job, JobCommand, JobCounts, JobLease, JobPayloadError, JobStatus, JobType, NewJob,
 };
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -12,6 +11,88 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct JobRepository {
     pool: PgPool,
+}
+
+/// A queue settlement requested by a family owner after the handler has
+/// finished. The family settlement boundary may update its domain row and the
+/// queue row in one transaction; the queue-only fallback uses the same low
+/// level transition helpers.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum JobSettlement {
+    Retry {
+        run_at: OffsetDateTime,
+        error_class: String,
+        error_message: String,
+        non_consuming: bool,
+    },
+    Defer {
+        run_at: OffsetDateTime,
+        error_class: String,
+        error_message: String,
+        non_consuming: bool,
+    },
+    Fail {
+        error_class: String,
+        error_message: String,
+    },
+}
+
+impl JobSettlement {
+    pub fn retry(
+        run_at: OffsetDateTime,
+        error_class: impl Into<String>,
+        error_message: impl Into<String>,
+    ) -> Self {
+        Self::Retry {
+            run_at,
+            error_class: error_class.into(),
+            error_message: error_message.into(),
+            non_consuming: false,
+        }
+    }
+
+    pub fn retry_without_consuming_attempt(
+        run_at: OffsetDateTime,
+        error_class: impl Into<String>,
+        error_message: impl Into<String>,
+    ) -> Self {
+        Self::Retry {
+            run_at,
+            error_class: error_class.into(),
+            error_message: error_message.into(),
+            non_consuming: true,
+        }
+    }
+
+    pub fn defer(
+        run_at: OffsetDateTime,
+        error_class: impl Into<String>,
+        error_message: impl Into<String>,
+    ) -> Self {
+        Self::Defer {
+            run_at,
+            error_class: error_class.into(),
+            error_message: error_message.into(),
+            non_consuming: false,
+        }
+    }
+
+    pub fn defer_without_consuming_attempt(
+        run_at: OffsetDateTime,
+        error_class: impl Into<String>,
+        error_message: impl Into<String>,
+    ) -> Self {
+        Self::Defer {
+            run_at,
+            error_class: error_class.into(),
+            error_message: error_message.into(),
+            non_consuming: true,
+        }
+    }
+
+    pub fn fail(error_class: impl Into<String>, error_message: impl Into<String>) -> Self {
+        Self::Fail { error_class: error_class.into(), error_message: error_message.into() }
+    }
 }
 
 impl JobRepository {
@@ -119,6 +200,9 @@ impl JobRepository {
         row.into_job()
     }
 
+    /// Complete is intentionally queue-only. Domain handlers that need a
+    /// domain-plus-queue commit complete their domain transition first and
+    /// make this operation idempotent through the already-succeeded check.
     pub async fn complete_lease(&self, lease: &JobLease) -> Result<Job, JobRepositoryError> {
         let row = sqlx::query_as::<_, JobRow>(
             r#"
@@ -160,6 +244,25 @@ impl JobRepository {
         already_succeeded.map(JobRow::into_job).transpose()?.ok_or(JobRepositoryError::LeaseLost)
     }
 
+    /// Dispatch a typed settlement to the owning family module. `job.command`
+    /// is the command decoded by the claim query; the dispatcher never parses
+    /// raw payload fields.
+    pub async fn settle_lease(
+        &self,
+        job: &Job,
+        lease: &JobLease,
+        settlement: JobSettlement,
+    ) -> Result<Job, JobRepositoryError> {
+        if !lease_matches_job(job, lease) {
+            return Err(JobRepositoryError::LeaseLost);
+        }
+        crate::settlement::settle(&self.pool, Some(&job.command), lease, settlement).await
+    }
+
+    // These lease-only methods remain as a small compatibility surface for
+    // repository callers and old integration fixtures. They enter the same
+    // typed settlement dispatcher, which decodes a command once at its
+    // boundary when the caller did not retain the claimed Job.
     pub async fn retry_lease(
         &self,
         lease: &JobLease,
@@ -167,74 +270,13 @@ impl JobRepository {
         error_class: &str,
         error_message: &str,
     ) -> Result<Job, JobRepositoryError> {
-        if self.is_publication_lease(lease).await? {
-            return self
-                .settle_publication_lease(lease, run_at, error_class, error_message, false, false)
-                .await;
-        }
-        let mut transaction = self.pool.begin().await?;
-        let row = sqlx::query_as::<_, JobRow>(
-            r#"
-            UPDATE queue.jobs
-            SET state = CASE WHEN attempt_count >= max_attempts THEN 'failed' ELSE 'queued' END,
-                run_at = $4, lease_token = NULL, lease_owner = NULL,
-                lease_expires_at = NULL, last_heartbeat_at = NULL,
-                error_class = $5, error_message = $6,
-                completed_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
-                updated_at = now()
-            WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
-              AND lease_expires_at > now()
-            RETURNING id, kind, payload, state, priority, run_at, attempt_count,
-                      max_attempts, lease_token, lease_owner, lease_expires_at,
-                      last_heartbeat_at, error_class, error_message, dedupe_key,
-                      created_at, updated_at, completed_at
-            "#,
+        self.settle_lease_without_job(
+            lease,
+            JobSettlement::retry(run_at, error_class, error_message),
         )
-        .bind(lease.job_id)
-        .bind(&lease.lease_owner)
-        .bind(lease.lease_token)
-        .bind(run_at)
-        .bind(error_class)
-        .bind(error_message)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(JobRepositoryError::LeaseLost)?;
-        if row.kind == JobType::SyncStorageCaption.as_str() {
-            let media_id = row
-                .payload
-                .get("media_id")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|value| Uuid::parse_str(value).ok());
-            let generation = row.payload.get("generation").and_then(serde_json::Value::as_i64);
-            if let (Some(media_id), Some(generation)) = (media_id, generation) {
-                if row.state == "queued" {
-                    sqlx::query(
-                        "UPDATE media SET caption_sync_state = 'pending', caption_sync_error = NULL, caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2 AND caption_sync_state = 'syncing'",
-                    )
-                    .bind(media_id)
-                    .bind(generation)
-                    .execute(&mut *transaction)
-                    .await?;
-                } else if row.state == "failed" {
-                    sqlx::query(
-                        "UPDATE media SET caption_sync_state = 'failed', caption_sync_error = left($3, 512), caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2 AND caption_sync_state = 'syncing'",
-                    )
-                    .bind(media_id)
-                    .bind(generation)
-                    .bind(error_message)
-                    .execute(&mut *transaction)
-                    .await?;
-                }
-            }
-        }
-        transaction.commit().await?;
-        row.into_job()
+        .await
     }
 
-    /// Requeues a job after a proven safe cancellation without consuming an
-    /// attempt. The lease may already be expired when a heartbeat loss was
-    /// the cancellation signal; the caller must only use this for work that
-    /// never reached its external side effect.
     pub async fn retry_lease_without_consuming_attempt(
         &self,
         lease: &JobLease,
@@ -242,47 +284,11 @@ impl JobRepository {
         error_class: &str,
         error_message: &str,
     ) -> Result<Job, JobRepositoryError> {
-        let row = sqlx::query_as::<_, JobRow>(
-            r#"
-            UPDATE queue.jobs
-            SET state = 'queued', attempt_count = GREATEST(attempt_count - 1, 0),
-                run_at = $4, lease_token = NULL, lease_owner = NULL,
-                lease_expires_at = NULL, last_heartbeat_at = NULL,
-                error_class = $5, error_message = $6,
-                completed_at = NULL, updated_at = now()
-            WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
-            RETURNING id, kind, payload, state, priority, run_at, attempt_count,
-                      max_attempts, lease_token, lease_owner, lease_expires_at,
-                      last_heartbeat_at, error_class, error_message, dedupe_key,
-                      created_at, updated_at, completed_at
-            "#,
+        self.settle_lease_without_job(
+            lease,
+            JobSettlement::retry_without_consuming_attempt(run_at, error_class, error_message),
         )
-        .bind(lease.job_id)
-        .bind(&lease.lease_owner)
-        .bind(lease.lease_token)
-        .bind(run_at)
-        .bind(error_class)
-        .bind(error_message)
-        .fetch_optional(&self.pool)
-        .await?;
-        if let Some(row) = row {
-            return row.into_job();
-        }
-        let already_requeued = sqlx::query_as::<_, JobRow>(
-            r#"
-            SELECT id, kind, payload, state, priority, run_at, attempt_count,
-                   max_attempts, lease_token, lease_owner, lease_expires_at,
-                   last_heartbeat_at, error_class, error_message, dedupe_key,
-                   created_at, updated_at, completed_at
-            FROM queue.jobs
-            WHERE id = $1 AND state = 'queued' AND error_class = $2
-            "#,
-        )
-        .bind(lease.job_id)
-        .bind(error_class)
-        .fetch_optional(&self.pool)
-        .await?;
-        already_requeued.map(JobRow::into_job).transpose()?.ok_or(JobRepositoryError::LeaseLost)
+        .await
     }
 
     pub async fn defer_lease(
@@ -292,43 +298,13 @@ impl JobRepository {
         error_class: &str,
         error_message: &str,
     ) -> Result<Job, JobRepositoryError> {
-        if self.is_publication_lease(lease).await? {
-            return self
-                .settle_publication_lease(lease, run_at, error_class, error_message, false, false)
-                .await;
-        }
-        let row = sqlx::query_as::<_, JobRow>(
-            r#"
-            UPDATE queue.jobs
-            SET state = CASE WHEN attempt_count >= max_attempts THEN 'failed' ELSE 'queued' END,
-                run_at = $4, lease_token = NULL, lease_owner = NULL,
-                lease_expires_at = NULL, last_heartbeat_at = NULL,
-                error_class = $5, error_message = $6,
-                completed_at = CASE WHEN attempt_count >= max_attempts THEN now() ELSE NULL END,
-                updated_at = now()
-            WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
-              AND lease_expires_at > now()
-            RETURNING id, kind, payload, state, priority, run_at, attempt_count,
-                      max_attempts, lease_token, lease_owner, lease_expires_at,
-                      last_heartbeat_at, error_class, error_message, dedupe_key,
-                      created_at, updated_at, completed_at
-            "#,
+        self.settle_lease_without_job(
+            lease,
+            JobSettlement::defer(run_at, error_class, error_message),
         )
-        .bind(lease.job_id)
-        .bind(&lease.lease_owner)
-        .bind(lease.lease_token)
-        .bind(run_at)
-        .bind(error_class)
-        .bind(error_message)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(JobRepositoryError::LeaseLost)?;
-        row.into_job()
+        .await
     }
 
-    /// Requeues a scheduled deferral without consuming the current attempt.
-    /// This is reserved for admission decisions where the work has not begun
-    /// and capacity may recover without any change to the job's retry budget.
     pub async fn defer_lease_without_consuming_attempt(
         &self,
         lease: &JobLease,
@@ -336,38 +312,11 @@ impl JobRepository {
         error_class: &str,
         error_message: &str,
     ) -> Result<Job, JobRepositoryError> {
-        if self.is_publication_lease(lease).await? {
-            return self
-                .settle_publication_lease(lease, run_at, error_class, error_message, false, true)
-                .await;
-        }
-        let row = sqlx::query_as::<_, JobRow>(
-            r#"
-            UPDATE queue.jobs
-            SET state = 'queued', attempt_count = GREATEST(attempt_count - 1, 0),
-                run_at = $4, lease_token = NULL, lease_owner = NULL,
-                lease_expires_at = NULL, last_heartbeat_at = NULL,
-                error_class = $5, error_message = $6,
-                completed_at = NULL,
-                updated_at = now()
-            WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
-              AND lease_expires_at > now()
-            RETURNING id, kind, payload, state, priority, run_at, attempt_count,
-                      max_attempts, lease_token, lease_owner, lease_expires_at,
-                      last_heartbeat_at, error_class, error_message, dedupe_key,
-                      created_at, updated_at, completed_at
-            "#,
+        self.settle_lease_without_job(
+            lease,
+            JobSettlement::defer_without_consuming_attempt(run_at, error_class, error_message),
         )
-        .bind(lease.job_id)
-        .bind(&lease.lease_owner)
-        .bind(lease.lease_token)
-        .bind(run_at)
-        .bind(error_class)
-        .bind(error_message)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(JobRepositoryError::LeaseLost)?;
-        row.into_job()
+        .await
     }
 
     pub async fn fail_lease(
@@ -376,354 +325,21 @@ impl JobRepository {
         error_class: &str,
         error_message: &str,
     ) -> Result<Job, JobRepositoryError> {
-        if self.is_publication_lease(lease).await? {
-            return self
-                .settle_publication_lease(
-                    lease,
-                    OffsetDateTime::now_utc(),
-                    error_class,
-                    error_message,
-                    true,
-                    false,
-                )
-                .await;
-        }
-        let row = sqlx::query_as::<_, JobRow>(
-            r#"
-            UPDATE queue.jobs
-            SET state = 'failed', lease_token = NULL, lease_owner = NULL,
-                lease_expires_at = NULL, last_heartbeat_at = NULL,
-                error_class = $4, error_message = $5, completed_at = now(), updated_at = now()
-            WHERE id = $1 AND state = 'running' AND lease_owner = $2 AND lease_token = $3
-              AND lease_expires_at > now()
-            RETURNING id, kind, payload, state, priority, run_at, attempt_count,
-                      max_attempts, lease_token, lease_owner, lease_expires_at,
-                      last_heartbeat_at, error_class, error_message, dedupe_key,
-                      created_at, updated_at, completed_at
-            "#,
-        )
-        .bind(lease.job_id)
-        .bind(&lease.lease_owner)
-        .bind(lease.lease_token)
-        .bind(error_class)
-        .bind(error_message)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(JobRepositoryError::LeaseLost)?;
-        row.into_job()
+        self.settle_lease_without_job(lease, JobSettlement::fail(error_class, error_message)).await
     }
 
-    pub async fn recover_stale_leases(&self) -> Result<u64, JobRepositoryError> {
-        let publication_recovered = self.recover_stale_publication_leases().await?;
-        let mut transaction = self.pool.begin().await?;
-        let recovered = sqlx::query_as::<_, RecoveredJob>(
-            r#"
-            UPDATE queue.jobs
-            SET state = CASE
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state = 'ready'
-                         ) THEN 'succeeded'
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state = 'pending_storage'
-                               AND media.storage_token IS NULL
-                         ) THEN 'queued'
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state = 'pending_storage'
-                               AND media.storage_token IS NOT NULL
-                         ) THEN 'failed'
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state IN ('storage_unknown', 'missing')
-                         ) THEN 'failed'
-                    WHEN attempt_count >= max_attempts THEN 'failed'
-                    ELSE 'queued'
-                END,
-                attempt_count = CASE
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state = 'pending_storage'
-                               AND media.storage_token IS NULL
-                         ) THEN GREATEST(attempt_count - 1, 0)
-                    ELSE attempt_count
-                END,
-                run_at = now(), lease_token = NULL, lease_owner = NULL,
-                lease_expires_at = NULL, last_heartbeat_at = NULL,
-                error_class = CASE
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state = 'ready'
-                         ) THEN NULL
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state = 'pending_storage'
-                               AND media.storage_token IS NULL
-                         ) THEN 'storage_upload_cancelled'
-                    ELSE COALESCE(error_class, 'lease_expired')
-                END,
-                error_message = CASE
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state = 'ready'
-                         ) THEN NULL
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state = 'pending_storage'
-                               AND media.storage_token IS NULL
-                         ) THEN 'storage upload was safely cancelled before Telegram dispatch'
-                    ELSE COALESCE(error_message, 'job lease expired')
-                END,
-                completed_at = CASE
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state = 'ready'
-                         ) THEN now()
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state = 'pending_storage'
-                               AND media.storage_token IS NULL
-                         ) THEN NULL
-                    WHEN kind = 'upload_storage_asset'
-                         AND EXISTS (
-                             SELECT 1
-                             FROM media
-                             WHERE media.id::text = queue.jobs.payload->>'media_id'
-                               AND media.storage_state = 'pending_storage'
-                               AND media.storage_token IS NOT NULL
-                         ) THEN now()
-                    WHEN attempt_count >= max_attempts
-                         OR (
-                             kind = 'upload_storage_asset'
-                             AND EXISTS (
-                                 SELECT 1
-                                 FROM media
-                                 WHERE media.id::text = queue.jobs.payload->>'media_id'
-                                   AND media.storage_state IN ('storage_unknown', 'missing')
-                             )
-                         ) THEN now()
-                    ELSE NULL
-                END,
-                updated_at = now()
-            WHERE state = 'running' AND kind <> 'publish_post' AND lease_expires_at <= now()
-              AND NOT (
-                  kind = 'upload_storage_asset'
-                  AND EXISTS (
-                      SELECT 1
-                      FROM media
-                      WHERE media.id::text = queue.jobs.payload->>'media_id'
-                        AND media.storage_state = 'pending_storage'
-                        AND media.storage_token IS NOT NULL
-                        AND media.storage_started_at > now() - interval '1 minute'
-                  )
-              )
-            RETURNING kind, payload, state, attempt_count, max_attempts
-            "#,
-        )
-        .fetch_all(&mut *transaction)
-        .await?;
-        for job in &recovered {
-            if job.kind == JobType::SyncStorageCaption.as_str() && job.state == "queued" {
-                let media_id = job
-                    .payload
-                    .get("media_id")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|value| Uuid::parse_str(value).ok());
-                let generation = job.payload.get("generation").and_then(serde_json::Value::as_i64);
-                if let (Some(media_id), Some(generation)) = (media_id, generation) {
-                    sqlx::query(
-                        "UPDATE media SET caption_sync_state = 'pending', caption_sync_error = NULL, caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2 AND caption_sync_state = 'syncing'",
-                    )
-                    .bind(media_id)
-                    .bind(generation)
-                    .execute(&mut *transaction)
-                    .await?;
-                }
-            }
-            if job.kind == JobType::UploadStorageAsset.as_str() && job.state == "succeeded" {
-                reconcile_exhausted_job(&mut transaction, job).await?;
-            }
-            if job.state == "failed"
-                && (job.attempt_count >= job.max_attempts
-                    || job.kind == JobType::UploadStorageAsset.as_str())
-            {
-                reconcile_exhausted_job(&mut transaction, job).await?;
-            }
-        }
-        transaction.commit().await?;
-        Ok(publication_recovered + recovered.len() as u64)
-    }
-
-    async fn is_publication_lease(&self, lease: &JobLease) -> Result<bool, JobRepositoryError> {
-        Ok(sqlx::query_scalar::<_, String>(
-            "SELECT kind FROM queue.jobs WHERE id = $1 AND state = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_expires_at > clock_timestamp()",
-        )
-        .bind(lease.job_id)
-        .bind(lease.attempt_number)
-        .bind(&lease.lease_owner)
-        .bind(lease.lease_token)
-        .fetch_optional(&self.pool)
-        .await?
-        .is_some_and(|kind| kind == JobType::PublishPost.as_str()))
-    }
-
-    async fn settle_publication_lease(
+    async fn settle_lease_without_job(
         &self,
         lease: &JobLease,
-        run_at: OffsetDateTime,
-        error_class: &str,
-        error_message: &str,
-        force_terminal: bool,
-        non_consuming: bool,
+        settlement: JobSettlement,
     ) -> Result<Job, JobRepositoryError> {
-        let payload = self.publication_payload(lease).await?;
-        let post_id = payload_uuid(&payload, "post_id");
-        let mut transaction = self.pool.begin().await?;
-        let post = match post_id {
-            Some(post_id) => lock_publication_post(&mut transaction, post_id).await?,
-            None => None,
-        };
-        let job = lock_running_job(&mut transaction, lease).await?;
-        let terminal = force_terminal || (!non_consuming && job.attempt_count >= job.max_attempts);
-        if terminal && let (Some(post), Some(post_id)) = (&post, post_id) {
-            settle_terminal_publication_post(
-                &mut transaction,
-                post,
-                post_id,
-                &job.payload,
-                error_class,
-                error_message,
-            )
-            .await?;
-        }
-        let state = if terminal { "failed" } else { "queued" };
-        let row = update_locked_job(
-            &mut transaction,
-            job.id,
-            state,
-            if terminal { job.run_at } else { run_at },
-            error_class,
-            error_message,
-            JobUpdateFlags { terminal, non_consuming },
-        )
-        .await?;
-        transaction.commit().await?;
-        row.into_job()
+        crate::settlement::settle(&self.pool, None, lease, settlement).await
     }
 
-    async fn publication_payload(
-        &self,
-        lease: &JobLease,
-    ) -> Result<serde_json::Value, JobRepositoryError> {
-        sqlx::query_scalar::<_, serde_json::Value>(
-            "SELECT payload FROM queue.jobs WHERE id = $1 AND kind = 'publish_post' AND state = 'running' AND attempt_count = $2 AND lease_owner = $3 AND lease_token = $4 AND lease_expires_at > clock_timestamp()",
-        )
-        .bind(lease.job_id)
-        .bind(lease.attempt_number)
-        .bind(&lease.lease_owner)
-        .bind(lease.lease_token)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(JobRepositoryError::LeaseLost)
-    }
-
-    async fn recover_stale_publication_leases(&self) -> Result<u64, JobRepositoryError> {
-        let candidates = sqlx::query_as::<_, StalePublicationJob>(
-            "SELECT id, payload FROM queue.jobs WHERE kind = 'publish_post' AND state = 'running' AND lease_expires_at <= clock_timestamp()",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let mut recovered = 0;
-        for candidate in candidates {
-            if self.recover_stale_publication_lease(candidate).await? {
-                recovered += 1;
-            }
-        }
-        Ok(recovered)
-    }
-
-    async fn recover_stale_publication_lease(
-        &self,
-        candidate: StalePublicationJob,
-    ) -> Result<bool, JobRepositoryError> {
-        let post_id = payload_uuid(&candidate.payload, "post_id");
-        let mut transaction = self.pool.begin().await?;
-        let post = match post_id {
-            Some(post_id) => lock_publication_post(&mut transaction, post_id).await?,
-            None => None,
-        };
-        let Some(job) = lock_expired_publication_job(&mut transaction, candidate.id).await? else {
-            transaction.commit().await?;
-            return Ok(false);
-        };
-        let terminal = job.attempt_count >= job.max_attempts;
-        if terminal
-            && let (Some(post), Some(post_id)) = (&post, post_id)
-            && payload_uuid(&job.payload, "post_id") == Some(post_id)
-        {
-            let error_class = job.error_class.as_deref().unwrap_or("lease_expired");
-            let error_message = job.error_message.as_deref().unwrap_or("job lease expired");
-            let (post_error_class, post_error_message) = if post.state == "sending" {
-                ("publication_interrupted", "publication job lease expired after the final attempt")
-            } else {
-                (error_class, error_message)
-            };
-            settle_terminal_publication_post(
-                &mut transaction,
-                post,
-                post_id,
-                &job.payload,
-                post_error_class,
-                post_error_message,
-            )
-            .await?;
-        }
-        update_locked_job(
-            &mut transaction,
-            job.id,
-            if terminal { "failed" } else { "queued" },
-            OffsetDateTime::now_utc(),
-            job.error_class.as_deref().unwrap_or("lease_expired"),
-            job.error_message.as_deref().unwrap_or("job lease expired"),
-            JobUpdateFlags { terminal, non_consuming: false },
-        )
-        .await?;
-        transaction.commit().await?;
-        Ok(true)
+    /// Recovery remains a compatibility entry point for worker startup; the
+    /// typed dispatcher routes each family to its owning repository policy.
+    pub async fn recover_stale_leases(&self) -> Result<u64, JobRepositoryError> {
+        crate::settlement::recover_stale(&self.pool).await
     }
 
     pub async fn live_job_ids(&self) -> Result<Vec<Uuid>, JobRepositoryError> {
@@ -733,18 +349,7 @@ impl JobRepository {
     }
 
     pub async fn protected_workspace_ids(&self) -> Result<Vec<Uuid>, JobRepositoryError> {
-        Ok(sqlx::query_scalar(
-            r#"
-            -- Reconciliation runs from a snapshot and deletes after this
-            -- query commits. Protect every workspace that is still current
-            -- for an ingest, not only active pipeline states, so a storage
-            -- reset cannot reopen bytes between the snapshot and deletion.
-            SELECT DISTINCT workspace_id
-            FROM ingests
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?)
+        crate::cleanup::protected_workspace_ids(&self.pool).await.map_err(Into::into)
     }
 
     pub async fn count_technical_jobs(&self) -> Result<JobCounts, JobRepositoryError> {
@@ -784,26 +389,34 @@ fn lease_seconds(duration: Duration) -> Result<f64, JobRepositoryError> {
     Ok(duration.as_secs_f64())
 }
 
+fn lease_matches_job(job: &Job, lease: &JobLease) -> bool {
+    job.status == JobStatus::Running
+        && job.id == lease.job_id
+        && job.attempt_count == lease.attempt_number
+        && job.lease_owner.as_deref() == Some(lease.lease_owner.as_str())
+        && job.lease_token == Some(lease.lease_token)
+}
+
 #[derive(Debug, FromRow)]
-struct JobRow {
-    id: Uuid,
-    kind: String,
-    payload: serde_json::Value,
-    state: String,
-    priority: i32,
-    run_at: OffsetDateTime,
-    attempt_count: i32,
-    max_attempts: i32,
-    lease_token: Option<Uuid>,
-    lease_owner: Option<String>,
-    lease_expires_at: Option<OffsetDateTime>,
-    last_heartbeat_at: Option<OffsetDateTime>,
-    error_class: Option<String>,
-    error_message: Option<String>,
-    dedupe_key: Option<String>,
-    created_at: OffsetDateTime,
-    updated_at: OffsetDateTime,
-    completed_at: Option<OffsetDateTime>,
+pub(crate) struct JobRow {
+    pub(crate) id: Uuid,
+    pub(crate) kind: String,
+    pub(crate) payload: serde_json::Value,
+    pub(crate) state: String,
+    pub(crate) priority: i32,
+    pub(crate) run_at: OffsetDateTime,
+    pub(crate) attempt_count: i32,
+    pub(crate) max_attempts: i32,
+    pub(crate) lease_token: Option<Uuid>,
+    pub(crate) lease_owner: Option<String>,
+    pub(crate) lease_expires_at: Option<OffsetDateTime>,
+    pub(crate) last_heartbeat_at: Option<OffsetDateTime>,
+    pub(crate) error_class: Option<String>,
+    pub(crate) error_message: Option<String>,
+    pub(crate) dedupe_key: Option<String>,
+    pub(crate) created_at: OffsetDateTime,
+    pub(crate) updated_at: OffsetDateTime,
+    pub(crate) completed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, FromRow)]
@@ -812,297 +425,8 @@ struct JobCountRow {
     count: i64,
 }
 
-#[derive(Debug, FromRow)]
-struct RecoveredJob {
-    kind: String,
-    payload: serde_json::Value,
-    state: String,
-    attempt_count: i32,
-    max_attempts: i32,
-}
-
-#[derive(Debug, FromRow)]
-struct StalePublicationJob {
-    id: Uuid,
-    payload: serde_json::Value,
-}
-
-#[derive(Debug, FromRow)]
-struct PublicationPostRow {
-    state: String,
-    revision: i64,
-}
-
-async fn lock_publication_post(
-    transaction: &mut Transaction<'_, Postgres>,
-    post_id: Uuid,
-) -> Result<Option<PublicationPostRow>, sqlx::Error> {
-    let channel_id = sqlx::query_scalar::<_, Uuid>("SELECT channel_id FROM posts WHERE id = $1")
-        .bind(post_id)
-        .fetch_optional(&mut **transaction)
-        .await?;
-    let Some(channel_id) = channel_id else {
-        return Ok(None);
-    };
-    sqlx::query("SELECT id FROM channels WHERE id = $1 FOR UPDATE")
-        .bind(channel_id)
-        .fetch_optional(&mut **transaction)
-        .await?;
-    sqlx::query_as::<_, PublicationPostRow>(
-        "SELECT state, revision FROM posts WHERE id = $1 FOR UPDATE",
-    )
-    .bind(post_id)
-    .fetch_optional(&mut **transaction)
-    .await
-}
-
-async fn lock_running_job(
-    transaction: &mut Transaction<'_, Postgres>,
-    lease: &JobLease,
-) -> Result<JobRow, JobRepositoryError> {
-    sqlx::query_as::<_, JobRow>(
-        r#"
-        SELECT id, kind, payload, state, priority, run_at, attempt_count,
-               max_attempts, lease_token, lease_owner, lease_expires_at,
-               last_heartbeat_at, error_class, error_message, dedupe_key,
-               created_at, updated_at, completed_at
-        FROM queue.jobs
-        WHERE id = $1 AND kind = 'publish_post' AND state = 'running'
-          AND attempt_count = $2 AND lease_owner = $3 AND lease_token = $4
-          AND lease_expires_at > clock_timestamp()
-        FOR UPDATE
-        "#,
-    )
-    .bind(lease.job_id)
-    .bind(lease.attempt_number)
-    .bind(&lease.lease_owner)
-    .bind(lease.lease_token)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(JobRepositoryError::LeaseLost)
-}
-
-async fn lock_expired_publication_job(
-    transaction: &mut Transaction<'_, Postgres>,
-    job_id: Uuid,
-) -> Result<Option<JobRow>, JobRepositoryError> {
-    Ok(sqlx::query_as::<_, JobRow>(
-        r#"
-        SELECT id, kind, payload, state, priority, run_at, attempt_count,
-               max_attempts, lease_token, lease_owner, lease_expires_at,
-               last_heartbeat_at, error_class, error_message, dedupe_key,
-               created_at, updated_at, completed_at
-        FROM queue.jobs
-        WHERE id = $1 AND kind = 'publish_post' AND state = 'running'
-          AND lease_expires_at <= clock_timestamp()
-        FOR UPDATE
-        "#,
-    )
-    .bind(job_id)
-    .fetch_optional(&mut **transaction)
-    .await?)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct JobUpdateFlags {
-    terminal: bool,
-    non_consuming: bool,
-}
-
-async fn update_locked_job(
-    transaction: &mut Transaction<'_, Postgres>,
-    job_id: Uuid,
-    state: &str,
-    run_at: OffsetDateTime,
-    error_class: &str,
-    error_message: &str,
-    flags: JobUpdateFlags,
-) -> Result<JobRow, JobRepositoryError> {
-    Ok(sqlx::query_as::<_, JobRow>(
-        r#"
-        UPDATE queue.jobs
-        SET state = $2,
-            attempt_count = CASE WHEN $7 THEN GREATEST(attempt_count - 1, 0) ELSE attempt_count END,
-            run_at = $3, lease_token = NULL, lease_owner = NULL,
-            lease_expires_at = NULL, last_heartbeat_at = NULL,
-            error_class = $4, error_message = $5,
-            completed_at = CASE WHEN $6 THEN now() ELSE NULL END,
-            updated_at = now()
-        WHERE id = $1 AND state = 'running'
-        RETURNING id, kind, payload, state, priority, run_at, attempt_count,
-                  max_attempts, lease_token, lease_owner, lease_expires_at,
-                  last_heartbeat_at, error_class, error_message, dedupe_key,
-                  created_at, updated_at, completed_at
-        "#,
-    )
-    .bind(job_id)
-    .bind(state)
-    .bind(run_at)
-    .bind(error_class)
-    .bind(error_message)
-    .bind(flags.terminal)
-    .bind(flags.non_consuming)
-    .fetch_one(&mut **transaction)
-    .await?)
-}
-
-async fn settle_terminal_publication_post(
-    transaction: &mut Transaction<'_, Postgres>,
-    post: &PublicationPostRow,
-    post_id: Uuid,
-    payload: &serde_json::Value,
-    error_class: &str,
-    error_message: &str,
-) -> Result<(), sqlx::Error> {
-    match post.state.as_str() {
-        "queued" if payload_i64(payload, "expected_revision") == Some(post.revision) => {
-            sqlx::query(
-                "UPDATE posts SET state = 'failed', send_token = NULL, send_started_at = NULL, error_class = $2, error_message = $3, revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'queued' AND revision = $4",
-            )
-            .bind(post_id)
-            .bind(error_class)
-            .bind(error_message)
-            .bind(post.revision)
-            .execute(&mut **transaction)
-            .await?;
-        }
-        "sending" => {
-            sqlx::query(
-                "UPDATE posts SET state = 'unknown', send_token = NULL, send_started_at = NULL, error_class = $2, error_message = $3, revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'sending'",
-            )
-            .bind(post_id)
-            .bind(error_class)
-            .bind(error_message)
-            .execute(&mut **transaction)
-            .await?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn payload_uuid(payload: &serde_json::Value, key: &str) -> Option<Uuid> {
-    payload
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-}
-
-fn payload_i64(payload: &serde_json::Value, key: &str) -> Option<i64> {
-    payload.get(key).and_then(serde_json::Value::as_i64)
-}
-
-async fn reconcile_exhausted_job(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    job: &RecoveredJob,
-) -> Result<(), sqlx::Error> {
-    let job_type = match JobType::try_from(job.kind.as_str()) {
-        Ok(job_type) => job_type,
-        Err(_) => return Ok(()),
-    };
-    let ingest_id = job
-        .payload
-        .get("ingest_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok());
-    if matches!(
-        job_type,
-        JobType::InspectSource
-            | JobType::DownloadSource
-            | JobType::ProbeAsset
-            | JobType::NormalizeAsset
-            | JobType::ComputeFingerprint
-            | JobType::FinalizeIngest
-    ) {
-        if let Some(ingest_id) = ingest_id {
-            sqlx::query(
-                "UPDATE ingests SET state = 'failed_terminal', error_code = 'job_lease_expired', error_message = 'job lease expired after the final attempt', completed_at = now(), updated_at = now() WHERE id = $1 AND state NOT IN ('completed', 'failed_terminal', 'cancelled')",
-            )
-            .bind(ingest_id)
-            .execute(&mut **transaction)
-            .await?;
-            if let Some(workspace_id) =
-                sqlx::query_scalar::<_, Uuid>("SELECT workspace_id FROM ingests WHERE id = $1")
-                    .bind(ingest_id)
-                    .fetch_optional(&mut **transaction)
-                    .await?
-            {
-                enqueue_workspace_cleanup(
-                    transaction,
-                    ingest_id,
-                    workspace_id,
-                    OffsetDateTime::now_utc() + WORKSPACE_CLEANUP_RETENTION,
-                )
-                .await?;
-            }
-        }
-        return Ok(());
-    }
-    if job_type == JobType::SyncStorageCaption {
-        let Some(media_id) = job
-            .payload
-            .get("media_id")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| Uuid::parse_str(value).ok())
-        else {
-            return Ok(());
-        };
-        let generation = job.payload.get("generation").and_then(serde_json::Value::as_i64);
-        sqlx::query(
-        "UPDATE media SET caption_sync_state = 'failed', caption_sync_error = 'caption sync job lease expired after the final attempt', caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_state = 'syncing' AND ($2::bigint IS NULL OR caption_sync_generation = $2)",
-        )
-        .bind(media_id)
-        .bind(generation)
-        .execute(&mut **transaction)
-        .await?;
-        return Ok(());
-    }
-    if job_type != JobType::UploadStorageAsset {
-        return Ok(());
-    }
-    let Some(media_id) = job
-        .payload
-        .get("media_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-    else {
-        return Ok(());
-    };
-    let storage_state =
-        sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1 FOR UPDATE")
-            .bind(media_id)
-            .fetch_optional(&mut **transaction)
-            .await?;
-    match storage_state.as_deref() {
-        Some("ready") => {
-            sqlx::query(
-                "UPDATE ingests SET state = 'completed', error_code = NULL, error_message = NULL, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
-            )
-            .bind(media_id)
-            .execute(&mut **transaction)
-            .await?;
-        }
-        Some(_) => {
-            sqlx::query(
-                "UPDATE media SET storage_state = 'storage_unknown', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1 AND storage_state <> 'ready'",
-            )
-            .bind(media_id)
-            .execute(&mut **transaction)
-            .await?;
-            sqlx::query(
-                "UPDATE ingests SET state = 'failed_terminal', error_code = 'storage_unknown', error_message = 'storage job lease expired; external storage result requires reconciliation', completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state NOT IN ('failed_terminal') OR error_code IN ('storage_upload', 'storage_unknown'))",
-            )
-            .bind(media_id)
-            .execute(&mut **transaction)
-            .await?;
-        }
-        None => {}
-    }
-    Ok(())
-}
-
 impl JobRow {
-    fn into_job(self) -> Result<Job, JobRepositoryError> {
+    pub(crate) fn into_job(self) -> Result<Job, JobRepositoryError> {
         let kind =
             JobType::try_from(self.kind.as_str()).map_err(JobRepositoryError::UnknownJobType)?;
         let command = JobCommand::from_payload(kind, self.payload)

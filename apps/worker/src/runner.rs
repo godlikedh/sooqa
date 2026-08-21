@@ -12,7 +12,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use sooqa_jobs::{Job, JobLease, JobStatus, JobType};
-use sooqa_persistence::{JobRepository, JobRepositoryError};
+use sooqa_persistence::{JobRepository, JobRepositoryError, JobSettlement};
 
 use crate::common::{HandlerCancellation, HandlerEntry, HandlerFailure, HandlerRegistry};
 
@@ -147,11 +147,14 @@ impl Worker {
                     }
                     HandlerRunOutcome::Shutdown => {
                         self.repository
-                            .retry_lease(
+                            .settle_lease(
+                                &job,
                                 &lease,
-                                OffsetDateTime::now_utc(),
-                                "worker_shutdown",
-                                "worker stopped while the job was active",
+                                JobSettlement::retry(
+                                    OffsetDateTime::now_utc(),
+                                    "worker_shutdown",
+                                    "worker stopped while the job was active",
+                                ),
                             )
                             .await?;
                         counters.shutdown_requeued += 1;
@@ -283,16 +286,23 @@ impl Worker {
                 let defer_until = failure.defer_until.expect("defer timestamp was checked");
                 if failure.defer_without_consuming_attempt {
                     self.repository
-                        .defer_lease_without_consuming_attempt(
+                        .settle_lease(
+                            job,
                             lease,
-                            defer_until,
-                            &failure.class,
-                            &failure.message,
+                            JobSettlement::defer_without_consuming_attempt(
+                                defer_until,
+                                &failure.class,
+                                &failure.message,
+                            ),
                         )
                         .await?;
                 } else {
                     self.repository
-                        .defer_lease(lease, defer_until, &failure.class, &failure.message)
+                        .settle_lease(
+                            job,
+                            lease,
+                            JobSettlement::defer(defer_until, &failure.class, &failure.message),
+                        )
                         .await?;
                 }
                 info!(worker_id = %self.worker_id, job_id = %job.id, "job deferred until dependent lease expires");
@@ -301,16 +311,23 @@ impl Worker {
                 let run_at = OffsetDateTime::now_utc() + TimeDuration::seconds(1);
                 let updated = if failure.retry_without_consuming_attempt {
                     self.repository
-                        .retry_lease_without_consuming_attempt(
+                        .settle_lease(
+                            job,
                             lease,
-                            run_at,
-                            &failure.class,
-                            &failure.message,
+                            JobSettlement::retry_without_consuming_attempt(
+                                run_at,
+                                &failure.class,
+                                &failure.message,
+                            ),
                         )
                         .await?
                 } else {
                     self.repository
-                        .retry_lease(lease, run_at, &failure.class, &failure.message)
+                        .settle_lease(
+                            job,
+                            lease,
+                            JobSettlement::retry(run_at, &failure.class, &failure.message),
+                        )
                         .await?
                 };
                 if updated.status == JobStatus::Queued {
@@ -322,7 +339,9 @@ impl Worker {
                 }
             }
             Err(failure) => {
-                self.repository.fail_lease(lease, &failure.class, &failure.message).await?;
+                self.repository
+                    .settle_lease(job, lease, JobSettlement::fail(&failure.class, &failure.message))
+                    .await?;
                 counters.failed += 1;
                 warn!(worker_id = %self.worker_id, job_id = %job.id, error_class = %failure.class, "job failed");
             }
