@@ -3051,6 +3051,9 @@ fn map_inbox_error(error: InboxRepositoryError) -> HandlerFailure {
     let message = error.to_string();
     match error {
         InboxRepositoryError::Library(error) => map_library_error(error),
+        InboxRepositoryError::InputEnvelope(_) => {
+            HandlerFailure::permanent("invalid_ingest_state", message)
+        }
         InboxRepositoryError::ResourceMissing(_)
         | InboxRepositoryError::MissingSourceUrl(_)
         | InboxRepositoryError::InvalidFailureStatus(_)
@@ -3525,6 +3528,16 @@ mod tests {
 
         assert!(registry.contains(JobType::CleanupWorkspace));
         assert!(!registry.contains(JobType::PublishPost));
+    }
+
+    #[test]
+    fn corrupt_durable_envelope_is_settled_permanently() {
+        let failure = map_inbox_error(InboxRepositoryError::InputEnvelope(
+            sooqa_inbox::IngestDataError::UnsupportedVersion(99),
+        ));
+        assert!(!failure.retryable);
+        assert_eq!(failure.class, "invalid_ingest_state");
+        assert!(failure.message.contains("version 99"));
     }
 
     #[test]
@@ -4100,7 +4113,8 @@ mod tests {
             IngestSubmissionInput::new("https://2ch.life/b/src/clip.webm", SubmittedVia::Companion);
         input.page_url = Some("https://2ch.life/b/res/123".to_owned());
         let submission = IngestSubmission::try_new(input).expect("submission should validate");
-        let mut request = Ingest::from_submission(Uuid::new_v4(), &submission);
+        let mut request =
+            Ingest::from_submission(Uuid::new_v4(), &submission).expect("valid submission");
         let mut input_data = request.input_data().expect("envelope should decode");
         input_data.inspection = Some(sooqa_inbox::SourceInspection {
             adapter: "two_ch".to_owned(),
@@ -4133,7 +4147,8 @@ mod tests {
             SubmittedVia::Companion,
         ))
         .expect("submission should validate");
-        let request = Ingest::from_submission(Uuid::new_v4(), &submission);
+        let request =
+            Ingest::from_submission(Uuid::new_v4(), &submission).expect("valid submission");
 
         let source = source_record_for_request(&request);
         assert_eq!(
@@ -4150,7 +4165,8 @@ mod tests {
             SubmittedVia::Companion,
         ))
         .expect("submission should validate");
-        let mut request = Ingest::from_submission(Uuid::new_v4(), &submission);
+        let mut request =
+            Ingest::from_submission(Uuid::new_v4(), &submission).expect("valid submission");
         let mut input_data = request.input_data().expect("envelope should decode");
         input_data.inspection = Some(sooqa_inbox::SourceInspection {
             adapter: "yt_dlp".to_owned(),

@@ -99,7 +99,8 @@ impl InboxRepository {
         }
 
         let request_id = Uuid::now_v7();
-        let mut request = Ingest::from_submission(request_id, &submission);
+        let mut request = Ingest::from_submission(request_id, &submission)
+            .map_err(InboxRepositoryError::InputEnvelope)?;
         request
             .transition_to(IngestStatus::Queued)
             .expect("received ingest requests must be queueable");
