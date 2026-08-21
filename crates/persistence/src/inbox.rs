@@ -12,7 +12,7 @@ use sooqa_inbox::{
     IngestSubmission, RequestedAction, SourceDownload, SourceInspection, SourceMediaKind,
     SubmittedVia,
 };
-use sooqa_jobs::{JobLease, NewJob};
+use sooqa_jobs::{Job, JobCommand, JobLease, NewJob};
 use sooqa_library::{
     MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, MediaIngest,
     VideoDuplicateClassification, VideoDuplicateEvidence, VideoFingerprintInput,
@@ -22,6 +22,11 @@ use sqlx::{FromRow, PgPool};
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+use crate::{
+    jobs::{JobRepositoryError, JobSettlement},
+    settlement::{lock_expired_job, lock_running_job, queue_parameters, update_locked_job},
+};
 
 #[derive(Clone)]
 pub struct InboxRepository {
@@ -2106,6 +2111,160 @@ fn storage_message_url((chat_id, message_id): (i64, i64)) -> Option<String> {
 struct IngestIdentityRow {
     id: Uuid,
     request_hash: Vec<u8>,
+}
+
+/// Ingest-family queue settlement and stale recovery. Domain state and the
+/// queue lease are locked in one short transaction; the worker's external
+/// work remains outside this boundary.
+pub(crate) async fn settle_job(
+    pool: &PgPool,
+    lease: &JobLease,
+    expected: &JobCommand,
+    settlement: JobSettlement,
+) -> Result<Job, JobRepositoryError> {
+    let ingest_id = match expected {
+        JobCommand::InspectSource(payload) => payload.ingest_id,
+        JobCommand::DownloadSource(payload) => payload.ingest_id,
+        JobCommand::ProbeAsset(payload)
+        | JobCommand::NormalizeAsset(payload)
+        | JobCommand::ComputeFingerprint(payload)
+        | JobCommand::FinalizeIngest(payload) => payload.ingest_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let mut transaction = pool.begin().await?;
+    // Inbox methods lock the ingest aggregate before the queue lease. This is
+    // the same order used by atomic ingest transitions and avoids stale
+    // recovery deadlocks.
+    lock_ingest_for_job(&mut transaction, ingest_id).await?;
+    let job = lock_running_job(&mut transaction, lease, settlement.allows_expired_lease()).await?;
+    let current_command = crate::settlement::validate_locked_command(&job, expected)?;
+    let current_ingest_id = match current_command {
+        JobCommand::InspectSource(payload) => payload.ingest_id,
+        JobCommand::DownloadSource(payload) => payload.ingest_id,
+        JobCommand::ProbeAsset(payload)
+        | JobCommand::NormalizeAsset(payload)
+        | JobCommand::ComputeFingerprint(payload)
+        | JobCommand::FinalizeIngest(payload) => payload.ingest_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let (state, run_at, error_class, error_message, terminal, non_consuming) =
+        queue_parameters(&job, settlement);
+    if terminal {
+        sqlx::query(
+            "UPDATE ingests SET state = 'failed_terminal', error_code = 'job_lease_expired', error_message = 'job lease expired after the final attempt', completed_at = now(), updated_at = now() WHERE id = $1 AND state NOT IN ('completed', 'failed_terminal', 'cancelled')",
+        )
+        .bind(current_ingest_id)
+        .execute(&mut *transaction)
+        .await?;
+        if let Some(workspace_id) =
+            sqlx::query_scalar::<_, Uuid>("SELECT workspace_id FROM ingests WHERE id = $1")
+                .bind(current_ingest_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+        {
+            enqueue_workspace_cleanup(
+                &mut transaction,
+                current_ingest_id,
+                workspace_id,
+                OffsetDateTime::now_utc() + WORKSPACE_CLEANUP_RETENTION,
+            )
+            .await?;
+        }
+    }
+    let row = update_locked_job(
+        &mut transaction,
+        job.id,
+        state,
+        run_at,
+        &error_class,
+        &error_message,
+        terminal,
+        non_consuming,
+    )
+    .await?;
+    transaction.commit().await?;
+    row.into_job()
+}
+
+pub(crate) async fn recover_job(
+    pool: &PgPool,
+    job_id: Uuid,
+    expected: &JobCommand,
+) -> Result<bool, JobRepositoryError> {
+    let ingest_id = match expected {
+        JobCommand::InspectSource(payload) => payload.ingest_id,
+        JobCommand::DownloadSource(payload) => payload.ingest_id,
+        JobCommand::ProbeAsset(payload)
+        | JobCommand::NormalizeAsset(payload)
+        | JobCommand::ComputeFingerprint(payload)
+        | JobCommand::FinalizeIngest(payload) => payload.ingest_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let mut transaction = pool.begin().await?;
+    // Keep stale recovery in the same ingest-then-queue lock order as normal
+    // inbox settlement.
+    lock_ingest_for_job(&mut transaction, ingest_id).await?;
+    let Some(job) = lock_expired_job(&mut transaction, job_id).await? else {
+        transaction.commit().await?;
+        return Ok(false);
+    };
+    let current_command = crate::settlement::validate_locked_command(&job, expected)?;
+    let current_ingest_id = match current_command {
+        JobCommand::InspectSource(payload) => payload.ingest_id,
+        JobCommand::DownloadSource(payload) => payload.ingest_id,
+        JobCommand::ProbeAsset(payload)
+        | JobCommand::NormalizeAsset(payload)
+        | JobCommand::ComputeFingerprint(payload)
+        | JobCommand::FinalizeIngest(payload) => payload.ingest_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let terminal = job.attempt_count >= job.max_attempts;
+    if terminal {
+        sqlx::query(
+            "UPDATE ingests SET state = 'failed_terminal', error_code = 'job_lease_expired', error_message = 'job lease expired after the final attempt', completed_at = now(), updated_at = now() WHERE id = $1 AND state NOT IN ('completed', 'failed_terminal', 'cancelled')",
+        )
+        .bind(current_ingest_id)
+        .execute(&mut *transaction)
+        .await?;
+        if let Some(workspace_id) =
+            sqlx::query_scalar::<_, Uuid>("SELECT workspace_id FROM ingests WHERE id = $1")
+                .bind(current_ingest_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+        {
+            enqueue_workspace_cleanup(
+                &mut transaction,
+                current_ingest_id,
+                workspace_id,
+                OffsetDateTime::now_utc() + WORKSPACE_CLEANUP_RETENTION,
+            )
+            .await?;
+        }
+    }
+    update_locked_job(
+        &mut transaction,
+        job.id,
+        if terminal { "failed" } else { "queued" },
+        OffsetDateTime::now_utc(),
+        job.error_class.as_deref().unwrap_or("lease_expired"),
+        job.error_message.as_deref().unwrap_or("job lease expired"),
+        terminal,
+        false,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+async fn lock_ingest_for_job(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ingest_id: Uuid,
+) -> Result<(), JobRepositoryError> {
+    let _ = sqlx::query_scalar::<_, Uuid>("SELECT id FROM ingests WHERE id = $1 FOR UPDATE")
+        .bind(ingest_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    Ok(())
 }
 
 #[derive(Debug, Error)]

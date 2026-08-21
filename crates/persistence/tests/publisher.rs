@@ -1,11 +1,11 @@
 use std::time::Duration as StdDuration;
 
 use serde_json::json;
-use sooqa_jobs::JobType;
+use sooqa_jobs::{JobType, NewJob};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
-use sooqa_persistence::{Database, PublishLease, PublisherRepositoryError};
+use sooqa_persistence::{Database, JobSettlement, PublishLease, PublisherRepositoryError};
 use sooqa_publisher::{NewChannel, NewPost, PostSchedule, PostState, PostUpdate};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -600,6 +600,73 @@ async fn safe_publication_retry_requeues_post_and_updates_job_revision(pool: sql
             .await
             .unwrap();
     assert_eq!(payload["expected_revision"], retried.post.revision);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn missing_publication_post_uses_queue_only_settlement_and_recovery(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let missing_post = Uuid::new_v4();
+    let failed_job = database
+        .jobs()
+        .enqueue(
+            NewJob::publish_post(missing_post, 0)
+                .dedupe_key(format!("missing-post-fail:{}", Uuid::new_v4())),
+        )
+        .await
+        .unwrap();
+    let failed_claim = database
+        .jobs()
+        .claim_next("missing-post-worker", StdDuration::from_secs(30), &[JobType::PublishPost])
+        .await
+        .unwrap()
+        .expect("missing-post job should claim");
+    let failed = database
+        .jobs()
+        .settle_lease(
+            &failed_claim,
+            &failed_claim.lease().expect("missing-post job should carry a lease"),
+            JobSettlement::fail("publication_dependency", "post was deleted before settlement"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.id, failed_job.id);
+    assert_eq!(failed.status.as_str(), "failed");
+
+    let recovery_job = database
+        .jobs()
+        .enqueue(
+            NewJob::publish_post(missing_post, 0)
+                .dedupe_key(format!("missing-post-recovery:{}", Uuid::new_v4())),
+        )
+        .await
+        .unwrap();
+    let recovery_claim = database
+        .jobs()
+        .claim_next(
+            "missing-post-recovery-worker",
+            StdDuration::from_secs(30),
+            &[JobType::PublishPost],
+        )
+        .await
+        .unwrap()
+        .expect("missing-post recovery job should claim");
+    sqlx::query(
+        "UPDATE queue.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(recovery_job.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    database.jobs().recover_stale_leases().await.unwrap();
+    let (state, error_class): (String, Option<String>) =
+        sqlx::query_as("SELECT state, error_class FROM queue.jobs WHERE id = $1")
+            .bind(recovery_claim.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, "queued");
+    assert_eq!(error_class.as_deref(), Some("lease_expired"));
 }
 
 #[sqlx::test(migrations = "../../migrations")]

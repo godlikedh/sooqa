@@ -93,6 +93,14 @@ schema; current five-table data is retained by forward-only migrations.
   concern. The Telegram adapter remains focused on capture, duplicate
   decisions, and sending; bounded web-admin slices own publication editing.
 - `sooqa-persistence` owns migrations and short database transactions.
+- Queue claiming, leases, heartbeats, and low-level queue transitions are
+  generic persistence concerns. After a typed `JobCommand` is decoded once,
+  ingest settlement/recovery stays with Inbox, storage and caption settlement
+  stays with Library, publication/materialization stays with Publisher, and
+  workspace cleanup stays with Cleanup. A family transaction locks its domain
+  row and queue lease together; no transaction spans network, filesystem, or
+  subprocess work. Ambiguous Telegram storage/publication effects remain
+  explicit unknown states and are never resent by generic queue recovery.
 - `sooqa-api` owns HTTP routing, one configured bearer secret, limits, and
   stable request-ID errors.
 

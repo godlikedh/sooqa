@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use sha2::{Digest, Sha256};
-use sooqa_jobs::JobLease;
+use sooqa_jobs::{Job, JobCommand, JobLease};
 use sooqa_publisher::{
     Channel, ChannelUpdate, ChannelValidationError, MAX_REPEAT_EVIDENCE_BYTES,
     MAX_REPEAT_EVIDENCE_CONFLICTS, NewChannel, NewPost, Post, PostCursor, PostExactSchedule,
@@ -13,6 +13,12 @@ use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use thiserror::Error;
 use time::{OffsetDateTime, Time};
 use uuid::Uuid;
+
+use crate::{
+    jobs::{JobRepositoryError, JobSettlement},
+    settlement,
+    settlement::{lock_expired_job, lock_running_job, queue_parameters, update_locked_job},
+};
 
 #[derive(Clone)]
 pub struct PublisherRepository {
@@ -1872,6 +1878,221 @@ fn validate_post_update(update: &PostUpdate) -> Result<(), PublisherRepositoryEr
         return Err(PublisherRepositoryError::Validation(
             PublisherValidationError::InvalidParseMode,
         ));
+    }
+    Ok(())
+}
+
+/// Publication-family settlement and stale recovery. The post/channel rows
+/// and the queue lease are fenced in one transaction; no Telegram call is
+/// made from these persistence functions.
+pub(crate) async fn settle_publish_job(
+    pool: &PgPool,
+    lease: &JobLease,
+    expected: &JobCommand,
+    settlement: JobSettlement,
+) -> Result<Job, JobRepositoryError> {
+    let post_id = match expected {
+        JobCommand::PublishPost(payload) => payload.post_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let mut transaction = pool.begin().await?;
+    let post = lock_publication_post(&mut transaction, post_id).await?;
+    let job = lock_running_job(&mut transaction, lease, settlement.allows_expired_lease()).await?;
+    let (current_post_id, expected_revision) =
+        match crate::settlement::validate_locked_command(&job, expected)? {
+            JobCommand::PublishPost(payload) => (payload.post_id, payload.expected_revision),
+            _ => return Err(JobRepositoryError::LeaseLost),
+        };
+    let (state, run_at, error_class, error_message, terminal, non_consuming) =
+        queue_parameters(&job, settlement);
+    if terminal && let Some(post) = post.as_ref() {
+        settle_terminal_publication_post(
+            &mut transaction,
+            current_post_id,
+            post,
+            expected_revision,
+            &error_class,
+            &error_message,
+        )
+        .await?;
+    }
+    let row = update_locked_job(
+        &mut transaction,
+        job.id,
+        state,
+        run_at,
+        &error_class,
+        &error_message,
+        terminal,
+        non_consuming,
+    )
+    .await?;
+    transaction.commit().await?;
+    row.into_job()
+}
+
+pub(crate) async fn recover_publish_job(
+    pool: &PgPool,
+    job_id: Uuid,
+    expected: &JobCommand,
+) -> Result<bool, JobRepositoryError> {
+    let post_id = match expected {
+        JobCommand::PublishPost(payload) => payload.post_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let mut transaction = pool.begin().await?;
+    let post = lock_publication_post(&mut transaction, post_id).await?;
+    let Some(job) = lock_expired_job(&mut transaction, job_id).await? else {
+        transaction.commit().await?;
+        return Ok(false);
+    };
+    let (current_post_id, expected_revision) =
+        match crate::settlement::validate_locked_command(&job, expected)? {
+            JobCommand::PublishPost(payload) => (payload.post_id, payload.expected_revision),
+            _ => return Err(JobRepositoryError::LeaseLost),
+        };
+    let terminal = job.attempt_count >= job.max_attempts;
+    if terminal && let Some(post) = post.as_ref() {
+        let (class, message) = if post.state == "sending" {
+            ("publication_interrupted", "publication job lease expired after the final attempt")
+        } else {
+            (
+                job.error_class.as_deref().unwrap_or("lease_expired"),
+                job.error_message.as_deref().unwrap_or("job lease expired"),
+            )
+        };
+        settle_terminal_publication_post(
+            &mut transaction,
+            current_post_id,
+            post,
+            expected_revision,
+            class,
+            message,
+        )
+        .await?;
+    }
+    update_locked_job(
+        &mut transaction,
+        job.id,
+        if terminal { "failed" } else { "queued" },
+        OffsetDateTime::now_utc(),
+        job.error_class.as_deref().unwrap_or("lease_expired"),
+        job.error_message.as_deref().unwrap_or("job lease expired"),
+        terminal,
+        false,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+pub(crate) async fn settle_materialize_job(
+    pool: &PgPool,
+    lease: &JobLease,
+    expected: &JobCommand,
+    settlement: JobSettlement,
+) -> Result<Job, JobRepositoryError> {
+    let ingest_id = match expected {
+        JobCommand::MaterializePublication(payload) => payload.ingest_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let mut transaction = pool.begin().await?;
+    lock_materialization_ingest(&mut transaction, ingest_id).await?;
+    let row =
+        settlement::settle_queue_in_transaction(&mut transaction, lease, expected, settlement)
+            .await?;
+    transaction.commit().await?;
+    row.into_job()
+}
+
+pub(crate) async fn recover_materialize_job(
+    pool: &PgPool,
+    job_id: Uuid,
+    expected: &JobCommand,
+) -> Result<bool, JobRepositoryError> {
+    let ingest_id = match expected {
+        JobCommand::MaterializePublication(payload) => payload.ingest_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let mut transaction = pool.begin().await?;
+    lock_materialization_ingest(&mut transaction, ingest_id).await?;
+    let recovered =
+        settlement::recover_queue_only_in_transaction(&mut transaction, job_id, expected).await?;
+    transaction.commit().await?;
+    Ok(recovered.is_some())
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct PublicationJobPostRow {
+    state: String,
+    revision: i64,
+}
+
+async fn lock_publication_post(
+    transaction: &mut Transaction<'_, Postgres>,
+    post_id: Uuid,
+) -> Result<Option<PublicationJobPostRow>, sqlx::Error> {
+    let channel_id = sqlx::query_scalar::<_, Uuid>("SELECT channel_id FROM posts WHERE id = $1")
+        .bind(post_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    let Some(channel_id) = channel_id else {
+        return Ok(None);
+    };
+    sqlx::query("SELECT id FROM channels WHERE id = $1 FOR UPDATE")
+        .bind(channel_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    sqlx::query_as::<_, PublicationJobPostRow>(
+        "SELECT state, revision FROM posts WHERE id = $1 FOR UPDATE",
+    )
+    .bind(post_id)
+    .fetch_optional(&mut **transaction)
+    .await
+}
+
+async fn lock_materialization_ingest(
+    transaction: &mut Transaction<'_, Postgres>,
+    ingest_id: Uuid,
+) -> Result<(), JobRepositoryError> {
+    let _ = sqlx::query_scalar::<_, Uuid>("SELECT id FROM ingests WHERE id = $1 FOR UPDATE")
+        .bind(ingest_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+async fn settle_terminal_publication_post(
+    transaction: &mut Transaction<'_, Postgres>,
+    post_id: Uuid,
+    post: &PublicationJobPostRow,
+    expected_revision: i64,
+    error_class: &str,
+    error_message: &str,
+) -> Result<(), sqlx::Error> {
+    match post.state.as_str() {
+        "queued" if expected_revision == post.revision => {
+            sqlx::query(
+                "UPDATE posts SET state = 'failed', send_token = NULL, send_started_at = NULL, error_class = $2, error_message = $3, revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'queued' AND revision = $4",
+            )
+            .bind(post_id)
+            .bind(error_class)
+            .bind(error_message)
+            .bind(post.revision)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        "sending" => {
+            sqlx::query(
+                "UPDATE posts SET state = 'unknown', send_token = NULL, send_started_at = NULL, error_class = $2, error_message = $3, revision = revision + 1, updated_at = now() WHERE id = $1 AND state = 'sending'",
+            )
+            .bind(post_id)
+            .bind(error_class)
+            .bind(error_message)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        _ => {}
     }
     Ok(())
 }

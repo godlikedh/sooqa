@@ -5,6 +5,7 @@ mod inbox;
 mod jobs;
 mod library;
 mod publisher;
+mod settlement;
 
 pub use cleanup::WORKSPACE_CLEANUP_RETENTION;
 pub use inbox::{
@@ -13,7 +14,7 @@ pub use inbox::{
     InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart,
     IngestVideoIdentityStart, SourceDownloadStart, SourceInspectionStart, WorkspaceCleanupStart,
 };
-pub use jobs::{JobRepository, JobRepositoryError};
+pub use jobs::{JobRepository, JobRepositoryError, JobSettlement};
 pub use library::{
     LibraryRepository, LibraryRepositoryError, VideoFingerprintCandidate, VideoIdentityPreparation,
     VideoIdentitySession,

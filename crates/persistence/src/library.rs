@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sooqa_jobs::NewJob;
+use sooqa_jobs::{Job, JobCommand, JobLease, NewJob};
 use sooqa_library::{
     CaptionSyncClaim, CaptionSyncCompletion, CaptionSyncFailure, CaptionSyncState,
     MAX_MEDIA_PREVIEW_BYTES, MAX_MEDIA_PREVIEW_HEIGHT, MAX_MEDIA_PREVIEW_WIDTH,
@@ -21,6 +21,11 @@ use sqlx::{Connection, FromRow, PgPool, Postgres, Transaction, pool::PoolConnect
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+use crate::{
+    jobs::{JobRepositoryError, JobSettlement},
+    settlement::{lock_expired_job, lock_running_job, queue_parameters, update_locked_job},
+};
 
 pub use sooqa_library::VideoFingerprintCandidate;
 
@@ -2049,6 +2054,335 @@ fn to_u64(value: Option<i64>, field: &'static str) -> Result<Option<u64>, Librar
             u64::try_from(value).map_err(|_| LibraryRepositoryError::InvalidNumber { field })
         })
         .transpose()
+}
+
+/// Storage-caption and storage-upload settlement/recovery policy. These
+/// transitions deliberately stay with the media aggregate, while the shared
+/// queue helpers only perform lease fencing and low-level queue updates.
+pub(crate) async fn settle_caption_job(
+    pool: &PgPool,
+    lease: &JobLease,
+    expected: &JobCommand,
+    settlement: JobSettlement,
+) -> Result<Job, JobRepositoryError> {
+    let media_id = match expected {
+        JobCommand::SyncStorageCaption(payload) => payload.media_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let mut transaction = pool.begin().await?;
+    // Media is the aggregate owner for caption state. Lock it before the
+    // queue row, matching all other library transitions and stale recovery.
+    lock_media_for_job(&mut transaction, media_id).await?;
+    let job = lock_running_job(&mut transaction, lease, settlement.allows_expired_lease()).await?;
+    let current_command = crate::settlement::validate_locked_command(&job, expected)?;
+    let generation = match current_command {
+        JobCommand::SyncStorageCaption(payload) => payload.generation,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let (state, run_at, error_class, error_message, terminal, non_consuming) =
+        queue_parameters(&job, settlement);
+    let caption_state = if terminal { "failed" } else { "pending" };
+    let caption_error = terminal.then(|| error_message.chars().take(512).collect::<String>());
+    sqlx::query(
+        "UPDATE media SET caption_sync_state = $2, caption_sync_error = $3, caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $4 AND caption_sync_state = 'syncing'",
+    )
+    .bind(media_id)
+    .bind(caption_state)
+    .bind(caption_error.as_deref())
+    .bind(generation)
+    .execute(&mut *transaction)
+    .await?;
+    let row = update_locked_job(
+        &mut transaction,
+        job.id,
+        state,
+        run_at,
+        &error_class,
+        &error_message,
+        terminal,
+        non_consuming,
+    )
+    .await?;
+    transaction.commit().await?;
+    row.into_job()
+}
+
+pub(crate) async fn settle_storage_job(
+    pool: &PgPool,
+    lease: &JobLease,
+    expected: &JobCommand,
+    settlement: JobSettlement,
+) -> Result<Job, JobRepositoryError> {
+    let media_id = match expected {
+        JobCommand::UploadStorageAsset(payload) => payload.media_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    // Upload handlers already persist the media result. On a terminal queue
+    // settlement, preserve the conservative unknown state if a reservation is
+    // still active; a Telegram effect is never resent implicitly.
+    let mut transaction = pool.begin().await?;
+    lock_media_for_job(&mut transaction, media_id).await?;
+    let job = lock_running_job(&mut transaction, lease, settlement.allows_expired_lease()).await?;
+    let current_media_id = match crate::settlement::validate_locked_command(&job, expected)? {
+        JobCommand::UploadStorageAsset(payload) => payload.media_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let (state, run_at, error_class, error_message, terminal, non_consuming) =
+        queue_parameters(&job, settlement);
+    if terminal {
+        reconcile_storage_terminal(
+            &mut transaction,
+            current_media_id,
+            &error_class,
+            &error_message,
+        )
+        .await?;
+    }
+    let row = update_locked_job(
+        &mut transaction,
+        job.id,
+        state,
+        run_at,
+        &error_class,
+        &error_message,
+        terminal,
+        non_consuming,
+    )
+    .await?;
+    transaction.commit().await?;
+    row.into_job()
+}
+
+async fn reconcile_storage_terminal(
+    transaction: &mut Transaction<'_, Postgres>,
+    media_id: Uuid,
+    error_class: &str,
+    error_message: &str,
+) -> Result<(), sqlx::Error> {
+    let state =
+        sqlx::query_scalar::<_, String>("SELECT storage_state FROM media WHERE id = $1 FOR UPDATE")
+            .bind(media_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+    match state.as_deref() {
+        Some("ready") => {
+            sqlx::query(
+                "UPDATE ingests SET state = 'completed', error_code = NULL, error_message = NULL, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
+            )
+            .bind(media_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        Some("pending_storage") => {
+            sqlx::query(
+                "UPDATE media SET storage_state = 'storage_unknown', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1 AND storage_state <> 'ready'",
+            )
+            .bind(media_id)
+            .execute(&mut **transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE ingests SET state = 'failed_terminal', error_code = 'storage_unknown', error_message = $2, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state NOT IN ('failed_terminal') OR error_code IN ('storage_upload', 'storage_unknown'))",
+            )
+            .bind(media_id)
+            .bind(error_message)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        Some("storage_unknown") => {
+            sqlx::query(
+                "UPDATE ingests SET state = 'failed_terminal', error_code = 'storage_unknown', error_message = $2, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND state NOT IN ('failed_terminal')",
+            )
+            .bind(media_id)
+            .bind(error_message)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        // `missing` is the explicit, known-no-effect terminal result from the
+        // storage handler. Preserve its storage_upload diagnostic; only an
+        // unresolved reservation is promoted to storage_unknown here.
+        Some("missing") => {}
+        _ => {
+            let _ = (error_class, error_message);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn recover_caption_job(
+    pool: &PgPool,
+    job_id: Uuid,
+    expected: &JobCommand,
+) -> Result<bool, JobRepositoryError> {
+    let media_id = match expected {
+        JobCommand::SyncStorageCaption(payload) => payload.media_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let mut transaction = pool.begin().await?;
+    lock_media_for_job(&mut transaction, media_id).await?;
+    let Some(job) = lock_expired_job(&mut transaction, job_id).await? else {
+        transaction.commit().await?;
+        return Ok(false);
+    };
+    let generation = match crate::settlement::validate_locked_command(&job, expected)? {
+        JobCommand::SyncStorageCaption(payload) => payload.generation,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let terminal = job.attempt_count >= job.max_attempts;
+    sqlx::query(
+        "UPDATE media SET caption_sync_state = CASE WHEN $3 THEN 'failed' ELSE 'pending' END, caption_sync_error = CASE WHEN $3 THEN 'caption sync job lease expired after the final attempt' ELSE NULL END, caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $2 AND caption_sync_state = 'syncing'",
+    )
+    .bind(media_id)
+    .bind(generation)
+    .bind(terminal)
+    .execute(&mut *transaction)
+    .await?;
+    update_locked_job(
+        &mut transaction,
+        job.id,
+        if terminal { "failed" } else { "queued" },
+        OffsetDateTime::now_utc(),
+        job.error_class.as_deref().unwrap_or("lease_expired"),
+        job.error_message.as_deref().unwrap_or("job lease expired"),
+        terminal,
+        false,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(true)
+}
+
+pub(crate) async fn recover_storage_job(
+    pool: &PgPool,
+    job_id: Uuid,
+    expected: &JobCommand,
+) -> Result<bool, JobRepositoryError> {
+    let media_id = match expected {
+        JobCommand::UploadStorageAsset(payload) => payload.media_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let mut transaction = pool.begin().await?;
+    lock_media_for_job(&mut transaction, media_id).await?;
+    let Some(job) = lock_expired_job(&mut transaction, job_id).await? else {
+        transaction.commit().await?;
+        return Ok(false);
+    };
+    let media_id = match crate::settlement::validate_locked_command(&job, expected)? {
+        JobCommand::UploadStorageAsset(payload) => payload.media_id,
+        _ => return Err(JobRepositoryError::LeaseLost),
+    };
+    let state = sqlx::query_as::<_, StorageRecoveryRow>(
+        "SELECT storage_state, storage_token, storage_started_at FROM media WHERE id = $1 FOR UPDATE",
+    )
+    .bind(media_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if let Some(state) = state {
+        if state.storage_state == "pending_storage"
+            && state.storage_token.is_some()
+            && state.storage_started_at.is_some_and(|started| {
+                started > OffsetDateTime::now_utc() - time::Duration::minutes(1)
+            })
+        {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let terminal = job.attempt_count >= job.max_attempts
+            || state.storage_state != "pending_storage"
+            || state.storage_token.is_some();
+        let (queue_state, error_class, error_message, consume) = match state.storage_state.as_str()
+        {
+            "ready" => ("succeeded", "", "", false),
+            "pending_storage" if state.storage_token.is_none() => (
+                "queued",
+                "storage_upload_cancelled",
+                "storage upload was safely cancelled before Telegram dispatch",
+                true,
+            ),
+            _ => (
+                "failed",
+                "storage_unknown",
+                "storage job lease expired; external storage result requires reconciliation",
+                false,
+            ),
+        };
+        if queue_state == "failed" {
+            sqlx::query(
+                "UPDATE media SET storage_state = 'storage_unknown', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1 AND storage_state <> 'ready'",
+            )
+            .bind(media_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE ingests SET state = 'failed_terminal', error_code = 'storage_unknown', error_message = $2, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state NOT IN ('failed_terminal') OR error_code IN ('storage_upload', 'storage_unknown'))",
+            )
+            .bind(media_id)
+            .bind(error_message)
+            .execute(&mut *transaction)
+            .await?;
+        } else if queue_state == "succeeded" {
+            sqlx::query(
+                "UPDATE ingests SET state = 'completed', error_code = NULL, error_message = NULL, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
+            )
+            .bind(media_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        let terminal = if queue_state == "queued" { false } else { terminal };
+        update_locked_job(
+            &mut transaction,
+            job.id,
+            queue_state,
+            if queue_state == "succeeded" { job.run_at } else { OffsetDateTime::now_utc() },
+            error_class,
+            error_message,
+            terminal || queue_state == "succeeded",
+            queue_state == "queued" && consume,
+        )
+        .await?;
+        if queue_state == "succeeded" {
+            sqlx::query(
+                "UPDATE queue.jobs SET error_class = NULL, error_message = NULL WHERE id = $1",
+            )
+            .bind(job.id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+    } else {
+        update_locked_job(
+            &mut transaction,
+            job.id,
+            "failed",
+            job.run_at,
+            "storage_unknown",
+            "storage media row is missing; external storage result requires reconciliation",
+            true,
+            false,
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(true)
+}
+
+async fn lock_media_for_job(
+    transaction: &mut Transaction<'_, Postgres>,
+    media_id: Uuid,
+) -> Result<(), JobRepositoryError> {
+    // A missing media row is handled by the caller's queue-only recovery
+    // policy, but the lookup still occurs before the queue lock whenever the
+    // aggregate exists.
+    let _ = sqlx::query_scalar::<_, Uuid>("SELECT id FROM media WHERE id = $1 FOR UPDATE")
+        .bind(media_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, FromRow)]
+struct StorageRecoveryRow {
+    storage_state: String,
+    storage_token: Option<Uuid>,
+    storage_started_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Error)]
