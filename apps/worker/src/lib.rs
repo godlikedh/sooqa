@@ -3038,66 +3038,70 @@ impl Worker {
         let mut counters = WorkerLogCounters::default();
         info!(worker_id = %self.worker_id, "worker loop started");
 
-        loop {
-            counters.polls += 1;
-            debug!(worker_id = %self.worker_id, "polling for a job");
-            let claimed = tokio::select! {
-                _ = &mut shutdown => break,
-                result = self.repository.claim_next(
-                    &self.worker_id,
-                    self.lease_duration,
-                    capabilities,
-                ) => result?,
-            };
-
-            let Some(job) = claimed else {
-                tokio::select! {
+        let result: Result<(), WorkerError> = async {
+            loop {
+                counters.polls += 1;
+                debug!(worker_id = %self.worker_id, "polling for a job");
+                let claimed = tokio::select! {
                     _ = &mut shutdown => break,
-                    _ = sleep(self.poll_interval) => continue,
-                }
-            };
+                    result = self.repository.claim_next(
+                        &self.worker_id,
+                        self.lease_duration,
+                        capabilities,
+                    ) => result?,
+                };
 
-            counters.claimed += 1;
-            info!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type(), "job claimed");
-            let lease = job.lease().ok_or(JobRepositoryError::LeaseLost)?;
+                let Some(job) = claimed else {
+                    tokio::select! {
+                        _ = &mut shutdown => break,
+                        _ = sleep(self.poll_interval) => continue,
+                    }
+                };
 
-            let Some(handler) = self.registry.handler(job.job_type()) else {
-                self.repository
-                    .fail_lease(
-                        &lease,
-                        "handler_not_registered",
-                        "no handler is registered for this job type",
-                    )
-                    .await?;
-                counters.failed += 1;
-                warn!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type(), "job failed because no handler is registered");
-                continue;
-            };
+                counters.claimed += 1;
+                info!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type(), "job claimed");
+                let lease = job.lease().ok_or(JobRepositoryError::LeaseLost)?;
 
-            let outcome = self.execute_handler(&job, &lease, handler, &mut shutdown).await?;
-            let stop_after_shutdown = match outcome {
-                HandlerRunOutcome::Completed(result) => {
-                    self.finish_job(&job, &lease, result, &mut counters).await?;
-                    false
-                }
-                HandlerRunOutcome::Shutdown => {
+                let Some(handler) = self.registry.handler(job.job_type()) else {
                     self.repository
-                        .retry_lease(
+                        .fail_lease(
                             &lease,
-                            OffsetDateTime::now_utc(),
-                            "worker_shutdown",
-                            "worker stopped while the job was active",
+                            "handler_not_registered",
+                            "no handler is registered for this job type",
                         )
                         .await?;
-                    counters.shutdown_requeued += 1;
-                    true
-                }
-            };
+                    counters.failed += 1;
+                    warn!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type(), "job failed because no handler is registered");
+                    continue;
+                };
 
-            if stop_after_shutdown {
-                break;
+                let outcome = self.execute_handler(&job, &lease, handler, &mut shutdown).await?;
+                let stop_after_shutdown = match outcome {
+                    HandlerRunOutcome::Completed(result) => {
+                        self.finish_job(&job, &lease, result, &mut counters).await?;
+                        false
+                    }
+                    HandlerRunOutcome::Shutdown => {
+                        self.repository
+                            .retry_lease(
+                                &lease,
+                                OffsetDateTime::now_utc(),
+                                "worker_shutdown",
+                                "worker stopped while the job was active",
+                            )
+                            .await?;
+                        counters.shutdown_requeued += 1;
+                        true
+                    }
+                };
+
+                if stop_after_shutdown {
+                    break;
+                }
             }
+            Ok(())
         }
+        .await;
 
         info!(
             worker_id = %self.worker_id,
@@ -3109,7 +3113,7 @@ impl Worker {
             shutdown_requeued = counters.shutdown_requeued,
             "worker loop stopped"
         );
-        Ok(())
+        result
     }
 
     async fn execute_handler<F>(
