@@ -660,7 +660,8 @@ impl PublisherRepository {
                 update_publish_job(&mut transaction, id, row.scheduled_at, row.revision).await?
             }
             PostState::Failed => {
-                update_failed_publish_job(&mut transaction, id, row.revision).await?
+                update_failed_publish_job(&mut transaction, id, row.scheduled_at, row.revision)
+                    .await?
             }
             _ => unreachable!("queue mutable states are limited to draft, queued, and failed"),
         }
@@ -1158,6 +1159,69 @@ impl PublisherRepository {
     }
 }
 
+/// Retention fences for publication-owned jobs.  Materialization is
+/// database-only and is replay-safe once its origin post exists.  A publish
+/// job is retained while a send is queued/running or unknown; known failed,
+/// cancelled, and published post states cannot trigger another Telegram send
+/// through the fenced claim path.  Failed rows are safe to prune because the
+/// update/schedule/cancel helpers recreate the fixed-dedupe job when needed.
+pub(crate) async fn terminal_job_retention_eligible(
+    transaction: &mut Transaction<'_, Postgres>,
+    job: &Job,
+) -> Result<bool, sqlx::Error> {
+    match &job.command {
+        JobCommand::MaterializePublication(payload) => {
+            let Some((state, requested_action)) = sqlx::query_as::<_, (String, String)>(
+                "SELECT state, requested_action FROM ingests WHERE id = $1 FOR UPDATE",
+            )
+            .bind(payload.ingest_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            else {
+                return Ok(false);
+            };
+            if requested_action == "save" {
+                return Ok(true);
+            }
+            if state != "completed" {
+                return Ok(false);
+            }
+            Ok(sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM posts WHERE origin_ingest_id = $1 FOR UPDATE",
+            )
+            .bind(payload.ingest_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .is_some())
+        }
+        JobCommand::PublishPost(payload) => {
+            let Some(channel_id) =
+                sqlx::query_scalar::<_, Uuid>("SELECT channel_id FROM posts WHERE id = $1")
+                    .bind(payload.post_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+            else {
+                return Ok(false);
+            };
+            // Publication mutation paths use channel -> post lock order.
+            let _ = sqlx::query("SELECT id FROM channels WHERE id = $1 FOR UPDATE")
+                .bind(channel_id)
+                .fetch_optional(&mut **transaction)
+                .await?;
+            let Some(state) =
+                sqlx::query_scalar::<_, String>("SELECT state FROM posts WHERE id = $1 FOR UPDATE")
+                    .bind(payload.post_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+            else {
+                return Ok(false);
+            };
+            Ok(matches!(state.as_str(), "published" | "failed" | "cancelled"))
+        }
+        _ => Ok(false),
+    }
+}
+
 async fn post_channel_id(
     transaction: &mut Transaction<'_, Postgres>,
     id: Uuid,
@@ -1497,12 +1561,23 @@ async fn insert_publish_job(
         }
         return update_publish_job(transaction, post_id, run_at, expected_revision).await;
     }
+    insert_publish_job_row(transaction, post_id, run_at, expected_revision, "queued").await
+}
+
+async fn insert_publish_job_row(
+    transaction: &mut Transaction<'_, Postgres>,
+    post_id: Uuid,
+    run_at: OffsetDateTime,
+    expected_revision: i64,
+    state: &str,
+) -> Result<(), PublisherRepositoryError> {
     let inserted = sqlx::query(
-        "INSERT INTO queue.jobs (kind, payload, state, run_at, dedupe_key) VALUES ('publish_post', $1, 'queued', $2, $3) ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING",
+        "INSERT INTO queue.jobs (kind, payload, state, run_at, dedupe_key, completed_at) VALUES ('publish_post', $1, $4, $2, $3, CASE WHEN $4 = 'failed' THEN now() ELSE NULL END) ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING",
     )
     .bind(serde_json::json!({ "post_id": post_id, "expected_revision": expected_revision }))
     .bind(run_at)
     .bind(format!("post:{post_id}:publish:v1"))
+    .bind(state)
     .execute(&mut **transaction)
     .await?;
     if inserted.rows_affected() != 1 {
@@ -1519,7 +1594,8 @@ async fn update_publish_job(
 ) -> Result<(), PublisherRepositoryError> {
     let row = lock_publish_job(transaction, post_id).await?;
     let Some(row) = row else {
-        return Err(PublisherRepositoryError::PublishJobMissing(post_id));
+        return insert_publish_job_row(transaction, post_id, run_at, expected_revision, "queued")
+            .await;
     };
     if row.state == "running" {
         return Err(PublisherRepositoryError::PublishJobRunning(post_id));
@@ -1544,11 +1620,13 @@ async fn update_publish_job(
 async fn update_failed_publish_job(
     transaction: &mut Transaction<'_, Postgres>,
     post_id: Uuid,
+    run_at: OffsetDateTime,
     expected_revision: i64,
 ) -> Result<(), PublisherRepositoryError> {
     let row = lock_publish_job(transaction, post_id).await?;
     let Some(row) = row else {
-        return Err(PublisherRepositoryError::PublishJobMissing(post_id));
+        return insert_publish_job_row(transaction, post_id, run_at, expected_revision, "failed")
+            .await;
     };
     if row.state != "failed" {
         return Err(PublisherRepositoryError::PublishJobUnavailable { post_id, state: row.state });
@@ -1570,9 +1648,11 @@ async fn cancel_publish_job(
     transaction: &mut Transaction<'_, Postgres>,
     post_id: Uuid,
 ) -> Result<(), PublisherRepositoryError> {
-    let row = lock_publish_job(transaction, post_id)
-        .await?
-        .ok_or(PublisherRepositoryError::PublishJobMissing(post_id))?;
+    let Some(row) = lock_publish_job(transaction, post_id).await? else {
+        // A known failed job may have been pruned.  Cancelling the post is
+        // still safe because there is no queued/running external effect left.
+        return Ok(());
+    };
     if row.state == "running" {
         return Err(PublisherRepositoryError::PublishJobRunning(post_id));
     }

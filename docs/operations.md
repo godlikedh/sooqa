@@ -45,6 +45,35 @@ If the final lease expires, recovery marks the owning ingest terminal instead
 of leaving it in an intermediate state. Inspect the row and its lease token
 when diagnosing a crash.
 
+Terminal technical-job retention runs in the same five-minute maintenance loop
+as workspace reconciliation. It is enabled by default with deliberately long
+horizons: succeeded jobs after 30 days, cancelled jobs after 90 days, and
+failed jobs after 365 days. Each pass deletes at most `batch_size` rows and
+inspects at most `scan_size` candidates; the process-local cursor continues
+bounded scans across passes so old unresolved rows cannot permanently starve
+eligible rows behind them. Set `[worker.job_retention].enabled = false` (or
+`SOOQA_WORKER_JOB_RETENTION_ENABLED=false`) to retain queue history. Horizons
+are capped at ten years, `batch_size` at 10,000, and `scan_size` must be at
+least the batch size and no greater than 100,000.
+
+Eligibility is state- and generation-fenced by the owning aggregate. Ingest
+stage jobs require a terminal ingest with no live successor; materialization
+requires its origin post (or a save-only intent) to exist; storage jobs keep
+`pending_storage`, `storage_unknown`, and active caption generations; and
+publication jobs keep queued/sending/unknown outcomes. Current-generation
+cleanup is pruned only after a successful filesystem hand-off; an old
+force-save generation is separately fenced by its workspace ID. A pruned
+failed publication job is recreated by the revision-fenced schedule/update/
+cancel paths if the post becomes mutable again, so pruning never removes the
+ability to retry a known no-effect publication. Every pass emits candidate,
+eligible, and pruned counts in structured worker logs.
+
+The queue keeps partial indexes for queued claims, expired running leases, and
+terminal retention scans. Multiple workers use short transactions and
+`SKIP LOCKED`; retention never contacts Telegram, the filesystem, or a
+subprocess. `storage_unknown`, publication `unknown`, queued/running jobs, and
+ambiguous filesystem hand-offs remain durable for explicit reconciliation.
+
 The HTTP server owns the server process lifetime. Telegram polling runs as a
 supervised task with bounded exponential backoff, so a Telegram outage or a
 temporary failure during webhook cleanup does not remove `/health/live` or the

@@ -1536,6 +1536,46 @@ async fn settle_queued_storage_upload_jobs(
     Ok(())
 }
 
+/// Retention fence for media-owned technical jobs.  A storage upload is only
+/// replay-safe once the media row says the effect is definitively present or
+/// definitively absent.  `storage_unknown` and a pending generation are kept
+/// for explicit reconciliation.  Caption jobs are replay-safe only when the
+/// current generation is no longer actionable (`synced`, `not_required`, or
+/// an explicit `failed` state); `syncing` remains an unresolved external
+/// effect.
+pub(crate) async fn terminal_job_retention_eligible(
+    transaction: &mut Transaction<'_, Postgres>,
+    job: &Job,
+) -> Result<bool, sqlx::Error> {
+    match &job.command {
+        JobCommand::UploadStorageAsset(payload) => {
+            let Some(state) = sqlx::query_scalar::<_, String>(
+                "SELECT storage_state FROM media WHERE id = $1 FOR UPDATE",
+            )
+            .bind(payload.media_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            else {
+                return Ok(false);
+            };
+            Ok(matches!(state.as_str(), "ready" | "missing"))
+        }
+        JobCommand::SyncStorageCaption(payload) => {
+            let Some(state) = sqlx::query_scalar::<_, String>(
+                "SELECT caption_sync_state FROM media WHERE id = $1 FOR UPDATE",
+            )
+            .bind(payload.media_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            else {
+                return Ok(false);
+            };
+            Ok(matches!(state.as_str(), "not_required" | "synced" | "failed"))
+        }
+        _ => Ok(false),
+    }
+}
+
 async fn reopen_linked_ingests_for_storage(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     media_id: Uuid,

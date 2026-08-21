@@ -11,7 +11,10 @@ use sooqa_media::{
     YtDlpConfig, YtDlpDownloader, diagnose_binaries, is_supported_deno_version,
     ytdlp_allowed_hosts_include_youtube,
 };
-use sooqa_persistence::{Database, JobRepository, WORKSPACE_CLEANUP_RETENTION};
+use sooqa_persistence::{
+    Database, JobRepository, JobRetentionCursor, JobRetentionPolicy, WORKSPACE_CLEANUP_RETENTION,
+};
+use time::Duration as TimeDuration;
 use uuid::Uuid;
 
 use sooqa_telegram::{StorageUploadProvider, TeloxideApi};
@@ -294,6 +297,28 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if removed_workspaces > 0 {
         tracing::info!(removed_workspaces, "removed stale media workspaces");
     }
+    let retention_policy = if config.worker.job_retention.enabled {
+        Some(JobRetentionPolicy::new(
+            TimeDuration::seconds(i64::try_from(config.worker.job_retention.succeeded_seconds)?),
+            TimeDuration::seconds(i64::try_from(config.worker.job_retention.cancelled_seconds)?),
+            TimeDuration::seconds(i64::try_from(config.worker.job_retention.failed_seconds)?),
+            config.worker.job_retention.batch_size,
+            config.worker.job_retention.scan_size,
+        ))
+    } else {
+        None
+    };
+    let mut retention_cursor = None;
+    if let Some(policy) = retention_policy {
+        let run = database.jobs().prune_terminal_jobs(policy).await?;
+        retention_cursor = run.next_cursor;
+        tracing::info!(
+            candidates = run.stats.candidates,
+            eligible = run.stats.eligible,
+            pruned = run.stats.pruned,
+            "terminal job retention maintenance completed"
+        );
+    }
     tracing::info!(
         capabilities = ?capabilities.iter().map(|job_type| job_type.as_str()).collect::<Vec<_>>(),
         "worker handler capabilities enabled"
@@ -311,11 +336,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let (stop_reconciliation, reconciliation_signal) = tokio::sync::watch::channel(false);
     let reconciliation_repository = database.jobs();
     let reconciliation_work_root = config.media.work_root.clone();
+    let reconciliation_retention_policy = retention_policy;
     let reconciliation_task = tokio::spawn(async move {
         reconcile_workspaces_periodically(
             reconciliation_repository,
             reconciliation_work_root,
             WORKSPACE_CLEANUP_RETENTION,
+            reconciliation_retention_policy,
+            retention_cursor,
             reconciliation_signal,
         )
         .await;
@@ -355,6 +383,8 @@ async fn reconcile_workspaces_periodically(
     jobs: JobRepository,
     work_root: PathBuf,
     max_age: time::Duration,
+    retention_policy: Option<JobRetentionPolicy>,
+    mut retention_cursor: Option<JobRetentionCursor>,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let interval = Duration::from_secs(5 * 60);
@@ -372,6 +402,20 @@ async fn reconcile_workspaces_periodically(
                     }
                     Ok(_) => {}
                     Err(error) => tracing::warn!(?error, "periodic workspace reconciliation failed"),
+                }
+                if let Some(policy) = retention_policy {
+                    match jobs.prune_terminal_jobs_from(policy, retention_cursor).await {
+                        Ok(run) => {
+                            retention_cursor = run.next_cursor;
+                            tracing::info!(
+                                candidates = run.stats.candidates,
+                                eligible = run.stats.eligible,
+                                pruned = run.stats.pruned,
+                                "periodic terminal job retention completed"
+                            );
+                        }
+                        Err(error) => tracing::warn!(?error, "periodic terminal job retention failed"),
+                    }
                 }
             }
         }

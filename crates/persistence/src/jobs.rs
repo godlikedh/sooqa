@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct JobRepository {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 /// A queue settlement requested by a family owner after the handler has
@@ -158,7 +158,7 @@ impl JobRepository {
                   AND run_at <= now()
                   AND attempt_count < max_attempts
                   AND kind = ANY($3::text[])
-                ORDER BY priority DESC, run_at ASC, created_at ASC
+                ORDER BY priority DESC, run_at ASC, created_at ASC, id ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
