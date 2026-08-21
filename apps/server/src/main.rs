@@ -11,8 +11,7 @@ use sooqa_inbox::{
 use sooqa_library::StorageUploadAttachment;
 use sooqa_persistence::InboxRepository;
 use sooqa_telegram::{
-    IngestAccepted, IngestService, MediaIngestCommand, MemoryUpdateStore, TelegramRuntime,
-    UrlIngestCommand,
+    IngestAccepted, IngestService, MediaIngestCommand, TelegramRuntime, UrlIngestCommand,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -95,7 +94,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
             token.expose_secret(),
             &config.telegram.api_base_url,
             std::time::Duration::from_secs(config.telegram.poll_timeout_seconds),
-            MemoryUpdateStore::default(),
             config.telegram.admin_user_ids.clone(),
             config.telegram.storage_chat_id,
             DatabaseIngestService { repository: database.inbox() },

@@ -21,7 +21,6 @@ use teloxide::{
     types::{CallbackQueryId, ChatId, FileId, Message, Update, UpdateKind},
 };
 use thiserror::Error as ThisError;
-use time::OffsetDateTime;
 use tracing::warn;
 use url::Url;
 use uuid::Uuid;
@@ -98,7 +97,6 @@ pub enum TelegramMedia {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum HandleOutcome {
-    DuplicateIgnored,
     NonMessageIgnored,
     NonPrivateIgnored,
     RateLimited,
@@ -115,19 +113,6 @@ pub enum Command {
     Help,
     Add,
     Status,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct UpdateClaim {
-    pub update_id: i64,
-    pub claim_token: Uuid,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum UpdateClaimResult {
-    Claimed(UpdateClaim),
-    Completed,
-    InProgress,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -195,8 +180,6 @@ impl IngestService for () {
 pub enum TelegramError {
     #[error("Telegram API request failed: {0}")]
     Api(#[source] Box<dyn Error + Send + Sync>),
-    #[error("Telegram update receipt store failed: {0}")]
-    UpdateStore(#[source] Box<dyn Error + Send + Sync>),
     #[error("Telegram API base URL is invalid: {0}")]
     InvalidApiBaseUrl(String),
     #[error("Telegram polling timeout must be greater than zero")]
@@ -209,8 +192,6 @@ pub enum TelegramError {
     HttpClient(#[source] reqwest::Error),
     #[error("Telegram Ctrl-C handler could not be initialized: {0}")]
     Shutdown(#[source] std::io::Error),
-    #[error("Telegram update is still being processed: {0}")]
-    UpdateInProgress(i64),
     #[error("Telegram URL ingest failed: {0}")]
     Ingest(#[source] Box<dyn Error + Send + Sync>),
 }
@@ -296,112 +277,9 @@ pub trait TelegramApi: Clone + Send + Sync + 'static {
     fn is_retryable_error(error: &Self::Error) -> bool;
 }
 
-#[async_trait]
-pub trait UpdateStore: Clone + Send + Sync + 'static {
-    type Error: Error + Send + Sync + 'static;
-
-    async fn claim_update(&self, update_id: i64) -> Result<UpdateClaimResult, Self::Error>;
-
-    async fn complete_update(&self, claim: UpdateClaim) -> Result<(), Self::Error>;
-
-    async fn release_update(&self, claim: UpdateClaim) -> Result<(), Self::Error>;
-}
-
-/// Process-local Telegram update deduplication. This intentionally belongs to
-/// the Telegram adapter: it is only a delivery optimization, while business
-/// effects remain durable in the five application tables and queue jobs.
-#[derive(Clone, Default)]
-pub struct MemoryUpdateStore {
-    updates: Arc<Mutex<HashMap<i64, MemoryUpdate>>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MemoryUpdate {
-    claim_token: Option<Uuid>,
-    claimed_at: Option<OffsetDateTime>,
-    completed_at: Option<OffsetDateTime>,
-}
-
-#[derive(Debug, ThisError)]
-pub enum MemoryUpdateStoreError {
-    #[error("Telegram update ID must be positive: {0}")]
-    InvalidUpdateId(i64),
-    #[error("Telegram update claim was lost: {0}")]
-    ClaimLost(i64),
-    #[error("Telegram update store lock was poisoned")]
-    LockPoisoned,
-}
-
-#[async_trait]
-impl UpdateStore for MemoryUpdateStore {
-    type Error = MemoryUpdateStoreError;
-
-    async fn claim_update(&self, update_id: i64) -> Result<UpdateClaimResult, Self::Error> {
-        if update_id <= 0 {
-            return Err(MemoryUpdateStoreError::InvalidUpdateId(update_id));
-        }
-        let mut updates = self.updates.lock().map_err(|_| MemoryUpdateStoreError::LockPoisoned)?;
-        let now = OffsetDateTime::now_utc();
-        if let Some(update) = updates.get_mut(&update_id) {
-            if update.completed_at.is_some() {
-                return Ok(UpdateClaimResult::Completed);
-            }
-            if update
-                .claimed_at
-                .is_some_and(|claimed_at| claimed_at > now - time::Duration::minutes(5))
-            {
-                return Ok(UpdateClaimResult::InProgress);
-            }
-            let claim_token = Uuid::now_v7();
-            update.claim_token = Some(claim_token);
-            update.claimed_at = Some(now);
-            return Ok(UpdateClaimResult::Claimed(UpdateClaim { update_id, claim_token }));
-        }
-
-        let claim_token = Uuid::now_v7();
-        updates.insert(
-            update_id,
-            MemoryUpdate {
-                claim_token: Some(claim_token),
-                claimed_at: Some(now),
-                completed_at: None,
-            },
-        );
-        Ok(UpdateClaimResult::Claimed(UpdateClaim { update_id, claim_token }))
-    }
-
-    async fn complete_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
-        let mut updates = self.updates.lock().map_err(|_| MemoryUpdateStoreError::LockPoisoned)?;
-        let update = updates
-            .get_mut(&claim.update_id)
-            .ok_or(MemoryUpdateStoreError::ClaimLost(claim.update_id))?;
-        if update.completed_at.is_some() || update.claim_token != Some(claim.claim_token) {
-            return Err(MemoryUpdateStoreError::ClaimLost(claim.update_id));
-        }
-        update.claim_token = None;
-        update.claimed_at = None;
-        update.completed_at = Some(OffsetDateTime::now_utc());
-        Ok(())
-    }
-
-    async fn release_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
-        let mut updates = self.updates.lock().map_err(|_| MemoryUpdateStoreError::LockPoisoned)?;
-        let update = updates
-            .get_mut(&claim.update_id)
-            .ok_or(MemoryUpdateStoreError::ClaimLost(claim.update_id))?;
-        if update.completed_at.is_some() || update.claim_token != Some(claim.claim_token) {
-            return Err(MemoryUpdateStoreError::ClaimLost(claim.update_id));
-        }
-        update.claim_token = None;
-        update.claimed_at = None;
-        Ok(())
-    }
-}
-
 #[derive(Clone)]
-pub struct TelegramService<A, S, I = ()> {
+pub struct TelegramService<A, I = ()> {
     api: A,
-    update_store: S,
     ingest_service: Option<I>,
     admin_user_ids: Arc<BTreeSet<i64>>,
     response_limiter: Arc<Mutex<HashMap<RateLimitKey, Instant>>>,
@@ -414,15 +292,13 @@ struct RateLimitKey {
     chat_id: i64,
 }
 
-impl<A, S> TelegramService<A, S, ()>
+impl<A> TelegramService<A, ()>
 where
     A: TelegramApi,
-    S: UpdateStore,
 {
-    pub fn new(api: A, update_store: S, admin_user_ids: impl IntoIterator<Item = i64>) -> Self {
+    pub fn new(api: A, admin_user_ids: impl IntoIterator<Item = i64>) -> Self {
         Self {
             api,
-            update_store,
             ingest_service: None,
             admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
             response_limiter: Arc::new(Mutex::new(HashMap::new())),
@@ -431,21 +307,18 @@ where
     }
 }
 
-impl<A, S, I> TelegramService<A, S, I>
+impl<A, I> TelegramService<A, I>
 where
     A: TelegramApi,
-    S: UpdateStore,
     I: IngestService,
 {
     pub fn with_ingest(
         api: A,
-        update_store: S,
         admin_user_ids: impl IntoIterator<Item = i64>,
         ingest_service: I,
     ) -> Self {
         Self {
             api,
-            update_store,
             ingest_service: Some(ingest_service),
             admin_user_ids: Arc::new(admin_user_ids.into_iter().collect()),
             response_limiter: Arc::new(Mutex::new(HashMap::new())),
@@ -454,10 +327,9 @@ where
     }
 }
 
-impl<A, S, I> TelegramService<A, S, I>
+impl<A, I> TelegramService<A, I>
 where
     A: TelegramApi,
-    S: UpdateStore,
     I: IngestService,
 {
     pub fn with_source_download_max_bytes(mut self, max_bytes: u64) -> Self {
@@ -469,15 +341,7 @@ where
         &self,
         message: IncomingMessage,
     ) -> Result<HandleOutcome, TelegramError> {
-        let claim = match self.claim(message.update_id).await? {
-            UpdateClaimResult::Claimed(claim) => claim,
-            UpdateClaimResult::Completed => return Ok(HandleOutcome::DuplicateIgnored),
-            UpdateClaimResult::InProgress => {
-                return Err(TelegramError::UpdateInProgress(message.update_id));
-            }
-        };
         if !message.is_private {
-            self.complete(claim).await?;
             return Ok(HandleOutcome::NonPrivateIgnored);
         }
         if !message.user_id.is_some_and(|id| self.admin_user_ids.contains(&id)) {
@@ -489,11 +353,9 @@ where
                 "unauthorized Telegram command attempt"
             );
             if !self.allow_response(message.user_id, message.chat_id) {
-                self.complete(claim).await?;
                 return Ok(HandleOutcome::RateLimited);
             }
-            self.send_and_complete(
-                claim,
+            self.send_response(
                 message.chat_id,
                 UNAUTHORIZED_RESPONSE,
                 RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
@@ -502,14 +364,13 @@ where
             return Ok(HandleOutcome::Unauthorized);
         }
         if let Some(media) = message.media.clone() {
-            return self.handle_media_message(message, claim, media).await;
+            return self.handle_media_message(message, media).await;
         }
         let action =
             message.text.as_deref().map(parse_message_action).unwrap_or(MessageAction::Ignore);
         match action {
             MessageAction::Url(source_url) => {
                 let Some(ingest_service) = self.ingest_service.as_ref() else {
-                    self.release(claim).await?;
                     return Err(TelegramError::Ingest(Box::new(IngestUnavailable)));
                 };
                 let user_id = message.user_id.expect("authorized Telegram messages have a user ID");
@@ -527,7 +388,6 @@ where
                             user_id: message.user_id,
                             chat_id: message.chat_id,
                         });
-                        self.release(claim).await?;
                         return Err(TelegramError::Ingest(Box::new(error)));
                     }
                 };
@@ -536,11 +396,9 @@ where
                     accepted.request_id, accepted.status
                 );
                 if !self.allow_response(message.user_id, message.chat_id) {
-                    self.complete(claim).await?;
                     return Ok(HandleOutcome::RateLimited);
                 }
-                self.send_and_complete(
-                    claim,
+                self.send_response(
                     message.chat_id,
                     &response,
                     RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
@@ -550,7 +408,6 @@ where
             }
             MessageAction::Command(command) => {
                 if !self.allow_response(message.user_id, message.chat_id) {
-                    self.complete(claim).await?;
                     return Ok(HandleOutcome::RateLimited);
                 }
                 let response = match command {
@@ -559,8 +416,7 @@ where
                     Command::Status => STATUS_RESPONSE,
                     Command::Add => ADD_USAGE_RESPONSE,
                 };
-                self.send_and_complete(
-                    claim,
+                self.send_response(
                     message.chat_id,
                     response,
                     RateLimitKey { user_id: message.user_id, chat_id: message.chat_id },
@@ -568,17 +424,13 @@ where
                 .await?;
                 Ok(HandleOutcome::Responded(command))
             }
-            MessageAction::Ignore => {
-                self.complete(claim).await?;
-                Ok(HandleOutcome::UnrecognizedIgnored)
-            }
+            MessageAction::Ignore => Ok(HandleOutcome::UnrecognizedIgnored),
         }
     }
 
     async fn handle_media_message(
         &self,
         message: IncomingMessage,
-        claim: UpdateClaim,
         media: TelegramMedia,
     ) -> Result<HandleOutcome, TelegramError> {
         let rate_limit_key = RateLimitKey { user_id: message.user_id, chat_id: message.chat_id };
@@ -590,10 +442,9 @@ where
                     mime_type.map(|value| format!(" ({value})")).unwrap_or_default()
                 );
                 if !self.allow_response(message.user_id, message.chat_id) {
-                    self.complete(claim).await?;
                     return Ok(HandleOutcome::RateLimited);
                 }
-                self.send_and_complete(claim, message.chat_id, &response, rate_limit_key).await?;
+                self.send_response(message.chat_id, &response, rate_limit_key).await?;
                 return Ok(HandleOutcome::MediaRejected);
             }
             TelegramMedia::Supported {
@@ -619,15 +470,13 @@ where
                     self.source_download_max_bytes
                 );
                 if !self.allow_response(message.user_id, message.chat_id) {
-                    self.complete(claim).await?;
                     return Ok(HandleOutcome::RateLimited);
                 }
-                self.send_and_complete(claim, message.chat_id, &response, rate_limit_key).await?;
+                self.send_response(message.chat_id, &response, rate_limit_key).await?;
                 return Ok(HandleOutcome::MediaRejected);
             }
             let user_id = message.user_id.expect("authorized Telegram messages have a user ID");
             let Some(ingest_service) = self.ingest_service.as_ref() else {
-                self.release(claim).await?;
                 return Err(TelegramError::Ingest(Box::new(IngestUnavailable)));
             };
             let accepted = match ingest_service
@@ -650,17 +499,15 @@ where
                 Ok(accepted) => accepted,
                 Err(error) => {
                     self.clear_response(rate_limit_key);
-                    self.release(claim).await?;
                     return Err(TelegramError::Ingest(Box::new(error)));
                 }
             };
             format!("✅ Ingest queued\nID: {}\nStatus: {}", accepted.request_id, accepted.status)
         };
         if !self.allow_response(message.user_id, message.chat_id) {
-            self.complete(claim).await?;
             return Ok(HandleOutcome::RateLimited);
         }
-        self.send_and_complete(claim, message.chat_id, &response, rate_limit_key).await?;
+        self.send_response(message.chat_id, &response, rate_limit_key).await?;
         Ok(HandleOutcome::Responded(Command::Add))
     }
 
@@ -690,72 +537,29 @@ where
                 })
                 .await
             }
-            _ => {
-                let claim = match self.claim(update_id).await? {
-                    UpdateClaimResult::Claimed(claim) => claim,
-                    UpdateClaimResult::Completed => return Ok(HandleOutcome::DuplicateIgnored),
-                    UpdateClaimResult::InProgress => {
-                        return Err(TelegramError::UpdateInProgress(update_id));
-                    }
-                };
-                self.complete(claim).await?;
-                Ok(HandleOutcome::NonMessageIgnored)
-            }
+            _ => Ok(HandleOutcome::NonMessageIgnored),
         }
     }
 
     /// Acknowledge callback queries left by superseded Telegram keyboards.
     ///
     /// Callback payloads are intentionally never parsed or dispatched: stale
-    /// buttons can only consume one bounded update claim and receive a normal
-    /// Telegram acknowledgement.
+    /// buttons receive only a normal Telegram acknowledgement.
     pub async fn acknowledge_callback(
         &self,
         callback: IncomingCallback,
     ) -> Result<HandleOutcome, TelegramError> {
-        let claim = match self.claim(callback.update_id).await? {
-            UpdateClaimResult::Claimed(claim) => claim,
-            UpdateClaimResult::Completed => return Ok(HandleOutcome::DuplicateIgnored),
-            UpdateClaimResult::InProgress => {
-                return Err(TelegramError::UpdateInProgress(callback.update_id));
-            }
-        };
-
         // Telegram clients keep showing a spinner until this is answered. Do
         // this before any repository work, including for rejected callbacks.
         if let Err(error) = self.api.answer_callback_query(&callback.callback_id).await {
-            self.release(claim).await?;
             return Err(TelegramError::Api(Box::new(error)));
         }
 
-        self.complete(claim).await?;
         Ok(HandleOutcome::CallbackHandled)
     }
 
-    async fn claim(&self, update_id: i64) -> Result<UpdateClaimResult, TelegramError> {
-        self.update_store
-            .claim_update(update_id)
-            .await
-            .map_err(|error| TelegramError::UpdateStore(Box::new(error)))
-    }
-
-    async fn complete(&self, claim: UpdateClaim) -> Result<(), TelegramError> {
-        self.update_store
-            .complete_update(claim)
-            .await
-            .map_err(|error| TelegramError::UpdateStore(Box::new(error)))
-    }
-
-    async fn release(&self, claim: UpdateClaim) -> Result<(), TelegramError> {
-        self.update_store
-            .release_update(claim)
-            .await
-            .map_err(|error| TelegramError::UpdateStore(Box::new(error)))
-    }
-
-    async fn send_and_complete(
+    async fn send_response(
         &self,
-        claim: UpdateClaim,
         chat_id: i64,
         text: &str,
         rate_limit_key: RateLimitKey,
@@ -767,10 +571,9 @@ where
             .map_err(|error| TelegramError::Api(Box::new(error)))
         {
             self.clear_response(rate_limit_key);
-            self.release(claim).await?;
             return Err(error);
         }
-        self.complete(claim).await
+        Ok(())
     }
 
     fn allow_response(&self, user_id: Option<i64>, chat_id: i64) -> bool {
@@ -1483,38 +1286,29 @@ impl tokio::io::AsyncWrite for LimitedWriter<'_> {
     }
 }
 
-pub struct TelegramRuntime<S, I, A = TeloxideApi> {
+pub struct TelegramRuntime<I, A = TeloxideApi> {
     api: A,
-    service: TelegramService<A, S, I>,
+    service: TelegramService<A, I>,
     poll_timeout: Duration,
     storage_chat_id: Option<i64>,
     retry_initial_delay: Duration,
     retry_max_delay: Duration,
 }
 
-impl<S, I> TelegramRuntime<S, I, TeloxideApi>
+impl<I> TelegramRuntime<I, TeloxideApi>
 where
-    S: UpdateStore,
     I: IngestService,
 {
     pub fn new(
         token: impl Into<String>,
         api_base_url: &str,
         poll_timeout: Duration,
-        update_store: S,
         admin_user_ids: impl IntoIterator<Item = i64>,
         storage_chat_id: Option<i64>,
         ingest_service: I,
     ) -> Result<Self, TelegramError> {
         let api = TeloxideApi::new(token, api_base_url, poll_timeout)?;
-        Ok(Self::new_with_api(
-            api,
-            poll_timeout,
-            update_store,
-            admin_user_ids,
-            storage_chat_id,
-            ingest_service,
-        ))
+        Ok(Self::new_with_api(api, poll_timeout, admin_user_ids, storage_chat_id, ingest_service))
     }
 
     pub fn with_upload_timeout(mut self, upload_timeout: Duration) -> Result<Self, TelegramError> {
@@ -1531,22 +1325,19 @@ where
     }
 }
 
-impl<S, I, A> TelegramRuntime<S, I, A>
+impl<I, A> TelegramRuntime<I, A>
 where
     A: TelegramApi + TelegramPollingApi,
-    S: UpdateStore,
     I: IngestService,
 {
     pub fn new_with_api(
         api: A,
         poll_timeout: Duration,
-        update_store: S,
         admin_user_ids: impl IntoIterator<Item = i64>,
         storage_chat_id: Option<i64>,
         ingest_service: I,
     ) -> Self {
-        let service =
-            TelegramService::with_ingest(api.clone(), update_store, admin_user_ids, ingest_service);
+        let service = TelegramService::with_ingest(api.clone(), admin_user_ids, ingest_service);
         Self {
             api,
             service,
@@ -1833,13 +1624,12 @@ where
     }
 }
 
-async fn handle_update_with_retries<A, S, I>(
-    service: &TelegramService<A, S, I>,
+async fn handle_update_with_retries<A, I>(
+    service: &TelegramService<A, I>,
     update: Update,
 ) -> Result<i32, TelegramError>
 where
     A: TelegramApi,
-    S: UpdateStore,
     I: IngestService,
 {
     for attempt in 1..=MAX_HANDLER_ATTEMPTS {
@@ -2029,16 +1819,26 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct MockStore {
-        claimed: Arc<Mutex<BTreeSet<i64>>>,
-        completed: Arc<Mutex<BTreeSet<i64>>>,
-    }
-
-    #[derive(Clone, Default)]
     struct MockIngestService {
         commands: Arc<Mutex<Vec<UrlIngestCommand>>>,
         media_commands: Arc<Mutex<Vec<MediaIngestCommand>>>,
+        accepted_keys: Arc<Mutex<BTreeSet<String>>>,
         fail: Arc<Mutex<bool>>,
+        failures_remaining: Arc<Mutex<usize>>,
+        attempts: Arc<Mutex<usize>>,
+    }
+
+    impl MockIngestService {
+        fn should_fail(&self) -> bool {
+            *self.attempts.lock().expect("mock mutex should not be poisoned") += 1;
+            let mut failures_remaining =
+                self.failures_remaining.lock().expect("mock mutex should not be poisoned");
+            if *failures_remaining > 0 {
+                *failures_remaining -= 1;
+                return true;
+            }
+            *self.fail.lock().expect("mock mutex should not be poisoned")
+        }
     }
 
     #[async_trait]
@@ -2049,8 +1849,19 @@ mod tests {
             &self,
             command: UrlIngestCommand,
         ) -> Result<IngestAccepted, Self::Error> {
-            if *self.fail.lock().expect("mock mutex should not be poisoned") {
+            if self.should_fail() {
                 return Err(MockError);
+            }
+            if !self
+                .accepted_keys
+                .lock()
+                .expect("mock mutex should not be poisoned")
+                .insert(command.idempotency_key.clone())
+            {
+                return Ok(IngestAccepted {
+                    request_id: Uuid::from_u128(1),
+                    status: "queued".to_owned(),
+                });
             }
             self.commands.lock().expect("mock mutex should not be poisoned").push(command);
             Ok(IngestAccepted { request_id: Uuid::from_u128(1), status: "queued".to_owned() })
@@ -2060,53 +1871,22 @@ mod tests {
             &self,
             command: MediaIngestCommand,
         ) -> Result<IngestAccepted, Self::Error> {
-            if *self.fail.lock().expect("mock mutex should not be poisoned") {
+            if self.should_fail() {
                 return Err(MockError);
+            }
+            if !self
+                .accepted_keys
+                .lock()
+                .expect("mock mutex should not be poisoned")
+                .insert(command.idempotency_key.clone())
+            {
+                return Ok(IngestAccepted {
+                    request_id: Uuid::from_u128(1),
+                    status: "queued".to_owned(),
+                });
             }
             self.media_commands.lock().expect("mock mutex should not be poisoned").push(command);
             Ok(IngestAccepted { request_id: Uuid::from_u128(1), status: "queued".to_owned() })
-        }
-    }
-
-    #[async_trait]
-    impl UpdateStore for MockStore {
-        type Error = MockError;
-
-        async fn claim_update(&self, update_id: i64) -> Result<UpdateClaimResult, Self::Error> {
-            if self
-                .completed
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .contains(&update_id)
-            {
-                return Ok(UpdateClaimResult::Completed);
-            }
-            if self.claimed.lock().expect("mock mutex should not be poisoned").contains(&update_id)
-            {
-                return Ok(UpdateClaimResult::InProgress);
-            }
-            self.claimed.lock().expect("mock mutex should not be poisoned").insert(update_id);
-            Ok(UpdateClaimResult::Claimed(UpdateClaim { update_id, claim_token: Uuid::new_v4() }))
-        }
-
-        async fn complete_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
-            self.claimed
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .remove(&claim.update_id);
-            self.completed
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .insert(claim.update_id);
-            Ok(())
-        }
-
-        async fn release_update(&self, claim: UpdateClaim) -> Result<(), Self::Error> {
-            self.claimed
-                .lock()
-                .expect("mock mutex should not be poisoned")
-                .remove(&claim.update_id);
-            Ok(())
         }
     }
 
@@ -2124,10 +1904,22 @@ mod tests {
         }
     }
 
+    fn url_update(update_id: u32) -> Update {
+        let message: teloxide::types::Message = serde_json::from_value(serde_json::json!({
+            "message_id": update_id,
+            "from": {"id": 123, "is_bot": false, "first_name": "Admin"},
+            "chat": {"id": 42, "type": "private", "first_name": "Admin"},
+            "date": 0,
+            "text": "https://example.test/video.webm"
+        }))
+        .expect("Telegram URL message fixture should deserialize");
+        Update { id: teloxide::types::UpdateId(update_id), kind: UpdateKind::Message(message) }
+    }
+
     #[tokio::test]
-    async fn authorized_commands_are_translated_and_deduplicated() {
+    async fn authorized_commands_are_translated_and_rate_limited() {
         let api = MockApi::default();
-        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+        let service = TelegramService::new(api.clone(), [123]);
 
         assert_eq!(
             service.handle_message(message(1, Some(123), "/status")).await.unwrap(),
@@ -2135,7 +1927,7 @@ mod tests {
         );
         assert_eq!(
             service.handle_message(message(1, Some(123), "/status")).await.unwrap(),
-            HandleOutcome::DuplicateIgnored
+            HandleOutcome::RateLimited
         );
         assert_eq!(api.messages.lock().unwrap().as_slice(), &[(42, STATUS_RESPONSE.to_owned())]);
     }
@@ -2144,8 +1936,7 @@ mod tests {
     async fn superseded_commands_and_callbacks_are_harmless() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
-        let service =
-            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
 
         assert_eq!(
             service.handle_message(message(11, Some(123), "/queue")).await.unwrap(),
@@ -2195,7 +1986,7 @@ mod tests {
     #[tokio::test]
     async fn unauthorized_private_user_gets_generic_response() {
         let api = MockApi::default();
-        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+        let service = TelegramService::new(api.clone(), [123]);
 
         assert_eq!(
             service.handle_message(message(2, Some(456), "/status")).await.unwrap(),
@@ -2210,7 +2001,7 @@ mod tests {
     #[tokio::test]
     async fn group_messages_are_ignored_before_authorization() {
         let api = MockApi::default();
-        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+        let service = TelegramService::new(api.clone(), [123]);
         let mut update = message(3, Some(123), "/status");
         update.is_private = false;
 
@@ -2221,7 +2012,7 @@ mod tests {
     #[tokio::test]
     async fn command_responses_are_rate_limited_per_user_and_chat() {
         let api = MockApi::default();
-        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+        let service = TelegramService::new(api.clone(), [123]);
 
         assert_eq!(
             service.handle_message(message(4, Some(123), "/status")).await.unwrap(),
@@ -2235,11 +2026,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_response_releases_update_for_retry() {
+    async fn failed_response_is_retryable() {
         let api = MockApi::default();
         *api.fail.lock().unwrap() = true;
-        let store = MockStore::default();
-        let service = TelegramService::new(api.clone(), store, [123]);
+        let service = TelegramService::new(api.clone(), [123]);
 
         assert!(service.handle_message(message(6, Some(123), "/status")).await.is_err());
         *api.fail.lock().unwrap() = false;
@@ -2253,8 +2043,7 @@ mod tests {
     async fn url_messages_create_ingest_and_return_status() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
-        let service =
-            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
 
         assert_eq!(
             service
@@ -2285,8 +2074,7 @@ mod tests {
     async fn authorized_media_is_queued_without_downloading_bytes() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
-        let service =
-            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
         let message = IncomingMessage {
             update_id: 11,
             message_id: 99,
@@ -2336,8 +2124,7 @@ mod tests {
     async fn slow_media_download_cannot_delay_concurrent_metadata_acceptance() {
         let api = BlockingDownloadApi;
         let ingest = MockIngestService::default();
-        let service =
-            TelegramService::with_ingest(api, MockStore::default(), [123], ingest.clone());
+        let service = TelegramService::with_ingest(api, [123], ingest.clone());
         let message = |update_id, chat_id| IncomingMessage {
             update_id,
             message_id: update_id,
@@ -2374,9 +2161,8 @@ mod tests {
     async fn advertised_media_size_is_rejected_before_workspace_or_download() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
-        let service =
-            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone())
-                .with_source_download_max_bytes(1024);
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone())
+            .with_source_download_max_bytes(1024);
         let message = IncomingMessage {
             update_id: 111,
             message_id: 199,
@@ -2406,8 +2192,7 @@ mod tests {
     async fn unsupported_telegram_document_is_rejected_without_download() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
-        let service =
-            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
         let message = IncomingMessage {
             update_id: 12,
             message_id: 100,
@@ -2436,8 +2221,7 @@ mod tests {
     async fn probeable_telegram_document_is_queued_without_declared_kind() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
-        let service =
-            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
         let message = IncomingMessage {
             update_id: 14,
             message_id: 102,
@@ -2468,11 +2252,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replayed_media_update_reuses_the_queued_ingest_without_downloading() {
+    async fn replayed_media_update_reuses_the_durable_ingest_key_without_downloading() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
-        let service =
-            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
         let message = IncomingMessage {
             update_id: 13,
             message_id: 101,
@@ -2496,57 +2279,71 @@ mod tests {
             service.handle_message(message.clone()).await.unwrap(),
             HandleOutcome::Responded(Command::Add)
         );
+        // A fresh service instance models a process restart. The shared mock
+        // Inbox keeps the durable input key, while the adapter has no receipt
+        // state to carry over.
+        let restarted = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
         assert_eq!(
-            service
-                .handle_message(IncomingMessage {
-                    update_id: 13,
-                    message_id: 101,
-                    reply_to_message_id: None,
-                    user_id: Some(123),
-                    chat_id: 42,
-                    is_private: true,
-                    text: None,
-                    caption: None,
-                    media: None,
-                })
-                .await
-                .unwrap(),
-            HandleOutcome::DuplicateIgnored
+            restarted.handle_message(message).await.unwrap(),
+            HandleOutcome::Responded(Command::Add)
         );
         assert_eq!(ingest.media_commands.lock().unwrap().len(), 1);
         assert!(api.downloads.lock().unwrap().is_empty());
+        assert_eq!(api.messages.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn ingest_failure_releases_update_and_rate_limit() {
+    async fn replayed_url_update_reuses_the_durable_ingest_key() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
+        let update = message(17, Some(123), "https://example.test/video.webm");
+
+        assert_eq!(
+            service.handle_message(update.clone()).await.unwrap(),
+            HandleOutcome::Responded(Command::Add)
+        );
+        let restarted = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
+        assert_eq!(
+            restarted.handle_message(update).await.unwrap(),
+            HandleOutcome::Responded(Command::Add)
+        );
+        assert_eq!(ingest.commands.lock().unwrap().len(), 1);
+        assert_eq!(api.messages.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn transient_ingest_failure_retries_before_offset_advances() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        *ingest.failures_remaining.lock().unwrap() = 2;
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
+
+        assert_eq!(handle_update_with_retries(&service, url_update(18)).await.unwrap(), 19);
+        assert_eq!(*ingest.attempts.lock().unwrap(), 3);
+        assert_eq!(ingest.commands.lock().unwrap().len(), 1);
+        assert_eq!(api.messages.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_ingest_failure_stops_at_the_handler_attempt_bound() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
         *ingest.fail.lock().unwrap() = true;
-        let store = MockStore::default();
-        let service = TelegramService::with_ingest(api.clone(), store, [123], ingest.clone());
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
 
-        assert!(
-            service
-                .handle_message(message(8, Some(123), "https://example.test/video.webm"))
-                .await
-                .is_err()
-        );
-        *ingest.fail.lock().unwrap() = false;
-        assert_eq!(
-            service
-                .handle_message(message(8, Some(123), "https://example.test/video.webm"))
-                .await
-                .unwrap(),
-            HandleOutcome::Responded(Command::Add)
-        );
+        let result = handle_update_with_retries(&service, url_update(19)).await;
+        assert!(matches!(result, Err(TelegramError::Ingest(_))));
+        assert_eq!(*ingest.attempts.lock().unwrap(), MAX_HANDLER_ATTEMPTS);
+        assert!(ingest.commands.lock().unwrap().is_empty());
+        assert!(api.messages.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn rate_limited_url_ack_still_creates_ingest_request() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
-        let service =
-            TelegramService::with_ingest(api.clone(), MockStore::default(), [123], ingest.clone());
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
 
         assert_eq!(
             service
@@ -2570,7 +2367,7 @@ mod tests {
     async fn failed_update_retries_before_offset_advances() {
         let api = MockApi::default();
         *api.failures_remaining.lock().unwrap() = 1;
-        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+        let service = TelegramService::new(api.clone(), [123]);
         let message: teloxide::types::Message = serde_json::from_value(serde_json::json!({
             "message_id": 1,
             "from": {"id": 123, "is_bot": false, "first_name": "Admin"},
@@ -2599,7 +2396,7 @@ mod tests {
         let update =
             Update { id: teloxide::types::UpdateId(7), kind: UpdateKind::Message(message) };
         let api = MockApi::default();
-        let service = TelegramService::new(api.clone(), MockStore::default(), [123]);
+        let service = TelegramService::new(api.clone(), [123]);
 
         assert_eq!(
             service.handle_update(update).await.unwrap(),
@@ -3521,23 +3318,5 @@ mod tests {
             MessageAction::Ignore
         );
         assert_eq!(parse_message_action("ftp://example.test/file"), MessageAction::Ignore);
-    }
-
-    #[tokio::test]
-    async fn memory_update_store_fences_duplicate_delivery() {
-        let store = MemoryUpdateStore::default();
-        let claim = match store.claim_update(42).await.expect("claim should succeed") {
-            UpdateClaimResult::Claimed(claim) => claim,
-            other => panic!("unexpected claim result: {other:?}"),
-        };
-        assert!(matches!(
-            store.claim_update(42).await.expect("duplicate claim should succeed"),
-            UpdateClaimResult::InProgress
-        ));
-        store.complete_update(claim).await.expect("completion should succeed");
-        assert!(matches!(
-            store.claim_update(42).await.expect("completed claim should succeed"),
-            UpdateClaimResult::Completed
-        ));
     }
 }
