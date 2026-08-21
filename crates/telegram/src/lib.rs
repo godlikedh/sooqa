@@ -1824,6 +1824,21 @@ mod tests {
         media_commands: Arc<Mutex<Vec<MediaIngestCommand>>>,
         accepted_keys: Arc<Mutex<BTreeSet<String>>>,
         fail: Arc<Mutex<bool>>,
+        failures_remaining: Arc<Mutex<usize>>,
+        attempts: Arc<Mutex<usize>>,
+    }
+
+    impl MockIngestService {
+        fn should_fail(&self) -> bool {
+            *self.attempts.lock().expect("mock mutex should not be poisoned") += 1;
+            let mut failures_remaining =
+                self.failures_remaining.lock().expect("mock mutex should not be poisoned");
+            if *failures_remaining > 0 {
+                *failures_remaining -= 1;
+                return true;
+            }
+            *self.fail.lock().expect("mock mutex should not be poisoned")
+        }
     }
 
     #[async_trait]
@@ -1834,7 +1849,7 @@ mod tests {
             &self,
             command: UrlIngestCommand,
         ) -> Result<IngestAccepted, Self::Error> {
-            if *self.fail.lock().expect("mock mutex should not be poisoned") {
+            if self.should_fail() {
                 return Err(MockError);
             }
             if !self
@@ -1856,7 +1871,7 @@ mod tests {
             &self,
             command: MediaIngestCommand,
         ) -> Result<IngestAccepted, Self::Error> {
-            if *self.fail.lock().expect("mock mutex should not be poisoned") {
+            if self.should_fail() {
                 return Err(MockError);
             }
             if !self
@@ -1887,6 +1902,18 @@ mod tests {
             caption: None,
             media: None,
         }
+    }
+
+    fn url_update(update_id: u32) -> Update {
+        let message: teloxide::types::Message = serde_json::from_value(serde_json::json!({
+            "message_id": update_id,
+            "from": {"id": 123, "is_bot": false, "first_name": "Admin"},
+            "chat": {"id": 42, "type": "private", "first_name": "Admin"},
+            "date": 0,
+            "text": "https://example.test/video.webm"
+        }))
+        .expect("Telegram URL message fixture should deserialize");
+        Update { id: teloxide::types::UpdateId(update_id), kind: UpdateKind::Message(message) }
     }
 
     #[tokio::test]
@@ -2286,26 +2313,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_failure_is_retryable() {
+    async fn transient_ingest_failure_retries_before_offset_advances() {
+        let api = MockApi::default();
+        let ingest = MockIngestService::default();
+        *ingest.failures_remaining.lock().unwrap() = 2;
+        let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
+
+        assert_eq!(handle_update_with_retries(&service, url_update(18)).await.unwrap(), 19);
+        assert_eq!(*ingest.attempts.lock().unwrap(), 3);
+        assert_eq!(ingest.commands.lock().unwrap().len(), 1);
+        assert_eq!(api.messages.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_ingest_failure_stops_at_the_handler_attempt_bound() {
         let api = MockApi::default();
         let ingest = MockIngestService::default();
         *ingest.fail.lock().unwrap() = true;
         let service = TelegramService::with_ingest(api.clone(), [123], ingest.clone());
 
-        assert!(
-            service
-                .handle_message(message(8, Some(123), "https://example.test/video.webm"))
-                .await
-                .is_err()
-        );
-        *ingest.fail.lock().unwrap() = false;
-        assert_eq!(
-            service
-                .handle_message(message(8, Some(123), "https://example.test/video.webm"))
-                .await
-                .unwrap(),
-            HandleOutcome::Responded(Command::Add)
-        );
+        let result = handle_update_with_retries(&service, url_update(19)).await;
+        assert!(matches!(result, Err(TelegramError::Ingest(_))));
+        assert_eq!(*ingest.attempts.lock().unwrap(), MAX_HANDLER_ATTEMPTS);
+        assert!(ingest.commands.lock().unwrap().is_empty());
+        assert!(api.messages.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
