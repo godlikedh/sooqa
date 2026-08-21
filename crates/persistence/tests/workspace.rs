@@ -1,6 +1,6 @@
 use serde_json::json;
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
-use sooqa_jobs::{JobAttempt, NewJob};
+use sooqa_jobs::{JobLease, NewJob};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
@@ -98,7 +98,7 @@ async fn prepare_completed_storage(
     (ingest.ingest.id, media.media.id, workspace_id)
 }
 
-async fn mark_cleanup_running(database: &Database, job_id: Uuid, worker_id: &str) -> JobAttempt {
+async fn mark_cleanup_running(database: &Database, job_id: Uuid, worker_id: &str) -> JobLease {
     let lease_token = Uuid::new_v4();
     sqlx::query(
         "UPDATE queue.jobs SET state = 'running', lease_token = $2, lease_owner = $3, lease_expires_at = now() + interval '30 seconds', last_heartbeat_at = now(), attempt_count = 1 WHERE id = $1",
@@ -109,13 +109,7 @@ async fn mark_cleanup_running(database: &Database, job_id: Uuid, worker_id: &str
     .execute(database.pool())
     .await
     .unwrap();
-    JobAttempt {
-        job_id,
-        attempt_number: 1,
-        worker_id: worker_id.to_owned(),
-        lease_owner: worker_id.to_owned(),
-        lease_token,
-    }
+    JobLease { job_id, attempt_number: 1, lease_owner: worker_id.to_owned(), lease_token }
 }
 
 #[sqlx::test(migrations = "../../migrations")]

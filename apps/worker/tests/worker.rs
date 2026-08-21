@@ -44,7 +44,7 @@ fn job_envelopes_have_typed_payloads_and_fenced_leases() {
         completed_at: None,
     };
     assert_eq!(job.job_type(), JobType::PublishPost);
-    assert_eq!(job.lease().unwrap().worker_id, "worker");
+    assert_eq!(job.lease().unwrap().lease_owner, "worker");
 }
 
 #[derive(Debug, Error)]

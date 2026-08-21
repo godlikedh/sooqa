@@ -7,10 +7,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -193,13 +190,13 @@ impl HandlerFailure {
     pub fn defer(
         class: impl Into<String>,
         message: impl Into<String>,
-        available_at: OffsetDateTime,
+        defer_until: OffsetDateTime,
     ) -> Self {
         Self {
             retryable: true,
             class: class.into(),
             message: message.into(),
-            defer_until: Some(available_at),
+            defer_until: Some(defer_until),
         }
     }
 }
@@ -307,7 +304,7 @@ where
             ));
         }
     };
-    let job_attempt = job.attempt().ok_or_else(|| {
+    let job_attempt = job.lease().ok_or_else(|| {
         HandlerFailure::permanent(
             "invalid_job_state",
             "sync_storage_caption handler requires a running job lease",
@@ -502,7 +499,7 @@ async fn cleanup_workspace(
             ));
         }
     };
-    let job_attempt = job.attempt().ok_or_else(|| {
+    let job_attempt = job.lease().ok_or_else(|| {
         HandlerFailure::permanent(
             "invalid_job_state",
             "cleanup_workspace handler requires a running job lease",
@@ -551,7 +548,7 @@ async fn probe_asset(
             ));
         }
     };
-    let job_attempt = job.attempt().ok_or_else(|| {
+    let job_attempt = job.lease().ok_or_else(|| {
         HandlerFailure::permanent(
             "invalid_job_state",
             "probe_asset handler requires a running job lease",
@@ -719,7 +716,7 @@ async fn ensure_telegram_source(
 async fn fail_probe(
     inbox: &InboxRepository,
     ingest_request_id: uuid::Uuid,
-    job_attempt: &sooqa_jobs::JobAttempt,
+    job_attempt: &sooqa_jobs::JobLease,
     failure: HandlerFailure,
 ) -> Result<(), HandlerFailure> {
     let status = if failure.retryable {
@@ -752,7 +749,7 @@ async fn normalize_asset(
             ));
         }
     };
-    let job_attempt = job.attempt().ok_or_else(|| {
+    let job_attempt = job.lease().ok_or_else(|| {
         HandlerFailure::permanent(
             "invalid_job_state",
             "normalize_asset handler requires a running job lease",
@@ -1177,7 +1174,7 @@ async fn normalize_image_asset(
     image_normalizer: ImageNormalizer,
     request: &sooqa_inbox::Ingest,
     ingest_request_id: Uuid,
-    job_attempt: &sooqa_jobs::JobAttempt,
+    job_attempt: &sooqa_jobs::JobLease,
     max_normalized_storage_bytes: u64,
 ) -> Result<(), HandlerFailure> {
     let (workspace_id, input_name) = match workspace_input(request) {
@@ -1259,7 +1256,7 @@ async fn normalize_exact_asset(
     work_root: &Path,
     request: &sooqa_inbox::Ingest,
     ingest_request_id: Uuid,
-    job_attempt: &sooqa_jobs::JobAttempt,
+    job_attempt: &sooqa_jobs::JobLease,
     spec: ExactNormalizationSpec<'_>,
 ) -> Result<(), HandlerFailure> {
     let ExactNormalizationSpec { media_kind, probe, max_normalized_storage_bytes } = spec;
@@ -1571,7 +1568,7 @@ fn normalized_storage_limit_failure(bytes: u64, limit: u64) -> Option<HandlerFai
 async fn fail_normalization(
     inbox: &InboxRepository,
     ingest_request_id: uuid::Uuid,
-    job_attempt: &sooqa_jobs::JobAttempt,
+    job_attempt: &sooqa_jobs::JobLease,
     failure: HandlerFailure,
 ) -> Result<(), HandlerFailure> {
     let status = if failure.retryable {
@@ -1607,7 +1604,7 @@ async fn finalize_ingest(
             ));
         }
     };
-    let job_attempt = job.attempt().ok_or_else(|| {
+    let job_attempt = job.lease().ok_or_else(|| {
         HandlerFailure::permanent(
             "invalid_job_state",
             "finalize_ingest handler requires a running job lease",
@@ -1729,7 +1726,7 @@ async fn compute_fingerprint(
             ));
         }
     };
-    let job_attempt = job.attempt().ok_or_else(|| {
+    let job_attempt = job.lease().ok_or_else(|| {
         HandlerFailure::permanent(
             "invalid_job_state",
             "compute_fingerprint handler requires a running job lease",
@@ -1928,7 +1925,7 @@ fn map_fingerprint_error(job: &Job, error: FrameExtractionError) -> HandlerFailu
 async fn fail_fingerprint(
     inbox: &InboxRepository,
     ingest_request_id: uuid::Uuid,
-    job_attempt: &sooqa_jobs::JobAttempt,
+    job_attempt: &sooqa_jobs::JobLease,
     failure: HandlerFailure,
 ) -> Result<(), HandlerFailure> {
     let status = if failure.retryable {
@@ -2318,7 +2315,7 @@ fn map_library_error(error: LibraryRepositoryError) -> HandlerFailure {
 async fn fail_finalization(
     inbox: &InboxRepository,
     ingest_request_id: uuid::Uuid,
-    job_attempt: &sooqa_jobs::JobAttempt,
+    job_attempt: &sooqa_jobs::JobLease,
     failure: HandlerFailure,
 ) -> Result<(), HandlerFailure> {
     let status = if failure.retryable {
@@ -2411,7 +2408,7 @@ where
             ));
         }
     };
-    let attempt = job.attempt().ok_or_else(|| {
+    let attempt = job.lease().ok_or_else(|| {
         HandlerFailure::permanent(
             "invalid_job_state",
             "publish_post handler requires a running job lease",
@@ -2664,7 +2661,7 @@ async fn inspect_source(
         }
     };
 
-    let job_attempt = job.attempt().ok_or_else(|| {
+    let job_attempt = job.lease().ok_or_else(|| {
         HandlerFailure::permanent(
             "invalid_job_state",
             "inspect_source handler requires a running job lease",
@@ -2724,7 +2721,7 @@ async fn download_source(
             ));
         }
     };
-    let job_attempt = job.attempt().ok_or_else(|| {
+    let job_attempt = job.lease().ok_or_else(|| {
         HandlerFailure::permanent(
             "invalid_job_state",
             "download_source handler requires a running job lease",
@@ -2922,7 +2919,7 @@ async fn read_source_artifact(
 async fn fail_download(
     inbox: &InboxRepository,
     ingest_request_id: uuid::Uuid,
-    job_attempt: &sooqa_jobs::JobAttempt,
+    job_attempt: &sooqa_jobs::JobLease,
     failure: HandlerFailure,
 ) -> Result<(), HandlerFailure> {
     let status = if failure.retryable {
@@ -2964,36 +2961,13 @@ fn map_inbox_error(error: InboxRepositoryError) -> HandlerFailure {
 }
 
 #[derive(Debug, Default)]
-pub struct WorkerMetrics {
-    polls: AtomicU64,
-    claimed: AtomicU64,
-    succeeded: AtomicU64,
-    retried: AtomicU64,
-    failed: AtomicU64,
-    shutdown_requeued: AtomicU64,
-}
-
-impl WorkerMetrics {
-    pub fn snapshot(&self) -> WorkerMetricsSnapshot {
-        WorkerMetricsSnapshot {
-            polls: self.polls.load(Ordering::Relaxed),
-            claimed: self.claimed.load(Ordering::Relaxed),
-            succeeded: self.succeeded.load(Ordering::Relaxed),
-            retried: self.retried.load(Ordering::Relaxed),
-            failed: self.failed.load(Ordering::Relaxed),
-            shutdown_requeued: self.shutdown_requeued.load(Ordering::Relaxed),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct WorkerMetricsSnapshot {
-    pub polls: u64,
-    pub claimed: u64,
-    pub succeeded: u64,
-    pub retried: u64,
-    pub failed: u64,
-    pub shutdown_requeued: u64,
+struct WorkerLogCounters {
+    polls: u64,
+    claimed: u64,
+    succeeded: u64,
+    retried: u64,
+    failed: u64,
+    shutdown_requeued: u64,
 }
 
 pub struct Worker {
@@ -3002,7 +2976,6 @@ pub struct Worker {
     worker_id: String,
     poll_interval: Duration,
     lease_duration: Duration,
-    metrics: Arc<WorkerMetrics>,
 }
 
 impl Worker {
@@ -3021,16 +2994,11 @@ impl Worker {
             worker_id: worker_id.into(),
             poll_interval,
             lease_duration,
-            metrics: Arc::new(WorkerMetrics::default()),
         })
     }
 
     pub fn worker_id(&self) -> &str {
         &self.worker_id
-    }
-
-    pub fn metrics(&self) -> Arc<WorkerMetrics> {
-        Arc::clone(&self.metrics)
     }
 
     pub async fn run<F>(&self, shutdown: F) -> Result<(), WorkerError>
@@ -3067,10 +3035,11 @@ impl Worker {
         F: Future<Output = ()> + Send,
     {
         tokio::pin!(shutdown);
+        let mut counters = WorkerLogCounters::default();
         info!(worker_id = %self.worker_id, "worker loop started");
 
         loop {
-            self.metrics.polls.fetch_add(1, Ordering::Relaxed);
+            counters.polls += 1;
             debug!(worker_id = %self.worker_id, "polling for a job");
             let claimed = tokio::select! {
                 _ = &mut shutdown => break,
@@ -3088,7 +3057,7 @@ impl Worker {
                 }
             };
 
-            self.metrics.claimed.fetch_add(1, Ordering::Relaxed);
+            counters.claimed += 1;
             info!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type(), "job claimed");
             let lease = job.lease().ok_or(JobRepositoryError::LeaseLost)?;
 
@@ -3100,7 +3069,7 @@ impl Worker {
                         "no handler is registered for this job type",
                     )
                     .await?;
-                self.metrics.failed.fetch_add(1, Ordering::Relaxed);
+                counters.failed += 1;
                 warn!(worker_id = %self.worker_id, job_id = %job.id, job_type = %job.job_type(), "job failed because no handler is registered");
                 continue;
             };
@@ -3108,7 +3077,7 @@ impl Worker {
             let outcome = self.execute_handler(&job, &lease, handler, &mut shutdown).await?;
             let stop_after_shutdown = match outcome {
                 HandlerRunOutcome::Completed(result) => {
-                    self.finish_job(&job, &lease, result).await?;
+                    self.finish_job(&job, &lease, result, &mut counters).await?;
                     false
                 }
                 HandlerRunOutcome::Shutdown => {
@@ -3120,7 +3089,7 @@ impl Worker {
                             "worker stopped while the job was active",
                         )
                         .await?;
-                    self.metrics.shutdown_requeued.fetch_add(1, Ordering::Relaxed);
+                    counters.shutdown_requeued += 1;
                     true
                 }
             };
@@ -3130,7 +3099,16 @@ impl Worker {
             }
         }
 
-        info!(worker_id = %self.worker_id, "worker loop stopped");
+        info!(
+            worker_id = %self.worker_id,
+            polls = counters.polls,
+            claimed = counters.claimed,
+            succeeded = counters.succeeded,
+            retried = counters.retried,
+            failed = counters.failed,
+            shutdown_requeued = counters.shutdown_requeued,
+            "worker loop stopped"
+        );
         Ok(())
     }
 
@@ -3188,11 +3166,12 @@ impl Worker {
         job: &Job,
         lease: &JobLease,
         result: Result<(), HandlerFailure>,
+        counters: &mut WorkerLogCounters,
     ) -> Result<(), WorkerError> {
         match result {
             Ok(()) => {
                 self.repository.complete_lease(lease).await?;
-                self.metrics.succeeded.fetch_add(1, Ordering::Relaxed);
+                counters.succeeded += 1;
                 info!(worker_id = %self.worker_id, job_id = %job.id, "job completed");
             }
             Err(failure) if failure.defer_until.is_some() => {
@@ -3217,16 +3196,16 @@ impl Worker {
                     )
                     .await?;
                 if updated.status == JobStatus::Queued {
-                    self.metrics.retried.fetch_add(1, Ordering::Relaxed);
+                    counters.retried += 1;
                     info!(worker_id = %self.worker_id, job_id = %job.id, "job scheduled for retry");
                 } else {
-                    self.metrics.failed.fetch_add(1, Ordering::Relaxed);
+                    counters.failed += 1;
                     warn!(worker_id = %self.worker_id, job_id = %job.id, "job exhausted its retry attempts");
                 }
             }
             Err(failure) => {
                 self.repository.fail_lease(lease, &failure.class, &failure.message).await?;
-                self.metrics.failed.fetch_add(1, Ordering::Relaxed);
+                counters.failed += 1;
                 warn!(worker_id = %self.worker_id, job_id = %job.id, error_class = %failure.class, "job failed");
             }
         }

@@ -131,7 +131,7 @@ cannot qualify as a full duplicate merely because its local frames align.
 Video fingerprint extraction and all ffmpeg/file work happen before the final
 identity transaction. The worker may perform a read-only exact-SHA preflight to
 skip extraction, but it does not merge metadata or reserve media there. The
-finalizer locks the ingest row and the current `JobAttempt`, rejects an expired
+finalizer locks the ingest row and the current `JobLease`, rejects an expired
 or recovered lease, acquires one transaction-scoped advisory lock, rechecks
 canonical SHA, runs the bounded shortlist/alignment decision, and then either
 reuses the existing media row, persists bounded `duplicate_pending` evidence,

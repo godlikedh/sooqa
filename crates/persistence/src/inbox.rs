@@ -12,7 +12,7 @@ use sooqa_inbox::{
     IngestPage, IngestStateError, IngestStatus, IngestSubmission, RequestedAction, SourceDownload,
     SourceInspection, SourceMediaKind, SubmittedVia,
 };
-use sooqa_jobs::{JobAttempt, NewJob};
+use sooqa_jobs::{JobLease, NewJob};
 use sooqa_library::{
     MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, MediaIngest,
     VideoDuplicateClassification, VideoDuplicateEvidence, VideoIdentityOutcome,
@@ -447,7 +447,7 @@ impl InboxRepository {
     pub async fn begin_source_inspection(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
     ) -> Result<SourceInspectionStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
@@ -475,7 +475,7 @@ impl InboxRepository {
     pub async fn begin_asset_probe(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
     ) -> Result<AssetProbeStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
@@ -524,7 +524,7 @@ impl InboxRepository {
     pub async fn begin_source_download(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
     ) -> Result<SourceDownloadStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
@@ -555,7 +555,7 @@ impl InboxRepository {
     pub async fn complete_asset_probe(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         probe: serde_json::Value,
     ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
@@ -657,7 +657,7 @@ impl InboxRepository {
     pub async fn begin_asset_normalization(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
     ) -> Result<AssetNormalizationStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
@@ -691,7 +691,7 @@ impl InboxRepository {
     pub async fn complete_asset_normalization(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         normalization: AssetNormalization,
     ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
@@ -743,7 +743,7 @@ impl InboxRepository {
     pub async fn fail_asset_normalization(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
@@ -765,7 +765,7 @@ impl InboxRepository {
     pub async fn begin_ingest_finalization(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
     ) -> Result<IngestFinalizationStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
@@ -793,7 +793,7 @@ impl InboxRepository {
     pub async fn complete_ingest_finalization(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         finalization: IngestFinalization,
     ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
@@ -841,7 +841,7 @@ impl InboxRepository {
     pub async fn begin_ingest_fingerprinting(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
     ) -> Result<IngestFingerprintStart, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
         let mut request = load_request(&mut transaction, id).await?;
@@ -869,7 +869,7 @@ impl InboxRepository {
     pub async fn finalize_video_identity(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         ingest: MediaIngest,
         fingerprint: Option<&VideoSequenceFingerprint>,
         config: SequenceAlignmentConfig,
@@ -1046,7 +1046,7 @@ impl InboxRepository {
 
     pub async fn begin_workspace_cleanup(
         &self,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         ingest_id: Uuid,
         workspace_id: Uuid,
     ) -> Result<WorkspaceCleanupStart, InboxRepositoryError> {
@@ -1143,7 +1143,7 @@ impl InboxRepository {
     pub async fn fail_ingest_fingerprint(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
@@ -1165,7 +1165,7 @@ impl InboxRepository {
     pub async fn fail_ingest_finalization(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
@@ -1187,7 +1187,7 @@ impl InboxRepository {
     pub async fn complete_source_inspection(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         inspection: SourceInspection,
     ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
@@ -1237,7 +1237,7 @@ impl InboxRepository {
     pub async fn complete_source_download(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         download: SourceDownload,
     ) -> Result<Ingest, InboxRepositoryError> {
         let mut transaction = self.pool.begin().await?;
@@ -1281,7 +1281,7 @@ impl InboxRepository {
     pub async fn fail_source_download(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
@@ -1303,7 +1303,7 @@ impl InboxRepository {
     pub async fn fail_source_inspection(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
@@ -1325,7 +1325,7 @@ impl InboxRepository {
     pub async fn fail_asset_probe(
         &self,
         id: Uuid,
-        attempt: &JobAttempt,
+        attempt: &JobLease,
         status: IngestStatus,
         error_code: &str,
         error_message: &str,
@@ -1449,7 +1449,7 @@ pub struct ForceSaveResult {
 
 struct IngestFailureGuard<'a> {
     ignore_completed_download: bool,
-    attempt: Option<&'a JobAttempt>,
+    attempt: Option<&'a JobLease>,
     expected_status: Option<IngestStatus>,
 }
 
@@ -1932,7 +1932,7 @@ async fn load_request(
 
 async fn lock_current_job_attempt(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    attempt: &JobAttempt,
+    attempt: &JobLease,
 ) -> Result<bool, sqlx::Error> {
     let current_job = sqlx::query_scalar::<_, Uuid>(
         r#"
@@ -1958,7 +1958,7 @@ async fn lock_current_job_attempt(
 
 async fn succeed_current_job_attempt(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    attempt: &JobAttempt,
+    attempt: &JobLease,
 ) -> Result<(), InboxRepositoryError> {
     let result = sqlx::query(
         r#"

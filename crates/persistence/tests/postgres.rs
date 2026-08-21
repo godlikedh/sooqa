@@ -141,6 +141,12 @@ async fn database_constraints_fence_running_jobs_and_bound_media_digests(pool: s
             .execute(database.pool())
             .await;
     assert!(running_without_lease.is_err());
+
+    let removed_recovery_kind =
+        sqlx::query("INSERT INTO queue.jobs (kind) VALUES ('recover_stale_jobs')")
+            .execute(database.pool())
+            .await;
+    assert!(removed_recovery_kind.is_err());
 }
 
 #[tokio::test]
@@ -419,6 +425,7 @@ async fn run_populated_upgrade(target_pool: sqlx::PgPool, target_url: Url) {
     assert_eq!(applied_versions, expected_versions);
     assert!(applied_versions.contains(&7), "publication intent migration must be exercised");
     assert!(applied_versions.contains(&8), "preview and caption migration must be exercised");
+    assert!(applied_versions.contains(&9), "job vocabulary migration must be exercised");
 
     let job_state_counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE state = 'queued'), count(*) FILTER (WHERE state = 'running'), count(*) FILTER (WHERE state = 'succeeded'), count(*) FILTER (WHERE state = 'failed'), count(*) FILTER (WHERE state = 'cancelled') FROM queue.jobs",
