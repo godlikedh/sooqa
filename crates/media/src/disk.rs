@@ -4,6 +4,19 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+/// The largest number of large workspace operations the home deployment
+/// promises to admit concurrently. A caller that supports a different
+/// concurrency envelope must pass its own bound to
+/// [`concurrent_operation_budget`].
+pub const MAX_CONCURRENT_WORKSPACE_OPERATIONS: u64 = 2;
+
+/// Return the aggregate operation budget that every concurrent admission must
+/// observe. Saturation turns an impossible-to-represent budget into a safe
+/// rejection when it is combined with a reserve.
+pub const fn concurrent_operation_budget(operation_bytes: u64, concurrency: u64) -> u64 {
+    operation_bytes.saturating_mul(concurrency)
+}
+
 /// A synthetic or observed filesystem free-space measurement.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct DiskSpace {
@@ -84,7 +97,7 @@ pub enum DiskAdmissionError {
     #[error("could not inspect free space for {path}: {message}")]
     Stat { path: PathBuf, message: String },
     #[error(
-        "work volume {path} has {available_bytes} free bytes, below the {reserve_bytes}-byte reserve plus {required_bytes} bytes required for the next bounded operation"
+        "work volume {path} has {available_bytes} free bytes, below the {reserve_bytes}-byte reserve plus {required_bytes} bytes required for the supported concurrent operation budget"
     )]
     Insufficient { path: PathBuf, available_bytes: u64, reserve_bytes: u64, required_bytes: u64 },
 }
@@ -105,17 +118,30 @@ mod tests {
 
         let recovered = DiskSpace::new(121);
         assert!(recovered.check("/synthetic", 21, 100).is_ok());
+        assert_eq!(concurrent_operation_budget(u64::MAX, 2), u64::MAX);
     }
 
     #[test]
     fn synthetic_two_worker_budget_preserves_the_reserve() {
         let reserve = 100;
         let per_worker = 400;
-        let after_first = DiskSpace::new(900 - per_worker);
-        assert!(after_first.check("/synthetic", reserve, per_worker).is_ok());
-        let after_second = DiskSpace::new(after_first.available_bytes - per_worker);
-        assert_eq!(after_second.available_bytes, reserve);
-        assert!(after_second.check("/synthetic", reserve, 1).is_err());
+        let aggregate =
+            concurrent_operation_budget(per_worker, MAX_CONCURRENT_WORKSPACE_OPERATIONS);
+        let before = DiskSpace::new(reserve + aggregate);
+
+        // Both workers can observe `before` concurrently. Requiring the full
+        // two-worker budget on each admission makes their combined peak end
+        // exactly at the reserve rather than below it.
+        assert!(before.check("/synthetic", reserve, aggregate).is_ok());
+        assert!(before.check("/synthetic", reserve, aggregate).is_ok());
+        let after_both = DiskSpace::new(before.available_bytes - (per_worker * 2));
+        assert_eq!(after_both.available_bytes, reserve);
+        assert!(after_both.check("/synthetic", reserve, aggregate).is_err());
+        assert!(
+            DiskSpace::new(before.available_bytes - 1)
+                .check("/synthetic", reserve, aggregate)
+                .is_err()
+        );
     }
 
     #[cfg(unix)]

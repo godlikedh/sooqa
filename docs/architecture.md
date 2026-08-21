@@ -309,7 +309,11 @@ Before a URL/Telegram source download, normalization, or video fingerprint
 extraction starts, the worker asks the media boundary for unprivileged free
 bytes on the filesystem containing the shared work root. It requires the
 configured reserve plus the operation's bounded worst-case temporary output;
-low space defers the durable job with a structured `work_disk_low` warning.
+the home admission policy doubles that operation budget so two workers that
+observe the same free-space value cannot consume the configured reserve.
+Low space defers the durable job with a structured `work_disk_low` warning;
+the durable deferral restores the claimed attempt so capacity waits do not
+exhaust ordinary retries.
 This check never removes a workspace and never changes Telegram storage
 outcomes. The home Compose worker has finite per-replica CPU, memory, and stop
 grace defaults so two replicas share a bounded host envelope.

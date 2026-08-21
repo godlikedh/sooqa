@@ -166,9 +166,14 @@ separate:
   the filesystem containing `media.work_root` by default. Before a URL
   download, Telegram-source reconstruction, normalization, or video
   fingerprint extraction starts, the worker checks the reserve plus that
-  operation's bounded worst-case temporary output. A low-space check defers
-  the queue job for one minute and logs `work_disk_low`; it does not fail the
-  ingest, remove a workspace, or touch Telegram storage state. URL admission
+  operation's bounded worst-case temporary output. The home admission policy
+  checks two copies of each operation budget, which is the explicit supported
+  bound for `--scale worker=2`; do not scale beyond two workers without
+  revisiting this bound. A low-space check defers
+  the queue job for one minute and logs `work_disk_low`; this durable deferral
+  does not consume the ordinary job-attempt budget, including when
+  `max_attempts=1`. It does not fail the ingest, remove a workspace, or touch
+  Telegram storage state. URL admission
   uses three source budgets because yt-dlp permits two recovery attempts and a
   progressive fallback. The reserve is an admission guard, not a promise that
   an undersized host volume can hold an arbitrary backlog;
@@ -330,7 +335,8 @@ budgets are:
 | Fingerprint frame sequence | 4 GiB | 8 GiB |
 | Telegram-local Bot API data | separate `home-telegram-bot-api-data` volume | same |
 
-These are upper bounds for one active phase per worker; existing workspaces and
+These are upper bounds for one active phase per worker; the admission guard is
+deliberately sized for at most two concurrent workers. Existing workspaces and
 the configured reserve must be added when sizing the shared
 `home-sooqa-work` volume. A practical two-worker starting point is at least
 64 GiB for transient media work plus 16 GiB reserve, with more space for a

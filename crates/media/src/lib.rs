@@ -35,7 +35,10 @@ pub use command::{
 };
 pub use diagnostics::{BinaryCheck, BinaryDiagnostic, diagnose_binaries};
 pub use direct_http::{DirectHttpDownloader, HostResolver, ResolvedAddress};
-pub use disk::{DiskAdmissionError, DiskSpace, check_disk_space};
+pub use disk::{
+    DiskAdmissionError, DiskSpace, MAX_CONCURRENT_WORKSPACE_OPERATIONS, check_disk_space,
+    concurrent_operation_budget,
+};
 pub use execute::{
     FfmpegExecutor, FfmpegProgress, FfmpegProgressState, NormalizationExecutionError,
     NormalizationResult, ProgressError, parse_ffmpeg_progress,
