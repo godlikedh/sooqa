@@ -2278,6 +2278,7 @@ dependencies = [
  "sooqa-persistence",
  "sooqa-runtime",
  "sooqa-telegram",
+ "teloxide",
  "thiserror",
  "tokio",
  "tower",

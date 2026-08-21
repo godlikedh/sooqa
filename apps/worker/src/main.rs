@@ -20,7 +20,7 @@ use sooqa_worker::{
     compute_fingerprint_handler, download_source_handler, finalize_ingest_handler,
     inspect_source_handler, materialize_publication_handler, media_processing_components,
     normalize_asset_handler, probe_asset_handler_with_telegram_source, publish_post_handler,
-    sync_storage_caption_handler, upload_storage_asset_handler,
+    spawn_storage_preflight, sync_storage_caption_handler, upload_storage_asset_handler,
 };
 
 #[tokio::main]
@@ -246,13 +246,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
         handlers.register(JobType::PublishPost, move |job| publication_handler(job));
         tracing::info!("fenced Telegram publication job handler enabled");
     }
+    let mut storage_preflight_tasks = Vec::new();
     match (telegram_api, config.telegram.storage_chat_id) {
         (Some(api), Some(storage_chat_id)) => {
             let caption_api = api.clone();
             let provider = StorageUploadProvider::new(api, database.library(), storage_chat_id)?
                 .with_max_storage_bytes(config.media.normalized_storage_max_bytes)
                 .with_work_root(config.media.work_root.clone());
-            provider.verify_storage_chat().await?;
+            // Storage availability is a job concern, not a worker-process
+            // prerequisite. Probe it in the background for an operator signal
+            // while the queue loop starts immediately.
+            storage_preflight_tasks
+                .push(spawn_storage_preflight(provider.clone(), storage_chat_id));
             let storage_handler = upload_storage_asset_handler(database.inbox(), provider);
             handlers.register(JobType::UploadStorageAsset, move |job| storage_handler(job));
             let caption_handler = sync_storage_caption_handler(database.library(), caption_api);
@@ -305,6 +310,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .await;
     });
     let worker_result = worker.run(sooqa_runtime::shutdown_signal()).await;
+    for task in storage_preflight_tasks {
+        task.abort();
+        let _ = task.await;
+    }
     let _ = stop_reconciliation.send(true);
     if let Err(error) = reconciliation_task.await {
         tracing::warn!(?error, "workspace reconciliation task stopped unexpectedly");
