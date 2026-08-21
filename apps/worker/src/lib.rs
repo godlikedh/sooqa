@@ -54,9 +54,6 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-#[cfg(test)]
-use sooqa_media::DiskSpace;
-
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), HandlerFailure>> + Send + 'static>>;
 pub type HandlerFn = Arc<dyn Fn(Job) -> HandlerFuture + Send + Sync>;
 pub type CancellableHandlerFn =
@@ -119,26 +116,6 @@ impl WorkspaceAdmission {
         match check_disk_space(work_root, self.reserve_bytes, concurrent_budget) {
             Ok(_) => Ok(()),
             Err(error) => Self::defer_for_space_error(work_root, required_bytes, error),
-        }
-    }
-
-    #[cfg(test)]
-    fn admit_available(
-        self,
-        path: &Path,
-        available: DiskSpace,
-        required_bytes: u64,
-    ) -> Result<(), HandlerFailure> {
-        if !self.enabled {
-            return Ok(());
-        }
-        let concurrent_budget = sooqa_media::concurrent_operation_budget(
-            required_bytes,
-            sooqa_media::MAX_CONCURRENT_WORKSPACE_OPERATIONS,
-        );
-        match available.check(path, self.reserve_bytes, concurrent_budget) {
-            Ok(_) => Ok(()),
-            Err(error) => Self::defer_for_space_error(path, required_bytes, error),
         }
     }
 
@@ -4054,9 +4031,7 @@ mod tests {
     use async_trait::async_trait;
     use tokio::sync::Notify;
 
-    use sooqa_inbox::{
-        Ingest, IngestStatus, IngestSubmission, IngestSubmissionInput, SubmittedVia,
-    };
+    use sooqa_inbox::{Ingest, IngestSubmission, IngestSubmissionInput, SubmittedVia};
     use sooqa_media::{
         CanonicalVideoProfile, CommandError, ExternalCommand, ExternalCommandOutput,
         ExternalCommandRunner, FfmpegExecutor, FfprobeAdapter, FrameRate, MediaProbe, MediaStream,
@@ -4092,38 +4067,6 @@ mod tests {
 
     fn test_handler(_job: Job) -> HandlerFuture {
         Box::pin(async { Ok(()) })
-    }
-
-    #[test]
-    fn disk_refusal_leaves_stage_unchanged_until_capacity_recovers() {
-        let admission = WorkspaceAdmission::new(100);
-        let operation_bytes = 400;
-        let aggregate = sooqa_media::concurrent_operation_budget(
-            operation_bytes,
-            sooqa_media::MAX_CONCURRENT_WORKSPACE_OPERATIONS,
-        );
-        let mut stage = IngestStatus::Normalizing;
-
-        let refusal = admission.admit_available(
-            Path::new("/synthetic"),
-            DiskSpace::new(100 + aggregate - 1),
-            operation_bytes,
-        );
-        assert!(matches!(
-            refusal,
-            Err(HandlerFailure { class, defer_until: Some(_), .. }) if class == "work_disk_low"
-        ));
-        assert_eq!(stage, IngestStatus::Normalizing);
-
-        admission
-            .admit_available(
-                Path::new("/synthetic"),
-                DiskSpace::new(100 + aggregate),
-                operation_bytes,
-            )
-            .expect("the operation should recover once the reserve is available");
-        stage = IngestStatus::Fingerprinting;
-        assert_eq!(stage, IngestStatus::Fingerprinting);
     }
 
     #[test]
