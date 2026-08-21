@@ -1,5 +1,6 @@
 use serde_json::json;
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
+use sooqa_jobs::{JobStatus, JobType, NewJob};
 use sooqa_library::{
     CaptionSyncCompletion, CaptionSyncState, MediaIngest, MediaKind, MediaMetadata,
     MediaSearchQuery, MediaSourceInput, MediaUpdate, NewMedia, SourceKind, StorageUploadAttachment,
@@ -7,7 +8,8 @@ use sooqa_library::{
     VideoFingerprintInput,
 };
 use sooqa_media::{VideoSequenceFingerprint, VideoSequenceSample};
-use sooqa_persistence::{Database, LibraryRepositoryError};
+use sooqa_persistence::{Database, JobSettlement, LibraryRepositoryError};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 fn ingest(sha256: Vec<u8>, source: &str) -> MediaIngest {
@@ -225,6 +227,141 @@ async fn caption_sync_is_generation_fenced_and_caption_metadata_is_bounded(pool:
     .await
     .unwrap();
     assert_eq!(jobs, 4);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn terminal_caption_settlement_bounds_persisted_error_message(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let media = database
+        .library()
+        .resolve_media(ingest(vec![72_u8; 32], "https://example.test/caption-error-bound"))
+        .await
+        .unwrap()
+        .media;
+    sqlx::query(
+        "UPDATE media SET storage_state = 'ready', telegram_storage_chat_id = -100123, telegram_storage_message_id = 43, telegram_file_id = 'caption-file', caption_sync_state = 'syncing', caption_sync_generation = 0 WHERE id = $1",
+    )
+    .bind(media.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let job = database
+        .jobs()
+        .enqueue(
+            NewJob::sync_storage_caption(media.id, 0)
+                .dedupe_key(format!("caption-error-bound:{}", Uuid::new_v4())),
+        )
+        .await
+        .unwrap();
+    let claimed = database
+        .jobs()
+        .claim_next(
+            "caption-bound-worker",
+            std::time::Duration::from_secs(30),
+            &[JobType::SyncStorageCaption],
+        )
+        .await
+        .unwrap()
+        .expect("caption job should claim");
+    assert_eq!(claimed.id, job.id);
+    let error_message = "x".repeat(600);
+    let settled = database
+        .jobs()
+        .settle_lease(
+            &claimed,
+            &claimed.lease().expect("caption job should carry a lease"),
+            JobSettlement::fail("caption_sync", &error_message),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settled.status, JobStatus::Failed);
+    let (state, persisted): (String, Option<String>) =
+        sqlx::query_as("SELECT caption_sync_state, caption_sync_error FROM media WHERE id = $1")
+            .bind(media.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, "failed");
+    assert_eq!(persisted.as_deref().map(str::len), Some(512));
+    assert_eq!(persisted.as_deref(), Some(&error_message[..512]));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn expired_storage_safe_cancellation_is_non_consuming_and_idempotent(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let media = database
+        .library()
+        .resolve_media(ingest(vec![73_u8; 32], "https://example.test/storage-safe-cancel"))
+        .await
+        .unwrap()
+        .media;
+    let job = database
+        .jobs()
+        .enqueue(
+            NewJob::upload_storage_asset(media.id)
+                .dedupe_key(format!("storage-safe-cancel:{}", Uuid::new_v4())),
+        )
+        .await
+        .unwrap();
+    let claimed = database
+        .jobs()
+        .claim_next(
+            "storage-safe-cancel-worker",
+            std::time::Duration::from_secs(30),
+            &[JobType::UploadStorageAsset],
+        )
+        .await
+        .unwrap()
+        .expect("storage job should claim");
+    assert_eq!(claimed.id, job.id);
+    let lease = claimed.lease().expect("storage job should carry a lease");
+    sqlx::query(
+        "UPDATE queue.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let first = database
+        .jobs()
+        .retry_lease_without_consuming_attempt(
+            &lease,
+            OffsetDateTime::now_utc(),
+            "storage_upload_cancelled",
+            "storage upload was safely cancelled before Telegram dispatch",
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status, JobStatus::Queued);
+    assert_eq!(first.attempt_count, 0);
+    let second = database
+        .jobs()
+        .retry_lease_without_consuming_attempt(
+            &lease,
+            OffsetDateTime::now_utc(),
+            "storage_upload_cancelled",
+            "storage upload was safely cancelled before Telegram dispatch",
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status, JobStatus::Queued);
+    assert_eq!(second.attempt_count, 0);
+    let (queue_state, attempts, storage_state, storage_token): (String, i32, String, Option<Uuid>) =
+        sqlx::query_as(
+            "SELECT q.state, q.attempt_count, m.storage_state, m.storage_token FROM queue.jobs q CROSS JOIN media m WHERE q.id = $1 AND m.id = $2",
+        )
+        .bind(job.id)
+        .bind(media.id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(queue_state, "queued");
+    assert_eq!(attempts, 0);
+    assert_eq!(storage_state, "pending_storage");
+    assert_eq!(storage_token, None);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

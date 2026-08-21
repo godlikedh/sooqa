@@ -1,4 +1,4 @@
-use sooqa_jobs::{Job, JobLease, NewJob};
+use sooqa_jobs::{Job, JobCommand, JobLease, NewJob};
 use sqlx::{PgPool, Postgres, Transaction};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -78,14 +78,48 @@ pub(crate) async fn protected_workspace_ids(pool: &PgPool) -> Result<Vec<Uuid>, 
 pub(crate) async fn settle_job(
     pool: &PgPool,
     lease: &JobLease,
+    expected: &JobCommand,
     settlement: JobSettlement,
 ) -> Result<Job, crate::JobRepositoryError> {
-    settlement::settle_queue(pool, lease, settlement).await
+    let ingest_id = match expected {
+        JobCommand::CleanupWorkspace(payload) => payload.ingest_id,
+        _ => return Err(crate::JobRepositoryError::LeaseLost),
+    };
+    let mut transaction = pool.begin().await?;
+    lock_cleanup_ingest(&mut transaction, ingest_id).await?;
+    let row =
+        settlement::settle_queue_in_transaction(&mut transaction, lease, expected, settlement)
+            .await?;
+    transaction.commit().await?;
+    row.into_job()
 }
 
 pub(crate) async fn recover_job(
     pool: &PgPool,
     job_id: Uuid,
+    expected: &JobCommand,
 ) -> Result<bool, crate::JobRepositoryError> {
-    settlement::recover_queue_only(pool, job_id).await
+    let ingest_id = match expected {
+        JobCommand::CleanupWorkspace(payload) => payload.ingest_id,
+        _ => return Err(crate::JobRepositoryError::LeaseLost),
+    };
+    let mut transaction = pool.begin().await?;
+    lock_cleanup_ingest(&mut transaction, ingest_id).await?;
+    let recovered =
+        settlement::recover_queue_only_in_transaction(&mut transaction, job_id, expected).await?;
+    transaction.commit().await?;
+    Ok(recovered.is_some())
+}
+
+async fn lock_cleanup_ingest(
+    transaction: &mut Transaction<'_, Postgres>,
+    ingest_id: Uuid,
+) -> Result<(), crate::JobRepositoryError> {
+    // Cleanup has no state transition on the ingest, but locking its stable
+    // aggregate first keeps its queue recovery order consistent with inbox.
+    let _ = sqlx::query_scalar::<_, Uuid>("SELECT id FROM ingests WHERE id = $1 FOR UPDATE")
+        .bind(ingest_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    Ok(())
 }

@@ -93,6 +93,21 @@ impl JobSettlement {
     pub fn fail(error_class: impl Into<String>, error_message: impl Into<String>) -> Self {
         Self::Fail { error_class: error_class.into(), error_message: error_message.into() }
     }
+
+    pub(crate) fn allows_expired_lease(&self) -> bool {
+        matches!(
+            self,
+            Self::Retry { non_consuming: true, .. } | Self::Defer { non_consuming: true, .. }
+        )
+    }
+
+    pub(crate) fn error_class(&self) -> Option<&str> {
+        match self {
+            Self::Retry { error_class, .. }
+            | Self::Defer { error_class, .. }
+            | Self::Fail { error_class, .. } => Some(error_class),
+        }
+    }
 }
 
 impl JobRepository {
@@ -397,7 +412,7 @@ fn lease_matches_job(job: &Job, lease: &JobLease) -> bool {
         && job.lease_token == Some(lease.lease_token)
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, Clone, FromRow)]
 pub(crate) struct JobRow {
     pub(crate) id: Uuid,
     pub(crate) kind: String,

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use sooqa_inbox::{IngestSubmission, IngestSubmissionInput, SubmittedVia};
-use sooqa_jobs::{JobStatus, JobType, NewJob};
+use sooqa_jobs::{InspectSourcePayload, JobCommand, JobStatus, JobType, NewJob};
 use sooqa_persistence::{Database, JobRepositoryError, JobSettlement};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -125,6 +125,95 @@ async fn settlement_rejects_a_job_with_another_jobs_lease(pool: sqlx::PgPool) {
             .expect("second job state should be readable"),
         "running"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn settlement_rejects_a_forged_command_before_domain_or_queue_mutation(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let repository = database.jobs();
+    let first_ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/forged-a-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .ingest
+        .id;
+    let second_ingest = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/forged-b-{}", Uuid::new_v4()),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .ingest
+        .id;
+    let first = repository
+        .claim_next("forged-worker-a", Duration::from_secs(30), &[JobType::InspectSource])
+        .await
+        .unwrap()
+        .expect("first inspect job should claim");
+    let second = repository
+        .claim_next("forged-worker-b", Duration::from_secs(30), &[JobType::InspectSource])
+        .await
+        .unwrap()
+        .expect("second inspect job should claim");
+    assert_eq!(
+        first.command,
+        JobCommand::InspectSource(InspectSourcePayload { ingest_id: first_ingest })
+    );
+    assert_eq!(
+        second.command,
+        JobCommand::InspectSource(InspectSourcePayload { ingest_id: second_ingest })
+    );
+
+    let mut forged = first.clone();
+    forged.command = JobCommand::InspectSource(InspectSourcePayload { ingest_id: second_ingest });
+    let error = repository
+        .settle_lease(
+            &forged,
+            &first.lease().expect("first job should carry a lease"),
+            JobSettlement::fail("forged_command", "must not mutate another ingest"),
+        )
+        .await
+        .expect_err("a same-lease command for another ingest must be fenced");
+    assert!(matches!(error, JobRepositoryError::LeaseLost));
+
+    for ingest_id in [first_ingest, second_ingest] {
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM ingests WHERE id = $1")
+                .bind(ingest_id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap(),
+            "queued"
+        );
+    }
+    let first_queue = sqlx::query_as::<_, (String, i32, Option<String>)>(
+        "SELECT state, attempt_count, error_class FROM queue.jobs WHERE id = $1",
+    )
+    .bind(first.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(first_queue, ("running".to_owned(), 1, None));
+    let second_queue =
+        sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")
+            .bind(second.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(second_queue, "running");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
