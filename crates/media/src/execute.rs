@@ -462,6 +462,7 @@ mod tests {
                 index: 0,
                 kind: MediaStreamKind::Video,
                 codec: Some("h264".to_owned()),
+                attached_picture: false,
                 codec_tag: Some("avc1".to_owned()),
                 codec_mime: Some("avc1.640028".to_owned()),
                 level: Some(40),
