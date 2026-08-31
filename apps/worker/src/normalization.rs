@@ -860,7 +860,7 @@ fn probe_media_kind(probe: &MediaProbe) -> Option<SourceMediaKind> {
     let video_streams = probe
         .streams
         .iter()
-        .filter(|stream| matches!(&stream.kind, MediaStreamKind::Video))
+        .filter(|stream| matches!(&stream.kind, MediaStreamKind::Video) && !stream.attached_picture)
         .collect::<Vec<_>>();
     let codecs =
         video_streams.iter().filter_map(|stream| stream.codec.as_deref()).collect::<Vec<_>>();
@@ -1006,6 +1006,48 @@ mod tests {
         assert!(failure.message.contains("101 bytes"));
         assert!(failure.message.contains("100 bytes"));
         assert!(normalized_storage_limit_failure(100, 100).is_none());
+    }
+
+    #[test]
+    fn attached_png_does_not_override_typed_mp4_video_kind() {
+        let mut probe = adaptation_probe(1920, 1080, 35_923_336);
+        probe.container_format = Some("mov,mp4,m4a,3gp,3g2,mj2".to_owned());
+        probe.duration_ms = Some(109_274);
+        probe.streams.push(MediaStream {
+            index: 2,
+            kind: MediaStreamKind::Video,
+            codec: Some("png".to_owned()),
+            attached_picture: true,
+            codec_tag: None,
+            codec_mime: None,
+            level: None,
+            profile: None,
+            pixel_format: Some("rgb24".to_owned()),
+            width: Some(1280),
+            height: Some(720),
+            display_aspect_ratio: None,
+            frame_rate: None,
+            rotation_degrees: None,
+            sample_rate_hz: None,
+            channels: None,
+            bit_rate: None,
+        });
+
+        assert_eq!(probe_media_kind(&probe), Some(SourceMediaKind::Video));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffprobe and SOOQA_TEST_ATTACHED_PICTURE_MEDIA"]
+    async fn classifies_external_attached_picture_fixture_as_video() {
+        let path = std::env::var_os("SOOQA_TEST_ATTACHED_PICTURE_MEDIA")
+            .expect("SOOQA_TEST_ATTACHED_PICTURE_MEDIA must name the external fixture");
+        let probe = FfprobeAdapter::new("ffprobe", Duration::from_secs(30))
+            .probe(path)
+            .await
+            .expect("external fixture should be probeable");
+
+        assert!(probe.streams.iter().any(|stream| stream.attached_picture));
+        assert_eq!(probe_media_kind(&probe), Some(SourceMediaKind::Video));
     }
 
     #[derive(Clone)]
@@ -1165,6 +1207,7 @@ mod tests {
                 index: 0,
                 kind: MediaStreamKind::Video,
                 codec: Some("h264".to_owned()),
+                attached_picture: false,
                 codec_tag: Some("avc1".to_owned()),
                 codec_mime: Some("avc1.640028".to_owned()),
                 level: Some(40),

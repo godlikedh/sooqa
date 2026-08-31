@@ -180,7 +180,7 @@ impl IngestProbe {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter(|stream| stream.get("kind").and_then(Value::as_str) == Some("video"))
+            .filter(|stream| is_playable_video_stream(stream))
             .filter_map(|stream| stream.get("codec").and_then(Value::as_str))
             .collect::<Vec<_>>();
         let container = container.map(str::to_ascii_lowercase);
@@ -203,9 +203,7 @@ impl IngestProbe {
             return Some(SourceMediaKind::Image);
         }
         let streams = self.0.get("streams").and_then(Value::as_array);
-        if streams.is_some_and(|streams| {
-            streams.iter().any(|stream| stream.get("kind").and_then(Value::as_str) == Some("video"))
-        }) {
+        if streams.is_some_and(|streams| streams.iter().any(is_playable_video_stream)) {
             return Some(SourceMediaKind::Video);
         }
         if streams.is_some_and(|streams| {
@@ -220,13 +218,18 @@ impl IngestProbe {
         self.0.get("container_format").and_then(Value::as_str).or_else(|| {
             self.0.get("streams").and_then(Value::as_array).and_then(|streams| {
                 streams.iter().find_map(|stream| {
-                    (stream.get("kind").and_then(Value::as_str) == Some("video"))
+                    is_playable_video_stream(stream)
                         .then(|| stream.get("codec").and_then(Value::as_str))
                         .flatten()
                 })
             })
         })
     }
+}
+
+fn is_playable_video_stream(stream: &Value) -> bool {
+    stream.get("kind").and_then(Value::as_str) == Some("video")
+        && stream.get("attached_picture").and_then(Value::as_bool) != Some(true)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -1302,6 +1305,37 @@ mod tests {
     fn submission(url: &str) -> IngestSubmission {
         IngestSubmission::try_new(IngestSubmissionInput::new(url, SubmittedVia::Api))
             .expect("submission should be valid")
+    }
+
+    #[test]
+    fn attached_png_does_not_override_mp4_video_kind() {
+        let probe = IngestProbe::from_value(json!({
+            "container_format": "mov,mp4,m4a,3gp,3g2,mj2",
+            "duration_ms": 109274,
+            "size_bytes": 35923336,
+            "streams": [
+                {"index": 0, "kind": "video", "codec": "h264", "attached_picture": false},
+                {"index": 1, "kind": "audio", "codec": "aac", "attached_picture": false},
+                {"index": 2, "kind": "video", "codec": "png", "attached_picture": true}
+            ]
+        }));
+
+        assert_eq!(probe.media_kind(), Some(SourceMediaKind::Video));
+    }
+
+    #[test]
+    fn attached_cover_art_does_not_override_audio_kind() {
+        let probe = IngestProbe::from_value(json!({
+            "container_format": "mp3",
+            "duration_ms": 1000,
+            "size_bytes": 1024,
+            "streams": [
+                {"index": 0, "kind": "audio", "codec": "mp3", "attached_picture": false},
+                {"index": 1, "kind": "video", "codec": "png", "attached_picture": true}
+            ]
+        }));
+
+        assert_eq!(probe.media_kind(), Some(SourceMediaKind::Audio));
     }
 
     #[test]

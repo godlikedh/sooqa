@@ -117,6 +117,10 @@ pub struct MediaStream {
     pub index: u32,
     pub kind: MediaStreamKind,
     pub codec: Option<String>,
+    /// True when the container marks this video stream as attached cover art
+    /// rather than playable media.
+    #[serde(default)]
+    pub attached_picture: bool,
     /// Container codec tag, such as `avc1` or `avc3` for MP4/H.264.
     #[serde(default)]
     pub codec_tag: Option<String>,
@@ -251,6 +255,14 @@ struct RawStream {
     sample_rate: Option<String>,
     channels: Option<u16>,
     bit_rate: Option<String>,
+    #[serde(default)]
+    disposition: RawDisposition,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawDisposition {
+    #[serde(default)]
+    attached_pic: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -337,6 +349,7 @@ fn parse_stream(stream: RawStream) -> Result<MediaStream, ProbeError> {
         index,
         kind,
         codec,
+        attached_picture: stream.disposition.attached_pic != 0,
         codec_tag,
         codec_mime,
         level: stream
@@ -650,6 +663,24 @@ mod tests {
         );
         assert_eq!(probe.streams[1].sample_rate_hz, Some(48000));
         assert_eq!(probe.streams[1].channels, Some(2));
+    }
+
+    #[test]
+    fn preserves_attached_picture_disposition() {
+        let json = br#"{
+          "streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "h264",
+             "disposition": {"attached_pic": 0}},
+            {"index": 1, "codec_type": "video", "codec_name": "png",
+             "disposition": {"attached_pic": 1}}
+          ],
+          "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "size": "35923336"}
+        }"#;
+
+        let probe = parse_probe_json(json, 35_923_336).expect("fixture should parse");
+
+        assert!(!probe.streams[0].attached_picture);
+        assert!(probe.streams[1].attached_picture);
     }
 
     #[test]
