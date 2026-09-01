@@ -77,7 +77,7 @@ allowlisted page is accepted, which is part of the single-admin deployment's
 explicit trust boundary; the separate `t.co` preflight prevents an open
 redirect from reaching yt-dlp first. The home Compose PO-token
 provider is private-network-only, has no host-published port, and is checked
-for the pinned `1.3.1` version at worker startup. Each yt-dlp attempt gets a
+for the pinned `1.3.2` version at worker startup. Each yt-dlp attempt gets a
 unique job-owned directory with a relative output and explicit home/temp paths;
 yt-dlp keeps its normal supported-client selection; the pinned PO-token
 provider is supplied only to YouTube selection without globally forcing an mweb
