@@ -1,5 +1,5 @@
-ARG BGUTIL_VERSION=1.3.1
-ARG BGUTIL_PLUGIN_SHA256=b8ceec7f76143da172aaf5ebeec0c2d218e5680c063b931586bca48567069b38
+ARG BGUTIL_VERSION=1.3.2
+ARG BGUTIL_PLUGIN_SHA256=d51cf1c54e487137df749bd8778cceaa62304e6c5054c955b95f028f93ad6d57
 
 FROM rust:1.97-bookworm AS builder
 
@@ -12,9 +12,9 @@ RUN grep --fixed-strings -- "pub const YTDLP_POT_PROVIDER_VERSION: &str = \"${BG
 
 FROM debian:bookworm-slim
 
-ARG YTDLP_VERSION=2026.07.04
-ARG YTDLP_AMD64_SHA256=6bbb3d314cde4febe36e5fa1d55462e29c974f63444e707871834f6d8cc210ae
-ARG YTDLP_ARM64_SHA256=b6ce97646773070d7a7ffd6bbbdcaecb47c48483909c54c915bf08a7a9b5e0b1
+ARG YTDLP_VERSION=2026.08.19
+ARG YTDLP_AMD64_SHA256=58162f9bfdc27458ea47bfcb311cf47028f17d8154a8bf7d689861d46399230a
+ARG YTDLP_ARM64_SHA256=b16e4dab368a816cd05d477d698a605a6ae87ccee1c8ffd38fa21d7254141fcc
 ARG DENO_VERSION=2.8.1
 ARG DENO_AMD64_SHA256=2d7bb6195226ac832e0bf7109a115f0af65ee69ac797a4bbde5b27a06cc242d9
 ARG DENO_ARM64_SHA256=67e9df91870fd0af700df924173e3009ea7ff6956e2c3c3bb86065d6070d0fd6
@@ -24,7 +24,7 @@ ARG BGUTIL_PLUGIN_SHA256
 RUN groupadd --system sooqa && useradd --system --gid sooqa sooqa \
     && apt-get update \
     && apt-get install --no-install-recommends --yes ca-certificates curl ffmpeg unzip \
-    && test "${BGUTIL_PLUGIN_SHA256}" = "b8ceec7f76143da172aaf5ebeec0c2d218e5680c063b931586bca48567069b38" \
+    && test "${BGUTIL_PLUGIN_SHA256}" = "d51cf1c54e487137df749bd8778cceaa62304e6c5054c955b95f028f93ad6d57" \
     && case "$(dpkg --print-architecture)" in \
         amd64) \
             ytdlp_asset=yt-dlp_linux; ytdlp_sha256="$YTDLP_AMD64_SHA256"; \

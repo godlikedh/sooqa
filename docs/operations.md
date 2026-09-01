@@ -288,7 +288,7 @@ architecture digest. The server and worker do not use a Compose health
 dependency on this service: direct-only or social-only deployments remain
 usable without a YouTube PO-token provider, while the worker's restart policy
 retries its fail-closed preflight when YouTube page support is enabled. The
-worker checks `/ping` for provider version `1.3.1` before enabling YouTube page
+worker checks `/ping` for provider version `1.3.2` before enabling YouTube page
 jobs; a missing provider or version mismatch fails startup with a
 provider-specific diagnostic. Standalone deployments can set
 `SOOQA_MEDIA_YTDLP_POT_PROVIDER_URL` to another validated provider origin.
@@ -317,8 +317,11 @@ job retry policy. Every attempt has its own directory and failed or partial
 files are removed before another attempt.
 
 The home image downloads the official standalone `yt-dlp` distribution, the
-`bgutil-ytdlp-pot-provider` plugin `1.3.1`, and a pinned Deno runtime. The
-current Dockerfile pins yt-dlp `2026.07.04`, Deno `2.8.1`, and the plugin ZIP
+`bgutil-ytdlp-pot-provider` plugin `1.3.2`, and a pinned Deno runtime. Provider
+1.3.2 mints WebPO tokens from a matching YouTube homepage challenge and
+configuration pair, mitigating the media-CDN 403s caused by YouTube's
+session-binding rollout. The current Dockerfile pins yt-dlp `2026.08.19`, Deno
+`2.8.1`, and the plugin ZIP
 with architecture-specific or release SHA-256 checksums. When the allowlist is
 enabled, worker startup runs an offline local-info fixture through yt-dlp with
 the configured plugin/EJS/Deno flags, checks that the bundled EJS and pinned

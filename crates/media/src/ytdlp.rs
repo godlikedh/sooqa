@@ -24,10 +24,10 @@ const DEFAULT_YTDLP_POT_PROVIDER_URL: &str = "http://127.0.0.1:4416";
 const MIN_SUPPORTED_DENO_VERSION: (u32, u32, u32) = (2, 3, 0);
 const MAX_POT_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024;
 const YTDLP_ATTEMPT_MAX_BYTES_MULTIPLIER: u64 = 3;
-pub const YTDLP_POT_PROVIDER_VERSION: &str = "1.3.1";
+pub const YTDLP_POT_PROVIDER_VERSION: &str = "1.3.2";
 pub const YTDLP_PLUGIN_DIRECTORY: &str = "/usr/local/share/sooqa/yt-dlp-plugins";
 pub const YTDLP_PLUGIN_ARCHIVE_PATH: &str =
-    "/usr/local/share/sooqa/yt-dlp-plugins/bgutil-ytdlp-pot-provider-1.3.1.zip";
+    "/usr/local/share/sooqa/yt-dlp-plugins/bgutil-ytdlp-pot-provider-1.3.2.zip";
 pub const MAX_YTDLP_FORMAT_SELECTION_BYTES: usize = 1024;
 pub const YTDLP_PROGRESSIVE_FALLBACK_FORMAT: &str =
     "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]";
@@ -1673,7 +1673,7 @@ mod tests {
                     stderr: format!(
                         "[debug] Optional libraries: yt_dlp_ejs-0.8.0\n[debug] JS runtimes: deno-2.8.1\n{}",
                         if self.plugin_discovered {
-                            "[debug] Plugin directories: /usr/local/share/sooqa/yt-dlp-plugins/bgutil-ytdlp-pot-provider-1.3.1.zip/yt_dlp_plugins\n"
+                            "[debug] Plugin directories: /usr/local/share/sooqa/yt-dlp-plugins/bgutil-ytdlp-pot-provider-1.3.2.zip/yt_dlp_plugins\n"
                         } else {
                             ""
                         }
@@ -1847,7 +1847,7 @@ mod tests {
     #[tokio::test]
     async fn provider_preflight_requires_the_pinned_provider_version() {
         let (provider_url, server) =
-            provider_fixture("200 OK", r#"{"server_uptime":1.0,"version":"1.3.1"}"#).await;
+            provider_fixture("200 OK", r#"{"server_uptime":1.0,"version":"1.3.2"}"#).await;
         let downloader = YtDlpDownloader::new(
             YtDlpConfig::new("yt-dlp", "best")
                 .expect("format selection should be valid")
@@ -1866,7 +1866,7 @@ mod tests {
         let (provider_url, server) = provider_fixture_with_headers(
             "302 Found",
             "Location: http://example.invalid/ping\r\n",
-            r#"{"server_uptime":1.0,"version":"1.3.1"}"#,
+            r#"{"server_uptime":1.0,"version":"1.3.2"}"#,
         )
         .await;
         let downloader = YtDlpDownloader::new(
