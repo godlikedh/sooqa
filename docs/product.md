@@ -157,17 +157,21 @@ Telegram storage uploads also use a separate bounded deadline suitable for
 2 GB-class transfers; it is independent from polling and download stall
 timeouts.
 
-Canonical video normalization is versioned as `canonical_video_v2`. The
-validated inline-playback policy defaults to a 14 MiB target, preferred CRF 23,
-maximum CRF 27, and a 480-pixel minimum short edge. Compatible videos already
-at or below the target are remuxed without re-encoding. Larger videos try CRF
-adaptation before descending an aspect-preserving even-dimension ladder. Actual
-candidate bytes are checked after every attempt, and candidates above the
-configured normalized-storage ceiling are discarded. When the target cannot be
-met without crossing either quality floor, the earliest highest-quality
-candidate within that storage ceiling is retained; if no candidate is
-storable, normalization fails clearly. Native inputs below the floor are never
-upscaled.
+Canonical video normalization is versioned as `canonical_video_v3`. The
+validated inline-playback policy defaults to a preferred 14 MiB target, a CRF
+27 constant-quality boundary, a 0.06 bits-per-pixel-per-frame target-bitrate
+floor, and a 480-pixel minimum short edge. Compatible videos already at or
+below the target are remuxed without re-encoding. Larger videos receive one
+highest-resolution constant-quality encode, allowing low-complexity material
+to finish naturally below the target. Only an oversized quality result enters
+two-pass target-bitrate encoding when a resolution at or above 480p still meets
+the quality floor. If that conservative bitrate check rejects every rung, each
+remaining lower resolution receives at most one CRF attempt so simple material
+can still prove that it fits without bitrate starvation. If CRF 27 at 480p also
+misses, original quality wins: a compatible input keeps its lossless remux,
+while an incompatible input keeps the highest-resolution CRF result. Actual
+candidate bytes are checked, every selected artifact must remain below the
+configured normalized-storage ceiling, and native inputs are never upscaled.
 
 New Telegram storage video uploads carry explicit canonical duration,
 dimensions, `supports_streaming=true`, and the existing persisted bounded JPEG

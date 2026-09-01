@@ -300,18 +300,24 @@ state machine on the same row: `pending_storage`, `ready`,
 ambiguous results. Exact-SHA deduplication preserves the first source identity
 and only fills missing non-identity metadata from later observations.
 
-Video normalization uses the versioned `canonical_video_v2` profile. The media
+Video normalization uses the versioned `canonical_video_v3` profile. The media
 planner identifies compatible MP4 remux candidates whose H.264 container `avcC`
 declaration matches the authoritative SPS level and has sufficient level
 capacity; contradictory or incomplete declarations take the transcode path.
-Oversized candidates are bounded by preferred/max CRF and an even,
-aspect-preserving resolution ladder with a configurable minimum short edge.
-The worker checks actual candidate bytes after ffmpeg/ffprobe, discards
-candidates above `normalized_storage_max_bytes`, retains the first
-highest-quality candidate within that ceiling when no candidate reaches the
-inline byte target, and publishes only one canonical artifact. If none is
-storable, normalization fails. All subprocess work remains outside database
-transactions.
+The worker tries one highest-resolution CRF quality encode before any size-
+targeted work, so x264 can represent low-complexity material below the preferred
+14 MiB target without padding it to that size. An oversized quality result uses
+standard two-pass target-bitrate encoding only at the highest even,
+aspect-preserving resolution that retains 0.06 bits per pixel per frame and a
+minimum 480-pixel short edge. When the conservative bitrate check rejects every
+rung, the remaining lower resolutions each receive one CRF quality attempt;
+this lets low-complexity media prove that it fits without overriding the floor
+for complex video. If CRF 27 at 480p still misses, the worker keeps the no-loss
+remux for a compatible source or the highest-resolution CRF quality result for
+an incompatible source. It validates actual candidate bytes, removes pass logs
+and losing candidates on every exit path, requires the chosen artifact to fit
+`normalized_storage_max_bytes`, and publishes only one canonical artifact. All
+subprocess work remains outside database transactions.
 
 Before a URL/Telegram source download, normalization, or video fingerprint
 extraction starts, the worker asks the media boundary for unprivileged free

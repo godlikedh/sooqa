@@ -205,8 +205,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let processing_timeout = Duration::from_secs(config.media.processing_timeout_seconds);
     let canonical_video_profile = CanonicalVideoProfile {
         target_max_bytes: config.media.inline_video.target_max_bytes,
-        preferred_crf: config.media.inline_video.preferred_crf,
-        maximum_crf: config.media.inline_video.maximum_crf,
+        quality_crf: config.media.inline_video.quality_crf,
         minimum_short_edge: config.media.inline_video.minimum_short_edge,
         ..Default::default()
     };

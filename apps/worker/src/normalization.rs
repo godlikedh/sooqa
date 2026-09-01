@@ -375,6 +375,41 @@ impl Drop for VideoCandidateCleanup {
     }
 }
 
+struct VideoPasslogCleanup {
+    directory: Option<PathBuf>,
+}
+
+impl VideoPasslogCleanup {
+    async fn reserve(output_path: &Path) -> Result<Self, NormalizationExecutionError> {
+        let directory = output_path.with_file_name(format!(".sooqa-two-pass-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.map_err(|source| {
+            NormalizationExecutionError::TemporaryOutput { path: directory.clone(), source }
+        })?;
+        Ok(Self { directory: Some(directory) })
+    }
+
+    fn prefix(&self) -> PathBuf {
+        self.directory.as_deref().expect("two-pass directory guard must be armed").join("stats")
+    }
+
+    async fn remove(&mut self) {
+        let Some(directory) = self.directory.as_ref() else {
+            return;
+        };
+        if tokio::fs::remove_dir_all(directory).await.is_ok() {
+            self.directory = None;
+        }
+    }
+}
+
+impl Drop for VideoPasslogCleanup {
+    fn drop(&mut self) {
+        if let Some(directory) = self.directory.take() {
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+}
+
 async fn execute_video_normalization(
     planner: &NormalizationPlanner,
     executor: &FfmpegExecutor,
@@ -429,37 +464,107 @@ async fn execute_video_normalization(
         .find(|stream| stream.kind == MediaStreamKind::Video)
         .ok_or(NormalizationExecutionError::OutputHasNoVideo)?;
     let ladder = planner.resolution_ladder(video);
-    if ladder.is_empty() {
+    let Some(quality_dimensions) = ladder.first().copied() else {
         return Err(NormalizationExecutionError::InvalidOutputProfile {
             message: "video dimensions are missing or invalid",
         });
+    };
+
+    // One constant-quality encode lets x264 exploit low-complexity inputs
+    // without padding them toward the preferred byte target. It also gives an
+    // incompatible source a bounded quality-preserving fallback.
+    attempts += 1;
+    let quality_path = video_candidate_path(output_path);
+    candidate_paths.push(quality_path.clone());
+    let quality_plan = if initial_plan.mode() == sooqa_media::NormalizationMode::Transcode {
+        initial_plan.with_output(&quality_path)
+    } else {
+        planner
+            .plan_quality_candidate(input_path, &quality_path, probe, quality_dimensions)
+            .map_err(map_candidate_plan_error)?
+    };
+    let quality = executor.execute(&quality_plan, std::future::pending()).await?;
+    validate_adapted_dimensions(&quality.probe, quality_dimensions, video, planner)?;
+    let quality_fits_storage = quality.digest.bytes <= max_normalized_storage_bytes;
+    if quality.digest.bytes <= planner.profile().target_max_bytes && quality_fits_storage {
+        if let Some(previous) = fallback.take() {
+            remove_video_candidate(&previous.output_path, &mut candidate_paths).await;
+        }
+        return publish_video_candidate(
+            quality,
+            output_path,
+            &mut candidate_paths,
+            attempts,
+            planner.profile().target_max_bytes,
+        )
+        .await;
+    }
+    if fallback.is_none() && quality_fits_storage {
+        fallback = Some(quality);
+    } else {
+        if !quality_fits_storage {
+            largest_oversized_candidate =
+                Some(largest_oversized_candidate.unwrap_or(0).max(quality.digest.bytes));
+        }
+        remove_video_candidate(&quality_path, &mut candidate_paths).await;
     }
 
-    for dimensions in ladder {
-        for crf in planner.profile().preferred_crf..=planner.profile().maximum_crf {
+    if let Some((dimensions, video_bitrate_kbps)) = planner.two_pass_candidate(probe) {
+        let candidate_path = video_candidate_path(output_path);
+        candidate_paths.push(candidate_path.clone());
+        let mut passlogs = VideoPasslogCleanup::reserve(output_path).await?;
+        let passlog_prefix = passlogs.prefix();
+        let plan = planner
+            .plan_two_pass(
+                input_path,
+                &candidate_path,
+                probe,
+                dimensions,
+                video_bitrate_kbps,
+                &passlog_prefix,
+            )
+            .map_err(map_candidate_plan_error)?;
+        attempts += 2;
+        executor.execute_analysis(plan.first_pass(), std::future::pending()).await?;
+        let result = executor.execute(plan.second_pass(), std::future::pending()).await?;
+        validate_adapted_dimensions(&result.probe, dimensions, video, planner)?;
+        passlogs.remove().await;
+        let improves_fallback =
+            fallback.as_ref().is_none_or(|previous| result.digest.bytes < previous.digest.bytes);
+        if result.digest.bytes <= max_normalized_storage_bytes && improves_fallback {
+            if let Some(previous) = fallback.take() {
+                remove_video_candidate(&previous.output_path, &mut candidate_paths).await;
+            }
+            return publish_video_candidate(
+                result,
+                output_path,
+                &mut candidate_paths,
+                attempts,
+                planner.profile().target_max_bytes,
+            )
+            .await;
+        }
+        if result.digest.bytes > max_normalized_storage_bytes {
+            largest_oversized_candidate =
+                Some(largest_oversized_candidate.unwrap_or(0).max(result.digest.bytes));
+        }
+        remove_video_candidate(&candidate_path, &mut candidate_paths).await;
+    } else {
+        // The bitrate heuristic is deliberately conservative and can reject a
+        // fixed-size encode for low-complexity material that CRF can represent
+        // efficiently. Try each remaining quality-preserving resolution once;
+        // if even the floor misses, retain the original-quality fallback.
+        for dimensions in ladder.into_iter().skip(1) {
             attempts += 1;
             let candidate_path = video_candidate_path(output_path);
             candidate_paths.push(candidate_path.clone());
-            let plan =
-                match planner.plan_candidate(input_path, &candidate_path, probe, dimensions, crf) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        return Err(NormalizationExecutionError::InvalidOutputProfile {
-                            message: match error {
-                                sooqa_media::NormalizationError::InvalidCandidateDimensions {
-                                    ..
-                                } => "candidate dimensions are outside the canonical profile",
-                                _ => "candidate normalization plan is invalid",
-                            },
-                        });
-                    }
-                };
+            let plan = planner
+                .plan_quality_candidate(input_path, &candidate_path, probe, dimensions)
+                .map_err(map_candidate_plan_error)?;
             let result = executor.execute(&plan, std::future::pending()).await?;
             validate_adapted_dimensions(&result.probe, dimensions, video, planner)?;
-            let fits_target = result.digest.bytes <= planner.profile().target_max_bytes
-                && result.digest.bytes <= max_normalized_storage_bytes;
             let fits_storage = result.digest.bytes <= max_normalized_storage_bytes;
-            if fits_target {
+            if result.digest.bytes <= planner.profile().target_max_bytes && fits_storage {
                 if let Some(previous) = fallback.take() {
                     remove_video_candidate(&previous.output_path, &mut candidate_paths).await;
                 }
@@ -479,13 +584,11 @@ async fn execute_video_normalization(
                     largest_oversized_candidate =
                         Some(largest_oversized_candidate.unwrap_or(0).max(result.digest.bytes));
                 }
-                // Losing candidates are not useful for selection or retry and
-                // can be full-sized videos. Keep disk use to one fallback plus
-                // the candidate currently under inspection.
                 remove_video_candidate(&candidate_path, &mut candidate_paths).await;
             }
         }
     }
+
     let selected = fallback.ok_or(NormalizationExecutionError::OutputExceedsStorageLimit {
         bytes: largest_oversized_candidate.unwrap_or(max_normalized_storage_bytes),
         limit: max_normalized_storage_bytes,
@@ -498,6 +601,17 @@ async fn execute_video_normalization(
         planner.profile().target_max_bytes,
     )
     .await
+}
+
+fn map_candidate_plan_error(error: sooqa_media::NormalizationError) -> NormalizationExecutionError {
+    NormalizationExecutionError::InvalidOutputProfile {
+        message: match error {
+            sooqa_media::NormalizationError::InvalidCandidateDimensions { .. } => {
+                "candidate dimensions are outside the canonical profile"
+            }
+            _ => "candidate normalization plan is invalid",
+        },
+    }
 }
 
 fn video_candidate_path(output_path: &Path) -> PathBuf {
@@ -1131,6 +1245,27 @@ mod tests {
                         stderr_truncated: false,
                     });
                 }
+                let pass = command
+                    .args()
+                    .windows(2)
+                    .find(|pair| pair[0] == "-pass")
+                    .and_then(|pair| pair[1].to_str());
+                if pass == Some("1") {
+                    let prefix = command
+                        .args()
+                        .windows(2)
+                        .find(|pair| pair[0] == "-passlogfile")
+                        .map(|pair| pair[1].to_owned())
+                        .expect("first pass should carry a passlog prefix");
+                    for suffix in ["-0.log", "-0.log.mbtree"] {
+                        let mut path = prefix.clone();
+                        path.push(suffix);
+                        tokio::fs::write(path, b"synthetic two-pass stats")
+                            .await
+                            .expect("synthetic passlog should be writable");
+                    }
+                    return Ok(successful_command_output());
+                }
                 let size = self
                     .sizes
                     .lock()
@@ -1246,7 +1381,8 @@ mod tests {
             let name = entry.file_name().to_string_lossy().into_owned();
             assert!(
                 !name.starts_with(".sooqa-inline-candidate-")
-                    && !name.starts_with(".sooqa-normalize-"),
+                    && !name.starts_with(".sooqa-normalize-")
+                    && !name.starts_with(".sooqa-two-pass-"),
                 "video attempt file was left behind: {name}"
             );
         }
@@ -1290,7 +1426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_fitting_transcode_wins_and_losing_candidates_are_removed() {
+    async fn content_aware_quality_candidate_wins_and_losing_candidates_are_removed() {
         let root = std::env::temp_dir().join(format!("sooqa-video-adaptation-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&root).await.expect("test root should be created");
         let output = root.join("canonical.mp4");
@@ -1314,7 +1450,7 @@ mod tests {
             initial_plan,
         )
         .await
-        .expect("first fitting transcode should be selected");
+        .expect("content-aware quality transcode should be selected");
         assert_eq!(result.digest.bytes, 9);
         assert_eq!(tokio::fs::metadata(&output).await.unwrap().len(), 9);
         assert_no_video_attempt_files(&root).await;
@@ -1322,19 +1458,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_remux_cannot_displace_storable_preferred_crf_candidate() {
+    async fn oversized_quality_candidate_uses_one_two_pass_encode_and_cleans_stats() {
+        let root = std::env::temp_dir().join(format!("sooqa-video-adaptation-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&root).await.expect("test root should be created");
+        let output = root.join("canonical.mp4");
+        let probe = adaptation_probe(320, 240, 30_000);
+        let planner = NormalizationPlanner::new(
+            "ffmpeg",
+            CanonicalVideoProfile { target_max_bytes: 20_000, ..Default::default() },
+        )
+        .expect("test profile should be valid");
+        let initial_plan = planner.plan("input.mp4", &output, &probe).expect("plan should build");
+        let runner = Arc::new(VideoAdaptationRunner::new([30_000, 25_000, 19_000], (320, 240)));
+        let executor = adaptation_executor(runner.clone());
+
+        let result = execute_video_normalization(
+            &planner,
+            &executor,
+            Path::new("input.mp4"),
+            &output,
+            &probe,
+            100_000,
+            initial_plan,
+        )
+        .await
+        .expect("two-pass target candidate should be selected");
+
+        assert_eq!(result.digest.bytes, 19_000);
+        let commands = runner.ffmpeg_commands();
+        assert_eq!(commands.len(), 4, "remux, quality, and two target-bitrate passes");
+        assert!(commands[2].args().windows(2).any(|pair| pair == ["-pass", "1"]));
+        assert!(commands[3].args().windows(2).any(|pair| pair == ["-pass", "2"]));
+        assert_no_video_attempt_files(&root).await;
+        clean_test_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_two_pass_result_cannot_displace_a_smaller_quality_fallback() {
+        let root = std::env::temp_dir().join(format!("sooqa-video-adaptation-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&root).await.expect("test root should be created");
+        let output = root.join("canonical.mp4");
+        let mut probe = adaptation_probe(320, 240, 30_000);
+        probe.container_format = Some("matroska,webm".to_owned());
+        probe.streams[0].codec = Some("vp9".to_owned());
+        let planner = NormalizationPlanner::new(
+            "ffmpeg",
+            CanonicalVideoProfile { target_max_bytes: 20_000, ..Default::default() },
+        )
+        .expect("test profile should be valid");
+        let initial_plan = planner.plan("input.webm", &output, &probe).expect("plan should build");
+        assert_eq!(initial_plan.mode(), NormalizationMode::Transcode);
+        let runner = Arc::new(VideoAdaptationRunner::new([25_000, 26_000], (320, 240)));
+        let executor = adaptation_executor(runner);
+
+        let result = execute_video_normalization(
+            &planner,
+            &executor,
+            Path::new("input.webm"),
+            &output,
+            &probe,
+            100_000,
+            initial_plan,
+        )
+        .await
+        .expect("smaller quality candidate should remain selected");
+
+        assert_eq!(result.digest.bytes, 25_000);
+        assert_no_video_attempt_files(&root).await;
+        clean_test_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_remux_cannot_displace_storable_quality_candidate() {
         let root = std::env::temp_dir().join(format!("sooqa-video-adaptation-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&root).await.expect("test root should be created");
         let output = root.join("canonical.mp4");
         let probe = adaptation_probe(320, 240, 20);
         let planner = NormalizationPlanner::new(
             "ffmpeg",
-            CanonicalVideoProfile {
-                target_max_bytes: 10,
-                preferred_crf: 23,
-                maximum_crf: 23,
-                ..Default::default()
-            },
+            CanonicalVideoProfile { target_max_bytes: 10, ..Default::default() },
         )
         .expect("test profile should be valid");
         let initial_plan = planner.plan("input.mp4", &output, &probe).expect("plan should build");
@@ -1366,12 +1568,7 @@ mod tests {
         let probe = adaptation_probe(320, 240, 20);
         let planner = NormalizationPlanner::new(
             "ffmpeg",
-            CanonicalVideoProfile {
-                target_max_bytes: 1,
-                preferred_crf: 23,
-                maximum_crf: 23,
-                ..Default::default()
-            },
+            CanonicalVideoProfile { target_max_bytes: 1, ..Default::default() },
         )
         .expect("test profile should be valid");
         let initial_plan = planner.plan("input.mp4", &output, &probe).expect("plan should build");
@@ -1398,23 +1595,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_fit_keeps_the_no_loss_remux_fallback_and_bounds_crf_resolution_attempts() {
+    async fn no_two_pass_fit_keeps_the_no_loss_remux_fallback() {
         let root = std::env::temp_dir().join(format!("sooqa-video-adaptation-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&root).await.expect("test root should be created");
         let output = root.join("canonical.mp4");
         let probe = adaptation_probe(1920, 1080, 20);
         let planner = NormalizationPlanner::new(
             "ffmpeg",
-            CanonicalVideoProfile {
-                target_max_bytes: 1,
-                preferred_crf: 23,
-                maximum_crf: 24,
-                ..Default::default()
-            },
+            CanonicalVideoProfile { target_max_bytes: 1, ..Default::default() },
         )
         .expect("test profile should be valid");
         let initial_plan = planner.plan("input.mp4", &output, &probe).expect("plan should build");
-        let runner = Arc::new(VideoAdaptationRunner::new([20; 9], (1920, 1080)));
+        let runner = Arc::new(VideoAdaptationRunner::new([20; 5], (1920, 1080)));
         let executor = adaptation_executor(runner.clone());
 
         let result = execute_video_normalization(
@@ -1430,42 +1622,75 @@ mod tests {
         .expect("quality-floor fallback should be selected");
         assert_eq!(result.digest.bytes, 20);
         let commands = runner.ffmpeg_commands();
-        assert_eq!(commands.len(), 9, "one remux plus two CRFs across four resolutions");
+        assert_eq!(commands.len(), 5, "one remux plus one CRF encode per resolution rung");
         for command in commands.iter().skip(1) {
-            let crf = command
-                .args()
-                .windows(2)
-                .find(|pair| pair[0] == "-crf")
-                .and_then(|pair| pair[1].to_str())
-                .and_then(|value| value.parse::<u8>().ok())
-                .expect("transcode candidate should carry CRF");
-            assert!((23..=24).contains(&crf));
-            let filter = command
-                .args()
-                .windows(2)
-                .find(|pair| pair[0] == "-vf")
-                .and_then(|pair| pair[1].to_str())
-                .expect("transcode candidate should carry a scale filter");
-            let (width, height) = parse_scale_dimensions(filter).expect("scale dimensions parse");
-            assert!(width <= 1920 && height <= 1080 && width.min(height) >= 480);
+            assert!(command.args().windows(2).any(|pair| pair == ["-crf", "27"]));
         }
+        assert!(
+            !commands
+                .iter()
+                .any(|command| { command.args().windows(2).any(|pair| pair == ["-pass", "1"]) })
+        );
         assert_no_video_attempt_files(&root).await;
         clean_test_root(&root).await;
     }
 
     #[tokio::test]
-    async fn adaptation_error_cleans_fallback_and_current_candidate() {
+    async fn conservative_bitrate_rejection_still_allows_a_simple_crf_rung_to_fit() {
         let root = std::env::temp_dir().join(format!("sooqa-video-adaptation-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&root).await.expect("test root should be created");
         let output = root.join("canonical.mp4");
-        let probe = adaptation_probe(320, 240, 20);
+        let probe = adaptation_probe(1920, 1080, 20);
         let planner = NormalizationPlanner::new(
             "ffmpeg",
             CanonicalVideoProfile { target_max_bytes: 10, ..Default::default() },
         )
         .expect("test profile should be valid");
+        assert_eq!(planner.two_pass_candidate(&probe), None);
         let initial_plan = planner.plan("input.mp4", &output, &probe).expect("plan should build");
-        let runner = Arc::new(VideoAdaptationRunner::new([20], (320, 240)).failing_at(2));
+        let runner = Arc::new(VideoAdaptationRunner::new([20, 20, 15, 9], (1920, 1080)));
+        let executor = adaptation_executor(runner.clone());
+
+        let result = execute_video_normalization(
+            &planner,
+            &executor,
+            Path::new("input.mp4"),
+            &output,
+            &probe,
+            100,
+            initial_plan,
+        )
+        .await
+        .expect("content-aware lower rung should satisfy the preferred target");
+
+        assert_eq!(result.digest.bytes, 9);
+        let commands = runner.ffmpeg_commands();
+        assert_eq!(commands.len(), 4, "remux, 1080p, 810p, and 608p CRF attempts");
+        let filter = commands[3]
+            .args()
+            .windows(2)
+            .find(|pair| pair[0] == "-vf")
+            .and_then(|pair| pair[1].to_str())
+            .expect("selected CRF rung should carry a scale filter");
+        assert_eq!(parse_scale_dimensions(filter), Some((1080, 608)));
+        assert_no_video_attempt_files(&root).await;
+        clean_test_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn two_pass_error_cleans_fallback_candidate_and_stats_directory() {
+        let root = std::env::temp_dir().join(format!("sooqa-video-adaptation-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&root).await.expect("test root should be created");
+        let output = root.join("canonical.mp4");
+        let probe = adaptation_probe(320, 240, 30_000);
+        let planner = NormalizationPlanner::new(
+            "ffmpeg",
+            CanonicalVideoProfile { target_max_bytes: 20_000, ..Default::default() },
+        )
+        .expect("test profile should be valid");
+        let initial_plan = planner.plan("input.mp4", &output, &probe).expect("plan should build");
+        let runner =
+            Arc::new(VideoAdaptationRunner::new([30_000, 25_000], (320, 240)).failing_at(3));
         let executor = adaptation_executor(runner);
 
         let error = execute_video_normalization(
@@ -1474,7 +1699,7 @@ mod tests {
             Path::new("input.mp4"),
             &output,
             &probe,
-            100,
+            100_000,
             initial_plan,
         )
         .await
@@ -1485,20 +1710,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adaptation_cancellation_cleans_attempt_files() {
+    async fn two_pass_cancellation_cleans_attempt_files_and_stats_directory() {
         let root = std::env::temp_dir().join(format!("sooqa-video-adaptation-{}", Uuid::new_v4()));
         tokio::fs::create_dir(&root).await.expect("test root should be created");
         let output = root.join("canonical.mp4");
-        let probe = adaptation_probe(320, 240, 20);
+        let probe = adaptation_probe(320, 240, 30_000);
         let planner = NormalizationPlanner::new(
             "ffmpeg",
-            CanonicalVideoProfile { target_max_bytes: 10, ..Default::default() },
+            CanonicalVideoProfile { target_max_bytes: 20_000, ..Default::default() },
         )
         .expect("test profile should be valid");
         let initial_plan = planner.plan("input.mp4", &output, &probe).expect("plan should build");
         let blocked = Arc::new(Notify::new());
-        let runner =
-            Arc::new(VideoAdaptationRunner::new([20], (320, 240)).blocking_at(2, blocked.clone()));
+        let runner = Arc::new(
+            VideoAdaptationRunner::new([30_000, 25_000], (320, 240))
+                .blocking_at(3, blocked.clone()),
+        );
         let executor = adaptation_executor(runner);
         let task = tokio::spawn(async move {
             execute_video_normalization(
@@ -1507,7 +1734,7 @@ mod tests {
                 Path::new("input.mp4"),
                 &output,
                 &probe,
-                100,
+                100_000,
                 initial_plan,
             )
             .await

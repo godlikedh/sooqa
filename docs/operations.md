@@ -219,30 +219,45 @@ separate:
   object uploaded to Telegram storage. It must remain below the documented
   2000 MB local Bot API upload limit.
 
-Canonical video adaptation uses the versioned `canonical_video_v2` profile. Its
+Canonical video adaptation uses the versioned `canonical_video_v3` profile. Its
 validated defaults are configured under `[media.inline_video]`:
 
 ```toml
 target_max_bytes = 14680064 # 14 MiB
-preferred_crf = 23
-maximum_crf = 27
+quality_crf = 27
 minimum_short_edge = 480
 ```
 
 The corresponding environment overrides are
 `SOOQA_MEDIA_INLINE_VIDEO_TARGET_MAX_BYTES`,
-`SOOQA_MEDIA_INLINE_VIDEO_PREFERRED_CRF`,
-`SOOQA_MEDIA_INLINE_VIDEO_MAXIMUM_CRF`, and
+`SOOQA_MEDIA_INLINE_VIDEO_QUALITY_CRF`, and
 `SOOQA_MEDIA_INLINE_VIDEO_MINIMUM_SHORT_EDGE`. A compatible MP4 at or below
-the target is remuxed. Oversized inputs try preferred CRF, then CRF values up
-to the maximum, then an aspect-preserving even-dimension ladder down to the
-minimum short edge. Every candidate is checked by actual output bytes, and
-candidates above `normalized_storage_max_bytes` are discarded. If the target
-cannot be met without crossing a quality floor, the earliest highest-quality
-candidate within that storage ceiling is retained and Telegram remains
-click-to-play. If no candidate is within the storage ceiling, normalization
-fails instead of producing an unstorable artifact.
-Native inputs smaller than the floor are never upscaled.
+the target is remuxed. Oversized inputs receive one highest-resolution
+constant-quality encode at `quality_crf`; simple or static material can
+therefore finish below 14 MiB without being filled to the target. If that
+result is larger, the worker reserves two percent for mux overhead, subtracts
+the configured 128 kbit/s audio budget when audio is present, and selects the
+highest aspect-preserving ladder rung where the remaining target video bitrate
+is at least 0.06 bits per pixel per frame. FFmpeg then uses its established
+two-pass H.264 workflow to allocate that bounded bitrate across the complete
+video.
+
+If no rung at or above the 480-pixel short-edge floor has enough target bitrate,
+the worker does not force a starved two-pass encode. It instead tries CRF 27
+once at each remaining lower rung. This content-aware exception lets simple or
+mostly static media fit below the heuristic bitrate floor while retaining the
+CRF quality boundary. If the 480p CRF result still misses the preferred target,
+a compatible source keeps its lossless remux and an incompatible source keeps
+the highest-resolution CRF quality encode. Every candidate is checked by actual
+output bytes, pass-log sidecars and losing candidates are removed on success,
+error, timeout, or cancellation, and the selected artifact must still fit
+`normalized_storage_max_bytes`. If no quality-preserving candidate is storable,
+normalization fails clearly. Native inputs smaller than the floor are never
+upscaled.
+
+When upgrading from `canonical_video_v2`, replace the removed
+`preferred_crf`/`maximum_crf` TOML keys with `quality_crf`; stale inline-video
+keys are rejected so an operator cannot unknowingly run a different policy.
 
 ### Allowlisted social-video pages
 
