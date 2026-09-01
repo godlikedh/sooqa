@@ -12,9 +12,9 @@ use uuid::Uuid;
 use crate::normalize::requires_frame_rate_cap;
 use crate::publication::{TempArtifact, publish_or_reuse};
 use crate::{
-    AudioCodec, CanonicalContainer, CommandError, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommandRunner,
-    FfprobeAdapter, FileDigest, HashError, MediaProbe, MediaStreamKind, NormalizationPlan,
-    PixelFormat, ProbeError, VideoCodec, sha256_file,
+    AudioCodec, CanonicalContainer, CommandError, DEFAULT_MAX_OUTPUT_BYTES, ExternalCommand,
+    ExternalCommandRunner, FfprobeAdapter, FileDigest, HashError, MediaProbe, MediaStreamKind,
+    NormalizationPlan, PixelFormat, ProbeError, VideoCodec, sha256_file,
 };
 
 const MAX_PROGRESS_LINE_BYTES: usize = 4096;
@@ -176,6 +176,30 @@ impl FfmpegExecutor {
         }
     }
 
+    /// Executes a bounded FFmpeg analysis pass that intentionally produces no
+    /// media artifact. The command still reports machine-readable progress and
+    /// receives the executor's timeout/output limits.
+    pub async fn execute_analysis<F>(
+        &self,
+        command: &ExternalCommand,
+        cancellation: F,
+    ) -> Result<FfmpegProgress, NormalizationExecutionError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        let args = command.args();
+        let mut with_progress = ExternalCommand::new(command.program().to_owned())
+            .timeout(self.timeout)
+            .max_output_bytes(self.max_output_bytes);
+        for argument in &args[..args.len().saturating_sub(1)] {
+            with_progress = with_progress.arg(argument.clone());
+        }
+        if let Some(output) = args.last() {
+            with_progress = with_progress.arg("-progress").arg("pipe:1").arg(output.clone());
+        }
+        self.run_with_progress(with_progress, cancellation).await
+    }
+
     async fn execute_inner<F>(
         &self,
         plan: &NormalizationPlan,
@@ -189,6 +213,31 @@ impl FfmpegExecutor {
             .command_with_progress_for_output(output_path)
             .timeout(self.timeout)
             .max_output_bytes(self.max_output_bytes);
+        let progress = self.run_with_progress(command, cancellation).await?;
+
+        let metadata = tokio::fs::metadata(output_path).await.map_err(|source| {
+            NormalizationExecutionError::OutputFile { path: output_path.to_owned(), source }
+        })?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(NormalizationExecutionError::InvalidOutput {
+                path: output_path.to_owned(),
+            });
+        }
+
+        let probe = self.ffprobe.probe(output_path).await?;
+        validate_output_probe(&probe, plan.profile())?;
+        let digest = sha256_file(output_path).await?;
+        Ok((progress, probe, digest))
+    }
+
+    async fn run_with_progress<F>(
+        &self,
+        command: ExternalCommand,
+        cancellation: F,
+    ) -> Result<FfmpegProgress, NormalizationExecutionError>
+    where
+        F: Future<Output = ()> + Send,
+    {
         tokio::pin!(cancellation);
         let command_output = tokio::select! {
             result = self.runner.run(command) => result.map_err(NormalizationExecutionError::Command)?,
@@ -207,31 +256,20 @@ impl FfmpegExecutor {
             });
         }
         // Progress is advisory. The stream remains bounded and fully drained by
-        // the command runner; a successful process with truncated progress is
-        // accepted only after the output is validated below.
-        let progress = if command_output.stdout_truncated {
-            FfmpegProgress { frame: None, out_time_ms: None, state: FfmpegProgressState::End }
-        } else {
-            let progress = parse_ffmpeg_progress(&command_output.stdout)?;
-            if progress.state != FfmpegProgressState::End {
-                return Err(NormalizationExecutionError::ProgressDidNotEnd);
-            }
-            progress
-        };
-
-        let metadata = tokio::fs::metadata(output_path).await.map_err(|source| {
-            NormalizationExecutionError::OutputFile { path: output_path.to_owned(), source }
-        })?;
-        if !metadata.is_file() || metadata.len() == 0 {
-            return Err(NormalizationExecutionError::InvalidOutput {
-                path: output_path.to_owned(),
+        // the command runner; successful truncated progress is represented as
+        // complete and later media-producing passes validate their artifact.
+        if command_output.stdout_truncated {
+            return Ok(FfmpegProgress {
+                frame: None,
+                out_time_ms: None,
+                state: FfmpegProgressState::End,
             });
         }
-
-        let probe = self.ffprobe.probe(output_path).await?;
-        validate_output_probe(&probe, plan.profile())?;
-        let digest = sha256_file(output_path).await?;
-        Ok((progress, probe, digest))
+        let progress = parse_ffmpeg_progress(&command_output.stdout)?;
+        if progress.state != FfmpegProgressState::End {
+            return Err(NormalizationExecutionError::ProgressDidNotEnd);
+        }
+        Ok(progress)
     }
 }
 
@@ -367,7 +405,7 @@ mod tests {
     use super::*;
     use crate::{
         CanonicalVideoProfile, ExternalCommand, ExternalCommandOutput, FrameRate, MediaStream,
-        NormalizationPlanner,
+        NormalizationPlanner, VideoDimensions,
     };
 
     const PROBE_JSON: &[u8] = br#"{
@@ -800,5 +838,76 @@ mod tests {
 
         let _ = tokio::fs::remove_file(input).await;
         let _ = tokio::fs::remove_file(output).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe installed on the test host"]
+    async fn executes_generated_video_with_real_two_pass_commands() {
+        let id = uuid::Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("sooqa-two-pass-{id}"));
+        tokio::fs::create_dir(&root).await.expect("test directory should be created");
+        let input = root.join("input.mp4");
+        let output = root.join("output.mp4");
+        let passlog = root.join("stats");
+        let runner: Arc<dyn ExternalCommandRunner> = Arc::new(crate::ProcessCommandRunner);
+        let generated = ExternalCommand::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("testsrc2=size=320x240:rate=25")
+            .arg("-t")
+            .arg("1")
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-an")
+            .arg(&input);
+        runner.run(generated).await.expect("generated fixture should be created");
+
+        let ffprobe = FfprobeAdapter::with_runner(
+            "ffprobe",
+            Duration::from_secs(30),
+            DEFAULT_MAX_OUTPUT_BYTES,
+            Arc::clone(&runner),
+        );
+        let input_probe = ffprobe.probe(&input).await.expect("generated input should probe");
+        let planner = NormalizationPlanner::new("ffmpeg", CanonicalVideoProfile::default())
+            .expect("default profile should be valid");
+        let plan = planner
+            .plan_two_pass(
+                &input,
+                &output,
+                &input_probe,
+                VideoDimensions { width: 320, height: 240 },
+                200,
+                &passlog,
+            )
+            .expect("two-pass plan should build");
+        let executor = FfmpegExecutor::with_runner(
+            Arc::clone(&runner),
+            ffprobe,
+            Duration::from_secs(30),
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+
+        let progress = executor
+            .execute_analysis(plan.first_pass(), std::future::pending())
+            .await
+            .expect("first pass should complete");
+        assert_eq!(progress.state, FfmpegProgressState::End);
+        let result = executor
+            .execute(plan.second_pass(), std::future::pending())
+            .await
+            .expect("second pass should produce canonical media");
+        assert!(result.digest.bytes > 0);
+        assert!(root.join("stats-0.log").exists());
+
+        tokio::fs::remove_dir_all(root).await.expect("test directory should be removable");
     }
 }

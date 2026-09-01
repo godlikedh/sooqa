@@ -64,7 +64,7 @@ pub use image_normalize::{
 pub use normalize::{
     AudioCodec, CANONICAL_VIDEO_PROFILE_VERSION, CanonicalContainer, CanonicalVideoProfile,
     NormalizationError, NormalizationMode, NormalizationPlan, NormalizationPlanner, PixelFormat,
-    ProfileError, VideoCodec, VideoDimensions, VideoPreset,
+    ProfileError, TwoPassNormalizationPlan, VideoCodec, VideoDimensions, VideoPreset,
 };
 pub use sequence_alignment::{
     SequenceAlignment, SequenceAlignmentConfig, SequenceAlignmentError, SequenceClassification,

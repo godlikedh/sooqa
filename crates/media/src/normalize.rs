@@ -8,7 +8,12 @@ use crate::{ExternalCommand, FrameRate, MediaProbe, MediaStream, MediaStreamKind
 /// Version of the project-owned canonical MP4/H.264 profile. Changing codec,
 /// adaptation, or metadata rules requires a new version before any explicit
 /// reprocessing of existing media is considered.
-pub const CANONICAL_VIDEO_PROFILE_VERSION: &str = "canonical_video_v2";
+pub const CANONICAL_VIDEO_PROFILE_VERSION: &str = "canonical_video_v3";
+
+const TWO_PASS_SIZE_HEADROOM_BPS: u64 = 200;
+const BASIS_POINTS: u64 = 10_000;
+const MINIMUM_VIDEO_BITS_PER_PIXEL_FRAME_MILLIONTHS: u64 = 60_000;
+const MILLION: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,8 +100,7 @@ pub struct CanonicalVideoProfile {
     pub max_frame_rate: FrameRate,
     pub video_preset: VideoPreset,
     pub target_max_bytes: u64,
-    pub preferred_crf: u8,
-    pub maximum_crf: u8,
+    pub quality_crf: u8,
     pub minimum_short_edge: u32,
     pub audio_bitrate_kbps: u32,
     pub fast_start: bool,
@@ -115,8 +119,7 @@ impl Default for CanonicalVideoProfile {
             max_frame_rate: FrameRate { numerator: 60, denominator: 1 },
             video_preset: VideoPreset::Medium,
             target_max_bytes: 14 * 1024 * 1024,
-            preferred_crf: 23,
-            maximum_crf: 27,
+            quality_crf: 27,
             minimum_short_edge: 480,
             audio_bitrate_kbps: 128,
             fast_start: true,
@@ -136,17 +139,8 @@ impl CanonicalVideoProfile {
         if self.max_frame_rate.numerator == 0 || self.max_frame_rate.denominator == 0 {
             return Err(ProfileError::InvalidFrameRate(self.max_frame_rate));
         }
-        if self.preferred_crf > 51 {
-            return Err(ProfileError::InvalidPreferredCrf(self.preferred_crf));
-        }
-        if self.maximum_crf > 51 {
-            return Err(ProfileError::InvalidMaximumCrf(self.maximum_crf));
-        }
-        if self.preferred_crf > self.maximum_crf {
-            return Err(ProfileError::CrfRangeReversed {
-                preferred: self.preferred_crf,
-                maximum: self.maximum_crf,
-            });
+        if self.quality_crf > 51 {
+            return Err(ProfileError::InvalidQualityCrf(self.quality_crf));
         }
         if self.target_max_bytes == 0 {
             return Err(ProfileError::InvalidTargetBytes);
@@ -187,6 +181,22 @@ pub struct NormalizationPlan {
     command: ExternalCommand,
     output: PathBuf,
     profile: CanonicalVideoProfile,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TwoPassNormalizationPlan {
+    first_pass: ExternalCommand,
+    second_pass: NormalizationPlan,
+}
+
+impl TwoPassNormalizationPlan {
+    pub fn first_pass(&self) -> &ExternalCommand {
+        &self.first_pass
+    }
+
+    pub fn second_pass(&self) -> &NormalizationPlan {
+        &self.second_pass
+    }
 }
 
 impl NormalizationPlan {
@@ -281,7 +291,7 @@ impl NormalizationPlanner {
                     input.as_ref(),
                     output.as_ref(),
                     dimensions,
-                    self.profile.preferred_crf,
+                    self.profile.quality_crf,
                     video,
                 )
             }
@@ -296,34 +306,102 @@ impl NormalizationPlanner {
 
     /// Builds one bounded adaptation candidate. The caller owns the candidate
     /// execution and must validate its actual output size before selecting it.
-    pub fn plan_candidate(
+    pub fn plan_quality_candidate(
         &self,
         input: impl AsRef<Path>,
         output: impl AsRef<Path>,
         probe: &MediaProbe,
         dimensions: VideoDimensions,
-        crf: u8,
     ) -> Result<NormalizationPlan, NormalizationError> {
         let video = first_video_stream(probe).ok_or(NormalizationError::NoVideoStream)?;
         validate_candidate_dimensions(dimensions, video, self.profile)?;
-        if crf < self.profile.preferred_crf || crf > self.profile.maximum_crf {
-            return Err(NormalizationError::CrfOutsideAdaptationRange {
-                crf,
-                preferred: self.profile.preferred_crf,
-                maximum: self.profile.maximum_crf,
-            });
-        }
         Ok(NormalizationPlan {
             mode: NormalizationMode::Transcode,
             command: self.transcode_command(
                 input.as_ref(),
                 output.as_ref(),
                 dimensions,
-                crf,
+                self.profile.quality_crf,
                 video,
             ),
             output: output.as_ref().to_owned(),
             profile: self.profile,
+        })
+    }
+
+    pub fn plan_two_pass(
+        &self,
+        input: impl AsRef<Path>,
+        output: impl AsRef<Path>,
+        probe: &MediaProbe,
+        dimensions: VideoDimensions,
+        video_bitrate_kbps: u64,
+        passlog_prefix: impl AsRef<Path>,
+    ) -> Result<TwoPassNormalizationPlan, NormalizationError> {
+        let video = first_video_stream(probe).ok_or(NormalizationError::NoVideoStream)?;
+        validate_candidate_dimensions(dimensions, video, self.profile)?;
+        if video_bitrate_kbps == 0 {
+            return Err(NormalizationError::InvalidVideoBitrate);
+        }
+        let input = input.as_ref();
+        let output = output.as_ref();
+        let passlog_prefix = passlog_prefix.as_ref().to_owned();
+        let first_pass = self.two_pass_command(
+            input,
+            Path::new("-"),
+            dimensions,
+            video_bitrate_kbps,
+            &passlog_prefix,
+            1,
+            video,
+        );
+        let second_pass_command = self.two_pass_command(
+            input,
+            output,
+            dimensions,
+            video_bitrate_kbps,
+            &passlog_prefix,
+            2,
+            video,
+        );
+        Ok(TwoPassNormalizationPlan {
+            first_pass,
+            second_pass: NormalizationPlan {
+                mode: NormalizationMode::Transcode,
+                command: second_pass_command,
+                output: output.to_owned(),
+                profile: self.profile,
+            },
+        })
+    }
+
+    /// Chooses the highest resolution at which the preferred byte target can
+    /// retain the v3 quality floor. A constant-quality result is allowed below
+    /// this bitrate because its measured content complexity already proves the
+    /// floor; this calculation governs only forced target-size encoding.
+    pub fn two_pass_candidate(&self, probe: &MediaProbe) -> Option<(VideoDimensions, u64)> {
+        let video = first_video_stream(probe)?;
+        let duration_ms = probe.duration_ms.filter(|duration| *duration > 0)?;
+        let target_bits = u128::from(self.profile.target_max_bytes)
+            .checked_mul(8)?
+            .checked_mul(u128::from(BASIS_POINTS - TWO_PASS_SIZE_HEADROOM_BPS))?
+            / u128::from(BASIS_POINTS);
+        let total_bitrate = target_bits.checked_mul(1_000)? / u128::from(duration_ms);
+        let audio_bitrate =
+            if probe.streams.iter().any(|stream| stream.kind == MediaStreamKind::Audio) {
+                u128::from(self.profile.audio_bitrate_kbps) * 1_000
+            } else {
+                0
+            };
+        let video_bitrate = total_bitrate.checked_sub(audio_bitrate)?;
+        let frame_rate = effective_frame_rate(video, self.profile.max_frame_rate);
+
+        self.resolution_ladder(video).into_iter().find_map(|dimensions| {
+            let required = minimum_video_bitrate(dimensions, frame_rate);
+            (video_bitrate >= required).then(|| {
+                let kbps = u64::try_from(video_bitrate / 1_000).unwrap_or(u64::MAX).max(1);
+                (dimensions, kbps)
+            })
         })
     }
 
@@ -432,6 +510,60 @@ impl NormalizationPlanner {
 
         command = self.append_output_options(command);
         command.arg(output.as_os_str())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn two_pass_command(
+        &self,
+        input: &Path,
+        output: &Path,
+        dimensions: VideoDimensions,
+        video_bitrate_kbps: u64,
+        passlog_prefix: &Path,
+        pass: u8,
+        video: &MediaStream,
+    ) -> ExternalCommand {
+        let mut command = base_command(&self.ffmpeg_executable)
+            .arg("-i")
+            .arg(input.as_os_str())
+            .arg("-map")
+            .arg("0:v:0");
+        if pass == 2 {
+            command = command.arg("-map").arg("0:a:0?");
+        }
+        command = command
+            .arg("-vf")
+            .arg(scale_filter(dimensions, self.profile.pixel_format))
+            .arg("-c:v")
+            .arg(self.profile.video_codec.ffmpeg_name())
+            .arg("-preset")
+            .arg(self.profile.video_preset.ffmpeg_name())
+            .arg("-b:v")
+            .arg(format!("{video_bitrate_kbps}k"))
+            .arg("-pass")
+            .arg(pass.to_string())
+            .arg("-passlogfile")
+            .arg(passlog_prefix.as_os_str())
+            .arg("-pix_fmt")
+            .arg(self.profile.pixel_format.ffmpeg_name());
+
+        if pass == 2 {
+            command = command
+                .arg("-c:a")
+                .arg(self.profile.audio_codec.ffmpeg_name())
+                .arg("-b:a")
+                .arg(format!("{}k", self.profile.audio_bitrate_kbps));
+        } else {
+            command = command.arg("-an");
+        }
+        if requires_frame_rate_cap(video, self.profile.max_frame_rate) {
+            command = command.arg("-r").arg(frame_rate_argument(self.profile.max_frame_rate));
+        }
+        if pass == 1 {
+            command.arg("-f").arg("null").arg(output.as_os_str())
+        } else {
+            self.append_output_options(command).arg(output.as_os_str())
+        }
     }
 
     fn append_output_options(&self, mut command: ExternalCommand) -> ExternalCommand {
@@ -673,18 +805,30 @@ fn frame_rate_argument(rate: FrameRate) -> String {
     }
 }
 
+fn effective_frame_rate(video: &MediaStream, maximum: FrameRate) -> FrameRate {
+    match video.frame_rate {
+        Some(rate) if !requires_frame_rate_cap(video, maximum) => rate,
+        _ => maximum,
+    }
+}
+
+fn minimum_video_bitrate(dimensions: VideoDimensions, frame_rate: FrameRate) -> u128 {
+    let pixels = u128::from(dimensions.width) * u128::from(dimensions.height);
+    let numerator = pixels
+        * u128::from(frame_rate.numerator)
+        * u128::from(MINIMUM_VIDEO_BITS_PER_PIXEL_FRAME_MILLIONTHS);
+    let denominator = u128::from(frame_rate.denominator) * u128::from(MILLION);
+    numerator.div_ceil(denominator)
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Error)]
 pub enum ProfileError {
     #[error("canonical profile dimensions must be greater than zero, got {width}x{height}")]
     InvalidDimensions { width: u32, height: u32 },
     #[error("canonical profile frame rate must be greater than zero")]
     InvalidFrameRate(FrameRate),
-    #[error("canonical profile preferred CRF must be between 0 and 51, got {0}")]
-    InvalidPreferredCrf(u8),
-    #[error("canonical profile maximum CRF must be between 0 and 51, got {0}")]
-    InvalidMaximumCrf(u8),
-    #[error("canonical profile CRF range is reversed: preferred {preferred}, maximum {maximum}")]
-    CrfRangeReversed { preferred: u8, maximum: u8 },
+    #[error("canonical profile quality CRF must be between 0 and 51, got {0}")]
+    InvalidQualityCrf(u8),
     #[error("canonical profile target byte ceiling must be greater than zero")]
     InvalidTargetBytes,
     #[error("canonical profile minimum short edge must be greater than zero")]
@@ -705,8 +849,8 @@ pub enum NormalizationError {
     NoVideoStream,
     #[error("media probe does not contain video dimensions")]
     MissingVideoDimensions,
-    #[error("candidate CRF {crf} is outside the adaptation range {preferred}..={maximum}")]
-    CrfOutsideAdaptationRange { crf: u8, preferred: u8, maximum: u8 },
+    #[error("two-pass video bitrate must be greater than zero")]
+    InvalidVideoBitrate,
     #[error("candidate dimensions {dimensions:?} are outside the bounded profile")]
     InvalidCandidateDimensions { dimensions: VideoDimensions },
 }
@@ -778,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn default_profile_matches_canonical_video_v2() {
+    fn default_profile_matches_canonical_video_v3() {
         let profile = CanonicalVideoProfile::default();
         assert_eq!(profile.container, CanonicalContainer::Mp4);
         assert_eq!(profile.video_codec, VideoCodec::H264);
@@ -788,8 +932,7 @@ mod tests {
         assert_eq!(profile.max_height, 1080);
         assert_eq!(profile.max_frame_rate, FrameRate { numerator: 60, denominator: 1 });
         assert_eq!(profile.target_max_bytes, 14 * 1024 * 1024);
-        assert_eq!(profile.preferred_crf, 23);
-        assert_eq!(profile.maximum_crf, 27);
+        assert_eq!(profile.quality_crf, 27);
         assert_eq!(profile.minimum_short_edge, 480);
         assert!(profile.validate().is_ok());
     }
@@ -942,12 +1085,11 @@ mod tests {
         );
         assert_eq!(planner.effective_minimum_short_edge(&probe.streams[0]), Some(456));
         planner
-            .plan_candidate(
+            .plan_quality_candidate(
                 "input.webm",
                 "output.mp4",
                 &probe,
                 VideoDimensions { width: 456, height: 1080 },
-                23,
             )
             .expect("highest portrait canonical dimensions should remain valid");
     }
@@ -972,12 +1114,11 @@ mod tests {
         );
         assert_eq!(planner.effective_minimum_short_edge(&probe.streams[0]), Some(608));
         planner
-            .plan_candidate(
+            .plan_quality_candidate(
                 "input.webm",
                 "output.mp4",
                 &probe,
                 VideoDimensions { width: 608, height: 1080 },
-                23,
             )
             .expect("aspect-limited canonical dimensions should remain valid");
     }
@@ -1080,14 +1221,95 @@ mod tests {
             vec![VideoDimensions { width: 320, height: 240 }]
         );
         planner
-            .plan_candidate(
+            .plan_quality_candidate(
                 "input.webm",
                 "output.mp4",
                 &small,
                 VideoDimensions { width: 320, height: 240 },
-                23,
             )
             .expect("native sub-floor source should not be rejected or upscaled");
+    }
+
+    #[test]
+    fn target_bitrate_selects_the_highest_resolution_that_meets_the_quality_floor() {
+        let planner = NormalizationPlanner::new("ffmpeg", Default::default())
+            .expect("default profile should be valid");
+        let mut probe = video_probe(
+            "matroska,webm",
+            "vp9",
+            "yuv420p",
+            1920,
+            1080,
+            Some(FrameRate { numerator: 30, denominator: 1 }),
+            Some("opus"),
+        );
+        probe.duration_ms = Some(30_000);
+
+        let (dimensions, bitrate) =
+            planner.two_pass_candidate(&probe).expect("30-second input should fit a lower rung");
+        assert_eq!(dimensions, VideoDimensions { width: 1440, height: 810 });
+        assert_eq!(bitrate, 3_708);
+    }
+
+    #[test]
+    fn movie_whose_audio_alone_exceeds_the_preferred_target_has_no_two_pass_candidate() {
+        let planner = NormalizationPlanner::new("ffmpeg", Default::default())
+            .expect("default profile should be valid");
+        let mut probe = video_probe(
+            "mp4",
+            "h264",
+            "yuv420p",
+            1920,
+            1080,
+            Some(FrameRate { numerator: 30, denominator: 1 }),
+            Some("aac"),
+        );
+        probe.duration_ms = Some(2 * 60 * 60 * 1_000);
+        probe.size_bytes = 1_500_000_000;
+
+        assert_eq!(planner.two_pass_candidate(&probe), None);
+    }
+
+    #[test]
+    fn two_pass_commands_share_bitrate_and_stats_but_encode_audio_only_on_pass_two() {
+        let planner = NormalizationPlanner::new("ffmpeg", Default::default())
+            .expect("default profile should be valid");
+        let probe = video_probe(
+            "matroska,webm",
+            "vp9",
+            "yuv420p",
+            1280,
+            720,
+            Some(FrameRate { numerator: 30, denominator: 1 }),
+            Some("opus"),
+        );
+        let plan = planner
+            .plan_two_pass(
+                "input.webm",
+                "output.mp4",
+                &probe,
+                VideoDimensions { width: 1280, height: 720 },
+                2_500,
+                "/tmp/sooqa-passlog",
+            )
+            .expect("two-pass plan should build");
+        let first: Vec<_> = plan
+            .first_pass()
+            .args()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        let second = args(plan.second_pass());
+
+        for command in [&first, &second] {
+            assert!(command.windows(2).any(|pair| pair == ["-b:v", "2500k"]));
+            assert!(command.windows(2).any(|pair| pair == ["-passlogfile", "/tmp/sooqa-passlog"]));
+        }
+        assert!(first.windows(2).any(|pair| pair == ["-pass", "1"]));
+        assert!(first.iter().any(|argument| argument == "-an"));
+        assert!(first.windows(2).any(|pair| pair == ["-f", "null"]));
+        assert!(second.windows(2).any(|pair| pair == ["-pass", "2"]));
+        assert!(second.windows(2).any(|pair| pair == ["-c:a", "aac"]));
     }
 
     #[test]
@@ -1154,10 +1376,10 @@ mod tests {
             Err(NormalizationError::InvalidProfile(ProfileError::InvalidDimensions { .. }))
         ));
 
-        let profile = CanonicalVideoProfile { preferred_crf: 52, ..Default::default() };
+        let profile = CanonicalVideoProfile { quality_crf: 52, ..Default::default() };
         assert!(matches!(
             NormalizationPlanner::new("ffmpeg", profile),
-            Err(NormalizationError::InvalidProfile(ProfileError::InvalidPreferredCrf(52)))
+            Err(NormalizationError::InvalidProfile(ProfileError::InvalidQualityCrf(52)))
         ));
     }
 }
