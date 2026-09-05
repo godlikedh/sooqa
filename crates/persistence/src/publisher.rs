@@ -17,7 +17,9 @@ use uuid::Uuid;
 use crate::{
     jobs::{JobRepositoryError, JobSettlement},
     settlement,
-    settlement::{lock_expired_job, lock_running_job, queue_parameters, update_locked_job},
+    settlement::{
+        QueueUpdate, lock_expired_job, lock_running_job, queue_parameters, update_locked_job,
+    },
 };
 
 #[derive(Clone)]
@@ -1815,19 +1817,28 @@ fn next_allowed_slot(
     for _ in 0..370 {
         let mut target = NaiveDateTime::new(date, start);
         let end_target = NaiveDateTime::new(date, end);
+        // A fall-back fold puts the second occurrence of an early local slot
+        // after the first occurrence of later local slots in UTC. Scan the
+        // complete local-day grid and choose the earliest UTC candidate
+        // instead of returning the first local-grid occurrence.
+        let mut earliest_utc = None;
         while target < end_target {
-            let mut resolved = match timezone.from_local_datetime(&target) {
+            let resolved = match timezone.from_local_datetime(&target) {
                 chrono::LocalResult::Single(value) => vec![value.with_timezone(&Utc)],
                 chrono::LocalResult::Ambiguous(earliest, latest) => {
                     vec![earliest.with_timezone(&Utc), latest.with_timezone(&Utc)]
                 }
                 chrono::LocalResult::None => Vec::new(),
             };
-            resolved.sort_unstable();
-            if let Some(result) = resolved.into_iter().find(|result| *result >= candidate) {
-                return from_chrono(result);
+            for result in resolved {
+                if result >= candidate && earliest_utc.is_none_or(|earliest| result < earliest) {
+                    earliest_utc = Some(result);
+                }
             }
             target += ChronoDuration::minutes(interval);
+        }
+        if let Some(result) = earliest_utc {
+            return from_chrono(result);
         }
         date += ChronoDuration::days(1);
     }
@@ -1983,30 +1994,21 @@ pub(crate) async fn settle_publish_job(
             JobCommand::PublishPost(payload) => (payload.post_id, payload.expected_revision),
             _ => return Err(JobRepositoryError::LeaseLost),
         };
-    let (state, run_at, error_class, error_message, terminal, non_consuming) =
-        queue_parameters(&job, settlement);
-    if terminal && let Some(post) = post.as_ref() {
+    let queue_update = queue_parameters(&job, settlement);
+    if queue_update.terminal
+        && let Some(post) = post.as_ref()
+    {
         settle_terminal_publication_post(
             &mut transaction,
             current_post_id,
             post,
             expected_revision,
-            &error_class,
-            &error_message,
+            &queue_update.error_class,
+            &queue_update.error_message,
         )
         .await?;
     }
-    let row = update_locked_job(
-        &mut transaction,
-        job.id,
-        state,
-        run_at,
-        &error_class,
-        &error_message,
-        terminal,
-        non_consuming,
-    )
-    .await?;
+    let row = update_locked_job(&mut transaction, job.id, queue_update).await?;
     transaction.commit().await?;
     row.into_job()
 }
@@ -2051,17 +2053,15 @@ pub(crate) async fn recover_publish_job(
         )
         .await?;
     }
-    update_locked_job(
-        &mut transaction,
-        job.id,
-        if terminal { "failed" } else { "queued" },
-        OffsetDateTime::now_utc(),
-        job.error_class.as_deref().unwrap_or("lease_expired"),
-        job.error_message.as_deref().unwrap_or("job lease expired"),
+    let queue_update = QueueUpdate {
+        state: if terminal { "failed" } else { "queued" },
+        run_at: OffsetDateTime::now_utc(),
+        error_class: job.error_class.as_deref().unwrap_or("lease_expired").to_owned(),
+        error_message: job.error_message.as_deref().unwrap_or("job lease expired").to_owned(),
         terminal,
-        false,
-    )
-    .await?;
+        non_consuming: false,
+    };
+    update_locked_job(&mut transaction, job.id, queue_update).await?;
     transaction.commit().await?;
     Ok(true)
 }
@@ -2314,6 +2314,25 @@ mod tests {
         let next = next_allowed_slot(timestamp("2026-03-08T06:40:00Z"), &channel)
             .expect("a later grid point should exist");
         assert_eq!(next, timestamp("2026-03-08T07:00:00Z"));
+    }
+
+    #[test]
+    fn next_allowed_slot_chooses_the_earliest_utc_fall_fold_candidate() {
+        let channel = channel("America/New_York", 1, 4);
+        let next = next_allowed_slot(timestamp("2026-11-01T05:15:00Z"), &channel)
+            .expect("a later fold candidate should exist");
+        assert_eq!(next, timestamp("2026-11-01T05:30:00Z"));
+    }
+
+    #[test]
+    fn next_allowed_slot_keeps_exact_fall_fold_grid_slots() {
+        let channel = channel("America/New_York", 1, 4);
+        let first_fold = next_allowed_slot(timestamp("2026-11-01T05:30:00Z"), &channel)
+            .expect("the exact first-fold slot should be available");
+        let second_fold = next_allowed_slot(timestamp("2026-11-01T06:30:00Z"), &channel)
+            .expect("the exact second-fold slot should be available");
+        assert_eq!(first_fold, timestamp("2026-11-01T05:30:00Z"));
+        assert_eq!(second_fold, timestamp("2026-11-01T06:30:00Z"));
     }
 
     #[test]

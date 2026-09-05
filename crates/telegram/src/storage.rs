@@ -485,15 +485,15 @@ where
             }
         };
 
-        let thumbnail_path = match thumbnail {
+        let thumbnail_cleanup = match thumbnail {
             Some(preview) => match stage_video_thumbnail(&local_work_path, preview).await {
-                Ok(path) => Some(path),
+                Ok(cleanup) => cleanup,
                 Err(error) => {
                     let _ = self.store.release_storage_upload(media_id, owner_token).await;
                     return Err(error);
                 }
             },
-            None => None,
+            None => StagedThumbnailCleanup(None),
         };
 
         if cancellation.is_cancelled() {
@@ -512,9 +512,8 @@ where
             duration,
             width,
             height,
-            thumbnail_path,
+            thumbnail_path: thumbnail_cleanup.path(),
         };
-        let thumbnail_cleanup = StagedThumbnailCleanup(request.thumbnail_path.clone());
         let dispatched = Arc::new(AtomicBool::new(false));
         let upload_api = self.api.clone();
         let mut upload = Box::pin({
@@ -655,6 +654,12 @@ async fn remove_staged_thumbnail(path: &Option<PathBuf>) {
 
 struct StagedThumbnailCleanup(Option<PathBuf>);
 
+impl StagedThumbnailCleanup {
+    fn path(&self) -> Option<PathBuf> {
+        self.0.clone()
+    }
+}
+
 impl Drop for StagedThumbnailCleanup {
     fn drop(&mut self) {
         if let Some(path) = self.0.take() {
@@ -680,7 +685,7 @@ fn checked_video_dimension(
 async fn stage_video_thumbnail(
     canonical_path: &Path,
     preview: MediaPreviewData,
-) -> Result<PathBuf, StorageUploadError> {
+) -> Result<StagedThumbnailCleanup, StorageUploadError> {
     if preview.metadata.mime_type != "image/jpeg" {
         return Err(StorageUploadError::InvalidVideoThumbnail {
             reason: "Telegram video thumbnails must be JPEG",
@@ -708,32 +713,32 @@ async fn stage_video_thumbnail(
         });
     };
     let path = parent.join(format!(".sooqa-storage-thumbnail-{}.jpg", Uuid::new_v4()));
-    let mut file =
-        tokio::fs::OpenOptions::new().write(true).create_new(true).open(&path).await.map_err(
-            |source| StorageUploadError::ThumbnailStaging { path: path.clone(), source },
-        )?;
-    if let Err(source) = file.write_all(&preview.bytes).await {
-        let _ = tokio::fs::remove_file(&path).await;
+    // Keep file creation and cleanup ownership in one non-awaiting step.
+    // Tokio's filesystem open may outlive a cancelled future on its blocking
+    // pool, which would otherwise leave a file created after the guard was
+    // supposed to take ownership.
+    let file =
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|source| {
+            StorageUploadError::ThumbnailStaging { path: path.clone(), source }
+        })?;
+    let cleanup = StagedThumbnailCleanup(Some(path.clone()));
+    let mut file = tokio::fs::File::from_std(file);
+    let staging_result = async {
+        file.write_all(&preview.bytes).await?;
+        file.flush().await
+    }
+    .await;
+    drop(file);
+    if let Err(source) = staging_result {
         return Err(StorageUploadError::ThumbnailStaging { path, source });
     }
-    if let Err(source) = file.flush().await {
-        let _ = tokio::fs::remove_file(&path).await;
-        return Err(StorageUploadError::ThumbnailStaging { path, source });
-    }
-    let digest = match sha256_file(&path).await {
-        Ok(digest) => digest,
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&path).await;
-            return Err(StorageUploadError::Hash(error));
-        }
-    };
+    let digest = sha256_file(&path).await.map_err(StorageUploadError::Hash)?;
     if digest.sha256 != hex_encode(&preview.metadata.sha256) {
-        let _ = tokio::fs::remove_file(&path).await;
         return Err(StorageUploadError::InvalidVideoThumbnail {
             reason: "thumbnail SHA-256 does not match encoded JPEG",
         });
     }
-    Ok(path)
+    Ok(cleanup)
 }
 
 const MAX_STORAGE_CAPTION_CHARS: usize = 1_024;
@@ -1177,6 +1182,7 @@ mod tests {
             _owner_token: Uuid,
         ) -> Result<(), Self::Error> {
             *self.released.lock().expect("mock mutex should not be poisoned") = true;
+            *self.reserved.lock().expect("mock mutex should not be poisoned") = false;
             Ok(())
         }
 
@@ -1481,6 +1487,110 @@ mod tests {
         assert!(!*store.unknown.lock().unwrap());
         assert!(api.requests.lock().unwrap().is_empty());
         tokio::fs::remove_file(path).await.expect("fixture should be removed");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_dispatch_cleans_staged_video_thumbnail() {
+        let directory =
+            std::env::temp_dir().join(format!("sooqa-storage-thumbnail-cancel-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.expect("fixture directory should be created");
+        let path = directory.join("canonical.mp4");
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let digest = sha256_file(&path).await.expect("fixture should hash");
+        let (thumbnail, thumbnail_sha256) = valid_thumbnail();
+        let api = MockApi::default();
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
+        *store.preview.lock().unwrap() = Some(MediaPreviewData {
+            metadata: sooqa_library::MediaPreviewMetadata {
+                mime_type: "image/jpeg".to_owned(),
+                width: 2,
+                height: 2,
+                size_bytes: thumbnail.len() as u32,
+                sha256: thumbnail_sha256,
+            },
+            bytes: thumbnail,
+        });
+        let provider = StorageUploadProvider::new(api.clone(), store.clone(), -100123)
+            .expect("storage chat ID should be valid");
+        let cancellation = StorageUploadCancellation::new();
+        cancellation.cancel();
+
+        assert!(matches!(
+            provider.upload_with_cancellation(input(), cancellation).await,
+            Err(StorageUploadError::CancelledBeforeDispatch)
+        ));
+        assert!(*store.released.lock().unwrap(), "reservation should be released");
+        assert!(!*store.reserved.lock().unwrap(), "reservation should no longer be held");
+        assert!(!*store.unknown.lock().unwrap(), "pre-dispatch cancellation is not ambiguous");
+        assert!(api.requests.lock().unwrap().is_empty(), "Telegram must not be called");
+        let mut entries =
+            tokio::fs::read_dir(&directory).await.expect("fixture directory should be readable");
+        while let Some(entry) = entries.next_entry().await.expect("directory should be readable") {
+            assert!(
+                !entry.file_name().to_string_lossy().starts_with(".sooqa-storage-thumbnail-"),
+                "pre-dispatch cancellation must remove the staged thumbnail"
+            );
+        }
+        tokio::fs::remove_dir_all(directory).await.expect("fixture directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn aborting_upload_cleans_staged_video_thumbnail() {
+        let directory =
+            std::env::temp_dir().join(format!("sooqa-storage-thumbnail-abort-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.expect("fixture directory should be created");
+        let path = directory.join("canonical.mp4");
+        tokio::fs::write(&path, b"canonical asset").await.expect("fixture should be written");
+        let digest = sha256_file(&path).await.expect("fixture should hash");
+        let (thumbnail, thumbnail_sha256) = valid_thumbnail();
+        let api =
+            BlockingApi { started: Arc::new(Notify::new()), release: Arc::new(Notify::new()) };
+        let store = MockStore::default();
+        *store.canonical.lock().unwrap() =
+            Some(canonical_asset(&path, hex_to_bytes(&digest.sha256)));
+        *store.preview.lock().unwrap() = Some(MediaPreviewData {
+            metadata: sooqa_library::MediaPreviewMetadata {
+                mime_type: "image/jpeg".to_owned(),
+                width: 2,
+                height: 2,
+                size_bytes: thumbnail.len() as u32,
+                sha256: thumbnail_sha256,
+            },
+            bytes: thumbnail,
+        });
+        let provider = StorageUploadProvider::new(api.clone(), store, -100123)
+            .expect("storage chat ID should be valid");
+        let upload = tokio::spawn({
+            let provider = provider.clone();
+            async move { provider.upload(input()).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), api.started.notified())
+            .await
+            .expect("mock API should observe the upload");
+
+        let staged_path = {
+            let mut entries = tokio::fs::read_dir(&directory)
+                .await
+                .expect("fixture directory should be readable");
+            let mut staged_path = None;
+            while let Some(entry) =
+                entries.next_entry().await.expect("directory should be readable")
+            {
+                if entry.file_name().to_string_lossy().starts_with(".sooqa-storage-thumbnail-") {
+                    staged_path = Some(entry.path());
+                    break;
+                }
+            }
+            staged_path.expect("thumbnail should be staged during upload")
+        };
+        assert!(staged_path.exists());
+
+        upload.abort();
+        assert!(upload.await.expect_err("aborted upload should not complete").is_cancelled());
+        assert!(!staged_path.exists(), "aborting an upload must remove the staged thumbnail");
+        tokio::fs::remove_dir_all(directory).await.expect("fixture directory should be removed");
     }
 
     #[tokio::test]

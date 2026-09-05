@@ -382,6 +382,9 @@ is a query over `posts.state = 'queued'`; normal scheduling assigns
 `cadence_slot_at`, while exact/manual scheduling stores the requested future
 `scheduled_at` with `cadence_slot_at = NULL` and permits collisions. Both paths
 enqueue one fixed-dedupe `publish_post` job referencing the post ID.
+Cadence resolution evaluates every valid local grid point on a bounded day and
+chooses the earliest UTC instant at or after the request, including the earlier
+side of a fall-back fold and skipping nonexistent spring-forward times.
 Creating an intent requires an explicit decision when the same media is already
 queued/sending or was published in the 14 days before the intended send time;
 older published history is allowed silently.

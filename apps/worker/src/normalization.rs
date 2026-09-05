@@ -104,55 +104,12 @@ async fn normalize_asset(
     // normalization stage transition. A low-space refusal therefore leaves
     // the ingest in its current state for a later retry.
     let current_request = load_ingest_for_admission(inbox, ingest_request_id).await?;
-    let mut preflight_failure = None;
-    if normalization_stage_may_run(current_request.status) {
-        let input_data = match current_request.input_data() {
-            Ok(input_data) => Some(input_data),
-            Err(error) => {
-                preflight_failure =
-                    Some(HandlerFailure::permanent("invalid_ingest_state", error.to_string()));
-                None
-            }
-        };
-        if let Some(input_data) = input_data
-            && !(input_data.normalization.is_some() && !current_request.force_save)
-        {
-            let probe = match input_data.probe {
-                Some(probe) => match probe.decode::<MediaProbe>() {
-                    Ok(probe) => Some(probe),
-                    Err(error) => {
-                        preflight_failure = Some(HandlerFailure::permanent(
-                            "invalid_ingest_state",
-                            format!("stored media probe could not be decoded: {error}"),
-                        ));
-                        None
-                    }
-                },
-                None => {
-                    preflight_failure = Some(HandlerFailure::permanent(
-                        "invalid_ingest_state",
-                        "ingest request has no stored media probe",
-                    ));
-                    None
-                }
-            };
-            if let Some(probe) = probe {
-                let media_kind =
-                    probe_media_kind(&probe).or_else(|| request_media_kind(&current_request));
-                match media_kind {
-                    Some(SourceMediaKind::Video) => admission
-                        .admit(work_root, max_normalized_storage_bytes.saturating_mul(2))?,
-                    Some(_) => admission.admit(work_root, max_normalized_storage_bytes)?,
-                    None => {
-                        preflight_failure = Some(HandlerFailure::permanent(
-                            "invalid_ingest_state",
-                            "ingest request has no stored source media kind",
-                        ));
-                    }
-                }
-            }
-        }
-    }
+    let preflight_failure = preflight_normalization(
+        &current_request,
+        work_root,
+        admission,
+        max_normalized_storage_bytes,
+    )?;
 
     let request = match inbox.begin_asset_normalization(ingest_request_id, &job_attempt).await {
         Ok(AssetNormalizationStart::Ready(request)) => request,
@@ -160,191 +117,173 @@ async fn normalize_asset(
         Err(error) => return Err(map_inbox_error(error)),
     };
     if let Some(failure) = preflight_failure {
-        return fail_normalization(inbox, ingest_request_id, &job_attempt, failure).await;
+        return settle_normalization(inbox, ingest_request_id, &job_attempt, Err(failure)).await;
+    }
+
+    let (probe, media_kind) = match stored_probe_and_kind(&request) {
+        Ok(value) => value,
+        Err(failure) => {
+            return settle_normalization(inbox, ingest_request_id, &job_attempt, Err(failure))
+                .await;
+        }
+    };
+    let artifact = match media_kind {
+        SourceMediaKind::Image => {
+            normalize_image_asset(
+                work_root,
+                image_normalizer,
+                &request,
+                max_normalized_storage_bytes,
+            )
+            .await
+        }
+        SourceMediaKind::Animation | SourceMediaKind::Audio => {
+            normalize_exact_asset(
+                work_root,
+                &request,
+                ExactNormalizationSpec { media_kind, probe: &probe, max_normalized_storage_bytes },
+            )
+            .await
+        }
+        SourceMediaKind::Video => {
+            normalize_video_asset(
+                work_root,
+                planner,
+                executor,
+                &request,
+                &probe,
+                &job,
+                max_normalized_storage_bytes,
+            )
+            .await
+        }
+        _ => Err(HandlerFailure::permanent(
+            "unsupported_media_kind",
+            format!("asset media kind {media_kind:?} is not supported by the video normalizer"),
+        )),
+    };
+    settle_normalization(inbox, ingest_request_id, &job_attempt, artifact).await
+}
+
+/// Performs checks that must happen before the durable stage transition.
+///
+/// Admission failures are returned immediately so no reservation is made, while
+/// malformed persisted metadata is returned as a deferred failure: the caller
+/// settles it only after `begin_asset_normalization` has recorded ownership of
+/// the running stage.
+fn preflight_normalization(
+    request: &sooqa_inbox::Ingest,
+    work_root: &Path,
+    admission: WorkspaceAdmission,
+    max_normalized_storage_bytes: u64,
+) -> Result<Option<HandlerFailure>, HandlerFailure> {
+    if !normalization_stage_may_run(request.status) {
+        return Ok(None);
     }
     let input_data = match request.input_data() {
         Ok(input_data) => input_data,
         Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                HandlerFailure::permanent("invalid_ingest_state", error.to_string()),
-            )
-            .await;
+            return Ok(Some(HandlerFailure::permanent("invalid_ingest_state", error.to_string())));
         }
     };
-    let probe = match input_data.probe {
-        Some(probe) => match probe.decode::<MediaProbe>() {
-            Ok(probe) => probe,
-            Err(error) => {
-                return fail_normalization(
-                    inbox,
-                    ingest_request_id,
-                    &job_attempt,
-                    HandlerFailure::permanent(
-                        "invalid_ingest_state",
-                        format!("stored media probe could not be decoded: {error}"),
-                    ),
-                )
-                .await;
-            }
-        },
-        None => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                HandlerFailure::permanent(
-                    "invalid_ingest_state",
-                    "ingest request has no stored media probe",
-                ),
-            )
-            .await;
-        }
-    };
-    let media_kind = match probe_media_kind(&probe).or_else(|| request_media_kind(&request)) {
-        Some(media_kind) => media_kind,
-        None => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                HandlerFailure::permanent(
-                    "invalid_ingest_state",
-                    "ingest request has no stored source media kind",
-                ),
-            )
-            .await;
-        }
-    };
-    if media_kind == SourceMediaKind::Image {
-        return normalize_image_asset(
-            inbox,
-            work_root,
-            image_normalizer,
-            &request,
-            ingest_request_id,
-            &job_attempt,
-            max_normalized_storage_bytes,
-        )
-        .await;
+    if input_data.normalization.is_some() && !request.force_save {
+        return Ok(None);
     }
-    if matches!(media_kind, SourceMediaKind::Animation | SourceMediaKind::Audio) {
-        return normalize_exact_asset(
-            inbox,
-            work_root,
-            &request,
-            ingest_request_id,
-            &job_attempt,
-            ExactNormalizationSpec { media_kind, probe: &probe, max_normalized_storage_bytes },
-        )
-        .await;
-    }
-    if media_kind != SourceMediaKind::Video {
-        return fail_normalization(
-            inbox,
-            ingest_request_id,
-            &job_attempt,
-            HandlerFailure::permanent(
-                "unsupported_media_kind",
-                format!("asset media kind {media_kind:?} is not supported by the video normalizer"),
-            ),
-        )
-        .await;
-    }
-    let (workspace_id, input_name) = match workspace_input(&request) {
+    let (_, media_kind) = match stored_probe_and_kind(request) {
         Ok(value) => value,
-        Err(failure) => {
-            return fail_normalization(inbox, ingest_request_id, &job_attempt, failure).await;
-        }
+        Err(failure) => return Ok(Some(failure)),
     };
-    let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
-        Ok(workspace) => workspace,
-        Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                map_workspace_error(error),
-            )
-            .await;
+    match media_kind {
+        SourceMediaKind::Video => {
+            admission.admit(work_root, max_normalized_storage_bytes.saturating_mul(2))?;
         }
-    };
-    if let Err(error) = workspace.validate() {
-        return fail_normalization(
-            inbox,
-            ingest_request_id,
-            &job_attempt,
-            map_workspace_error(error),
-        )
-        .await;
+        _ => admission.admit(work_root, max_normalized_storage_bytes)?,
     }
-    let input_path = match workspace.path(WorkspaceArea::Source, input_name) {
-        Ok(path) => path,
-        Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                map_workspace_error(error),
+    Ok(None)
+}
+
+fn stored_probe_and_kind(
+    request: &sooqa_inbox::Ingest,
+) -> Result<(MediaProbe, SourceMediaKind), HandlerFailure> {
+    let input_data = request
+        .input_data()
+        .map_err(|error| HandlerFailure::permanent("invalid_ingest_state", error.to_string()))?;
+    let probe = input_data
+        .probe
+        .as_ref()
+        .ok_or_else(|| {
+            HandlerFailure::permanent(
+                "invalid_ingest_state",
+                "ingest request has no stored media probe",
             )
-            .await;
-        }
-    };
-    let output_path = match workspace.path(WorkspaceArea::Normalized, "canonical.mp4") {
-        Ok(path) => path,
-        Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                map_workspace_error(error),
+        })?
+        .decode::<MediaProbe>()
+        .map_err(|error| {
+            HandlerFailure::permanent(
+                "invalid_ingest_state",
+                format!("stored media probe could not be decoded: {error}"),
             )
-            .await;
-        }
-    };
-    let plan = match planner.plan(&input_path, &output_path, &probe) {
-        Ok(plan) => plan,
-        Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                &job_attempt,
-                HandlerFailure::permanent("normalize_plan", error.to_string()),
+        })?;
+    let media_kind =
+        probe_media_kind(&probe).or_else(|| request_media_kind(request)).ok_or_else(|| {
+            HandlerFailure::permanent(
+                "invalid_ingest_state",
+                "ingest request has no stored source media kind",
             )
-            .await;
-        }
-    };
-    let result = match execute_video_normalization(
+        })?;
+    Ok((probe, media_kind))
+}
+
+async fn normalize_video_asset(
+    work_root: &Path,
+    planner: &NormalizationPlanner,
+    executor: &FfmpegExecutor,
+    request: &sooqa_inbox::Ingest,
+    probe: &MediaProbe,
+    job: &Job,
+    max_normalized_storage_bytes: u64,
+) -> Result<AssetNormalization, HandlerFailure> {
+    let (workspace, input_name) = prepare_workspace(work_root, request).await?;
+    let input_path =
+        workspace.path(WorkspaceArea::Source, input_name).map_err(map_workspace_error)?;
+    let output_path =
+        workspace.path(WorkspaceArea::Normalized, "canonical.mp4").map_err(map_workspace_error)?;
+    let plan = planner
+        .plan(&input_path, &output_path, probe)
+        .map_err(|error| HandlerFailure::permanent("normalize_plan", error.to_string()))?;
+    let result = execute_video_normalization(
         planner,
         executor,
         &input_path,
         &output_path,
-        &probe,
+        probe,
         max_normalized_storage_bytes,
         plan,
     )
     .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            let retryable = normalization_error_is_retryable(&error);
-            let terminal = !retryable || job.attempt_count >= job.max_attempts;
-            let failure = if terminal {
-                HandlerFailure::permanent("normalize", error.to_string())
-            } else {
-                HandlerFailure::retryable("normalize_timeout", error.to_string())
-            };
-            return fail_normalization(inbox, ingest_request_id, &job_attempt, failure).await;
-        }
-    };
-    let normalization = normalization_metadata(result);
-    inbox
-        .complete_asset_normalization(ingest_request_id, &job_attempt, normalization)
-        .await
-        .map_err(map_inbox_error)?;
-    Ok(())
+    .map_err(|error| map_video_normalization_error(error, job))?;
+    Ok(normalization_metadata(result))
+}
+
+fn map_video_normalization_error(error: NormalizationExecutionError, job: &Job) -> HandlerFailure {
+    let retryable = normalization_error_is_retryable(&error);
+    let message = error.to_string();
+    if retryable && job.attempt_count < job.max_attempts {
+        HandlerFailure::retryable("normalize_timeout", message)
+    } else {
+        HandlerFailure::permanent("normalize", message)
+    }
+}
+
+async fn prepare_workspace(
+    work_root: &Path,
+    request: &sooqa_inbox::Ingest,
+) -> Result<(MediaWorkspace, &'static str), HandlerFailure> {
+    let (workspace_id, input_name) = workspace_input(request)?;
+    let workspace =
+        MediaWorkspace::create(work_root, workspace_id).await.map_err(map_workspace_error)?;
+    workspace.validate().map_err(map_workspace_error)?;
+    Ok((workspace, input_name))
 }
 
 struct VideoCandidateCleanup {
@@ -372,6 +311,95 @@ impl Drop for VideoCandidateCleanup {
         for path in &self.paths {
             let _ = fs::remove_file(path);
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FallbackPolicy {
+    KeepFirst,
+    KeepSmallest,
+}
+
+/// Tracks all adaptation outputs until one candidate is published.
+///
+/// A candidate can be retained as the best quality-preserving fallback, but
+/// every other output remains owned by the cleanup guard until it is removed.
+struct VideoCandidateSet {
+    cleanup: VideoCandidateCleanup,
+    fallback: Option<sooqa_media::NormalizationResult>,
+    largest_oversized_candidate: Option<u64>,
+    attempts: usize,
+    target_max_bytes: u64,
+    storage_limit: u64,
+}
+
+impl VideoCandidateSet {
+    fn new(target_max_bytes: u64, storage_limit: u64) -> Self {
+        Self {
+            cleanup: VideoCandidateCleanup { paths: Vec::new() },
+            fallback: None,
+            largest_oversized_candidate: None,
+            attempts: 0,
+            target_max_bytes,
+            storage_limit,
+        }
+    }
+
+    fn next_path(&mut self, output_path: &Path) -> PathBuf {
+        self.attempts += 1;
+        let path = video_candidate_path(output_path);
+        self.cleanup.push(path.clone());
+        path
+    }
+
+    fn record_attempt(&mut self) {
+        self.attempts += 1;
+    }
+
+    async fn consider(
+        &mut self,
+        result: sooqa_media::NormalizationResult,
+        fallback_policy: FallbackPolicy,
+    ) -> Option<sooqa_media::NormalizationResult> {
+        let fits_storage = result.digest.bytes <= self.storage_limit;
+        let selects_candidate = fits_storage
+            && match fallback_policy {
+                FallbackPolicy::KeepFirst => result.digest.bytes <= self.target_max_bytes,
+                FallbackPolicy::KeepSmallest => self
+                    .fallback
+                    .as_ref()
+                    .is_none_or(|previous| result.digest.bytes < previous.digest.bytes),
+            };
+        if selects_candidate {
+            if let Some(previous) = self.fallback.take() {
+                remove_video_candidate(&previous.output_path, &mut self.cleanup).await;
+            }
+            return Some(result);
+        }
+
+        if result.digest.bytes > self.storage_limit {
+            self.largest_oversized_candidate =
+                Some(self.largest_oversized_candidate.unwrap_or(0).max(result.digest.bytes));
+        }
+
+        let should_keep_as_fallback = fits_storage
+            && self.fallback.is_none()
+            && matches!(fallback_policy, FallbackPolicy::KeepFirst);
+        if should_keep_as_fallback {
+            self.fallback = Some(result);
+        } else {
+            remove_video_candidate(&result.output_path, &mut self.cleanup).await;
+        }
+        None
+    }
+
+    fn take_fallback(
+        &mut self,
+    ) -> Result<sooqa_media::NormalizationResult, NormalizationExecutionError> {
+        self.fallback.take().ok_or(NormalizationExecutionError::OutputExceedsStorageLimit {
+            bytes: self.largest_oversized_candidate.unwrap_or(self.storage_limit),
+            limit: self.storage_limit,
+        })
     }
 }
 
@@ -419,42 +447,25 @@ async fn execute_video_normalization(
     max_normalized_storage_bytes: u64,
     initial_plan: sooqa_media::NormalizationPlan,
 ) -> Result<sooqa_media::NormalizationResult, NormalizationExecutionError> {
-    let mut candidate_paths = VideoCandidateCleanup { paths: Vec::new() };
-    let mut fallback = None;
-    let mut largest_oversized_candidate = None;
-    let mut attempts = 0;
+    let mut candidates =
+        VideoCandidateSet::new(planner.profile().target_max_bytes, max_normalized_storage_bytes);
 
     if initial_plan.mode() == sooqa_media::NormalizationMode::Remux {
         // Never run a decision-making remux directly against canonical.mp4.
         // Its actual bytes may cross the target, and a lease-expired worker
         // must not delete or replace a newer canonical artifact.
-        let candidate_path = video_candidate_path(output_path);
-        candidate_paths.push(candidate_path.clone());
-        attempts += 1;
+        let candidate_path = candidates.next_path(output_path);
         let remux_plan = initial_plan.with_output(&candidate_path);
         let result = executor.execute(&remux_plan, std::future::pending()).await?;
-        if result.digest.bytes <= planner.profile().target_max_bytes
-            && result.digest.bytes <= max_normalized_storage_bytes
-        {
+        if let Some(selected) = candidates.consider(result, FallbackPolicy::KeepFirst).await {
             return publish_video_candidate(
-                result,
+                selected,
                 output_path,
-                &mut candidate_paths,
-                attempts,
+                &mut candidates.cleanup,
+                candidates.attempts,
                 planner.profile().target_max_bytes,
             )
             .await;
-        }
-        // Remux is the highest-quality candidate even when incidental
-        // container overhead keeps it above the eligibility target. Retain it
-        // as a fallback only when it can still be stored under the hard
-        // ceiling; an oversized remux must not displace a later CRF result.
-        if result.digest.bytes <= max_normalized_storage_bytes {
-            fallback = Some(result);
-        } else {
-            largest_oversized_candidate =
-                Some(largest_oversized_candidate.unwrap_or(0).max(result.digest.bytes));
-            remove_video_candidate(&candidate_path, &mut candidate_paths).await;
         }
     }
 
@@ -473,9 +484,7 @@ async fn execute_video_normalization(
     // One constant-quality encode lets x264 exploit low-complexity inputs
     // without padding them toward the preferred byte target. It also gives an
     // incompatible source a bounded quality-preserving fallback.
-    attempts += 1;
-    let quality_path = video_candidate_path(output_path);
-    candidate_paths.push(quality_path.clone());
+    let quality_path = candidates.next_path(output_path);
     let quality_plan = if initial_plan.mode() == sooqa_media::NormalizationMode::Transcode {
         initial_plan.with_output(&quality_path)
     } else {
@@ -483,35 +492,22 @@ async fn execute_video_normalization(
             .plan_quality_candidate(input_path, &quality_path, probe, quality_dimensions)
             .map_err(map_candidate_plan_error)?
     };
-    let quality = executor.execute(&quality_plan, std::future::pending()).await?;
-    validate_adapted_dimensions(&quality.probe, quality_dimensions, video, planner)?;
-    let quality_fits_storage = quality.digest.bytes <= max_normalized_storage_bytes;
-    if quality.digest.bytes <= planner.profile().target_max_bytes && quality_fits_storage {
-        if let Some(previous) = fallback.take() {
-            remove_video_candidate(&previous.output_path, &mut candidate_paths).await;
-        }
+    let quality =
+        execute_quality_candidate(executor, &quality_plan, quality_dimensions, video, planner)
+            .await?;
+    if let Some(selected) = candidates.consider(quality, FallbackPolicy::KeepFirst).await {
         return publish_video_candidate(
-            quality,
+            selected,
             output_path,
-            &mut candidate_paths,
-            attempts,
+            &mut candidates.cleanup,
+            candidates.attempts,
             planner.profile().target_max_bytes,
         )
         .await;
     }
-    if fallback.is_none() && quality_fits_storage {
-        fallback = Some(quality);
-    } else {
-        if !quality_fits_storage {
-            largest_oversized_candidate =
-                Some(largest_oversized_candidate.unwrap_or(0).max(quality.digest.bytes));
-        }
-        remove_video_candidate(&quality_path, &mut candidate_paths).await;
-    }
 
     if let Some((dimensions, video_bitrate_kbps)) = planner.two_pass_candidate(probe) {
-        let candidate_path = video_candidate_path(output_path);
-        candidate_paths.push(candidate_path.clone());
+        let candidate_path = candidates.next_path(output_path);
         let mut passlogs = VideoPasslogCleanup::reserve(output_path).await?;
         let passlog_prefix = passlogs.prefix();
         let plan = planner
@@ -524,83 +520,79 @@ async fn execute_video_normalization(
                 &passlog_prefix,
             )
             .map_err(map_candidate_plan_error)?;
-        attempts += 2;
-        executor.execute_analysis(plan.first_pass(), std::future::pending()).await?;
-        let result = executor.execute(plan.second_pass(), std::future::pending()).await?;
-        validate_adapted_dimensions(&result.probe, dimensions, video, planner)?;
+        candidates.record_attempt();
+        let result =
+            execute_two_pass_candidate(executor, &plan, dimensions, video, planner).await?;
         passlogs.remove().await;
-        let improves_fallback =
-            fallback.as_ref().is_none_or(|previous| result.digest.bytes < previous.digest.bytes);
-        if result.digest.bytes <= max_normalized_storage_bytes && improves_fallback {
-            if let Some(previous) = fallback.take() {
-                remove_video_candidate(&previous.output_path, &mut candidate_paths).await;
-            }
+        if let Some(selected) = candidates.consider(result, FallbackPolicy::KeepSmallest).await {
             return publish_video_candidate(
-                result,
+                selected,
                 output_path,
-                &mut candidate_paths,
-                attempts,
+                &mut candidates.cleanup,
+                candidates.attempts,
                 planner.profile().target_max_bytes,
             )
             .await;
         }
-        if result.digest.bytes > max_normalized_storage_bytes {
-            largest_oversized_candidate =
-                Some(largest_oversized_candidate.unwrap_or(0).max(result.digest.bytes));
-        }
-        remove_video_candidate(&candidate_path, &mut candidate_paths).await;
     } else {
         // The bitrate heuristic is deliberately conservative and can reject a
         // fixed-size encode for low-complexity material that CRF can represent
         // efficiently. Try each remaining quality-preserving resolution once;
         // if even the floor misses, retain the original-quality fallback.
         for dimensions in ladder.into_iter().skip(1) {
-            attempts += 1;
-            let candidate_path = video_candidate_path(output_path);
-            candidate_paths.push(candidate_path.clone());
+            let candidate_path = candidates.next_path(output_path);
             let plan = planner
                 .plan_quality_candidate(input_path, &candidate_path, probe, dimensions)
                 .map_err(map_candidate_plan_error)?;
-            let result = executor.execute(&plan, std::future::pending()).await?;
-            validate_adapted_dimensions(&result.probe, dimensions, video, planner)?;
-            let fits_storage = result.digest.bytes <= max_normalized_storage_bytes;
-            if result.digest.bytes <= planner.profile().target_max_bytes && fits_storage {
-                if let Some(previous) = fallback.take() {
-                    remove_video_candidate(&previous.output_path, &mut candidate_paths).await;
-                }
+            let result =
+                execute_quality_candidate(executor, &plan, dimensions, video, planner).await?;
+            if let Some(selected) = candidates.consider(result, FallbackPolicy::KeepFirst).await {
                 return publish_video_candidate(
-                    result,
+                    selected,
                     output_path,
-                    &mut candidate_paths,
-                    attempts,
+                    &mut candidates.cleanup,
+                    candidates.attempts,
                     planner.profile().target_max_bytes,
                 )
                 .await;
             }
-            if fallback.is_none() && fits_storage {
-                fallback = Some(result);
-            } else {
-                if !fits_storage {
-                    largest_oversized_candidate =
-                        Some(largest_oversized_candidate.unwrap_or(0).max(result.digest.bytes));
-                }
-                remove_video_candidate(&candidate_path, &mut candidate_paths).await;
-            }
         }
     }
 
-    let selected = fallback.ok_or(NormalizationExecutionError::OutputExceedsStorageLimit {
-        bytes: largest_oversized_candidate.unwrap_or(max_normalized_storage_bytes),
-        limit: max_normalized_storage_bytes,
-    })?;
+    let selected = candidates.take_fallback()?;
     publish_video_candidate(
         selected,
         output_path,
-        &mut candidate_paths,
-        attempts,
+        &mut candidates.cleanup,
+        candidates.attempts,
         planner.profile().target_max_bytes,
     )
     .await
+}
+
+async fn execute_quality_candidate(
+    executor: &FfmpegExecutor,
+    plan: &sooqa_media::NormalizationPlan,
+    dimensions: sooqa_media::VideoDimensions,
+    source: &sooqa_media::MediaStream,
+    planner: &NormalizationPlanner,
+) -> Result<sooqa_media::NormalizationResult, NormalizationExecutionError> {
+    let result = executor.execute(plan, std::future::pending()).await?;
+    validate_adapted_dimensions(&result.probe, dimensions, source, planner)?;
+    Ok(result)
+}
+
+async fn execute_two_pass_candidate(
+    executor: &FfmpegExecutor,
+    plan: &sooqa_media::TwoPassNormalizationPlan,
+    dimensions: sooqa_media::VideoDimensions,
+    source: &sooqa_media::MediaStream,
+    planner: &NormalizationPlanner,
+) -> Result<sooqa_media::NormalizationResult, NormalizationExecutionError> {
+    executor.execute_analysis(plan.first_pass(), std::future::pending()).await?;
+    let result = executor.execute(plan.second_pass(), std::future::pending()).await?;
+    validate_adapted_dimensions(&result.probe, dimensions, source, planner)?;
+    Ok(result)
 }
 
 fn map_candidate_plan_error(error: sooqa_media::NormalizationError) -> NormalizationExecutionError {
@@ -697,80 +689,29 @@ fn validate_adapted_dimensions(
 }
 
 async fn normalize_image_asset(
-    inbox: &InboxRepository,
-    work_root: &std::path::Path,
+    work_root: &Path,
     image_normalizer: ImageNormalizer,
     request: &sooqa_inbox::Ingest,
-    ingest_request_id: Uuid,
-    job_attempt: &sooqa_jobs::JobLease,
     max_normalized_storage_bytes: u64,
-) -> Result<(), HandlerFailure> {
-    let (workspace_id, input_name) = match workspace_input(request) {
-        Ok(value) => value,
-        Err(failure) => {
-            return fail_normalization(inbox, ingest_request_id, job_attempt, failure).await;
-        }
-    };
-    let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
-        Ok(workspace) => workspace,
-        Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                job_attempt,
-                map_workspace_error(error),
-            )
-            .await;
-        }
-    };
-    if let Err(error) = workspace.validate() {
-        return fail_normalization(
-            inbox,
-            ingest_request_id,
-            job_attempt,
-            map_workspace_error(error),
-        )
-        .await;
-    }
+) -> Result<AssetNormalization, HandlerFailure> {
+    let (workspace, input_name) = prepare_workspace(work_root, request).await?;
     let plan = match image_normalizer.plan(&workspace, input_name, "canonical", "thumbnail") {
         Ok(plan) => plan,
         Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                job_attempt,
-                HandlerFailure::permanent("normalize_plan", error.to_string()),
-            )
-            .await;
+            return Err(HandlerFailure::permanent("normalize_plan", error.to_string()));
         }
     };
     let result = match image_normalizer.execute(&plan).await {
         Ok(result) => result,
-        Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                job_attempt,
-                HandlerFailure::permanent("normalize_image", error.to_string()),
-            )
-            .await;
-        }
+        Err(error) => return Err(HandlerFailure::permanent("normalize_image", error.to_string())),
     };
     if let Some(failure) = normalized_storage_limit_failure(
         result.canonical_digest.bytes,
         max_normalized_storage_bytes,
     ) {
-        return fail_normalization(inbox, ingest_request_id, job_attempt, failure).await;
+        return Err(failure);
     }
-    inbox
-        .complete_asset_normalization(
-            ingest_request_id,
-            job_attempt,
-            image_normalization_metadata(result),
-        )
-        .await
-        .map_err(map_inbox_error)?;
-    Ok(())
+    Ok(image_normalization_metadata(result))
 }
 
 struct ExactNormalizationSpec<'a> {
@@ -780,53 +721,14 @@ struct ExactNormalizationSpec<'a> {
 }
 
 async fn normalize_exact_asset(
-    inbox: &InboxRepository,
     work_root: &Path,
     request: &sooqa_inbox::Ingest,
-    ingest_request_id: Uuid,
-    job_attempt: &sooqa_jobs::JobLease,
     spec: ExactNormalizationSpec<'_>,
-) -> Result<(), HandlerFailure> {
+) -> Result<AssetNormalization, HandlerFailure> {
     let ExactNormalizationSpec { media_kind, probe, max_normalized_storage_bytes } = spec;
-    let (workspace_id, input_name) = match workspace_input(request) {
-        Ok(value) => value,
-        Err(failure) => {
-            return fail_normalization(inbox, ingest_request_id, job_attempt, failure).await;
-        }
-    };
-    let workspace = match MediaWorkspace::create(work_root, workspace_id).await {
-        Ok(workspace) => workspace,
-        Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                job_attempt,
-                map_workspace_error(error),
-            )
-            .await;
-        }
-    };
-    if let Err(error) = workspace.validate() {
-        return fail_normalization(
-            inbox,
-            ingest_request_id,
-            job_attempt,
-            map_workspace_error(error),
-        )
-        .await;
-    }
-    let input_path = match workspace.path(WorkspaceArea::Source, input_name) {
-        Ok(path) => path,
-        Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                job_attempt,
-                map_workspace_error(error),
-            )
-            .await;
-        }
-    };
+    let (workspace, input_name) = prepare_workspace(work_root, request).await?;
+    let input_path =
+        workspace.path(WorkspaceArea::Source, input_name).map_err(map_workspace_error)?;
     let canonical_name = match media_kind {
         SourceMediaKind::Animation => "canonical.animation",
         SourceMediaKind::Audio => "canonical.audio",
@@ -834,52 +736,26 @@ async fn normalize_exact_asset(
             "canonical.media"
         }
     };
-    let canonical_path = match workspace.path(WorkspaceArea::Normalized, canonical_name) {
-        Ok(path) => path,
-        Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                job_attempt,
-                map_workspace_error(error),
-            )
-            .await;
-        }
-    };
+    let canonical_path =
+        workspace.path(WorkspaceArea::Normalized, canonical_name).map_err(map_workspace_error)?;
     match source_artifact_exists(&canonical_path).await {
         Ok(true) => {}
         Ok(false) => match publish_artifact(&input_path, &canonical_path).await {
             Ok(()) | Err(ArtifactPublicationError::DestinationConflict) => {}
             Err(error) => {
-                return fail_normalization(
-                    inbox,
-                    ingest_request_id,
-                    job_attempt,
-                    HandlerFailure::permanent("normalize_exact", error.to_string()),
-                )
-                .await;
+                return Err(HandlerFailure::permanent("normalize_exact", error.to_string()));
             }
         },
-        Err(failure) => {
-            return fail_normalization(inbox, ingest_request_id, job_attempt, failure).await;
-        }
+        Err(failure) => return Err(failure),
     }
     let digest = match sha256_file(&canonical_path).await {
         Ok(digest) => digest,
-        Err(error) => {
-            return fail_normalization(
-                inbox,
-                ingest_request_id,
-                job_attempt,
-                HandlerFailure::permanent("normalize_exact", error.to_string()),
-            )
-            .await;
-        }
+        Err(error) => return Err(HandlerFailure::permanent("normalize_exact", error.to_string())),
     };
     if let Some(failure) =
         normalized_storage_limit_failure(digest.bytes, max_normalized_storage_bytes)
     {
-        return fail_normalization(inbox, ingest_request_id, job_attempt, failure).await;
+        return Err(failure);
     }
     let thumbnail = if media_kind == SourceMediaKind::Animation {
         match decode_first_preview_frame(&canonical_path).await {
@@ -950,11 +826,7 @@ async fn normalize_exact_asset(
         bit_rate: probe.bit_rate,
         thumbnail,
     };
-    inbox
-        .complete_asset_normalization(ingest_request_id, job_attempt, normalization)
-        .await
-        .map_err(map_inbox_error)?;
-    Ok(())
+    Ok(normalization)
 }
 
 fn source_mime_type(request: &sooqa_inbox::Ingest) -> Option<String> {
@@ -1065,6 +937,22 @@ fn normalized_storage_limit_failure(bytes: u64, limit: u64) -> Option<HandlerFai
             ),
         )
     })
+}
+
+async fn settle_normalization(
+    inbox: &InboxRepository,
+    ingest_request_id: Uuid,
+    job_attempt: &sooqa_jobs::JobLease,
+    artifact: Result<AssetNormalization, HandlerFailure>,
+) -> Result<(), HandlerFailure> {
+    match artifact {
+        Ok(normalization) => inbox
+            .complete_asset_normalization(ingest_request_id, job_attempt, normalization)
+            .await
+            .map(|_| ())
+            .map_err(map_inbox_error),
+        Err(failure) => fail_normalization(inbox, ingest_request_id, job_attempt, failure).await,
+    }
 }
 
 async fn fail_normalization(
@@ -1332,6 +1220,19 @@ mod tests {
         }
     }
 
+    fn candidate_result(path: impl AsRef<Path>, bytes: u64) -> sooqa_media::NormalizationResult {
+        sooqa_media::NormalizationResult {
+            output_path: path.as_ref().to_owned(),
+            progress: sooqa_media::FfmpegProgress {
+                frame: None,
+                out_time_ms: None,
+                state: sooqa_media::FfmpegProgressState::End,
+            },
+            probe: adaptation_probe(320, 240, bytes),
+            digest: sooqa_media::FileDigest { bytes, sha256: format!("{bytes:064x}") },
+        }
+    }
+
     fn adaptation_probe(width: u32, height: u32, size_bytes: u64) -> MediaProbe {
         MediaProbe {
             container_format: Some("mp4".to_owned()),
@@ -1385,6 +1286,69 @@ mod tests {
                     && !name.starts_with(".sooqa-two-pass-"),
                 "video attempt file was left behind: {name}"
             );
+        }
+    }
+
+    async fn candidate_fixture(
+        candidates: &mut VideoCandidateSet,
+        root: &Path,
+        name: &str,
+        bytes: u64,
+    ) -> sooqa_media::NormalizationResult {
+        let path = root.join(name);
+        tokio::fs::write(&path, b"candidate").await.expect("candidate should be writable");
+        candidates.cleanup.push(path.clone());
+        candidate_result(path, bytes)
+    }
+
+    #[tokio::test]
+    async fn two_pass_candidate_above_target_can_replace_larger_quality_fallback() {
+        let root = std::env::temp_dir().join(format!("sooqa-candidate-set-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&root).await.expect("test root should be created");
+        let mut candidates = VideoCandidateSet::new(100, 1_000);
+        let quality = candidate_fixture(&mut candidates, &root, "quality.mp4", 120).await;
+        let quality_path = quality.output_path.clone();
+        let two_pass = candidate_fixture(&mut candidates, &root, "two-pass.mp4", 110).await;
+        let two_pass_path = two_pass.output_path.clone();
+
+        assert!(candidates.consider(quality, FallbackPolicy::KeepFirst).await.is_none());
+        let selected = candidates
+            .consider(two_pass, FallbackPolicy::KeepSmallest)
+            .await
+            .expect("a smaller two-pass candidate should be accepted");
+        assert_eq!(selected.digest.bytes, 110);
+        assert!(!quality_path.exists(), "the replaced fallback should be removed");
+        assert!(two_pass_path.exists(), "the selected fallback should remain owned");
+        drop(candidates);
+        clean_test_root(&root).await;
+    }
+
+    #[tokio::test]
+    async fn equal_or_larger_quality_candidate_keeps_the_remux_fallback() {
+        for quality_bytes in [110, 111] {
+            let root = std::env::temp_dir().join(format!("sooqa-candidate-set-{}", Uuid::new_v4()));
+            tokio::fs::create_dir(&root).await.expect("test root should be created");
+            let mut candidates = VideoCandidateSet::new(100, 1_000);
+            let remux = candidate_fixture(&mut candidates, &root, "remux.mp4", 110).await;
+            let remux_path = remux.output_path.clone();
+            let quality =
+                candidate_fixture(&mut candidates, &root, "quality.mp4", quality_bytes).await;
+            let quality_path = quality.output_path.clone();
+
+            assert!(candidates.consider(remux, FallbackPolicy::KeepFirst).await.is_none());
+            assert!(candidates.consider(quality, FallbackPolicy::KeepSmallest).await.is_none());
+            assert_eq!(
+                candidates
+                    .fallback
+                    .as_ref()
+                    .expect("the remux should remain as the quality fallback")
+                    .output_path,
+                remux_path
+            );
+            assert!(remux_path.exists(), "the retained remux should remain owned");
+            assert!(!quality_path.exists(), "an equal or larger candidate should be removed");
+            drop(candidates);
+            clean_test_root(&root).await;
         }
     }
 

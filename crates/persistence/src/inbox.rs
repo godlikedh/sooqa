@@ -25,7 +25,9 @@ use uuid::Uuid;
 
 use crate::{
     jobs::{JobRepositoryError, JobSettlement},
-    settlement::{lock_expired_job, lock_running_job, queue_parameters, update_locked_job},
+    settlement::{
+        QueueUpdate, lock_expired_job, lock_running_job, queue_parameters, update_locked_job,
+    },
 };
 
 #[derive(Clone)]
@@ -2184,9 +2186,8 @@ pub(crate) async fn settle_job(
         | JobCommand::FinalizeIngest(payload) => payload.ingest_id,
         _ => return Err(JobRepositoryError::LeaseLost),
     };
-    let (state, run_at, error_class, error_message, terminal, non_consuming) =
-        queue_parameters(&job, settlement);
-    if terminal {
+    let queue_update = queue_parameters(&job, settlement);
+    if queue_update.terminal {
         sqlx::query(
             "UPDATE ingests SET state = 'failed_terminal', error_code = 'job_lease_expired', error_message = 'job lease expired after the final attempt', completed_at = now(), updated_at = now() WHERE id = $1 AND state NOT IN ('completed', 'failed_terminal', 'cancelled')",
         )
@@ -2208,17 +2209,7 @@ pub(crate) async fn settle_job(
             .await?;
         }
     }
-    let row = update_locked_job(
-        &mut transaction,
-        job.id,
-        state,
-        run_at,
-        &error_class,
-        &error_message,
-        terminal,
-        non_consuming,
-    )
-    .await?;
+    let row = update_locked_job(&mut transaction, job.id, queue_update).await?;
     transaction.commit().await?;
     row.into_job()
 }
@@ -2278,17 +2269,15 @@ pub(crate) async fn recover_job(
             .await?;
         }
     }
-    update_locked_job(
-        &mut transaction,
-        job.id,
-        if terminal { "failed" } else { "queued" },
-        OffsetDateTime::now_utc(),
-        job.error_class.as_deref().unwrap_or("lease_expired"),
-        job.error_message.as_deref().unwrap_or("job lease expired"),
+    let queue_update = QueueUpdate {
+        state: if terminal { "failed" } else { "queued" },
+        run_at: OffsetDateTime::now_utc(),
+        error_class: job.error_class.as_deref().unwrap_or("lease_expired").to_owned(),
+        error_message: job.error_message.as_deref().unwrap_or("job lease expired").to_owned(),
         terminal,
-        false,
-    )
-    .await?;
+        non_consuming: false,
+    };
+    update_locked_job(&mut transaction, job.id, queue_update).await?;
     transaction.commit().await?;
     Ok(true)
 }

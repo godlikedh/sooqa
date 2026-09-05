@@ -381,6 +381,16 @@ async function settle() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
 function buttonWithText(element, text) {
   return element.querySelectorAll("button").find((button) => button.textContent === text);
 }
@@ -453,6 +463,131 @@ test("admin runtime handles token lifecycle, safe rendering, and both decisions"
   assert.equal(runtime.document.getElementById("admin-shell").hidden, true);
 });
 
+test("admin runtime ignores a delayed response from an older auth session", async () => {
+  const oldResponse = deferred();
+  const calls = [];
+  const runtime = createAdminRuntime({
+    token: "old-secret",
+    handler: async (pathName, options) => {
+      const authorization = options.headers.get("Authorization");
+      calls.push({ pathName, authorization });
+      if (authorization === "Bearer old-secret") return oldResponse.promise;
+      return jsonResponse({ counts: { ready_media: 7 }, attention: {} });
+    },
+  });
+  await settle();
+  assert.deepEqual(calls, [{ pathName: "/api/v1/dashboard?limit=20", authorization: "Bearer old-secret" }]);
+
+  runtime.document.getElementById("lock-button").dispatchEvent({ type: "click" });
+  const tokenInput = runtime.document.getElementById("api-token");
+  tokenInput.value = "new-secret";
+  runtime.document.getElementById("token-form").dispatchEvent({ type: "submit" });
+  await settle();
+
+  assert.equal(runtime.storage.get("sooqa.admin.api_token"), "new-secret");
+  assert.equal(runtime.document.getElementById("admin-shell").hidden, false);
+  assert.match(runtime.document.getElementById("dashboard-counts").textContent, /7/);
+
+  oldResponse.resolve(jsonResponse({ error: { message: "old token" } }, 401));
+  await settle();
+
+  assert.equal(runtime.storage.get("sooqa.admin.api_token"), "new-secret");
+  assert.equal(runtime.document.getElementById("admin-shell").hidden, false);
+  assert.equal(runtime.document.getElementById("session-status").textContent, "Session token active");
+  assert.match(runtime.document.getElementById("dashboard-counts").textContent, /7/);
+});
+
+test("admin runtime reports a current token rejection", async () => {
+  const runtime = createAdminRuntime({
+    token: "rejected-secret",
+    handler: async () => jsonResponse({ error: { message: "invalid token" } }, 401),
+  });
+  await settle();
+
+  assert.equal(runtime.storage.has("sooqa.admin.api_token"), false);
+  assert.equal(runtime.document.getElementById("admin-shell").hidden, true);
+  assert.match(runtime.document.getElementById("toast").textContent, /token was rejected/);
+  assert.equal(runtime.document.getElementById("toast").className.includes("error"), true);
+});
+
+test("admin runtime ignores a page response after navigation", async () => {
+  const oldDashboardResponse = deferred();
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (pathName) => {
+      if (pathName === "/api/v1/dashboard?limit=20") return oldDashboardResponse.promise;
+      if (pathName === "/api/v1/media?limit=50") {
+        return jsonResponse({ items: [{ id: "media-current", kind: "image", title: "current page", storage_state: "ready" }], next_cursor: null });
+      }
+      return jsonResponse({ counts: {}, attention: {} });
+    },
+  });
+  await settle();
+
+  runtime.window.location.hash = "#media";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+  assert.match(runtime.document.getElementById("media-grid").textContent, /current page/);
+
+  oldDashboardResponse.resolve(jsonResponse({ counts: { ready_media: 99 }, attention: {} }));
+  await settle();
+
+  assert.equal(runtime.document.getElementById("dashboard-counts").textContent, "");
+  assert.match(runtime.document.getElementById("media-grid").textContent, /current page/);
+});
+
+for (const scenario of [
+  {
+    name: "a successful stale payload",
+    response: () => jsonResponse({
+      items: [{ id: "stale-media", kind: "image", title: "stale result", storage_state: "ready" }],
+      next_cursor: null,
+    }),
+  },
+  {
+    name: "a stale failure",
+    response: () => jsonResponse({ error: { message: "old lookup failed" } }, 500),
+  },
+]) {
+  test(`admin runtime keeps a newer media lookup after ${scenario.name} arrives`, async () => {
+    const olderResponse = deferred();
+    const freshMedia = { id: "fresh-media", kind: "image", title: "fresh result", storage_state: "ready" };
+    const runtime = createAdminRuntime({
+      token: "secret",
+      handler: async (pathName) => {
+        if (pathName.includes("q=old")) return olderResponse.promise;
+        if (pathName === "/api/v1/media?limit=50") return jsonResponse({ items: [freshMedia], next_cursor: null });
+        return jsonResponse({ counts: {}, attention: {} });
+      },
+    });
+    await settle();
+    runtime.window.location.hash = "#media";
+    runtime.dispatchWindow("hashchange");
+    await settle();
+
+    const search = runtime.document.getElementById("media-search");
+    search.value = "old";
+    runtime.document.getElementById("media-search-form").dispatchEvent({ type: "submit" });
+    await settle();
+    assert.equal(runtime.document.getElementById("media-search-button").disabled, true);
+
+    runtime.document.getElementById("media-clear-search").dispatchEvent({ type: "click" });
+    await settle();
+    const grid = runtime.document.getElementById("media-grid");
+    assert.match(grid.textContent, /fresh result/);
+
+    olderResponse.resolve(scenario.response());
+    await settle();
+
+    assert.match(grid.textContent, /fresh result/);
+    assert.doesNotMatch(grid.textContent, /stale result/);
+    assert.equal(runtime.document.getElementById("media-status").hidden, true);
+    if (scenario.name === "a stale failure") {
+      assert.doesNotMatch(runtime.document.getElementById("toast").textContent, /old lookup failed/);
+    }
+  });
+}
+
 test("admin runtime paginates ingests and refreshes only the first page", async () => {
   const paths = [];
   const runtime = createAdminRuntime({
@@ -494,6 +629,39 @@ test("admin runtime paginates ingests and refreshes only the first page", async 
   runtime.tickIntervals();
   await settle();
   assert.equal(paths.at(-1), "/api/v1/ingests?limit=50");
+});
+
+test("admin runtime keeps ingest auto-refresh single-flight", async () => {
+  const slowRefresh = deferred();
+  let ingestCalls = 0;
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (pathName) => {
+      if (pathName === "/api/v1/ingests?limit=50") {
+        ingestCalls += 1;
+        if (ingestCalls === 2) return slowRefresh.promise;
+        return jsonResponse({ items: [], next_cursor: null });
+      }
+      return jsonResponse({ counts: {}, attention: {} });
+    },
+  });
+  await settle();
+  runtime.window.location.hash = "#ingests";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+
+  runtime.tickIntervals();
+  await settle();
+  assert.equal(ingestCalls, 2);
+  runtime.tickIntervals();
+  await settle();
+  assert.equal(ingestCalls, 2);
+
+  slowRefresh.resolve(jsonResponse({ items: [], next_cursor: null }));
+  await settle();
+  runtime.tickIntervals();
+  await settle();
+  assert.equal(ingestCalls, 3);
 });
 
 test("admin runtime sends the settings fence and reloads after a stale save", async () => {

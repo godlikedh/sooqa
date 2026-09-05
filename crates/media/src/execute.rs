@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
@@ -188,15 +189,18 @@ impl FfmpegExecutor {
         F: Future<Output = ()> + Send,
     {
         let args = command.args();
-        let mut with_progress = ExternalCommand::new(command.program().to_owned())
+        let mut progress_args = args[..args.len().saturating_sub(1)].to_vec();
+        if let Some(output) = args.last() {
+            progress_args.extend([
+                OsString::from("-progress"),
+                OsString::from("pipe:1"),
+                output.clone(),
+            ]);
+        }
+        let with_progress = command
+            .with_args(progress_args)
             .timeout(self.timeout)
             .max_output_bytes(self.max_output_bytes);
-        for argument in &args[..args.len().saturating_sub(1)] {
-            with_progress = with_progress.arg(argument.clone());
-        }
-        if let Some(output) = args.last() {
-            with_progress = with_progress.arg("-progress").arg("pipe:1").arg(output.clone());
-        }
         self.run_with_progress(with_progress, cancellation).await
     }
 
@@ -485,6 +489,29 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CaptureRunner {
+        command: Arc<Mutex<Option<ExternalCommand>>>,
+    }
+
+    #[async_trait]
+    impl ExternalCommandRunner for CaptureRunner {
+        async fn run(
+            &self,
+            command: ExternalCommand,
+        ) -> Result<ExternalCommandOutput, CommandError> {
+            *self.command.lock().expect("command mutex should not be poisoned") = Some(command);
+            Ok(ExternalCommandOutput {
+                success: true,
+                exit_code: Some(0),
+                stdout: b"progress=end\n".to_vec(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            })
+        }
+    }
+
     fn planner() -> NormalizationPlanner {
         NormalizationPlanner::new("ffmpeg", CanonicalVideoProfile::default())
             .expect("default profile should be valid")
@@ -547,6 +574,62 @@ mod tests {
             Err(ProgressError::LineTooLong { .. })
         ));
         assert_eq!(parse_ffmpeg_progress(b"frame=1\n"), Err(ProgressError::MissingState));
+    }
+
+    #[tokio::test]
+    async fn analysis_preserves_command_context_when_adding_progress() {
+        let captured = Arc::new(Mutex::new(None));
+        let runner = Arc::new(CaptureRunner { command: Arc::clone(&captured) });
+        let runner_trait: Arc<dyn ExternalCommandRunner> = runner;
+        let ffprobe = FfprobeAdapter::with_runner(
+            "ffprobe",
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+            Arc::clone(&runner_trait),
+        );
+        let executor = FfmpegExecutor::with_runner(
+            Arc::clone(&runner_trait),
+            ffprobe,
+            Duration::from_secs(10),
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        let command = ExternalCommand::new("ffmpeg")
+            .arg("-f")
+            .arg("null")
+            .arg("-")
+            .current_dir("/var/lib/sooqa/work")
+            .clear_environment()
+            .env("PATH", "/usr/bin")
+            .timeout(Duration::from_secs(90))
+            .max_output_bytes(512);
+
+        let progress = executor
+            .execute_analysis(&command, std::future::pending())
+            .await
+            .expect("analysis should complete");
+        assert_eq!(progress.state, FfmpegProgressState::End);
+
+        let captured = captured
+            .lock()
+            .expect("command mutex should not be poisoned")
+            .clone()
+            .expect("analysis command should be captured");
+        assert_eq!(captured.program(), Path::new("ffmpeg"));
+        assert_eq!(captured.current_directory(), Some(Path::new("/var/lib/sooqa/work")));
+        assert!(captured.clears_environment());
+        assert_eq!(captured.environment(), [(OsString::from("PATH"), OsString::from("/usr/bin"))]);
+        assert_eq!(captured.timeout_duration(), Duration::from_secs(10));
+        assert_eq!(captured.max_output_bytes_limit(), DEFAULT_MAX_OUTPUT_BYTES);
+        assert_eq!(
+            captured.args(),
+            [
+                OsString::from("-f"),
+                OsString::from("null"),
+                OsString::from("-progress"),
+                OsString::from("pipe:1"),
+                OsString::from("-")
+            ]
+        );
     }
 
     #[tokio::test]

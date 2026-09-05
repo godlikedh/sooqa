@@ -76,6 +76,12 @@ impl ExternalCommand {
         self
     }
 
+    pub(crate) fn with_args(&self, args: Vec<OsString>) -> Self {
+        let mut command = self.clone();
+        command.args = args;
+        command
+    }
+
     pub fn program(&self) -> &Path {
         &self.program
     }
@@ -190,6 +196,34 @@ enum OutputLimitTarget {
     Directory { path: PathBuf, max_bytes: u64 },
 }
 
+impl OutputLimitTarget {
+    fn path(&self) -> &Path {
+        match self {
+            Self::File { path, .. } | Self::Directory { path, .. } => path,
+        }
+    }
+
+    fn limit(&self) -> u64 {
+        match self {
+            Self::File { max_bytes, .. } | Self::Directory { max_bytes, .. } => *max_bytes,
+        }
+    }
+
+    async fn size(&self) -> Result<u64, std::io::Error> {
+        match self {
+            Self::File { path, .. } => file_size(path).await,
+            Self::Directory { path, .. } => sequence_directory_size(path).await,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProcessOutput {
+    stdout: BoundedOutput,
+    stderr: BoundedOutput,
+    status: std::process::ExitStatus,
+}
+
 async fn run_process_command(
     command: ExternalCommand,
     output_limit: Option<OutputLimitTarget>,
@@ -214,35 +248,7 @@ async fn run_process_command(
         .map_err(|source| CommandError::Spawn { program: program.clone(), source })?;
     let mut group_cleanup = ProcessGroupCleanup::new(child.id());
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| CommandError::Pipe { program: program.clone(), stream: "stdout" })?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| CommandError::Pipe { program: program.clone(), stream: "stderr" })?;
-
-    let max_output_bytes = command.max_output_bytes_limit();
-    let execution = async {
-        let stdout_read = read_bounded(stdout, max_output_bytes);
-        let stderr_read = read_bounded(stderr, max_output_bytes);
-        let wait = child.wait();
-        let (stdout, stderr, status) = tokio::join!(stdout_read, stderr_read, wait);
-        let stdout = stdout.map_err(|source| CommandError::Read {
-            program: program.clone(),
-            stream: "stdout",
-            source,
-        })?;
-        let stderr = stderr.map_err(|source| CommandError::Read {
-            program: program.clone(),
-            stream: "stderr",
-            source,
-        })?;
-        let status =
-            status.map_err(|source| CommandError::Wait { program: program.clone(), source })?;
-        Ok::<_, CommandError>((stdout, stderr, status))
-    };
+    let execution = collect_process_output(&mut child, &program, command.max_output_bytes_limit());
     let monitor_config = output_limit.clone();
     let monitor = async move {
         match monitor_config {
@@ -250,12 +256,11 @@ async fn run_process_command(
             None => std::future::pending::<Result<(), std::io::Error>>().await,
         }
     };
-    let (stdout, stderr, status) = tokio::select! {
+    let execution = tokio::select! {
         result = timeout(command.timeout_duration(), execution) => match result {
             Ok(result) => result?,
             Err(_) => {
-                terminate_process_group(&mut child).await;
-                group_cleanup.disarm();
+                terminate_and_disarm(&mut child, &mut group_cleanup).await;
                 return Err(CommandError::TimedOut {
                     program,
                     timeout: command.timeout_duration(),
@@ -267,19 +272,17 @@ async fn run_process_command(
                 Ok(()) => {
                     let limit = output_limit
                         .as_ref()
-                        .map(output_limit_target_limit)
+                        .map(OutputLimitTarget::limit)
                         .expect("an output monitor has a configured limit");
-                    terminate_process_group(&mut child).await;
-                    group_cleanup.disarm();
+                    terminate_and_disarm(&mut child, &mut group_cleanup).await;
                     return Err(CommandError::OutputLimitExceeded { program, limit });
                 }
                 Err(source) => {
                     let directory = output_limit
                         .as_ref()
-                        .map(output_limit_target_path)
+                        .map(|target| target.path().to_owned())
                         .expect("an output monitor has a configured path");
-                    terminate_process_group(&mut child).await;
-                    group_cleanup.disarm();
+                    terminate_and_disarm(&mut child, &mut group_cleanup).await;
                     return Err(CommandError::OutputMonitor { program, directory, source });
                 }
             }
@@ -288,60 +291,75 @@ async fn run_process_command(
     group_cleanup.disarm();
 
     if let Some(target) = output_limit.as_ref() {
-        let size = output_limit_target_size(target).await.map_err(|source| {
-            CommandError::OutputMonitor {
-                program: program.clone(),
-                directory: output_limit_target_path(target),
-                source,
-            }
+        let size = target.size().await.map_err(|source| CommandError::OutputMonitor {
+            program: program.clone(),
+            directory: target.path().to_owned(),
+            source,
         })?;
-        if size > output_limit_target_limit(target) {
-            return Err(CommandError::OutputLimitExceeded {
-                program,
-                limit: output_limit_target_limit(target),
-            });
+        if size > target.limit() {
+            return Err(CommandError::OutputLimitExceeded { program, limit: target.limit() });
         }
     }
 
     Ok(ExternalCommandOutput {
-        success: status.success(),
-        exit_code: status.code(),
-        stdout: stdout.bytes,
-        stderr: stderr.bytes,
-        stdout_truncated: stdout.truncated,
-        stderr_truncated: stderr.truncated,
+        success: execution.status.success(),
+        exit_code: execution.status.code(),
+        stdout: execution.stdout.bytes,
+        stderr: execution.stderr.bytes,
+        stdout_truncated: execution.stdout.truncated,
+        stderr_truncated: execution.stderr.truncated,
     })
 }
 
 async fn monitor_output_limit(target: OutputLimitTarget) -> Result<(), std::io::Error> {
     loop {
-        if output_limit_target_size(&target).await? > output_limit_target_limit(&target) {
+        if target.size().await? > target.limit() {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
-fn output_limit_target_path(target: &OutputLimitTarget) -> PathBuf {
-    match target {
-        OutputLimitTarget::File { path, .. } | OutputLimitTarget::Directory { path, .. } => {
-            path.clone()
-        }
-    }
+async fn terminate_and_disarm(
+    child: &mut tokio::process::Child,
+    group_cleanup: &mut ProcessGroupCleanup,
+) {
+    terminate_process_group(child).await;
+    group_cleanup.disarm();
 }
 
-fn output_limit_target_limit(target: &OutputLimitTarget) -> u64 {
-    match target {
-        OutputLimitTarget::File { max_bytes, .. }
-        | OutputLimitTarget::Directory { max_bytes, .. } => *max_bytes,
-    }
-}
+async fn collect_process_output(
+    child: &mut tokio::process::Child,
+    program: &Path,
+    max_output_bytes: usize,
+) -> Result<ProcessOutput, CommandError> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CommandError::Pipe { program: program.to_owned(), stream: "stdout" })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CommandError::Pipe { program: program.to_owned(), stream: "stderr" })?;
 
-async fn output_limit_target_size(target: &OutputLimitTarget) -> Result<u64, std::io::Error> {
-    match target {
-        OutputLimitTarget::File { path, .. } => file_size(path).await,
-        OutputLimitTarget::Directory { path, .. } => sequence_directory_size(path).await,
-    }
+    let stdout_read = read_bounded(stdout, max_output_bytes);
+    let stderr_read = read_bounded(stderr, max_output_bytes);
+    let wait = child.wait();
+    let (stdout, stderr, status) = tokio::join!(stdout_read, stderr_read, wait);
+    let stdout = stdout.map_err(|source| CommandError::Read {
+        program: program.to_owned(),
+        stream: "stdout",
+        source,
+    })?;
+    let stderr = stderr.map_err(|source| CommandError::Read {
+        program: program.to_owned(),
+        stream: "stderr",
+        source,
+    })?;
+    let status =
+        status.map_err(|source| CommandError::Wait { program: program.to_owned(), source })?;
+
+    Ok(ProcessOutput { stdout, stderr, status })
 }
 
 async fn file_size(path: &Path) -> Result<u64, std::io::Error> {
@@ -628,26 +646,20 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancelling_process_runner_kills_and_reaps_descendants() {
-        use std::{os::unix::fs::PermissionsExt, process::Stdio};
+        use std::process::Stdio;
 
-        let script =
-            std::env::temp_dir().join(format!("sooqa-cancel-process-{}.sh", uuid::Uuid::new_v4()));
-        let pid_file = script.with_extension("pid");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nsleep 30 &\nchild=$!\nprintf '%s' \"$child\" > \"$1\"\nwait \"$child\"\n",
-        )
-        .expect("cancellation fixture should be written");
-        let mut permissions = std::fs::metadata(&script)
-            .expect("cancellation fixture metadata should be readable")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&script, permissions)
-            .expect("cancellation fixture should be executable");
-
-        let command = ExternalCommand::new(&script)
+        let pid_file =
+            std::env::temp_dir().join(format!("sooqa-cancel-process-{}.pid", uuid::Uuid::new_v4()));
+        let command = ExternalCommand::new("/bin/sh")
+            // The shell is only a test fixture: production commands still use
+            // argument arrays and never invoke a shell. The PID file is the
+            // readiness signal that the descendant has been spawned.
+            .arg("-c")
+            .arg("sleep 30 & child=$!; printf '%s' \"$child\" > \"$1\"; wait \"$child\"")
+            .arg("sooqa-cancel-process")
             .arg(pid_file.to_string_lossy().into_owned())
             .timeout(Duration::from_secs(30));
+
         let task = tokio::spawn(async move { ProcessCommandRunner.run(command).await });
         let mut child_pid = None;
         for _ in 0..100 {
@@ -677,6 +689,5 @@ mod tests {
         }
         assert!(terminated, "cancellation should kill and reap the descendant");
         let _ = tokio::fs::remove_file(&pid_file).await;
-        let _ = tokio::fs::remove_file(&script).await;
     }
 }
