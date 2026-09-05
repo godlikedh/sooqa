@@ -23,6 +23,15 @@
     scheduleEditing: new Set(),
     schedulePreviewEntries: new Map(),
     schedulePreviewUrls: new Set(),
+    authGeneration: 0,
+    viewGeneration: 0,
+    loadGenerations: {
+      dashboard: 0,
+      ingests: 0,
+      media: 0,
+      schedule: 0,
+      settings: 0,
+    },
   };
 
   const $ = (id) => document.getElementById(id);
@@ -32,6 +41,13 @@
       super(message);
       this.name = "UiError";
       this.status = status;
+    }
+  }
+
+  class SupersededRequest extends Error {
+    constructor() {
+      super("The request was superseded.");
+      this.name = "SupersededRequest";
     }
   }
 
@@ -253,11 +269,68 @@
     $("session-status").textContent = unlocked ? "Session token active" : "Locked";
   }
 
+  function currentAuthContext() {
+    return { token: state.token, generation: state.authGeneration };
+  }
+
+  function isCurrentAuth(context) {
+    return context.token === state.token && context.generation === state.authGeneration;
+  }
+
+  function currentViewContext(page) {
+    return {
+      page,
+      generation: state.viewGeneration,
+      auth: currentAuthContext(),
+    };
+  }
+
+  function isCurrentView(context) {
+    return context
+      && state.page === context.page
+      && state.viewGeneration === context.generation
+      && isCurrentAuth(context.auth);
+  }
+
+  function beginLoad(name, page, viewContext) {
+    const generation = ++state.loadGenerations[name];
+    const context = viewContext || currentViewContext(page);
+    return () => generation === state.loadGenerations[name] && isCurrentView(context);
+  }
+
+  async function runLoad(isCurrent, operation) {
+    try {
+      const data = await operation();
+      return isCurrent() ? data : undefined;
+    } catch (error) {
+      if (!isCurrent() && !isAuthRejection(error)) {
+        throw new SupersededRequest();
+      }
+      throw error;
+    }
+  }
+
+  function errorMessage(error, fallback) {
+    return error instanceof Error ? error.message : fallback;
+  }
+
+  function isAuthRejection(error) {
+    return error instanceof UiError && error.status === 401;
+  }
+
+  function reportError(error, fallback) {
+    if (error instanceof SupersededRequest) return;
+    showToast(errorMessage(error, fallback), true);
+  }
+
   function lock() {
     stopIngestAutoRefresh();
     invalidateMediaPreviews();
     invalidateSchedulePreviews();
     discardScheduleEdits();
+    closePublicationDialog();
+    state.authGeneration += 1;
+    state.viewGeneration += 1;
     state.token = "";
     try {
       writeToken("");
@@ -271,14 +344,22 @@
 
   async function request(path, options) {
     if (!state.token) throw new UiError("Unlock the admin before making requests.");
+    const auth = currentAuthContext();
     const requestOptions = options || {};
     const headers = new Headers(requestOptions.headers || {});
-    headers.set("Authorization", `Bearer ${state.token}`);
+    headers.set("Authorization", `Bearer ${auth.token}`);
     if (requestOptions.body && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
     if (!headers.has("Accept")) headers.set("Accept", "application/json");
-    const response = await fetch(path, { ...requestOptions, headers, credentials: "same-origin" });
+    let response;
+    try {
+      response = await fetch(path, { ...requestOptions, headers, credentials: "same-origin" });
+    } catch (error) {
+      if (!isCurrentAuth(auth)) throw new SupersededRequest();
+      throw error;
+    }
+    if (!isCurrentAuth(auth)) throw new SupersededRequest();
     if (response.status === 401) {
       lock();
       throw new UiError("The token was rejected. Enter it again.", response.status);
@@ -286,15 +367,19 @@
     if (!response.ok) {
       const contentType = response.headers.get("content-type") || "";
       const payload = contentType.includes("json") ? await response.json() : null;
+      if (!isCurrentAuth(auth)) throw new SupersededRequest();
       throw new UiError(payload?.error?.message || `Request failed (${response.status}).`, response.status);
     }
     return response;
   }
 
   async function api(path, options) {
+    const auth = currentAuthContext();
     const response = await request(path, options);
     const contentType = response.headers.get("content-type") || "";
-    return contentType.includes("json") ? response.json() : null;
+    const payload = contentType.includes("json") ? await response.json() : null;
+    if (!isCurrentAuth(auth)) throw new SupersededRequest();
+    return payload;
   }
 
   async function withBusy(button, operation) {
@@ -304,7 +389,7 @@
     try {
       await operation();
     } catch (error) {
-      showToast(error instanceof Error ? error.message : "The request failed.", true);
+      reportError(error, "The request failed.");
       if (error instanceof UiError && error.status === 409) await route();
     } finally {
       button.disabled = false;
@@ -452,8 +537,10 @@
     }
   }
 
-  async function loadDashboard() {
-    const data = await api("/api/v1/dashboard?limit=20");
+  async function loadDashboard(viewContext) {
+    const isCurrent = beginLoad("dashboard", "dashboard", viewContext);
+    const data = await runLoad(isCurrent, () => api("/api/v1/dashboard?limit=20"));
+    if (data === undefined) return;
     renderCounts(data.counts);
     renderDuplicates(data.attention?.technical_duplicates || []);
     renderRepeats(data.attention?.publication_repeats || []);
@@ -516,18 +603,20 @@
     state.ingestCursor = data.next_cursor || null;
   }
 
-  async function loadIngests(cursor) {
-    if (state.ingestLoading) return;
+  async function loadIngests(cursor, viewContext, force = false) {
+    if (state.ingestLoading && !force) return;
+    const isCurrent = beginLoad("ingests", "ingests", viewContext);
     state.ingestLoading = true;
     state.ingestPageCursor = cursor || null;
     const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
     try {
-      const data = await api(`/api/v1/ingests?limit=50${suffix}`);
+      const data = await runLoad(isCurrent, () => api(`/api/v1/ingests?limit=50${suffix}`));
+      if (data === undefined) return;
       renderIngests(data);
       if (state.ingestPageCursor === null) startIngestAutoRefresh();
       else stopIngestAutoRefresh();
     } finally {
-      state.ingestLoading = false;
+      if (isCurrent()) state.ingestLoading = false;
     }
   }
 
@@ -547,7 +636,7 @@
         return;
       }
       void loadIngests(null).catch((error) => {
-        showToast(error instanceof Error ? error.message : "The ingests could not be refreshed.", true);
+        reportError(error, "The ingests could not be refreshed.");
       });
     }, INGEST_AUTO_REFRESH_MS);
   }
@@ -816,11 +905,13 @@
     $("media-next").hidden = !state.mediaCursor;
   }
 
-  async function loadMedia(cursor) {
+  async function loadMedia(cursor, viewContext) {
+    const isCurrent = beginLoad("media", "media", viewContext);
     let path = "/api/v1/media?limit=50";
     if (state.mediaQuery) path += `&q=${encodeURIComponent(state.mediaQuery)}`;
     if (cursor) path += `&cursor=${encodeURIComponent(cursor)}`;
-    const data = await api(path);
+    const data = await runLoad(isCurrent, () => api(path));
+    if (data === undefined) return;
     renderMedia(data);
   }
 
@@ -1067,10 +1158,12 @@
     $("schedule-next").hidden = !state.scheduleCursor;
   }
 
-  async function loadSchedule(cursor) {
+  async function loadSchedule(cursor, viewContext) {
+    const isCurrent = beginLoad("schedule", "schedule", viewContext);
     let path = "/api/v1/posts?limit=50";
     if (cursor) path += `&cursor=${encodeURIComponent(cursor)}`;
-    const data = await api(path);
+    const data = await runLoad(isCurrent, () => api(path));
+    if (data === undefined) return;
     renderSchedule(data);
   }
 
@@ -1182,8 +1275,10 @@
     fillSettings(channel);
   }
 
-  async function loadSettings() {
-    const data = await api("/api/v1/channels");
+  async function loadSettings(viewContext) {
+    const isCurrent = beginLoad("settings", "settings", viewContext);
+    const data = await runLoad(isCurrent, () => api("/api/v1/channels"));
+    if (data === undefined) return;
     renderSettings(data.items || []);
   }
 
@@ -1231,6 +1326,7 @@
     if (state.page === "media") invalidateMediaPreviews();
     const requested = window.location.hash.slice(1);
     const nextPage = PAGE_NAMES.has(requested) ? requested : "dashboard";
+    state.viewGeneration += 1;
     if (state.page === "schedule" && nextPage !== "schedule") {
       invalidateSchedulePreviews();
       discardScheduleEdits();
@@ -1243,17 +1339,20 @@
       return;
     }
     setAuthView(true);
+    const viewContext = currentViewContext(nextPage);
     try {
-      if (state.page === "dashboard") await loadDashboard();
-      if (state.page === "ingests") await loadIngests(null);
-      if (state.page === "media") {
+      if (nextPage === "dashboard") await loadDashboard(viewContext);
+      if (nextPage === "ingests") await loadIngests(null, viewContext, true);
+      if (nextPage === "media") {
         $("media-search").value = state.mediaQuery;
-        await loadMedia(null);
+        await loadMedia(null, viewContext);
       }
-      if (state.page === "schedule") await loadSchedule(null);
-      if (state.page === "settings") await loadSettings();
+      if (nextPage === "schedule") await loadSchedule(null, viewContext);
+      if (nextPage === "settings") await loadSettings(viewContext);
     } catch (error) {
-      showToast(error instanceof Error ? error.message : "The page could not be loaded.", true);
+      if (isCurrentView(viewContext) || isAuthRejection(error)) {
+        reportError(error, "The page could not be loaded.");
+      }
     }
   }
 
@@ -1264,6 +1363,7 @@
     try {
       writeToken(token);
       state.token = token;
+      state.authGeneration += 1;
       $("token-error").hidden = true;
       $("api-token").value = "";
       void route();
@@ -1274,12 +1374,12 @@
   });
   $("lock-button").addEventListener("click", lock);
   $("dashboard-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, loadDashboard); });
-  $("ingests-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, () => loadIngests(null)); });
+  $("ingests-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, () => loadIngests(null, undefined, true)); });
   $("ingests-next").addEventListener("click", (event) => {
     const cursor = state.ingestCursor;
     if (cursor) {
       stopIngestAutoRefresh();
-      void withBusy(event.currentTarget, () => loadIngests(cursor));
+      void withBusy(event.currentTarget, () => loadIngests(cursor, undefined, true));
     }
   });
   $("media-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, () => loadMedia(null)); });
