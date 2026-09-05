@@ -64,22 +64,26 @@ async fn wait_for_job(
     job_id: Uuid,
     expected_state: &'static str,
     expected_attempt_count: i32,
+    expected_error_class: Option<&'static str>,
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let row = sqlx::query_as::<_, (String, i32)>(
-            "SELECT state, attempt_count FROM queue.jobs WHERE id = $1",
+        let row = sqlx::query_as::<_, (String, i32, Option<String>)>(
+            "SELECT state, attempt_count, error_class FROM queue.jobs WHERE id = $1",
         )
         .bind(job_id)
         .fetch_one(pool)
         .await
         .expect("job state should be readable");
-        if row.0 == expected_state && row.1 == expected_attempt_count {
+        if row.0 == expected_state
+            && row.1 == expected_attempt_count
+            && row.2.as_deref() == expected_error_class
+        {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "job {job_id} did not reach {expected_state}/{expected_attempt_count}; got {row:?}"
+            "job {job_id} did not reach {expected_state}/{expected_attempt_count}/{expected_error_class:?}; got {row:?}"
         );
         sleep(Duration::from_millis(5)).await;
     }
@@ -91,6 +95,7 @@ async fn run_download_worker_until(
     job_id: Uuid,
     expected_state: &'static str,
     expected_attempt_count: i32,
+    expected_error_class: Option<&'static str>,
     worker_id: &'static str,
 ) {
     let mut registry = HandlerRegistry::new();
@@ -107,7 +112,14 @@ async fn run_download_worker_until(
     tokio::time::timeout(
         Duration::from_secs(8),
         worker.run(async move {
-            wait_for_job(&pool, job_id, expected_state, expected_attempt_count).await;
+            wait_for_job(
+                &pool,
+                job_id,
+                expected_state,
+                expected_attempt_count,
+                expected_error_class,
+            )
+            .await;
         }),
     )
     .await
@@ -199,6 +211,7 @@ async fn download_admission_refusal_is_durable_and_recovers_without_stage_mutati
         download_job_id,
         "queued",
         0,
+        Some("work_disk_low"),
         "disk-admission-refusal",
     )
     .await;
@@ -246,6 +259,8 @@ async fn download_admission_refusal_is_durable_and_recovers_without_stage_mutati
         download_job_id,
         "succeeded",
         1,
+        // Completion keeps the prior durable deferral diagnostic for inspection.
+        Some("work_disk_low"),
         "disk-admission-recovery",
     )
     .await;
@@ -327,6 +342,7 @@ async fn already_advanced_download_skips_admission_and_large_work(pool: sqlx::Pg
         duplicate.id,
         "succeeded",
         1,
+        None,
         "already-advanced-worker",
     )
     .await;

@@ -44,16 +44,18 @@ PostgreSQL account, never a runtime or production database account, for the
 test suite. One legacy-migration test creates an additional uniquely named
 database and therefore also requires the account to create databases directly.
 
-Cargo's separator is intentional:
+Use the shared PostgreSQL gate for all integration suites:
 
 ```bash
 DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa \
-  cargo test -p sooqa-persistence --tests -- --ignored
+  sh tools/test-postgres.sh
 ```
 
-The first `--` belongs to Cargo; `--ignored` is passed to the test harness and
-causes ignored tests to run. `just test-integration` runs the focused
-persistence, API, and worker integration commands. Do not add
+The script runs persistence and API tests plus the named worker targets for
+worker, inspection, identity, publication, disk admission, and storage
+shutdown. The caller's `DATABASE_URL` is preserved; `just test-integration`
+uses the disposable development URL above only when the variable is unset.
+Each Cargo command passes `--ignored` to the test harness. Do not add
 `--test-threads=1`; isolation is provided by SQLx and serialization would hide
 missing isolation while slowing the suite.
 
