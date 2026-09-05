@@ -24,7 +24,9 @@ use uuid::Uuid;
 
 use crate::{
     jobs::{JobRepositoryError, JobSettlement},
-    settlement::{lock_expired_job, lock_running_job, queue_parameters, update_locked_job},
+    settlement::{
+        QueueUpdate, lock_expired_job, lock_running_job, queue_parameters, update_locked_job,
+    },
 };
 
 pub use sooqa_library::VideoFingerprintCandidate;
@@ -2119,10 +2121,11 @@ pub(crate) async fn settle_caption_job(
         JobCommand::SyncStorageCaption(payload) => payload.generation,
         _ => return Err(JobRepositoryError::LeaseLost),
     };
-    let (state, run_at, error_class, error_message, terminal, non_consuming) =
-        queue_parameters(&job, settlement);
-    let caption_state = if terminal { "failed" } else { "pending" };
-    let caption_error = terminal.then(|| error_message.chars().take(512).collect::<String>());
+    let queue_update = queue_parameters(&job, settlement);
+    let caption_state = if queue_update.terminal { "failed" } else { "pending" };
+    let caption_error = queue_update
+        .terminal
+        .then(|| queue_update.error_message.chars().take(512).collect::<String>());
     sqlx::query(
         "UPDATE media SET caption_sync_state = $2, caption_sync_error = $3, caption_sync_claim_token = NULL, updated_at = now() WHERE id = $1 AND caption_sync_generation = $4 AND caption_sync_state = 'syncing'",
     )
@@ -2132,17 +2135,7 @@ pub(crate) async fn settle_caption_job(
     .bind(generation)
     .execute(&mut *transaction)
     .await?;
-    let row = update_locked_job(
-        &mut transaction,
-        job.id,
-        state,
-        run_at,
-        &error_class,
-        &error_message,
-        terminal,
-        non_consuming,
-    )
-    .await?;
+    let row = update_locked_job(&mut transaction, job.id, queue_update).await?;
     transaction.commit().await?;
     row.into_job()
 }
@@ -2167,28 +2160,17 @@ pub(crate) async fn settle_storage_job(
         JobCommand::UploadStorageAsset(payload) => payload.media_id,
         _ => return Err(JobRepositoryError::LeaseLost),
     };
-    let (state, run_at, error_class, error_message, terminal, non_consuming) =
-        queue_parameters(&job, settlement);
-    if terminal {
+    let queue_update = queue_parameters(&job, settlement);
+    if queue_update.terminal {
         reconcile_storage_terminal(
             &mut transaction,
             current_media_id,
-            &error_class,
-            &error_message,
+            &queue_update.error_class,
+            &queue_update.error_message,
         )
         .await?;
     }
-    let row = update_locked_job(
-        &mut transaction,
-        job.id,
-        state,
-        run_at,
-        &error_class,
-        &error_message,
-        terminal,
-        non_consuming,
-    )
-    .await?;
+    let row = update_locked_job(&mut transaction, job.id, queue_update).await?;
     transaction.commit().await?;
     row.into_job()
 }
@@ -2276,17 +2258,15 @@ pub(crate) async fn recover_caption_job(
     .bind(terminal)
     .execute(&mut *transaction)
     .await?;
-    update_locked_job(
-        &mut transaction,
-        job.id,
-        if terminal { "failed" } else { "queued" },
-        OffsetDateTime::now_utc(),
-        job.error_class.as_deref().unwrap_or("lease_expired"),
-        job.error_message.as_deref().unwrap_or("job lease expired"),
+    let queue_update = QueueUpdate {
+        state: if terminal { "failed" } else { "queued" },
+        run_at: OffsetDateTime::now_utc(),
+        error_class: job.error_class.as_deref().unwrap_or("lease_expired").to_owned(),
+        error_message: job.error_message.as_deref().unwrap_or("job lease expired").to_owned(),
         terminal,
-        false,
-    )
-    .await?;
+        non_consuming: false,
+    };
+    update_locked_job(&mut transaction, job.id, queue_update).await?;
     transaction.commit().await?;
     Ok(true)
 }
@@ -2329,22 +2309,22 @@ pub(crate) async fn recover_storage_job(
         let terminal = job.attempt_count >= job.max_attempts
             || state.storage_state != "pending_storage"
             || state.storage_token.is_some();
-        let (queue_state, error_class, error_message, consume) = match state.storage_state.as_str()
-        {
-            "ready" => ("succeeded", "", "", false),
-            "pending_storage" if state.storage_token.is_none() => (
-                "queued",
-                "storage_upload_cancelled",
-                "storage upload was safely cancelled before Telegram dispatch",
-                true,
-            ),
-            _ => (
-                "failed",
-                "storage_unknown",
-                "storage job lease expired; external storage result requires reconciliation",
-                false,
-            ),
-        };
+        let (queue_state, error_class, error_message, refund_attempt) =
+            match state.storage_state.as_str() {
+                "ready" => ("succeeded", "", "", false),
+                "pending_storage" if state.storage_token.is_none() => (
+                    "queued",
+                    "storage_upload_cancelled",
+                    "storage upload was safely cancelled before Telegram dispatch",
+                    true,
+                ),
+                _ => (
+                    "failed",
+                    "storage_unknown",
+                    "storage job lease expired; external storage result requires reconciliation",
+                    false,
+                ),
+            };
         if queue_state == "failed" {
             sqlx::query(
                 "UPDATE media SET storage_state = 'storage_unknown', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1 AND storage_state <> 'ready'",
@@ -2368,17 +2348,15 @@ pub(crate) async fn recover_storage_job(
             .await?;
         }
         let terminal = if queue_state == "queued" { false } else { terminal };
-        update_locked_job(
-            &mut transaction,
-            job.id,
-            queue_state,
-            if queue_state == "succeeded" { job.run_at } else { OffsetDateTime::now_utc() },
-            error_class,
-            error_message,
-            terminal || queue_state == "succeeded",
-            queue_state == "queued" && consume,
-        )
-        .await?;
+        let queue_update = QueueUpdate {
+            state: queue_state,
+            run_at: if queue_state == "succeeded" { job.run_at } else { OffsetDateTime::now_utc() },
+            error_class: error_class.to_owned(),
+            error_message: error_message.to_owned(),
+            terminal: terminal || queue_state == "succeeded",
+            non_consuming: queue_state == "queued" && refund_attempt,
+        };
+        update_locked_job(&mut transaction, job.id, queue_update).await?;
         if queue_state == "succeeded" {
             sqlx::query(
                 "UPDATE queue.jobs SET error_class = NULL, error_message = NULL WHERE id = $1",
@@ -2388,17 +2366,17 @@ pub(crate) async fn recover_storage_job(
             .await?;
         }
     } else {
-        update_locked_job(
-            &mut transaction,
-            job.id,
-            "failed",
-            job.run_at,
-            "storage_unknown",
-            "storage media row is missing; external storage result requires reconciliation",
-            true,
-            false,
-        )
-        .await?;
+        let queue_update = QueueUpdate {
+            state: "failed",
+            run_at: job.run_at,
+            error_class: "storage_unknown".to_owned(),
+            error_message:
+                "storage media row is missing; external storage result requires reconciliation"
+                    .to_owned(),
+            terminal: true,
+            non_consuming: false,
+        };
+        update_locked_job(&mut transaction, job.id, queue_update).await?;
     }
     transaction.commit().await?;
     Ok(true)

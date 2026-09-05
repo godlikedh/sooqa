@@ -191,19 +191,8 @@ pub(crate) async fn settle_queue_in_transaction(
 ) -> Result<JobRow, JobRepositoryError> {
     let job = lock_running_job(&mut *transaction, lease, settlement.allows_expired_lease()).await?;
     let _ = validate_locked_command(&job, expected)?;
-    let (state, run_at, error_class, error_message, terminal, non_consuming) =
-        queue_parameters(&job, settlement);
-    let row = update_locked_job(
-        &mut *transaction,
-        job.id,
-        state,
-        run_at,
-        &error_class,
-        &error_message,
-        terminal,
-        non_consuming,
-    )
-    .await?;
+    let queue_update = queue_parameters(&job, settlement);
+    let row = update_locked_job(&mut *transaction, job.id, queue_update).await?;
     Ok(row)
 }
 
@@ -253,26 +242,37 @@ fn commands_have_same_owner(expected: &JobCommand, actual: &JobCommand) -> bool 
     }
 }
 
-pub(crate) fn queue_parameters(
-    job: &JobRow,
-    settlement: JobSettlement,
-) -> (&'static str, OffsetDateTime, String, String, bool, bool) {
+pub(crate) struct QueueUpdate {
+    pub(crate) state: &'static str,
+    pub(crate) run_at: OffsetDateTime,
+    pub(crate) error_class: String,
+    pub(crate) error_message: String,
+    pub(crate) terminal: bool,
+    pub(crate) non_consuming: bool,
+}
+
+pub(crate) fn queue_parameters(job: &JobRow, settlement: JobSettlement) -> QueueUpdate {
     match settlement {
         JobSettlement::Retry { run_at, error_class, error_message, non_consuming }
         | JobSettlement::Defer { run_at, error_class, error_message, non_consuming } => {
             let terminal = !non_consuming && job.attempt_count >= job.max_attempts;
-            (
-                if terminal { "failed" } else { "queued" },
-                if terminal { job.run_at } else { run_at },
+            QueueUpdate {
+                state: if terminal { "failed" } else { "queued" },
+                run_at: if terminal { job.run_at } else { run_at },
                 error_class,
                 error_message,
                 terminal,
                 non_consuming,
-            )
+            }
         }
-        JobSettlement::Fail { error_class, error_message } => {
-            ("failed", job.run_at, error_class, error_message, true, false)
-        }
+        JobSettlement::Fail { error_class, error_message } => QueueUpdate {
+            state: "failed",
+            run_at: job.run_at,
+            error_class,
+            error_message,
+            terminal: true,
+            non_consuming: false,
+        },
     }
 }
 
@@ -305,18 +305,12 @@ pub(crate) async fn lock_running_job(
 }
 
 // This helper mirrors the queue.jobs columns changed by every family
-// settlement. Keeping them explicit makes terminal and non-consuming retry
-// semantics visible at each call site.
-#[allow(clippy::too_many_arguments)]
+// settlement. QueueUpdate keeps terminal and non-consuming retry semantics
+// named at each call site.
 pub(crate) async fn update_locked_job(
     transaction: &mut Transaction<'_, Postgres>,
     job_id: Uuid,
-    state: &str,
-    run_at: OffsetDateTime,
-    error_class: &str,
-    error_message: &str,
-    terminal: bool,
-    non_consuming: bool,
+    update: QueueUpdate,
 ) -> Result<JobRow, JobRepositoryError> {
     Ok(sqlx::query_as::<_, JobRow>(
         r#"
@@ -336,12 +330,12 @@ pub(crate) async fn update_locked_job(
         "#,
     )
     .bind(job_id)
-    .bind(state)
-    .bind(run_at)
-    .bind(error_class)
-    .bind(error_message)
-    .bind(terminal)
-    .bind(non_consuming)
+    .bind(update.state)
+    .bind(update.run_at)
+    .bind(&update.error_class)
+    .bind(&update.error_message)
+    .bind(update.terminal)
+    .bind(update.non_consuming)
     .fetch_one(&mut **transaction)
     .await?)
 }
@@ -359,17 +353,15 @@ pub(crate) async fn recover_queue_only_in_transaction(
     };
     let _ = validate_locked_command(&job, expected)?;
     let terminal = job.attempt_count >= job.max_attempts;
-    let row = update_locked_job(
-        transaction,
-        job.id,
-        if terminal { "failed" } else { "queued" },
-        OffsetDateTime::now_utc(),
-        job.error_class.as_deref().unwrap_or("lease_expired"),
-        job.error_message.as_deref().unwrap_or("job lease expired"),
+    let queue_update = QueueUpdate {
+        state: if terminal { "failed" } else { "queued" },
+        run_at: OffsetDateTime::now_utc(),
+        error_class: job.error_class.as_deref().unwrap_or("lease_expired").to_owned(),
+        error_message: job.error_message.as_deref().unwrap_or("job lease expired").to_owned(),
         terminal,
-        false,
-    )
-    .await?;
+        non_consuming: false,
+    };
+    let row = update_locked_job(transaction, job.id, queue_update).await?;
     Ok(Some(row))
 }
 
@@ -383,17 +375,15 @@ pub(crate) async fn recover_queue_only_untyped(
         return Ok(false);
     };
     let terminal = job.attempt_count >= job.max_attempts;
-    update_locked_job(
-        &mut transaction,
-        job.id,
-        if terminal { "failed" } else { "queued" },
-        OffsetDateTime::now_utc(),
-        job.error_class.as_deref().unwrap_or("lease_expired"),
-        job.error_message.as_deref().unwrap_or("job lease expired"),
+    let queue_update = QueueUpdate {
+        state: if terminal { "failed" } else { "queued" },
+        run_at: OffsetDateTime::now_utc(),
+        error_class: job.error_class.as_deref().unwrap_or("lease_expired").to_owned(),
+        error_message: job.error_message.as_deref().unwrap_or("job lease expired").to_owned(),
         terminal,
-        false,
-    )
-    .await?;
+        non_consuming: false,
+    };
+    update_locked_job(&mut transaction, job.id, queue_update).await?;
     transaction.commit().await?;
     Ok(true)
 }
