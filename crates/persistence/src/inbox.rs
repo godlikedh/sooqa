@@ -60,6 +60,13 @@ pub struct AcceptDuplicateResult {
     pub replayed: bool,
 }
 
+/// A revision-fenced snapshot of terminal ingest failures awaiting review.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IngestFailureSummary {
+    pub count: u64,
+    pub revision: String,
+}
+
 /// The short preparation transaction has completed and the global identity
 /// session remains held while the worker performs CPU alignment.
 pub enum IngestVideoIdentityStart {
@@ -283,6 +290,85 @@ impl InboxRepository {
         .fetch_one(&self.pool)
         .await?;
         u64::try_from(count).map_err(|_| InboxRepositoryError::InvalidCount)
+    }
+
+    /// Return the current set of terminal failures that have not been
+    /// acknowledged. The revision is an opaque MD5 digest over row IDs and
+    /// failure identities, ordered by ID and independent of the session time
+    /// zone.
+    pub async fn ingest_failure_summary(
+        &self,
+    ) -> Result<IngestFailureSummary, InboxRepositoryError> {
+        let (count, revision): (i64, String) = sqlx::query_as(
+            r#"
+            WITH failures AS MATERIALIZED (
+                SELECT id, COALESCE(completed_at, updated_at) AS failure_at
+                FROM ingests
+                WHERE state = 'failed_terminal'
+                  AND acknowledged_failure_at IS DISTINCT FROM COALESCE(completed_at, updated_at)
+            )
+            SELECT count(*)::bigint AS count,
+                   md5(COALESCE(
+                       string_agg(
+                           id::text || ':' || extract(epoch FROM failure_at)::text,
+                           chr(10) ORDER BY id
+                       ),
+                       ''
+                   )) AS revision
+            FROM failures
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(IngestFailureSummary {
+            count: u64::try_from(count).map_err(|_| InboxRepositoryError::InvalidCount)?,
+            revision,
+        })
+    }
+
+    /// Acknowledge exactly the terminal failures represented by `revision`.
+    /// A stale revision changes no rows; an empty pending set is an
+    /// idempotent success regardless of the supplied revision.
+    pub async fn acknowledge_ingest_failures(
+        &self,
+        expected_revision: &str,
+    ) -> Result<bool, InboxRepositoryError> {
+        sqlx::query_scalar::<_, bool>(
+            r#"
+            WITH failures AS MATERIALIZED (
+                SELECT i.id, COALESCE(i.completed_at, i.updated_at) AS failure_at
+                FROM ingests AS i
+                WHERE i.state = 'failed_terminal'
+                  AND i.acknowledged_failure_at IS DISTINCT FROM COALESCE(i.completed_at, i.updated_at)
+                ORDER BY i.id
+                FOR UPDATE OF i
+            ), snapshot AS MATERIALIZED (
+                SELECT count(*)::bigint AS count,
+                       md5(COALESCE(
+                           string_agg(
+                               id::text || ':' || extract(epoch FROM failure_at)::text,
+                               chr(10) ORDER BY id
+                           ),
+                           ''
+                       )) AS revision
+                FROM failures
+            ), acknowledged AS (
+                UPDATE ingests AS i
+                SET acknowledged_failure_at = failures.failure_at
+                FROM failures
+                CROSS JOIN snapshot
+                WHERE i.id = failures.id
+                  AND (snapshot.count = 0 OR snapshot.revision = $1)
+                RETURNING i.id
+            )
+            SELECT snapshot.count = 0 OR snapshot.revision = $1
+            FROM snapshot
+            "#,
+        )
+        .bind(expected_revision)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(InboxRepositoryError::Database)
     }
 
     /// Accept one already-evidenced media candidate without creating a media

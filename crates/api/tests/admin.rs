@@ -114,6 +114,139 @@ async fn stored_media(database: &Database, ingest_id: Uuid) -> Uuid {
     result.media.id
 }
 
+async fn create_terminal_failure(database: &Database, suffix: &str, epoch_seconds: i64) -> Uuid {
+    let ingest_id = database
+        .inbox()
+        .create_ingest(
+            IngestSubmission::try_new(IngestSubmissionInput::new(
+                format!("https://example.test/dashboard-failure-{suffix}"),
+                SubmittedVia::Api,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .ingest
+        .id;
+    sqlx::query(
+        "UPDATE ingests SET state = 'failed_terminal', error_code = 'test_failure', error_message = 'dashboard failure', updated_at = to_timestamp($2), completed_at = to_timestamp($2) WHERE id = $1",
+    )
+    .bind(ingest_id)
+    .bind(epoch_seconds as f64)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    ingest_id
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn dashboard_ingest_failures_are_authorized_revision_fenced_and_replay_safe(
+    pool: sqlx::PgPool,
+) {
+    let (database, app) = app(pool);
+    let first_id = create_terminal_failure(&database, "first", 1_000).await;
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/dashboard/ingest-failures/acknowledge")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"expected_revision": "0123456789abcdef0123456789abcdef"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let (status, dashboard) = request(&app, Method::GET, "/api/v1/dashboard", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dashboard["ingest_failures"]["count"], 1);
+    let first_revision = dashboard["ingest_failures"]["revision"].as_str().unwrap().to_owned();
+
+    let (status, invalid) = request(
+        &app,
+        Method::POST,
+        "/api/v1/dashboard/ingest-failures/acknowledge",
+        json!({"expected_revision": "not-a-revision"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(invalid["error"]["code"], "invalid_revision");
+
+    create_terminal_failure(&database, "second", 2_000).await;
+    let (status, stale) = request(
+        &app,
+        Method::POST,
+        "/api/v1/dashboard/ingest-failures/acknowledge",
+        json!({"expected_revision": first_revision}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(stale["error"]["code"], "ingest_failures_changed");
+
+    let (status, current) = request(&app, Method::GET, "/api/v1/dashboard", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(current["ingest_failures"]["count"], 2);
+    let reset_revision = current["ingest_failures"]["revision"].as_str().unwrap();
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        "/api/v1/dashboard/ingest-failures/acknowledge",
+        json!({"expected_revision": reset_revision}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, empty) = request(&app, Method::GET, "/api/v1/dashboard", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty["ingest_failures"]["count"], 0);
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        "/api/v1/dashboard/ingest-failures/acknowledge",
+        json!({"expected_revision": reset_revision}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "empty-set replay is idempotent");
+
+    sqlx::query("UPDATE ingests SET state = 'failed_retryable' WHERE id = $1")
+        .bind(first_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE ingests SET state = 'failed_terminal', updated_at = to_timestamp(3000), completed_at = to_timestamp(3000) WHERE id = $1",
+    )
+    .bind(first_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let (status, newly_failed) = request(&app, Method::GET, "/api/v1/dashboard", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(newly_failed["ingest_failures"]["count"], 1);
+    let (status, stale_after_reset) = request(
+        &app,
+        Method::POST,
+        "/api/v1/dashboard/ingest-failures/acknowledge",
+        json!({"expected_revision": reset_revision}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(stale_after_reset["error"]["code"], "ingest_failures_changed");
+    assert_eq!(newly_failed["ingest_failures"]["count"], 1);
+    let pending_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ingests WHERE state = 'failed_terminal' AND acknowledged_failure_at IS DISTINCT FROM COALESCE(completed_at, updated_at)",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(pending_count, 1, "the new failure remains pending");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
 async fn admin_api_lists_ingests_media_schedule_dashboard_and_channel_settings(pool: sqlx::PgPool) {

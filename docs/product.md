@@ -107,7 +107,15 @@ and provides a lock action that forgets it. The UI is an operational client,
 not a second workflow authority: PostgreSQL-backed API commands remain the
 source of truth, and stale revision conflicts refresh the affected view.
 
-The Dashboard renders bounded totals and attention cards for technical
+The Dashboard shows a prominent **New failed ingests** panel, red when terminal
+failures remain unacknowledged and neutral at zero. It refreshes every 15 seconds
+while the dashboard tab is visible. **Reset count** durably acknowledges the
+current failure set in PostgreSQL without deleting ingests, clearing their errors,
+or retrying work. An outdated reset refreshes the view instead of acknowledging
+new failures. Existing terminal failures appear initially; a new terminal failure
+after a retry counts again. Transient failures still being retried are excluded.
+
+The Dashboard also renders bounded totals and attention cards for technical
 duplicate decisions, publication-repeat decisions, and storage-caption sync
 failures. Duplicate and repeat cards invoke their existing revision/idempotent
 commands; cancellation leaves media intact. Ingests is a read-only, newest-first

@@ -40,6 +40,37 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/dashboard/ingest-failures/acknowledge:
+    post:
+      tags: [admin]
+      operationId: acknowledgeIngestFailures
+      summary: Reset the new failed ingests count
+      description: >-
+        Acknowledge the terminal failures represented by the dashboard revision.
+        Preserves ingests, errors, jobs, and media. A changed failure set returns
+        409 without acknowledging anything; refresh the dashboard before trying
+        again. An already empty failure set succeeds, making reset replays safe.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_revision]
+              properties:
+                expected_revision:
+                  type: string
+                  pattern: '^[0-9a-fA-F]{32}$'
+                  description: Opaque ingest_failures.revision from the dashboard.
+      responses:
+        '204':
+          description: Failures acknowledged, or none remain to acknowledge.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
   /health/live:
     get:
       tags: [health]
@@ -886,10 +917,24 @@ components:
         token_overlap_bps: { type: integer, format: int64, minimum: 0, maximum: 10000 }
     DashboardResponse:
       type: object
-      required: [counts, attention]
+      required: [counts, attention, ingest_failures]
       properties:
         counts: { $ref: '#/components/schemas/DashboardCounts' }
         attention: { $ref: '#/components/schemas/DashboardAttention' }
+        ingest_failures: { $ref: '#/components/schemas/IngestFailureSummary' }
+    IngestFailureSummary:
+      type: object
+      required: [count, revision]
+      properties:
+        count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Currently terminal ingests whose latest failure has not been acknowledged.
+        revision:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+          description: Opaque revision of this failure set; pass unchanged when resetting.
     DashboardCounts:
       type: object
       required: [ready_media, future_queued_posts, active_ingests, technical_jobs_queued, technical_jobs_running, technical_duplicate_decisions, publication_repeat_decisions, caption_sync_failures]

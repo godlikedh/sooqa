@@ -227,6 +227,8 @@ function makeAdminDocument() {
     ["section", "token-gate"], ["div", "admin-shell"], ["button", "lock-button"],
     ["span", "session-status"], ["form", "token-form"], ["input", "api-token"],
     ["p", "token-error"], ["div", "toast"], ["div", "dashboard-counts"],
+    ["section", "ingest-failures-panel"], ["div", "ingest-failures-count"],
+    ["p", "ingest-failures-status"], ["button", "ingest-failures-reset"],
     ["span", "duplicate-count"], ["div", "duplicate-list"], ["span", "repeat-count"],
     ["div", "repeat-list"], ["span", "caption-failure-count"], ["div", "caption-failure-list"],
     ["button", "dashboard-refresh"], ["tbody", "ingest-rows"], ["button", "ingests-refresh"],
@@ -402,6 +404,140 @@ function copyButton(element) {
 function copyButtons(element) {
   return element.querySelectorAll("button").filter((button) => button.className.includes("copyable-id-button"));
 }
+
+test("dashboard highlights failed ingests and acknowledges only the displayed revision", async () => {
+  const acknowledgement = deferred();
+  const calls = [];
+  let failures = { count: 13, revision: "a".repeat(32) };
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (pathName, options) => {
+      calls.push({ pathName, options });
+      if (options.method === "POST") return acknowledgement.promise;
+      return jsonResponse({ ingest_failures: failures });
+    },
+  });
+  await settle();
+  const panel = runtime.document.getElementById("ingest-failures-panel");
+  const count = runtime.document.getElementById("ingest-failures-count");
+  const reset = runtime.document.getElementById("ingest-failures-reset");
+  assert.equal(count.textContent, "13");
+  assert.match(panel.className, /has-failures/);
+  assert.equal(reset.disabled, false);
+
+  reset.dispatchEvent({ type: "click" });
+  reset.dispatchEvent({ type: "click" });
+  runtime.tickIntervals();
+  await settle();
+  assert.equal(reset.disabled, true);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].pathName, "/api/v1/dashboard/ingest-failures/acknowledge");
+  assert.equal(calls[1].options.headers.get("Authorization"), "Bearer secret");
+  assert.deepEqual(JSON.parse(calls[1].options.body), { expected_revision: failures.revision });
+
+  failures = { count: 0, revision: "b".repeat(32) };
+  acknowledgement.resolve({ ok: true, status: 204, headers: { get: () => "" } });
+  await settle();
+  assert.equal(count.textContent, "0");
+  assert.doesNotMatch(panel.className, /has-failures/);
+  assert.equal(reset.disabled, true);
+  assert.match(runtime.document.getElementById("toast").textContent, /Ingests are unchanged/);
+
+  failures = { count: 1, revision: "c".repeat(32) };
+  runtime.tickIntervals();
+  await settle();
+  assert.equal(count.textContent, "1");
+  assert.match(panel.className, /has-failures/);
+  assert.equal(reset.disabled, false);
+});
+
+test("dashboard refreshes a changed failure set without automatically resetting again", async () => {
+  let failures = { count: 2, revision: "a".repeat(32) };
+  let resets = 0;
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (_pathName, options) => {
+      if (options.method === "POST") {
+        resets += 1;
+        failures = { count: 3, revision: "b".repeat(32) };
+        return jsonResponse({ error: { message: "The failures changed. Review the refreshed count." } }, 409);
+      }
+      return jsonResponse({ ingest_failures: failures });
+    },
+  });
+  await settle();
+  runtime.document.getElementById("ingest-failures-reset").dispatchEvent({ type: "click" });
+  await settle();
+  assert.equal(resets, 1);
+  assert.equal(runtime.document.getElementById("ingest-failures-count").textContent, "3");
+  assert.match(runtime.document.getElementById("ingest-failures-panel").className, /has-failures/);
+  assert.match(runtime.document.getElementById("toast").textContent, /failures changed/);
+  assert.equal(runtime.document.getElementById("ingest-failures-reset").disabled, false);
+});
+
+test("dashboard polling avoids overlap, hidden tabs, and requests after leaving or locking", async () => {
+  let calls = 0;
+  const slow = deferred();
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async () => {
+      calls += 1;
+      if (calls === 2) return slow.promise;
+      return jsonResponse({ ingest_failures: { count: 0, revision: "a".repeat(32) } });
+    },
+  });
+  await settle();
+  assert.equal(runtime.intervalCount(), 1);
+  runtime.document.hidden = true;
+  runtime.tickIntervals();
+  assert.equal(calls, 1);
+  runtime.document.hidden = false;
+  runtime.tickIntervals();
+  runtime.tickIntervals();
+  assert.equal(calls, 2);
+  slow.resolve(jsonResponse({ ingest_failures: { count: 1, revision: "b".repeat(32) } }));
+  await settle();
+  assert.equal(runtime.document.getElementById("ingest-failures-count").textContent, "1");
+
+  runtime.window.location.hash = "#media";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+  assert.equal(runtime.intervalCount(), 0);
+  runtime.window.location.hash = "#dashboard";
+  runtime.dispatchWindow("hashchange");
+  await settle();
+  assert.equal(runtime.intervalCount(), 1);
+  runtime.document.getElementById("lock-button").dispatchEvent({ type: "click" });
+  assert.equal(runtime.intervalCount(), 0);
+  assert.equal(runtime.document.getElementById("ingest-failures-reset").disabled, true);
+});
+
+test("dashboard retains a failed count on errors and recovers on the next refresh", async () => {
+  let fail = false;
+  const runtime = createAdminRuntime({
+    token: "secret",
+    handler: async (_pathName, options) => {
+      if (fail || options.method === "POST") throw new Error("Network unavailable");
+      return jsonResponse({ ingest_failures: { count: 4, revision: "a".repeat(32) } });
+    },
+  });
+  await settle();
+  runtime.document.getElementById("ingest-failures-reset").dispatchEvent({ type: "click" });
+  await settle();
+  assert.equal(runtime.document.getElementById("ingest-failures-count").textContent, "4");
+  assert.match(runtime.document.getElementById("ingest-failures-panel").className, /has-failures/);
+  assert.match(runtime.document.getElementById("toast").textContent, /request failed/);
+  assert.equal(runtime.document.getElementById("ingest-failures-reset").disabled, false);
+  fail = true;
+  runtime.tickIntervals();
+  await settle();
+  assert.match(runtime.document.getElementById("ingest-failures-status").textContent, /out of date/);
+  assert.equal(runtime.document.getElementById("ingest-failures-count").textContent, "4");
+  fail = false;
+  runtime.tickIntervals();
+  await settle();
+  assert.doesNotMatch(runtime.document.getElementById("ingest-failures-status").textContent, /out of date/);
+});
 
 test("admin runtime handles token lifecycle, safe rendering, and both decisions", async () => {
   const calls = [];

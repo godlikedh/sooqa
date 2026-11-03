@@ -48,6 +48,15 @@
           </div>
           <button id="dashboard-refresh" class="button button-secondary" type="button">Refresh</button>
         </div>
+        <section id="ingest-failures-panel" class="panel ingest-failures" aria-labelledby="ingest-failures-title">
+          <div id="ingest-failures-count" class="ingest-failures-count" aria-live="polite" aria-atomic="true">—</div>
+          <div class="ingest-failures-copy">
+            <h2 id="ingest-failures-title">New failed ingests</h2>
+            <p id="ingest-failures-status" class="muted">Loading failures…</p>
+          </div>
+          <a class="safe-link" href="#ingests">View ingests</a>
+          <button id="ingest-failures-reset" class="button button-secondary" type="button" disabled>Reset count</button>
+        </section>
         <div id="dashboard-counts" class="metric-grid" aria-live="polite"><p class="loading-state">Loading dashboard…</p></div>
         <div class="attention-grid">
           <section class="panel" aria-labelledby="duplicates-title">

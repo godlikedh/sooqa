@@ -12,7 +12,7 @@ pub use cleanup::WORKSPACE_CLEANUP_RETENTION;
 pub use inbox::{
     AcceptDuplicateResult, AssetNormalizationStart, AssetProbeStart, CreateIngestResult,
     DuplicateCandidate, DuplicatePendingIngest, ForceSaveResult, InboxRepository,
-    InboxRepositoryError, IngestFinalizationStart, IngestFingerprintStart,
+    InboxRepositoryError, IngestFailureSummary, IngestFinalizationStart, IngestFingerprintStart,
     IngestVideoIdentityStart, SourceDownloadStart, SourceInspectionStart, WorkspaceCleanupStart,
 };
 pub use jobs::{JobRepository, JobRepositoryError, JobSettlement};
