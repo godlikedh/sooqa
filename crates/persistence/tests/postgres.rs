@@ -426,6 +426,10 @@ async fn run_populated_upgrade(target_pool: sqlx::PgPool, target_url: Url) {
     assert!(applied_versions.contains(&7), "publication intent migration must be exercised");
     assert!(applied_versions.contains(&8), "preview and caption migration must be exercised");
     assert!(applied_versions.contains(&9), "job vocabulary migration must be exercised");
+    assert!(
+        applied_versions.contains(&11),
+        "ingest failure acknowledgement migration must be exercised"
+    );
 
     let job_state_counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE state = 'queued'), count(*) FILTER (WHERE state = 'running'), count(*) FILTER (WHERE state = 'succeeded'), count(*) FILTER (WHERE state = 'failed'), count(*) FILTER (WHERE state = 'cancelled') FROM queue.jobs",
@@ -467,6 +471,16 @@ async fn run_populated_upgrade(target_pool: sqlx::PgPool, target_url: Url) {
         .expect("completed upgraded ingest should still exist");
     assert_eq!(completed.status, sooqa_inbox::IngestStatus::Completed);
     assert_eq!(completed.media_id, Some(ready_media_id));
+    let failed = database
+        .inbox()
+        .find(failed_ingest_id)
+        .await
+        .expect("current inbox repository should load an upgraded failed ingest")
+        .expect("failed upgraded ingest should still exist");
+    assert_eq!(failed.status, sooqa_inbox::IngestStatus::FailedTerminal);
+    assert_eq!(failed.error_code.as_deref(), Some("legacy_failure"));
+    assert_eq!(failed.error_message.as_deref(), Some("preserved failure"));
+    assert_eq!(database.inbox().ingest_failure_summary().await.unwrap().count, 1);
 
     let ready = database
         .library()

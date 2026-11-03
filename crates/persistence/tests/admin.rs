@@ -7,6 +7,257 @@ use sooqa_publisher::{ChannelUpdate, NewChannel, NewPost, PostExactSchedule};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+async fn set_terminal_failure(database: &Database, ingest_id: Uuid, epoch_seconds: i64) {
+    sqlx::query(
+        "UPDATE ingests SET state = 'failed_terminal', error_code = 'test_failure', error_message = 'failed for test', updated_at = to_timestamp($2), completed_at = to_timestamp($2) WHERE id = $1",
+    )
+    .bind(ingest_id)
+    .bind(epoch_seconds as f64)
+    .execute(database.pool())
+    .await
+    .unwrap();
+}
+
+async fn wait_for_failure_reset_block(pool: &sqlx::PgPool, blocker_pid: i32) -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_stat_activity AS activity
+                    WHERE activity.datname = current_database()
+                      AND activity.wait_event_type = 'Lock'
+                      AND activity.query LIKE '%WITH failures AS MATERIALIZED%'
+                      AND $1::integer = ANY(pg_blocking_pids(activity.pid))
+                )
+                "#,
+            )
+            .bind(blocker_pid)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn ingest_failure_summary_acknowledges_only_the_current_terminal_failure_identity(
+    pool: sqlx::PgPool,
+) {
+    let database = Database::from_pool(pool);
+    let terminal_id = ingest(&database, "failure-terminal").await;
+    let retryable_id = ingest(&database, "failure-retryable").await;
+
+    let empty = database.inbox().ingest_failure_summary().await.unwrap();
+    assert_eq!(empty.count, 0);
+    assert_eq!(empty.revision.len(), 32);
+    assert!(empty.revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    set_terminal_failure(&database, terminal_id, 1_000).await;
+    sqlx::query(
+        "UPDATE ingests SET state = 'failed_retryable', error_code = 'retryable', updated_at = to_timestamp(1000), completed_at = to_timestamp(1000) WHERE id = $1",
+    )
+    .bind(retryable_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let summary = database.inbox().ingest_failure_summary().await.unwrap();
+    assert_eq!(summary.count, 1, "retryable failures are not included");
+
+    let row_before: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(i) - 'acknowledged_failure_at' FROM ingests AS i WHERE id = $1",
+    )
+    .bind(terminal_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let jobs_before: serde_json::Value = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(j) ORDER BY j.id), '[]'::jsonb) FROM queue.jobs AS j",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+
+    assert!(database.inbox().acknowledge_ingest_failures(&summary.revision).await.unwrap());
+    let row_after: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(i) - 'acknowledged_failure_at' FROM ingests AS i WHERE id = $1",
+    )
+    .bind(terminal_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let jobs_after: serde_json::Value = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(j) ORDER BY j.id), '[]'::jsonb) FROM queue.jobs AS j",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(row_after, row_before, "acknowledgement must not edit ingest data");
+    assert_eq!(jobs_after, jobs_before, "acknowledgement must not edit jobs");
+    assert_eq!(database.inbox().ingest_failure_summary().await.unwrap().count, 0);
+    assert!(
+        database.inbox().acknowledge_ingest_failures(&summary.revision).await.unwrap(),
+        "replaying an acknowledgement with no pending failures succeeds"
+    );
+
+    sqlx::query("UPDATE ingests SET updated_at = to_timestamp(1500) WHERE id = $1")
+        .bind(terminal_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        database.inbox().ingest_failure_summary().await.unwrap().count,
+        0,
+        "an unrelated updated_at edit must not make an acknowledged failure new"
+    );
+
+    sqlx::query("UPDATE ingests SET state = 'failed_retryable' WHERE id = $1")
+        .bind(terminal_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    set_terminal_failure(&database, terminal_id, 2_000).await;
+    assert_eq!(
+        database.inbox().ingest_failure_summary().await.unwrap().count,
+        1,
+        "a later terminal failure on the same ingest has a new identity"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn stale_ingest_failure_acknowledgement_changes_no_rows(pool: sqlx::PgPool) {
+    let database = Database::from_pool(pool);
+    let first_id = ingest(&database, "failure-stale-first").await;
+    let second_id = ingest(&database, "failure-stale-second").await;
+    set_terminal_failure(&database, first_id, 1_000).await;
+    let stale_revision = database.inbox().ingest_failure_summary().await.unwrap().revision;
+    set_terminal_failure(&database, second_id, 2_000).await;
+
+    assert!(!database.inbox().acknowledge_ingest_failures(&stale_revision).await.unwrap());
+    let acknowledged_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ingests WHERE id = ANY($1) AND acknowledged_failure_at IS NOT NULL",
+    )
+    .bind(vec![first_id, second_id])
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(acknowledged_count, 0, "a stale reset must not acknowledge any row");
+    assert_eq!(database.inbox().ingest_failure_summary().await.unwrap().count, 2);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires PostgreSQL"]
+async fn concurrent_ingest_failure_reset_rechecks_locked_failure_and_does_not_sweep_new_failures(
+    pool: sqlx::PgPool,
+) {
+    let database = Database::from_pool(pool);
+    let first_id = ingest(&database, "failure-concurrent-first").await;
+    let second_id = ingest(&database, "failure-concurrent-second").await;
+    set_terminal_failure(&database, first_id, 1_000).await;
+
+    let first_revision = database.inbox().ingest_failure_summary().await.unwrap().revision;
+    let mut blocker = database.pool().begin().await.unwrap();
+    let _: Uuid = sqlx::query_scalar("SELECT id FROM ingests WHERE id = $1 FOR UPDATE")
+        .bind(first_id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let blocker_pid: i32 =
+        sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *blocker).await.unwrap();
+    let inbox = Database::from_pool(database.pool().clone()).inbox();
+    let reset =
+        tokio::spawn(async move { inbox.acknowledge_ingest_failures(&first_revision).await });
+
+    let reset_blocked = wait_for_failure_reset_block(database.pool(), blocker_pid).await;
+    if reset_blocked {
+        sqlx::query(
+            "UPDATE ingests SET completed_at = to_timestamp(2000), updated_at = to_timestamp(2000) WHERE id = $1",
+        )
+        .bind(first_id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    }
+    blocker.commit().await.unwrap();
+    let reset_result = tokio::time::timeout(std::time::Duration::from_secs(5), reset)
+        .await
+        .expect("the reset should finish after the blocking transaction commits")
+        .unwrap()
+        .unwrap();
+    assert!(reset_blocked, "PostgreSQL should report the reset waiting on the row lock");
+    assert!(!reset_result, "the failure identity changed while the reset waited");
+    assert_eq!(database.inbox().ingest_failure_summary().await.unwrap().count, 1);
+    let first_acknowledged: bool = sqlx::query_scalar(
+        "SELECT acknowledged_failure_at IS NOT DISTINCT FROM COALESCE(completed_at, updated_at) FROM ingests WHERE id = $1",
+    )
+    .bind(first_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(!first_acknowledged, "the new failure identity must remain unacknowledged");
+
+    let current_revision = database.inbox().ingest_failure_summary().await.unwrap().revision;
+    let mut blocker = database.pool().begin().await.unwrap();
+    let _: Uuid = sqlx::query_scalar("SELECT id FROM ingests WHERE id = $1 FOR UPDATE")
+        .bind(first_id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let blocker_pid: i32 =
+        sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *blocker).await.unwrap();
+    let inbox = Database::from_pool(database.pool().clone()).inbox();
+    let reset =
+        tokio::spawn(async move { inbox.acknowledge_ingest_failures(&current_revision).await });
+
+    let reset_blocked = wait_for_failure_reset_block(database.pool(), blocker_pid).await;
+    if reset_blocked {
+        sqlx::query(
+            "UPDATE ingests SET state = 'failed_terminal', error_code = 'test_failure', error_message = 'failed for test', completed_at = to_timestamp(3000), updated_at = to_timestamp(3000) WHERE id = $1",
+        )
+        .bind(second_id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    }
+    blocker.commit().await.unwrap();
+    let reset_result = tokio::time::timeout(std::time::Duration::from_secs(5), reset)
+        .await
+        .expect("the reset should finish after the blocking transaction commits")
+        .unwrap()
+        .unwrap();
+    assert!(reset_blocked, "PostgreSQL should report the reset waiting on the row lock");
+    assert!(reset_result, "the snapshot still matches when only a later failure is added");
+
+    let first_acknowledged: bool = sqlx::query_scalar(
+        "SELECT acknowledged_failure_at IS NOT DISTINCT FROM COALESCE(completed_at, updated_at) FROM ingests WHERE id = $1",
+    )
+    .bind(first_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(first_acknowledged, "the failure present in the snapshot should be acknowledged");
+    let pending_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM ingests WHERE state = 'failed_terminal' AND acknowledged_failure_at IS DISTINCT FROM COALESCE(completed_at, updated_at)",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        pending_ids,
+        vec![second_id],
+        "a failure committed after the snapshot stays pending"
+    );
+}
+
 async fn ingest(database: &Database, suffix: &str) -> Uuid {
     database
         .inbox()

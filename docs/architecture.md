@@ -458,6 +458,11 @@ read models with stable timestamp-plus-UUID cursors and a maximum page size of
 50; the API does not expose queue payloads, lease tokens, secrets, or complete
 error logs. Dashboard counts are aggregate SQL reads, while attention cards
 carry only bounded duplicate, repeat-decision, and caption-sync evidence.
+The failure alert counts terminal ingests whose failure timestamp differs from
+`ingests.acknowledged_failure_at`. Reset acknowledges a revision of the pending
+failure set under row locks and changes only this column. It preserves workflow
+timestamps, errors, and jobs; a later failure after retry becomes unacknowledged
+again. No additional settings table or browser-local counter is involved.
 Media `q` lookups are exact identifiers/URLs rather than semantic search. The
 media row may also carry one validated preview (at most 320 by 320 and 128 KiB)
 and a generation-fenced storage-caption sync state. The authenticated preview

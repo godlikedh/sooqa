@@ -3,10 +3,15 @@
 
   const TOKEN_KEY = "sooqa.admin.api_token";
   const INGEST_AUTO_REFRESH_MS = 15_000;
+  const DASHBOARD_AUTO_REFRESH_MS = 15_000;
   const PAGE_NAMES = new Set(["dashboard", "ingests", "media", "schedule", "settings"]);
   const state = {
     token: readToken(),
     page: "dashboard",
+    dashboardLoading: false,
+    dashboardRefreshTimer: null,
+    ingestFailures: null,
+    ingestFailuresResetting: false,
     ingestPageCursor: null,
     ingestCursor: null,
     ingestLoading: false,
@@ -325,6 +330,9 @@
 
   function lock() {
     stopIngestAutoRefresh();
+    stopDashboardAutoRefresh();
+    state.ingestFailures = null;
+    renderIngestFailures();
     invalidateMediaPreviews();
     invalidateSchedulePreviews();
     discardScheduleEdits();
@@ -537,14 +545,80 @@
     }
   }
 
+  function renderIngestFailures() {
+    const failures = state.ingestFailures;
+    $("ingest-failures-count").textContent = String(failures?.count ?? "—");
+    $("ingest-failures-panel").classList.toggle("has-failures", failures?.count > 0);
+    $("ingest-failures-status").textContent = !failures
+      ? "Failure count unavailable. Refresh to check again."
+      : failures.count > 0
+        ? "Ingests stopped with errors. Reset acknowledges this alert and keeps the ingests."
+        : "No new failed ingests.";
+    $("ingest-failures-reset").disabled = !failures?.count || state.ingestFailuresResetting;
+  }
+
+  async function resetIngestFailures() {
+    const failures = state.ingestFailures;
+    if (!failures?.count || state.ingestFailuresResetting) return;
+    const viewContext = currentViewContext("dashboard");
+    state.ingestFailuresResetting = true;
+    try {
+      await withBusy($("ingest-failures-reset"), async () => {
+        await api("/api/v1/dashboard/ingest-failures/acknowledge", {
+          method: "POST",
+          body: JSON.stringify({ expected_revision: failures.revision }),
+        });
+        if (!isCurrentView(viewContext)) return;
+        showToast("Failure count reset. Ingests are unchanged.");
+        await loadDashboard(viewContext);
+      });
+    } finally {
+      state.ingestFailuresResetting = false;
+      $("ingest-failures-reset").disabled = !state.ingestFailures?.count;
+    }
+  }
+
+  function stopDashboardAutoRefresh() {
+    if (state.dashboardRefreshTimer !== null) {
+      window.clearInterval(state.dashboardRefreshTimer);
+      state.dashboardRefreshTimer = null;
+    }
+  }
+
+  function startDashboardAutoRefresh() {
+    stopDashboardAutoRefresh();
+    if (!state.token || state.page !== "dashboard") return;
+    state.dashboardRefreshTimer = window.setInterval(() => {
+      if (document.hidden || state.dashboardLoading || state.ingestFailuresResetting) return;
+      void loadDashboard().catch((error) => {
+        reportError(error, "The dashboard could not be refreshed.");
+      });
+    }, DASHBOARD_AUTO_REFRESH_MS);
+  }
+
   async function loadDashboard(viewContext) {
     const isCurrent = beginLoad("dashboard", "dashboard", viewContext);
-    const data = await runLoad(isCurrent, () => api("/api/v1/dashboard?limit=20"));
-    if (data === undefined) return;
-    renderCounts(data.counts);
-    renderDuplicates(data.attention?.technical_duplicates || []);
-    renderRepeats(data.attention?.publication_repeats || []);
-    renderCaptionFailures(data.attention?.caption_sync_failures || []);
+    state.dashboardLoading = true;
+    try {
+      const data = await runLoad(isCurrent, () => api("/api/v1/dashboard?limit=20"));
+      if (data === undefined) return;
+      state.ingestFailures = data.ingest_failures || null;
+      renderIngestFailures();
+      renderCounts(data.counts);
+      renderDuplicates(data.attention?.technical_duplicates || []);
+      renderRepeats(data.attention?.publication_repeats || []);
+      renderCaptionFailures(data.attention?.caption_sync_failures || []);
+    } catch (error) {
+      if (isCurrent()) {
+        $("ingest-failures-status").textContent = "Could not refresh. The count may be out of date.";
+      }
+      throw error;
+    } finally {
+      if (isCurrent()) {
+        state.dashboardLoading = false;
+        startDashboardAutoRefresh();
+      }
+    }
   }
 
   function appendIngestCell(row, value) {
@@ -1323,6 +1397,7 @@
 
   async function route() {
     stopIngestAutoRefresh();
+    stopDashboardAutoRefresh();
     if (state.page === "media") invalidateMediaPreviews();
     const requested = window.location.hash.slice(1);
     const nextPage = PAGE_NAMES.has(requested) ? requested : "dashboard";
@@ -1374,6 +1449,7 @@
   });
   $("lock-button").addEventListener("click", lock);
   $("dashboard-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, loadDashboard); });
+  $("ingest-failures-reset").addEventListener("click", () => { void resetIngestFailures(); });
   $("ingests-refresh").addEventListener("click", (event) => { void withBusy(event.currentTarget, () => loadIngests(null, undefined, true)); });
   $("ingests-next").addEventListener("click", (event) => {
     const cursor = state.ingestCursor;
@@ -1413,6 +1489,7 @@
   window.addEventListener("hashchange", () => { void route(); });
   window.addEventListener("pagehide", () => {
     stopIngestAutoRefresh();
+    stopDashboardAutoRefresh();
     invalidateMediaPreviews();
     invalidateSchedulePreviews();
     discardScheduleEdits();

@@ -1,8 +1,8 @@
 use axum::{
     Json, Router,
-    extract::{Query, State},
-    http::HeaderMap,
-    routing::get,
+    extract::{Json as JsonExtractor, Query, State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use sooqa_inbox::{IngestStatus, RequestedAction};
@@ -14,7 +14,9 @@ use uuid::Uuid;
 use super::{ApiError, ApiState, authorize};
 
 pub(crate) fn routes() -> Router<ApiState> {
-    Router::new().route("/api/v1/dashboard", get(get_dashboard))
+    Router::new()
+        .route("/api/v1/dashboard", get(get_dashboard))
+        .route("/api/v1/dashboard/ingest-failures/acknowledge", post(acknowledge_ingest_failures))
 }
 
 pub(crate) async fn list_ingests(
@@ -101,6 +103,10 @@ async fn get_dashboard(
             tracing::error!(error = %error, "dashboard caption sync items failed");
             ApiError::internal(&headers)
         })?;
+    let ingest_failures = state.inbox.ingest_failure_summary().await.map_err(|error| {
+        tracing::error!(error = %error, "dashboard ingest failure summary failed");
+        ApiError::internal(&headers)
+    })?;
 
     Ok(Json(DashboardResponse {
         counts: DashboardCounts {
@@ -112,6 +118,10 @@ async fn get_dashboard(
             technical_duplicate_decisions: technical_duplicate_count,
             publication_repeat_decisions: repeat_count,
             caption_sync_failures,
+        },
+        ingest_failures: IngestFailureSummaryResponse {
+            count: ingest_failures.count,
+            revision: ingest_failures.revision,
         },
         attention: DashboardAttention {
             technical_duplicates: technical_duplicate_decisions
@@ -128,6 +138,45 @@ async fn get_dashboard(
                 .collect(),
         },
     }))
+}
+
+async fn acknowledge_ingest_failures(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Result<JsonExtractor<AcknowledgeIngestFailuresRequest>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    authorize(&state.api_token, &headers).await?;
+    let JsonExtractor(payload) = body.map_err(|_| {
+        ApiError::bad_request("invalid_json", "The request body must be valid JSON", &headers)
+    })?;
+    if payload.expected_revision.len() != 32
+        || !payload.expected_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ApiError::bad_request(
+            "invalid_revision",
+            "expected_revision must contain 32 hexadecimal characters",
+            &headers,
+        ));
+    }
+    let expected_revision = payload.expected_revision.to_ascii_lowercase();
+    let accepted =
+        state.inbox.acknowledge_ingest_failures(&expected_revision).await.map_err(|error| {
+            tracing::error!(error = %error, "dashboard ingest failure acknowledgement failed");
+            ApiError::internal(&headers)
+        })?;
+    if !accepted {
+        return Err(ApiError::conflict(
+            "ingest_failures_changed",
+            "Terminal ingest failures changed since they were loaded",
+            &headers,
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct AcknowledgeIngestFailuresRequest {
+    expected_revision: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -209,7 +258,14 @@ impl IngestListResponse {
 #[derive(Debug, Serialize)]
 struct DashboardResponse {
     counts: DashboardCounts,
+    ingest_failures: IngestFailureSummaryResponse,
     attention: DashboardAttention,
+}
+
+#[derive(Debug, Serialize)]
+struct IngestFailureSummaryResponse {
+    count: u64,
+    revision: String,
 }
 
 #[derive(Debug, Serialize)]
