@@ -506,11 +506,32 @@ async fn download_source(
         admission.admit(work_root, required_bytes)?;
     }
 
-    match inbox.begin_source_download(ingest_request_id, &job_attempt).await {
-        Ok(SourceDownloadStart::Ready(_)) => {}
+    let request = match inbox.begin_source_download(ingest_request_id, &job_attempt).await {
+        Ok(SourceDownloadStart::Ready(request)) => request,
         Ok(SourceDownloadStart::AlreadyAdvanced(_)) => return Ok(()),
         Err(error) => return Err(map_inbox_error(error)),
-    }
+    };
+    // Inspection and this job's snapshot are committed together. Keep the
+    // durable payload readable, but never download from a conflicting snapshot.
+    let recorded_inspection = request
+        .input_data()
+        .map_err(|error| HandlerFailure::permanent("invalid_ingest_state", error.to_string()))?
+        .inspection;
+    let inspection = match recorded_inspection {
+        Some(recorded) if recorded == inspection => recorded,
+        _ => {
+            return fail_download(
+                inbox,
+                ingest_request_id,
+                &job_attempt,
+                HandlerFailure::permanent(
+                    "invalid_ingest_state",
+                    "download inspection does not match the durable ingest snapshot",
+                ),
+            )
+            .await;
+        }
+    };
 
     let workspace = match MediaWorkspace::create(work_root, ingest_request_id).await {
         Ok(workspace) => workspace,

@@ -104,6 +104,12 @@ schema; current five-table data is retained by forward-only migrations.
 - `sooqa-api` owns HTTP routing, one configured bearer secret, limits, and
   stable request-ID errors.
 
+Within `sooqa-telegram`, `service.rs` owns inbound authorization, command parsing,
+and ingest policy; `client.rs` owns Teloxide protocol and file-transfer operations;
+and `polling.rs` owns update offsets, bounded retries, and shutdown supervision.
+The crate root defines shared protocol types and re-exports the service, client,
+and runtime. Storage upload and publication remain separate effect modules.
+
 Workspace lifecycle is shared across the ingest, jobs, persistence, media, and
 worker boundaries. Persistence owns the durable generation ID and cleanup-job
 enqueue/state fence. A valid cleanup attempt clears the current media
@@ -227,6 +233,12 @@ shape. A malformed or unsupported envelope is rejected with a bounded
 `invalid ingest input envelope` diagnostic and never panics. The discarded
 pre-reset schema has no compatibility reader.
 
+Source inspection and the download job's inspection snapshot commit together.
+The worker verifies that the claimed job snapshot matches the fenced ingest
+snapshot before downloading. A missing or conflicting snapshot fails with
+`invalid_ingest_state` before network or artifact writes. The existing job
+payload shape is retained so queued work remains readable.
+
 Telegram file messages follow the same durable boundary: the polling server
 validates the administrator and advertised size, persists the Telegram file
 metadata, and acknowledges only after the ingest transaction commits. It does
@@ -277,6 +289,10 @@ an expired storage upload becomes `storage_unknown` unless the media row is
 already `ready`. `run_at` is the retry and scheduling clock; there is no
 separate retry-wait state.
 
+Workspace I/O failures use the same bounded, attempt-consuming retry policy as
+other transient stage failures. Invalid filenames, unsafe paths, and malformed
+or mismatched workspace manifests remain permanent failures.
+
 Storage uploads use cooperative, phase-aware cancellation. If shutdown or a
 lost worker heartbeat is observed after reservation but before the Telegram
 request can escape, the reservation is released and the upload job remains
@@ -299,6 +315,12 @@ state machine on the same row: `pending_storage`, `ready`,
 `storage_unknown`, or `missing`, with generation/token fields for retries and
 ambiguous results. Exact-SHA deduplication preserves the first source identity
 and only fills missing non-identity metadata from later observations.
+
+The `MediaStorageState` Serde representation uses those same four state names,
+matching the database conversions and API representation.
+Normal media-row reads decode that state before making transition decisions;
+unrecognized values fail decoding. Recovery retains its conservative unknown-state
+handling, and cleanup/retention keep unresolved work for reconciliation.
 
 Video normalization uses the versioned `canonical_video_v3` profile. The media
 planner identifies compatible MP4 remux candidates whose H.264 container `avcC`

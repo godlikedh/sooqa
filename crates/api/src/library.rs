@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use url::Url;
 use uuid::Uuid;
 
-use super::{ApiError, ApiState, authorize, map_library_error};
+use super::{ApiError, ApiState, authorize, cursor, map_json_rejection, map_library_error};
 
 pub(crate) fn routes() -> Router<ApiState> {
     Router::new()
@@ -337,14 +337,11 @@ fn is_tracking_parameter(name: &str) -> bool {
 }
 
 fn encode_cursor(cursor: &MediaCursor) -> String {
-    format!("{}:{}", cursor.updated_at.unix_timestamp_nanos(), cursor.id)
+    cursor::encode(cursor.updated_at, cursor.id)
 }
 
 fn decode_cursor(value: &str) -> Result<MediaCursor, ()> {
-    let (timestamp, id) = value.split_once(':').ok_or(())?;
-    let timestamp = timestamp.parse::<i128>().map_err(|_| ())?;
-    let updated_at = OffsetDateTime::from_unix_timestamp_nanos(timestamp).map_err(|_| ())?;
-    let id = Uuid::parse_str(id).map_err(|_| ())?;
+    let (updated_at, id) = cursor::decode(value)?;
     Ok(MediaCursor { updated_at, id })
 }
 
@@ -516,14 +513,6 @@ impl MediaResponse {
 
 fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn map_json_rejection(rejection: JsonRejection, headers: &HeaderMap) -> ApiError {
-    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        ApiError::payload_too_large(headers)
-    } else {
-        ApiError::bad_request("invalid_json", "The request body must be valid JSON", headers)
-    }
 }
 
 #[cfg(test)]

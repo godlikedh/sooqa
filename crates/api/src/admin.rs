@@ -11,7 +11,7 @@ use sooqa_publisher::{Post, PostState, PublicationAction, RepeatEvidence};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::{ApiError, ApiState, authorize};
+use super::{ApiError, ApiState, authorize, cursor, map_json_rejection};
 
 pub(crate) fn routes() -> Router<ApiState> {
     Router::new()
@@ -146,9 +146,8 @@ async fn acknowledge_ingest_failures(
     body: Result<JsonExtractor<AcknowledgeIngestFailuresRequest>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     authorize(&state.api_token, &headers).await?;
-    let JsonExtractor(payload) = body.map_err(|_| {
-        ApiError::bad_request("invalid_json", "The request body must be valid JSON", &headers)
-    })?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     if payload.expected_revision.len() != 32
         || !payload.expected_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
@@ -191,14 +190,11 @@ struct DashboardParams {
 }
 
 fn encode_ingest_cursor(cursor: &sooqa_inbox::IngestCursor) -> String {
-    format!("{}:{}", cursor.created_at.unix_timestamp_nanos(), cursor.id)
+    cursor::encode(cursor.created_at, cursor.id)
 }
 
 fn decode_ingest_cursor(value: &str) -> Result<sooqa_inbox::IngestCursor, ()> {
-    let (timestamp, id) = value.split_once(':').ok_or(())?;
-    let timestamp = timestamp.parse::<i128>().map_err(|_| ())?;
-    let created_at = OffsetDateTime::from_unix_timestamp_nanos(timestamp).map_err(|_| ())?;
-    let id = Uuid::parse_str(id).map_err(|_| ())?;
+    let (created_at, id) = cursor::decode(value)?;
     Ok(sooqa_inbox::IngestCursor { created_at, id })
 }
 

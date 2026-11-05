@@ -1,3 +1,4 @@
 target/
 .git/
+.desloppify/
 deploy/home/.env

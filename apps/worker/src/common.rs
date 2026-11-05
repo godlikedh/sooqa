@@ -280,7 +280,11 @@ impl HandlerRegistry {
 }
 
 pub(crate) fn map_workspace_error(error: WorkspaceError) -> HandlerFailure {
-    HandlerFailure::permanent("workspace_error", error.to_string())
+    let message = error.to_string();
+    match error {
+        WorkspaceError::Io { .. } => HandlerFailure::retryable("workspace_error", message),
+        _ => HandlerFailure::permanent("workspace_error", message),
+    }
 }
 
 pub(crate) async fn load_ingest_for_admission(
@@ -355,5 +359,45 @@ pub(crate) fn map_inbox_error(error: InboxRepositoryError) -> HandlerFailure {
             HandlerFailure::permanent("invalid_ingest_state", message)
         }
         _ => HandlerFailure::retryable("database_error", message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io, path::PathBuf};
+
+    use super::*;
+
+    #[test]
+    fn workspace_io_errors_are_retryable_and_consume_attempts() {
+        let failure = map_workspace_error(WorkspaceError::Io {
+            path: PathBuf::from("/work/jobs"),
+            source: io::Error::other("temporary filesystem error"),
+        });
+
+        assert!(failure.retryable);
+        assert_eq!(failure.class, "workspace_error");
+        assert!(failure.defer_until.is_none());
+        assert!(!failure.defer_without_consuming_attempt);
+        assert!(!failure.retry_without_consuming_attempt);
+        assert!(!failure.requires_storage_reconciliation);
+    }
+
+    #[test]
+    fn workspace_path_and_manifest_errors_remain_permanent() {
+        let errors = [
+            WorkspaceError::Symlink(PathBuf::from("/work/jobs/link")),
+            WorkspaceError::InvalidFileName("../outside".to_owned()),
+            WorkspaceError::ManifestFormat(
+                serde_json::from_str::<serde_json::Value>("{")
+                    .expect_err("incomplete JSON should fail"),
+            ),
+        ];
+
+        for error in errors {
+            let failure = map_workspace_error(error);
+            assert!(!failure.retryable);
+            assert_eq!(failure.class, "workspace_error");
+        }
     }
 }

@@ -327,11 +327,14 @@ async fn expired_storage_safe_cancellation_is_non_consuming_and_idempotent(pool:
 
     let first = database
         .jobs()
-        .retry_lease_without_consuming_attempt(
+        .settle_lease(
+            &claimed,
             &lease,
-            OffsetDateTime::now_utc(),
-            "storage_upload_cancelled",
-            "storage upload was safely cancelled before Telegram dispatch",
+            JobSettlement::retry_without_consuming_attempt(
+                OffsetDateTime::now_utc(),
+                "storage_upload_cancelled",
+                "storage upload was safely cancelled before Telegram dispatch",
+            ),
         )
         .await
         .unwrap();
@@ -339,11 +342,14 @@ async fn expired_storage_safe_cancellation_is_non_consuming_and_idempotent(pool:
     assert_eq!(first.attempt_count, 0);
     let second = database
         .jobs()
-        .retry_lease_without_consuming_attempt(
+        .settle_lease(
+            &claimed,
             &lease,
-            OffsetDateTime::now_utc(),
-            "storage_upload_cancelled",
-            "storage upload was safely cancelled before Telegram dispatch",
+            JobSettlement::retry_without_consuming_attempt(
+                OffsetDateTime::now_utc(),
+                "storage_upload_cancelled",
+                "storage upload was safely cancelled before Telegram dispatch",
+            ),
         )
         .await
         .unwrap();

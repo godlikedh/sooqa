@@ -11,7 +11,7 @@ use sooqa_jobs::JobType;
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
 };
-use sooqa_persistence::Database;
+use sooqa_persistence::{Database, JobSettlement};
 use sooqa_publisher::{NewChannel, NewPost, PostSchedule, PostState, PostUpdate};
 use sooqa_telegram::{TelegramPublicationApi, TelegramPublicationRequest};
 use sooqa_worker::{HandlerFailure, HandlerRegistry, Worker, publish_post_handler};
@@ -283,7 +283,11 @@ async fn ambiguous_publication_becomes_unknown_without_fallback(pool: sqlx::PgPo
     assert!(handler(job.clone()).await.is_err());
     database
         .jobs()
-        .fail_lease(&job.lease().unwrap(), "publication_unknown", "ambiguous")
+        .settle_lease(
+            &job,
+            &job.lease().unwrap(),
+            JobSettlement::fail("publication_unknown", "ambiguous"),
+        )
         .await
         .unwrap();
     let post = database.publisher().find_post(created.id).await.unwrap().unwrap();
@@ -302,7 +306,11 @@ async fn caption_rejection_is_failed_and_can_be_corrected_and_requeued(pool: sql
     assert!(handler(job.clone()).await.is_err());
     database
         .jobs()
-        .fail_lease(&job.lease().unwrap(), "caption_rejected", "bad entities")
+        .settle_lease(
+            &job,
+            &job.lease().unwrap(),
+            JobSettlement::fail("caption_rejected", "bad entities"),
+        )
         .await
         .unwrap();
     let failed = database.publisher().find_post(created.id).await.unwrap().unwrap();
@@ -389,11 +397,14 @@ async fn scheduled_publication_deferral_without_consuming_attempt_stays_queued(p
 
     let deferred = database
         .jobs()
-        .defer_lease_without_consuming_attempt(
+        .settle_lease(
+            &job,
             &job.lease().expect("claimed publication should have a lease"),
-            OffsetDateTime::now_utc(),
-            "work_disk_low",
-            "synthetic reserve is full",
+            JobSettlement::defer_without_consuming_attempt(
+                OffsetDateTime::now_utc(),
+                "work_disk_low",
+                "synthetic reserve is full",
+            ),
         )
         .await
         .unwrap();
@@ -573,7 +584,11 @@ async fn final_retry_fails_post_before_job_is_failed(pool: sqlx::PgPool) {
     assert_eq!(
         database
             .jobs()
-            .fail_lease(&job.lease().unwrap(), "telegram_retryable", "final retry")
+            .settle_lease(
+                &job,
+                &job.lease().unwrap(),
+                JobSettlement::fail("telegram_retryable", "final retry")
+            )
             .await
             .unwrap()
             .status,
@@ -611,11 +626,14 @@ async fn final_preclaim_disabled_channel_fails_post_with_no_telegram_call(pool: 
     assert!(telegram.calls().is_empty());
     let failed_job = database
         .jobs()
-        .retry_lease(
+        .settle_lease(
+            &job,
             &job.lease().unwrap(),
-            OffsetDateTime::now_utc(),
-            "publication_dependency",
-            "channel disabled",
+            JobSettlement::retry(
+                OffsetDateTime::now_utc(),
+                "publication_dependency",
+                "channel disabled",
+            ),
         )
         .await
         .unwrap();
@@ -653,7 +671,11 @@ async fn final_preclaim_non_ready_media_fails_post_with_no_telegram_call(pool: s
     assert!(telegram.calls().is_empty());
     let failed_job = database
         .jobs()
-        .fail_lease(&job.lease().unwrap(), "publication_dependency", "media is not ready")
+        .settle_lease(
+            &job,
+            &job.lease().unwrap(),
+            JobSettlement::fail("publication_dependency", "media is not ready"),
+        )
         .await
         .unwrap();
     assert_eq!(failed_job.status, sooqa_jobs::JobStatus::Failed);
@@ -680,11 +702,14 @@ async fn nonterminal_preclaim_failure_requeues_job_and_leaves_post_queued(pool: 
     assert!(telegram.calls().is_empty());
     let queued_job = database
         .jobs()
-        .retry_lease(
+        .settle_lease(
+            &job,
             &job.lease().unwrap(),
-            OffsetDateTime::now_utc(),
-            "publication_dependency",
-            "channel disabled",
+            JobSettlement::retry(
+                OffsetDateTime::now_utc(),
+                "publication_dependency",
+                "channel disabled",
+            ),
         )
         .await
         .unwrap();

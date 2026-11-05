@@ -271,88 +271,11 @@ impl JobRepository {
         if !lease_matches_job(job, lease) {
             return Err(JobRepositoryError::LeaseLost);
         }
-        crate::settlement::settle(&self.pool, Some(&job.command), lease, settlement).await
+        crate::settlement::settle(&self.pool, &job.command, lease, settlement).await
     }
 
-    // These lease-only methods remain as a small compatibility surface for
-    // repository callers and old integration fixtures. They enter the same
-    // typed settlement dispatcher, which decodes a command once at its
-    // boundary when the caller did not retain the claimed Job.
-    pub async fn retry_lease(
-        &self,
-        lease: &JobLease,
-        run_at: OffsetDateTime,
-        error_class: &str,
-        error_message: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        self.settle_lease_without_job(
-            lease,
-            JobSettlement::retry(run_at, error_class, error_message),
-        )
-        .await
-    }
-
-    pub async fn retry_lease_without_consuming_attempt(
-        &self,
-        lease: &JobLease,
-        run_at: OffsetDateTime,
-        error_class: &str,
-        error_message: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        self.settle_lease_without_job(
-            lease,
-            JobSettlement::retry_without_consuming_attempt(run_at, error_class, error_message),
-        )
-        .await
-    }
-
-    pub async fn defer_lease(
-        &self,
-        lease: &JobLease,
-        run_at: OffsetDateTime,
-        error_class: &str,
-        error_message: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        self.settle_lease_without_job(
-            lease,
-            JobSettlement::defer(run_at, error_class, error_message),
-        )
-        .await
-    }
-
-    pub async fn defer_lease_without_consuming_attempt(
-        &self,
-        lease: &JobLease,
-        run_at: OffsetDateTime,
-        error_class: &str,
-        error_message: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        self.settle_lease_without_job(
-            lease,
-            JobSettlement::defer_without_consuming_attempt(run_at, error_class, error_message),
-        )
-        .await
-    }
-
-    pub async fn fail_lease(
-        &self,
-        lease: &JobLease,
-        error_class: &str,
-        error_message: &str,
-    ) -> Result<Job, JobRepositoryError> {
-        self.settle_lease_without_job(lease, JobSettlement::fail(error_class, error_message)).await
-    }
-
-    async fn settle_lease_without_job(
-        &self,
-        lease: &JobLease,
-        settlement: JobSettlement,
-    ) -> Result<Job, JobRepositoryError> {
-        crate::settlement::settle(&self.pool, None, lease, settlement).await
-    }
-
-    /// Recovery remains a compatibility entry point for worker startup; the
-    /// typed dispatcher routes each family to its owning repository policy.
+    /// Recover expired jobs through the typed dispatcher and their owning
+    /// repository policy.
     pub async fn recover_stale_leases(&self) -> Result<u64, JobRepositoryError> {
         crate::settlement::recover_stale(&self.pool).await
     }

@@ -92,7 +92,8 @@ pub struct LibraryRepository {
 struct MediaRow {
     id: Uuid,
     kind: String,
-    storage_state: String,
+    #[sqlx(try_from = "String")]
+    storage_state: MediaStorageState,
     canonical_sha256: Option<Vec<u8>>,
     title: Option<String>,
     description: Option<String>,
@@ -1351,7 +1352,7 @@ impl StorageUploadStore for LibraryRepository {
     ) -> Result<Option<StorageReceipt>, Self::Error> {
         let row = self.load(media_id).await?;
         row.map(|row| {
-            if row.storage_state == "ready" {
+            if row.storage_state == MediaStorageState::Ready {
                 row.into_storage_receipt().map(Some)
             } else {
                 Ok(None)
@@ -1371,7 +1372,7 @@ impl StorageUploadStore for LibraryRepository {
             .fetch_optional(&mut *transaction)
             .await?
             .ok_or(LibraryRepositoryError::ResourceMissing(request.media_id))?;
-        if row.storage_state == "ready" {
+        if row.storage_state == MediaStorageState::Ready {
             let receipt = row.into_storage_receipt()?;
             transaction.commit().await?;
             return Ok(StorageUploadReservation::Reused(receipt));
@@ -1382,7 +1383,7 @@ impl StorageUploadStore for LibraryRepository {
                 current_generation: row.storage_generation,
             });
         }
-        if matches!(row.storage_state.as_str(), "storage_unknown" | "missing") {
+        if matches!(row.storage_state, MediaStorageState::Unknown | MediaStorageState::Missing) {
             transaction.commit().await?;
             return Ok(StorageUploadReservation::ReconciliationRequired);
         }
@@ -1560,7 +1561,11 @@ pub(crate) async fn terminal_job_retention_eligible(
             else {
                 return Ok(false);
             };
-            Ok(matches!(state.as_str(), "ready" | "missing"))
+            // Unknown states must retain their terminal job for reconciliation.
+            Ok(matches!(
+                MediaStorageState::try_from(state.as_str()),
+                Ok(MediaStorageState::Ready | MediaStorageState::Missing)
+            ))
         }
         JobCommand::SyncStorageCaption(payload) => {
             let Some(state) = sqlx::query_scalar::<_, String>(
@@ -1642,8 +1647,7 @@ impl MediaRow {
             file_size_bytes: to_u64(self.file_size_bytes, "file_size_bytes")?,
             sha256: self.canonical_sha256,
             local_work_path: self.local_work_path,
-            storage_state: MediaStorageState::try_from(self.storage_state.as_str())
-                .map_err(LibraryRepositoryError::UnknownStorageState)?,
+            storage_state: self.storage_state,
             preview,
             caption_sync_generation: self.caption_sync_generation,
             caption_sync_state: CaptionSyncState::try_from(self.caption_sync_state.as_str())
@@ -1715,7 +1719,7 @@ impl MediaRow {
     fn into_storage_info(self) -> Result<StorageUploadInfo, LibraryRepositoryError> {
         Ok(StorageUploadInfo {
             media_id: self.id,
-            state: self.storage_state,
+            state: self.storage_state.as_str().to_owned(),
             generation: self.storage_generation,
             storage_chat_id: self.telegram_storage_chat_id,
             storage_message_id: self.telegram_storage_message_id,
@@ -1923,7 +1927,7 @@ fn next_caption_sync_values(
 }
 
 fn has_storage_message(row: &MediaRow) -> bool {
-    row.storage_state == "ready"
+    row.storage_state == MediaStorageState::Ready
         && row.telegram_storage_chat_id.is_some()
         && row.telegram_storage_message_id.is_some()
 }
@@ -2186,8 +2190,8 @@ async fn reconcile_storage_terminal(
             .bind(media_id)
             .fetch_optional(&mut **transaction)
             .await?;
-    match state.as_deref() {
-        Some("ready") => {
+    match state.as_deref().map(MediaStorageState::try_from) {
+        Some(Ok(MediaStorageState::Ready)) => {
             sqlx::query(
                 "UPDATE ingests SET state = 'completed', error_code = NULL, error_message = NULL, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND (state = 'storing' OR (state = 'failed_retryable' AND error_code IN ('storage_upload', 'storage_unknown')) OR (state = 'failed_terminal' AND error_code IN ('storage_upload', 'storage_unknown')))",
             )
@@ -2195,7 +2199,7 @@ async fn reconcile_storage_terminal(
             .execute(&mut **transaction)
             .await?;
         }
-        Some("pending_storage") => {
+        Some(Ok(MediaStorageState::Pending)) => {
             sqlx::query(
                 "UPDATE media SET storage_state = 'storage_unknown', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1 AND storage_state <> 'ready'",
             )
@@ -2210,7 +2214,7 @@ async fn reconcile_storage_terminal(
             .execute(&mut **transaction)
             .await?;
         }
-        Some("storage_unknown") => {
+        Some(Ok(MediaStorageState::Unknown)) => {
             sqlx::query(
                 "UPDATE ingests SET state = 'failed_terminal', error_code = 'storage_unknown', error_message = $2, completed_at = now(), updated_at = now() WHERE media_id = $1 AND state <> 'cancelled' AND state NOT IN ('failed_terminal')",
             )
@@ -2222,8 +2226,9 @@ async fn reconcile_storage_terminal(
         // `missing` is the explicit, known-no-effect terminal result from the
         // storage handler. Preserve its storage_upload diagnostic; only an
         // unresolved reservation is promoted to storage_unknown here.
-        Some("missing") => {}
-        _ => {
+        Some(Ok(MediaStorageState::Missing)) => {}
+        // Preserve the existing no-op for a missing row or unrecognized state.
+        None | Some(Err(_)) => {
             let _ = (error_class, error_message);
         }
     }
@@ -2297,7 +2302,9 @@ pub(crate) async fn recover_storage_job(
     .fetch_optional(&mut *transaction)
     .await?;
     if let Some(state) = state {
-        if state.storage_state == "pending_storage"
+        // Recovery keeps unrecognized states on the conservative reconciliation path.
+        let storage_state = MediaStorageState::try_from(state.storage_state.as_str());
+        if storage_state == Ok(MediaStorageState::Pending)
             && state.storage_token.is_some()
             && state.storage_started_at.is_some_and(|started| {
                 started > OffsetDateTime::now_utc() - time::Duration::minutes(1)
@@ -2307,24 +2314,23 @@ pub(crate) async fn recover_storage_job(
             return Ok(false);
         }
         let terminal = job.attempt_count >= job.max_attempts
-            || state.storage_state != "pending_storage"
+            || storage_state != Ok(MediaStorageState::Pending)
             || state.storage_token.is_some();
-        let (queue_state, error_class, error_message, refund_attempt) =
-            match state.storage_state.as_str() {
-                "ready" => ("succeeded", "", "", false),
-                "pending_storage" if state.storage_token.is_none() => (
-                    "queued",
-                    "storage_upload_cancelled",
-                    "storage upload was safely cancelled before Telegram dispatch",
-                    true,
-                ),
-                _ => (
-                    "failed",
-                    "storage_unknown",
-                    "storage job lease expired; external storage result requires reconciliation",
-                    false,
-                ),
-            };
+        let (queue_state, error_class, error_message, refund_attempt) = match storage_state {
+            Ok(MediaStorageState::Ready) => ("succeeded", "", "", false),
+            Ok(MediaStorageState::Pending) if state.storage_token.is_none() => (
+                "queued",
+                "storage_upload_cancelled",
+                "storage upload was safely cancelled before Telegram dispatch",
+                true,
+            ),
+            _ => (
+                "failed",
+                "storage_unknown",
+                "storage job lease expired; external storage result requires reconciliation",
+                false,
+            ),
+        };
         if queue_state == "failed" {
             sqlx::query(
                 "UPDATE media SET storage_state = 'storage_unknown', storage_token = NULL, storage_started_at = NULL, updated_at = now() WHERE id = $1 AND storage_state <> 'ready'",
@@ -2347,13 +2353,13 @@ pub(crate) async fn recover_storage_job(
             .execute(&mut *transaction)
             .await?;
         }
-        let terminal = if queue_state == "queued" { false } else { terminal };
+        let is_terminal = terminal && queue_state != "queued";
         let queue_update = QueueUpdate {
             state: queue_state,
             run_at: if queue_state == "succeeded" { job.run_at } else { OffsetDateTime::now_utc() },
             error_class: error_class.to_owned(),
             error_message: error_message.to_owned(),
-            terminal: terminal || queue_state == "succeeded",
+            terminal: is_terminal || queue_state == "succeeded",
             non_consuming: queue_state == "queued" && refund_attempt,
         };
         update_locked_job(&mut transaction, job.id, queue_update).await?;
@@ -2459,8 +2465,6 @@ pub enum LibraryRepositoryError {
     CaptionSyncGenerationOverflow(Uuid),
     #[error("media {0} has an invalid kind")]
     UnknownMediaKind(String),
-    #[error("media has an invalid storage state: {0}")]
-    UnknownStorageState(String),
     #[error("media has an invalid caption-sync state: {0}")]
     UnknownCaptionSyncState(String),
     #[error("media source has an invalid kind: {0}")]

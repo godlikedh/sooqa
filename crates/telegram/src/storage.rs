@@ -485,7 +485,7 @@ where
             }
         };
 
-        let thumbnail_cleanup = match thumbnail {
+        let mut thumbnail_cleanup = match thumbnail {
             Some(preview) => match stage_video_thumbnail(&local_work_path, preview).await {
                 Ok(cleanup) => cleanup,
                 Err(error) => {
@@ -496,159 +496,142 @@ where
             None => StagedThumbnailCleanup(None),
         };
 
-        if cancellation.is_cancelled() {
-            self.store
-                .release_storage_upload(media_id, owner_token)
-                .await
-                .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
-            return Err(StorageUploadError::CancelledBeforeDispatch);
-        }
-
-        let request = StorageUploadRequest {
-            storage_chat_id: self.storage_chat_id,
-            media_kind: media.kind,
-            local_work_path,
-            caption: storage_caption(&caption_metadata),
-            duration,
-            width,
-            height,
-            thumbnail_path: thumbnail_cleanup.path(),
-        };
-        let dispatched = Arc::new(AtomicBool::new(false));
-        let upload_api = self.api.clone();
-        let mut upload = Box::pin({
-            let dispatched = Arc::clone(&dispatched);
-            async move {
-                dispatched.store(true, Ordering::Release);
-                upload_api.upload_media(request).await
+        let result: Result<StorageUploadOutcome, StorageUploadError> = async {
+            if cancellation.is_cancelled() {
+                self.store
+                    .release_storage_upload(media_id, owner_token)
+                    .await
+                    .map_err(|error| StorageUploadError::Persistence(Box::new(error)))?;
+                return Err(StorageUploadError::CancelledBeforeDispatch);
             }
-        });
-        let mut renewal = tokio::time::interval(STORAGE_UPLOAD_RENEW_INTERVAL);
-        renewal.tick().await;
-        let uploaded = loop {
-            tokio::select! {
-                _ = cancellation.cancelled() => {
-                    if dispatched.load(Ordering::Acquire) {
+
+            let request = StorageUploadRequest {
+                storage_chat_id: self.storage_chat_id,
+                media_kind: media.kind,
+                local_work_path,
+                caption: storage_caption(&caption_metadata),
+                duration,
+                width,
+                height,
+                thumbnail_path: thumbnail_cleanup.path(),
+            };
+            let dispatched = Arc::new(AtomicBool::new(false));
+            let upload_api = self.api.clone();
+            let mut upload = Box::pin({
+                let dispatched = Arc::clone(&dispatched);
+                async move {
+                    dispatched.store(true, Ordering::Release);
+                    upload_api.upload_media(request).await
+                }
+            });
+            let mut renewal = tokio::time::interval(STORAGE_UPLOAD_RENEW_INTERVAL);
+            renewal.tick().await;
+            let uploaded = loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        if dispatched.load(Ordering::Acquire) {
+                            if let Err(error) = self
+                                .store
+                                .mark_storage_upload_unknown(media_id, owner_token)
+                                .await
+                            {
+                                return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
+                            }
+                            return Err(StorageUploadError::CancelledAfterDispatch);
+                        }
+                        if let Err(error) =
+                            self.store.release_storage_upload(media_id, owner_token).await
+                        {
+                            return Err(StorageUploadError::Persistence(Box::new(error)));
+                        }
+                        return Err(StorageUploadError::CancelledBeforeDispatch);
+                    }
+                    result = &mut upload => break result,
+                    _ = renewal.tick() => {
                         if let Err(error) = self
                             .store
-                            .mark_storage_upload_unknown(media_id, owner_token)
+                            .renew_storage_upload(
+                                media_id,
+                                owner_token,
+                                STORAGE_UPLOAD_LEASE_DURATION,
+                            )
                             .await
                         {
-                            remove_staged_thumbnail(&thumbnail_cleanup.0).await;
+                            if let Err(mark_error) =
+                                self.store.mark_storage_upload_unknown(media_id, owner_token).await
+                            {
+                                return Err(StorageUploadError::AmbiguousPersistence(Box::new(
+                                    mark_error,
+                                )));
+                            }
                             return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
                         }
-                        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                        return Err(StorageUploadError::CancelledAfterDispatch);
                     }
-                    if let Err(error) =
-                        self.store.release_storage_upload(media_id, owner_token).await
-                    {
-                        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                        return Err(StorageUploadError::Persistence(Box::new(error)));
-                    }
-                    remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                    return Err(StorageUploadError::CancelledBeforeDispatch);
                 }
-                result = &mut upload => break result,
-                _ = renewal.tick() => {
-                    if let Err(error) = self
-                        .store
-                        .renew_storage_upload(
-                            media_id,
-                            owner_token,
-                            STORAGE_UPLOAD_LEASE_DURATION,
-                        )
-                        .await
-                    {
+            };
+            let uploaded = match uploaded {
+                Ok(uploaded) => uploaded,
+                Err(error) => {
+                    if A::is_ambiguous_error(&error) {
                         if let Err(mark_error) =
                             self.store.mark_storage_upload_unknown(media_id, owner_token).await
                         {
-                            remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                            return Err(StorageUploadError::AmbiguousPersistence(Box::new(
-                                mark_error,
-                            )));
+                            return Err(StorageUploadError::AmbiguousPersistence(Box::new(mark_error)));
                         }
-                        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                        return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
+                        return Err(StorageUploadError::AmbiguousApi(Box::new(error)));
                     }
+                    self.store.release_storage_upload(media_id, owner_token).await.map_err(
+                        |release_error| StorageUploadError::Persistence(Box::new(release_error)),
+                    )?;
+                    return Err(StorageUploadError::Api(Box::new(error)));
                 }
-            }
-        };
-        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-        let uploaded = match uploaded {
-            Ok(uploaded) => uploaded,
-            Err(error) => {
-                if A::is_ambiguous_error(&error) {
-                    if let Err(mark_error) =
-                        self.store.mark_storage_upload_unknown(media_id, owner_token).await
-                    {
-                        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                        return Err(StorageUploadError::AmbiguousPersistence(Box::new(mark_error)));
-                    }
-                    remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                    return Err(StorageUploadError::AmbiguousApi(Box::new(error)));
-                }
-                remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                self.store.release_storage_upload(media_id, owner_token).await.map_err(
-                    |release_error| StorageUploadError::Persistence(Box::new(release_error)),
-                )?;
-                return Err(StorageUploadError::Api(Box::new(error)));
-            }
-        };
+            };
 
-        if cancellation.is_cancelled() {
-            if let Err(error) = self.store.mark_storage_upload_unknown(media_id, owner_token).await
-            {
-                remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
-            }
-            remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-            return Err(StorageUploadError::CancelledAfterDispatch);
-        }
-
-        let attachment = sooqa_library::StorageUploadAttachment {
-            storage_chat_id: self.storage_chat_id,
-            storage_message_id: uploaded.storage_message_id,
-            telegram_file_id: Some(uploaded.telegram_file_id),
-            telegram_file_unique_id: Some(uploaded.telegram_file_unique_id),
-            caption_metadata: Some(caption_metadata),
-        };
-        let mut completion =
-            Box::pin(self.store.complete_storage_upload(input.media_id, owner_token, attachment));
-        let object = tokio::select! {
-            _ = cancellation.cancelled() => {
-                if let Err(error) = self
-                    .store
-                    .mark_storage_upload_unknown(media_id, owner_token)
-                    .await
+            if cancellation.is_cancelled() {
+                if let Err(error) = self.store.mark_storage_upload_unknown(media_id, owner_token).await
                 {
-                    remove_staged_thumbnail(&thumbnail_cleanup.0).await;
                     return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
                 }
-                remove_staged_thumbnail(&thumbnail_cleanup.0).await;
                 return Err(StorageUploadError::CancelledAfterDispatch);
             }
-            result = &mut completion => match result {
-                Ok(object) => object,
-                Err(error) => {
-                    if let Err(mark_error) =
-                        self.store.mark_storage_upload_unknown(media_id, owner_token).await
-                    {
-                        remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                        return Err(StorageUploadError::AmbiguousPersistence(Box::new(mark_error)));
-                    }
-                    remove_staged_thumbnail(&thumbnail_cleanup.0).await;
-                    return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
-                }
-            },
-        };
-        Ok(StorageUploadOutcome::Uploaded(object))
-    }
-}
 
-async fn remove_staged_thumbnail(path: &Option<PathBuf>) {
-    if let Some(path) = path {
-        let _ = tokio::fs::remove_file(path).await;
+            let attachment = sooqa_library::StorageUploadAttachment {
+                storage_chat_id: self.storage_chat_id,
+                storage_message_id: uploaded.storage_message_id,
+                telegram_file_id: Some(uploaded.telegram_file_id),
+                telegram_file_unique_id: Some(uploaded.telegram_file_unique_id),
+                caption_metadata: Some(caption_metadata),
+            };
+            let mut completion =
+                Box::pin(self.store.complete_storage_upload(input.media_id, owner_token, attachment));
+            let object = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    if let Err(error) = self
+                        .store
+                        .mark_storage_upload_unknown(media_id, owner_token)
+                        .await
+                    {
+                        return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
+                    }
+                    return Err(StorageUploadError::CancelledAfterDispatch);
+                }
+                result = &mut completion => match result {
+                    Ok(object) => object,
+                    Err(error) => {
+                        if let Err(mark_error) =
+                            self.store.mark_storage_upload_unknown(media_id, owner_token).await
+                        {
+                            return Err(StorageUploadError::AmbiguousPersistence(Box::new(mark_error)));
+                        }
+                        return Err(StorageUploadError::AmbiguousPersistence(Box::new(error)));
+                    }
+                },
+            };
+            Ok(StorageUploadOutcome::Uploaded(object))
+        }
+        .await;
+        thumbnail_cleanup.remove_after_upload().await;
+        result
     }
 }
 
@@ -657,6 +640,17 @@ struct StagedThumbnailCleanup(Option<PathBuf>);
 impl StagedThumbnailCleanup {
     fn path(&self) -> Option<PathBuf> {
         self.0.clone()
+    }
+
+    async fn remove_after_upload(&mut self) {
+        let Some(path) = self.0.as_ref() else {
+            return;
+        };
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => self.0 = None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.0 = None,
+            Err(_) => {}
+        }
     }
 }
 
@@ -1367,6 +1361,46 @@ mod tests {
         }
         assert!(!path.exists(), "staged thumbnail should be removed by its guard");
         tokio::fs::remove_dir(directory).await.expect("fixture directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn staged_thumbnail_cleanup_disarms_after_removal_or_not_found() {
+        let directory = std::env::temp_dir().join(format!("sooqa-thumbnail-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.expect("fixture directory should be created");
+        let path = directory.join("thumbnail.jpg");
+        tokio::fs::write(&path, b"thumbnail").await.expect("fixture should be written");
+
+        let mut cleanup = StagedThumbnailCleanup(Some(path.clone()));
+        cleanup.remove_after_upload().await;
+        assert!(!path.exists(), "successful removal should delete the staged thumbnail");
+        tokio::fs::write(&path, b"replacement").await.unwrap();
+        drop(cleanup);
+        assert!(path.exists(), "a disarmed guard must not delete a later file at the same path");
+        tokio::fs::remove_file(&path).await.unwrap();
+
+        let missing_path = directory.join("already-removed.jpg");
+        let mut cleanup = StagedThumbnailCleanup(Some(missing_path.clone()));
+        cleanup.remove_after_upload().await;
+        tokio::fs::write(&missing_path, b"replacement").await.unwrap();
+        drop(cleanup);
+        assert!(missing_path.exists(), "NotFound must also disarm later deletion");
+        tokio::fs::remove_file(missing_path).await.unwrap();
+
+        tokio::fs::remove_dir(directory).await.expect("fixture directory should be removed");
+    }
+
+    #[tokio::test]
+    async fn staged_thumbnail_cleanup_keeps_drop_fallback_after_failure() {
+        let directory = std::env::temp_dir().join(format!("sooqa-thumbnail-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.expect("fixture directory should be created");
+
+        let mut cleanup = StagedThumbnailCleanup(Some(directory.clone()));
+        cleanup.remove_after_upload().await;
+        assert!(directory.is_dir(), "async file removal must leave a directory intact");
+        tokio::fs::remove_dir(&directory).await.unwrap();
+        tokio::fs::write(&directory, b"now removable").await.unwrap();
+        drop(cleanup);
+        assert!(!directory.exists(), "Drop must retry removal after the earlier failure");
     }
 
     fn valid_thumbnail() -> (Vec<u8>, Vec<u8>) {
