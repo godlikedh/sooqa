@@ -9,7 +9,7 @@ use tokio::{
     task::JoinError,
     time::sleep,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use sooqa_jobs::{Job, JobLease, JobStatus, JobType};
 use sooqa_persistence::{JobRepository, JobRepositoryError, JobSettlement};
@@ -97,7 +97,6 @@ impl Worker {
         let result: Result<(), WorkerError> = async {
             loop {
                 counters.polls += 1;
-                debug!(worker_id = %self.worker_id, "polling for a job");
                 let claimed = tokio::select! {
                     _ = &mut shutdown => break,
                     result = self.repository.claim_next(
@@ -120,10 +119,13 @@ impl Worker {
 
                 let Some(handler) = self.registry.handler(job.job_type()) else {
                     self.repository
-                        .fail_lease(
+                        .settle_lease(
+                            &job,
                             &lease,
-                            "handler_not_registered",
-                            "no handler is registered for this job type",
+                            JobSettlement::fail(
+                                "handler_not_registered",
+                                "no handler is registered for this job type",
+                            ),
                         )
                         .await?;
                     counters.failed += 1;

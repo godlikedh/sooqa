@@ -1,6 +1,7 @@
 //! HTTP API boundary for sooqa.
 
 mod admin;
+mod cursor;
 mod library;
 mod publisher;
 
@@ -113,6 +114,14 @@ async fn health_live() -> impl IntoResponse {
     )
 }
 
+fn map_json_rejection(rejection: JsonRejection, headers: &HeaderMap) -> ApiError {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::payload_too_large(headers)
+    } else {
+        ApiError::bad_request("invalid_json", "The request body must be valid JSON", headers)
+    }
+}
+
 async fn create_ingest(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -120,13 +129,8 @@ async fn create_ingest(
 ) -> Result<(StatusCode, Json<IngestAcceptedResponse>), ApiError> {
     authorize(&state.api_token, &headers).await?;
     let idempotency_key = required_header(&headers, "idempotency-key")?;
-    let JsonExtractor(payload) = body.map_err(|rejection| {
-        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::payload_too_large(&headers)
-        } else {
-            ApiError::bad_request("invalid_json", "The request body must be valid JSON", &headers)
-        }
-    })?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
 
     let requested_action =
         RequestedAction::try_from(payload.requested_action.as_str()).map_err(|_| {
@@ -214,13 +218,8 @@ async fn accept_duplicate(
     body: Result<JsonExtractor<AcceptDuplicateRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<IngestResponse>), ApiError> {
     authorize(&state.api_token, &headers).await?;
-    let JsonExtractor(payload) = body.map_err(|rejection| {
-        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::payload_too_large(&headers)
-        } else {
-            ApiError::bad_request("invalid_json", "The request body must be valid JSON", &headers)
-        }
-    })?;
+    let JsonExtractor(payload) =
+        body.map_err(|rejection| map_json_rejection(rejection, &headers))?;
     let result = state
         .inbox
         .accept_duplicate(id, payload.media_id)
@@ -838,6 +837,53 @@ mod tests {
         assert!(body.contains("\"status\":\"ok\""));
         assert!(body.contains("\"version\":\"0.1.0\""));
         assert!(body.contains("\"git_sha\":\"unknown\""));
+    }
+
+    #[tokio::test]
+    async fn json_rejections_preserve_status_and_request_id_across_api_routes() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .unwrap();
+        let database = sooqa_persistence::Database::from_pool(pool);
+        // Allow the body through the outer layer so the JSON extractor's own
+        // limit exercises each handler's rejection mapping without database I/O.
+        let app = router(
+            ApiSettings { request_body_limit_bytes: 4 * 1024 * 1024, ..ApiSettings::default() },
+            ApiState::new(database.inbox(), "test-token", database.library(), database.publisher()),
+        );
+        let oversized = format!("{{\"padding\":\"{}\"}}", "x".repeat(2 * 1024 * 1024));
+        for (method, uri) in [
+            ("POST", "/api/v1/ingests"),
+            ("POST", "/api/v1/dashboard/ingest-failures/acknowledge"),
+            ("PATCH", "/api/v1/media/00000000-0000-0000-0000-000000000001"),
+            ("POST", "/api/v1/posts"),
+        ] {
+            for (body, status, code) in [
+                ("{", StatusCode::BAD_REQUEST, "invalid_json"),
+                (oversized.as_str(), StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header("authorization", "Bearer test-token")
+                            .header("idempotency-key", "json-rejection-test")
+                            .header("content-type", "application/json")
+                            .header("x-request-id", "json-rejection-test")
+                            .body(Body::from(body.to_owned()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status, "{method} {uri}");
+                let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["error"]["code"], code, "{method} {uri}");
+                assert_eq!(body["error"]["request_id"], "json-rejection-test");
+            }
+        }
     }
 
     #[test]

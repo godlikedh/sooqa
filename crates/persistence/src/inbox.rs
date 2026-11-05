@@ -15,7 +15,7 @@ use sooqa_inbox::{
 use sooqa_jobs::{Job, JobCommand, JobLease, NewJob};
 use sooqa_library::{
     MAX_VIDEO_DUPLICATE_EVIDENCE_BYTES, MAX_VIDEO_DUPLICATE_MATCHES, MediaIngest,
-    VideoDuplicateClassification, VideoDuplicateEvidence, VideoFingerprintInput,
+    MediaStorageState, VideoDuplicateClassification, VideoDuplicateEvidence, VideoFingerprintInput,
     VideoIdentityDecision, VideoIdentityOutcome,
 };
 use sqlx::{FromRow, PgPool};
@@ -441,10 +441,11 @@ impl InboxRepository {
         .await?
         .ok_or(InboxRepositoryError::DuplicateCandidateMissing(media_id))?;
 
-        if !matches!(candidate.storage_state.as_str(), "ready" | "pending_storage") {
+        if !matches!(candidate.storage_state, MediaStorageState::Ready | MediaStorageState::Pending)
+        {
             return Err(InboxRepositoryError::DuplicateCandidateUnavailable {
                 media_id,
-                state: candidate.storage_state,
+                state: candidate.storage_state.as_str().to_owned(),
             });
         }
 
@@ -485,7 +486,7 @@ impl InboxRepository {
         request.error_message = None;
         request.completed_at = None;
         request.transition_to(IngestStatus::Storing)?;
-        if candidate.storage_state == "ready" {
+        if candidate.storage_state == MediaStorageState::Ready {
             request.transition_to(IngestStatus::Completed)?;
             request.completed_at = Some(OffsetDateTime::now_utc());
             if request.requested_action != RequestedAction::Save {
@@ -538,7 +539,7 @@ impl InboxRepository {
                 let (storage_state, storage_chat_id, storage_message_id) =
                     storage.map_or(("missing".to_owned(), None, None), |row| {
                         (
-                            row.storage_state,
+                            row.storage_state.as_str().to_owned(),
                             row.telegram_storage_chat_id,
                             row.telegram_storage_message_id,
                         )
@@ -1294,8 +1295,13 @@ impl InboxRepository {
             }
             None => None,
         };
-        let storage_ready =
-            storage_state.as_deref().is_none_or(|state| matches!(state, "ready" | "missing"));
+        // An unknown state must keep its workspace until explicitly reconciled.
+        let storage_ready = storage_state.as_deref().is_none_or(|state| {
+            matches!(
+                MediaStorageState::try_from(state),
+                Ok(MediaStorageState::Ready | MediaStorageState::Missing)
+            )
+        });
         let state_allows_cleanup = matches!(
             row.1.as_str(),
             "completed" | "duplicate_pending" | "failed_terminal" | "cancelled" | "storing"
@@ -1723,8 +1729,10 @@ async fn advance_after_media_processing(
     request.error_code = None;
     request.error_message = None;
     request.completed_at = None;
-    match storage_state.as_str() {
-        "ready" => {
+    let storage_state = MediaStorageState::try_from(storage_state.as_str())
+        .map_err(InboxRepositoryError::UnknownStorageState)?;
+    match storage_state {
+        MediaStorageState::Ready => {
             request.transition_to(IngestStatus::Completed)?;
             request.completed_at = Some(OffsetDateTime::now_utc());
             if request.requested_action != RequestedAction::Save {
@@ -1738,11 +1746,11 @@ async fn advance_after_media_processing(
             )
             .await?;
         }
-        "pending_storage" => {
+        MediaStorageState::Pending => {
             request.transition_to(IngestStatus::Storing)?;
             insert_storage_job(transaction, media_id).await?;
         }
-        "storage_unknown" | "missing" => {
+        MediaStorageState::Unknown | MediaStorageState::Missing => {
             request.transition_to(IngestStatus::FailedTerminal)?;
             request.error_code = Some("storage_unknown".to_owned());
             request.error_message = Some(
@@ -1758,7 +1766,6 @@ async fn advance_after_media_processing(
             )
             .await?;
         }
-        state => return Err(InboxRepositoryError::UnknownStorageState(state.to_owned())),
     }
     request.updated_at = OffsetDateTime::now_utc();
     update_ingest_state(transaction, request).await?;
@@ -2132,13 +2139,15 @@ struct IngestRow {
 
 #[derive(Debug, FromRow)]
 struct DuplicateMediaRow {
-    storage_state: String,
+    #[sqlx(try_from = "String")]
+    storage_state: MediaStorageState,
     tags: Vec<String>,
 }
 
 #[derive(Debug, FromRow)]
 struct DuplicateMediaStorageRow {
-    storage_state: String,
+    #[sqlx(try_from = "String")]
+    storage_state: MediaStorageState,
     telegram_storage_chat_id: Option<i64>,
     telegram_storage_message_id: Option<i64>,
 }

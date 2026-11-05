@@ -48,6 +48,10 @@ configuration; neither is returned to the browser or written to logs. The
 Tampermonkey script stores only the local token and never contains the backend
 or Telegram token.
 
+Companion forwarding failures log only the backend HTTP status or a transport
+error category. Request payloads and backend response bodies are omitted, and
+the browser receives the same generic `backend_request_failed` error.
+
 Telegram accepts private messages from configured positive administrator IDs.
 Media is staged below UUID-derived workspaces. Direct HTTP rejects credentials,
 private/special destinations, and unsafe redirects. ffmpeg, ffprobe, and

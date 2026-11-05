@@ -18,7 +18,7 @@ use crate::common::{
 };
 
 /// A best-effort startup probe for optional Telegram storage.  It is
-/// intentionally separate from [`Worker::run`]: a remote outage must not
+/// intentionally separate from [`crate::Worker::run`]: a remote outage must not
 /// prevent non-storage jobs from being claimed, and storage jobs continue to
 /// use their durable handler retry policy.
 #[async_trait]

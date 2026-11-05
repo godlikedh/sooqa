@@ -129,6 +129,8 @@ pub struct InspectSourcePayload {
 #[serde(deny_unknown_fields)]
 pub struct DownloadSourcePayload {
     pub ingest_id: Uuid,
+    /// Snapshot committed with the ingest inspection. The worker checks both
+    /// copies agree before using the ingest's inspection for external I/O.
     pub inspection: SourceInspection,
 }
 
@@ -281,18 +283,12 @@ impl NewJob {
         Self::new(JobCommand::PublishPost(PublishPostPayload { post_id, expected_revision }))
     }
 
-    pub fn upload_storage_asset(asset_id: Uuid) -> Self {
-        Self::new(JobCommand::UploadStorageAsset(MediaJobPayload {
-            media_id: asset_id,
-            generation: 0,
-        }))
+    pub fn upload_storage_asset(media_id: Uuid) -> Self {
+        Self::new(JobCommand::UploadStorageAsset(MediaJobPayload { media_id, generation: 0 }))
     }
 
-    pub fn upload_storage_asset_generation(asset_id: Uuid, generation: i32) -> Self {
-        Self::new(JobCommand::UploadStorageAsset(MediaJobPayload {
-            media_id: asset_id,
-            generation,
-        }))
+    pub fn upload_storage_asset_generation(media_id: Uuid, generation: i32) -> Self {
+        Self::new(JobCommand::UploadStorageAsset(MediaJobPayload { media_id, generation }))
     }
 
     pub fn sync_storage_caption(media_id: Uuid, generation: i32) -> Self {

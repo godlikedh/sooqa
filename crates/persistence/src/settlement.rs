@@ -13,54 +13,44 @@ use uuid::Uuid;
 
 pub(crate) async fn settle(
     pool: &PgPool,
-    command: Option<&JobCommand>,
+    command: &JobCommand,
     lease: &JobLease,
     settlement: JobSettlement,
 ) -> Result<Job, JobRepositoryError> {
     let allow_expired = settlement.allows_expired_lease();
-    let command = match command {
-        Some(command) => command.clone(),
-        None => match load_running_job(pool, lease, allow_expired).await {
-            Ok(job) => job.command,
-            Err(JobRepositoryError::LeaseLost) if allow_expired => {
-                return load_already_requeued(pool, lease, &settlement, None).await;
-            }
-            Err(error) => return Err(error),
-        },
-    };
     let fallback_settlement = settlement.clone();
-    let result = match &command {
+    let result = match command {
         JobCommand::PublishPost(_) => {
-            crate::publisher::settle_publish_job(pool, lease, &command, settlement).await
+            crate::publisher::settle_publish_job(pool, lease, command, settlement).await
         }
         JobCommand::UploadStorageAsset(_) => {
-            crate::library::settle_storage_job(pool, lease, &command, settlement).await
+            crate::library::settle_storage_job(pool, lease, command, settlement).await
         }
         JobCommand::SyncStorageCaption(_) => {
-            crate::library::settle_caption_job(pool, lease, &command, settlement).await
+            crate::library::settle_caption_job(pool, lease, command, settlement).await
         }
         JobCommand::InspectSource(_) => {
-            crate::inbox::settle_job(pool, lease, &command, settlement).await
+            crate::inbox::settle_job(pool, lease, command, settlement).await
         }
         JobCommand::DownloadSource(_) => {
-            crate::inbox::settle_job(pool, lease, &command, settlement).await
+            crate::inbox::settle_job(pool, lease, command, settlement).await
         }
         JobCommand::ProbeAsset(_)
         | JobCommand::NormalizeAsset(_)
         | JobCommand::ComputeFingerprint(_)
         | JobCommand::FinalizeIngest(_) => {
-            crate::inbox::settle_job(pool, lease, &command, settlement).await
+            crate::inbox::settle_job(pool, lease, command, settlement).await
         }
         JobCommand::MaterializePublication(_) => {
-            crate::publisher::settle_materialize_job(pool, lease, &command, settlement).await
+            crate::publisher::settle_materialize_job(pool, lease, command, settlement).await
         }
         JobCommand::CleanupWorkspace(_) => {
-            crate::cleanup::settle_job(pool, lease, &command, settlement).await
+            crate::cleanup::settle_job(pool, lease, command, settlement).await
         }
     };
     match result {
         Err(JobRepositoryError::LeaseLost) if allow_expired => {
-            load_already_requeued(pool, lease, &fallback_settlement, Some(&command)).await
+            load_already_requeued(pool, lease, &fallback_settlement, command).await
         }
         result => result,
     }
@@ -120,39 +110,11 @@ async fn recover_one(pool: &PgPool, candidate: JobRow) -> Result<bool, JobReposi
     }
 }
 
-async fn load_running_job(
-    pool: &PgPool,
-    lease: &JobLease,
-    allow_expired: bool,
-) -> Result<Job, JobRepositoryError> {
-    sqlx::query_as::<_, JobRow>(
-        r#"
-        SELECT id, kind, payload, state, priority, run_at, attempt_count,
-               max_attempts, lease_token, lease_owner, lease_expires_at,
-               last_heartbeat_at, error_class, error_message, dedupe_key,
-               created_at, updated_at, completed_at
-        FROM queue.jobs
-        WHERE id = $1 AND state = 'running' AND attempt_count = $2
-          AND lease_owner = $3 AND lease_token = $4
-          AND ($5 OR lease_expires_at > clock_timestamp())
-        "#,
-    )
-    .bind(lease.job_id)
-    .bind(lease.attempt_number)
-    .bind(&lease.lease_owner)
-    .bind(lease.lease_token)
-    .bind(allow_expired)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(JobRepositoryError::LeaseLost)
-    .and_then(JobRow::into_job)
-}
-
 async fn load_already_requeued(
     pool: &PgPool,
     lease: &JobLease,
     settlement: &JobSettlement,
-    expected: Option<&JobCommand>,
+    expected: &JobCommand,
 ) -> Result<Job, JobRepositoryError> {
     let error_class = settlement.error_class().ok_or(JobRepositoryError::LeaseLost)?;
     sqlx::query_as::<_, JobRow>(
@@ -172,7 +134,7 @@ async fn load_already_requeued(
     .ok_or(JobRepositoryError::LeaseLost)
     .and_then(JobRow::into_job)
     .and_then(|job| {
-        if expected.is_none_or(|expected| commands_have_same_owner(expected, &job.command)) {
+        if commands_have_same_owner(expected, &job.command) {
             Ok(job)
         } else {
             Err(JobRepositoryError::LeaseLost)

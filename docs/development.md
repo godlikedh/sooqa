@@ -52,7 +52,7 @@ DATABASE_URL=postgres://sooqa:sooqa_dev_only@127.0.0.1:5432/sooqa \
 ```
 
 The script runs persistence and API tests plus the named worker targets for
-worker, inspection, identity, publication, disk admission, and storage
+worker, inspection, identity, caption synchronization, publication, disk admission, and storage
 shutdown. The caller's `DATABASE_URL` is preserved; `just test-integration`
 uses the disposable development URL above only when the variable is unset.
 Each Cargo command passes `--ignored` to the test harness. Do not add
@@ -77,3 +77,38 @@ just test-media
 
 External commands use argument arrays and never a shell. Database transactions
 must be closed before network or subprocess work starts.
+
+## Code health reviews
+
+[Desloppify](https://github.com/peteromallet/desloppify) supplements the required
+quality gate with structural, duplication, and subjective review findings. It
+does not replace `just check` or the PostgreSQL and media acceptance tests.
+Install the review tools locally with Python 3.11+ and npm:
+
+```bash
+python3 -m venv .desloppify/venv
+.desloppify/venv/bin/python -m pip install --cache-dir .desloppify/pip-cache 'desloppify[full]==1.0'
+npm install --prefix .desloppify/npm --cache .desloppify/npm-cache --no-audit --no-fund jscpd@5.4.2
+export PATH="$PWD/.desloppify/venv/bin:$PWD/.desloppify/npm/node_modules/.bin:$PATH"
+DESLOPPIFY_ROOT="$PWD/.desloppify" desloppify update-skill codex
+desloppify config set generate_scorecard false
+desloppify exclude target
+desloppify exclude work-data
+desloppify exclude .desloppify
+desloppify --lang rust scan --path . --no-badge
+desloppify --lang rust next
+```
+
+The Rust workspace is one coherent scan target. Build output, runtime media,
+and the review environment are excluded; source and tests remain visible.
+The environment, workflow guide, review packets, and scan state stay under
+`.desloppify/`, which is ignored by Git and Docker builds. Re-export the `PATH`
+above in each shell before continuing with `desloppify --lang rust next`.
+
+Follow the generated review and triage queue, verify findings against code and
+the product authority, and resolve only changes actually made. Blind reviews
+must use the generated packet without score history. Unassessed subjective
+dimensions count as zero, so report the objective score separately until the
+review is complete. In particular, public Rust items within this unpublished
+workspace do not automatically need published-library compatibility machinery,
+and inline test doubles need to be distinguished from production async code.

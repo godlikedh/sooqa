@@ -12,7 +12,7 @@ use sooqa_library::{
     VideoFingerprintInput, VideoIdentityDecision,
 };
 use sooqa_media::{VideoSequenceFingerprint, VideoSequenceSample};
-use sooqa_persistence::{Database, InboxRepositoryError, SourceInspectionStart};
+use sooqa_persistence::{Database, InboxRepositoryError, JobSettlement, SourceInspectionStart};
 use sooqa_publisher::NewChannel;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -124,11 +124,10 @@ async fn input_key_replays_identical_ingests_and_rejects_conflicts(pool: sqlx::P
     let stale_attempt = claimed.lease().expect("claimed job should have a lease");
     database
         .jobs()
-        .retry_lease(
+        .settle_lease(
+            &claimed,
             &stale_attempt,
-            time::OffsetDateTime::now_utc(),
-            "test_retry",
-            "simulated retry",
+            JobSettlement::retry(time::OffsetDateTime::now_utc(), "test_retry", "simulated retry"),
         )
         .await
         .unwrap();

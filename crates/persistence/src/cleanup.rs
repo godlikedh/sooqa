@@ -1,4 +1,5 @@
 use sooqa_jobs::{Job, JobCommand, JobLease, JobStatus, NewJob};
+use sooqa_library::MediaStorageState;
 use sqlx::{PgPool, Postgres, Transaction};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -124,7 +125,10 @@ pub(crate) async fn terminal_job_retention_eligible(
     else {
         return Ok(false);
     };
-    Ok(matches!(storage_state.as_str(), "ready" | "missing") && local_work_path.is_none())
+    Ok(matches!(
+        MediaStorageState::try_from(storage_state.as_str()),
+        Ok(MediaStorageState::Ready | MediaStorageState::Missing)
+    ) && local_work_path.is_none())
 }
 
 /// Cleanup has no additional durable domain transition after its handler has

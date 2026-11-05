@@ -16,7 +16,7 @@ use sooqa_config::CompanionConfig;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
-use tracing::debug;
+use tracing::{debug, warn};
 use url::Url;
 
 const SUBMIT_PATH: &str = "/v1/submit";
@@ -113,6 +113,14 @@ pub enum CompanionError {
     Respond(String),
 }
 
+#[derive(Debug, Clone, Copy, Error, Eq, PartialEq)]
+enum BackendForwardError {
+    #[error("backend returned HTTP status {0}")]
+    HttpStatus(u16),
+    #[error("backend transport failure ({0:?})")]
+    Transport(ureq::ErrorKind),
+}
+
 #[derive(Debug)]
 struct RequestLimiter {
     events: Mutex<VecDeque<Instant>>,
@@ -158,7 +166,7 @@ impl<'a> CompanionService<'a> {
         Self { config, backend_url, agent, limiter: Arc::new(RequestLimiter::new()) }
     }
 
-    fn handle(&self, mut request: Request) -> Result<(), CompanionError> {
+    fn handle_submit_request(&self, mut request: Request) -> Result<(), CompanionError> {
         if request.method() != &Method::Post || request.url() != SUBMIT_PATH {
             return respond_error(request, StatusCode(404), "not_found");
         }
@@ -212,7 +220,18 @@ impl<'a> CompanionService<'a> {
                 debug!("companion submission accepted by backend");
                 respond_json(request, StatusCode(202), &AcceptedResponse { accepted: true })
             }
-            Err(_) => respond_error(request, StatusCode(502), "backend_request_failed"),
+            Err(BackendForwardError::HttpStatus(status)) => {
+                warn!(backend_error = "http_status", status, "companion backend request failed");
+                respond_error(request, StatusCode(502), "backend_request_failed")
+            }
+            Err(BackendForwardError::Transport(kind)) => {
+                warn!(
+                    backend_error = "transport",
+                    transport_kind = ?kind,
+                    "companion backend request failed"
+                );
+                respond_error(request, StatusCode(502), "backend_request_failed")
+            }
         }
     }
 }
@@ -225,7 +244,7 @@ pub fn serve(config: &CompanionConfig, stop: &AtomicBool) -> Result<(), Companio
     while !stop.load(Ordering::Acquire) {
         let request = server.recv_timeout(RECEIVE_POLL).map_err(CompanionError::Receive)?;
         if let Some(request) = request {
-            service.handle(request)?;
+            service.handle_submit_request(request)?;
         }
     }
     Ok(())
@@ -403,15 +422,27 @@ fn forward(
     backend_token: &str,
     idempotency_key: &str,
     payload: &BackendIngestRequest<'_>,
-) -> Result<(), ()> {
+) -> Result<(), BackendForwardError> {
     let authorization = format!("Bearer {backend_token}");
-    let response = agent
+    let response = match agent
         .post(backend_url)
         .set("Authorization", &authorization)
         .set("Idempotency-Key", idempotency_key)
         .send_json(payload)
-        .map_err(|_| ())?;
-    if (200..300).contains(&response.status()) { Ok(()) } else { Err(()) }
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, _response)) => {
+            return Err(BackendForwardError::HttpStatus(status));
+        }
+        Err(ureq::Error::Transport(error)) => {
+            return Err(BackendForwardError::Transport(error.kind()));
+        }
+    };
+    if (200..300).contains(&response.status()) {
+        Ok(())
+    } else {
+        Err(BackendForwardError::HttpStatus(response.status()))
+    }
 }
 
 fn respond_error(
@@ -501,9 +532,16 @@ mod tests {
                     .lock()
                     .expect("capture lock should not be poisoned")
                     .push(CapturedBackendRequest { path, authorization, idempotency_key, body });
-                request
-                    .respond(Response::from_string("{}").with_status_code(StatusCode(status)))
-                    .map_err(|error| error.to_string())?;
+                let mut response = Response::from_string("backend-response-secret")
+                    .with_status_code(StatusCode(status));
+                if (300..400).contains(&status) {
+                    let location = format!("http://{address}/redirect-target");
+                    response.add_header(
+                        Header::from_bytes(&b"Location"[..], location.as_bytes())
+                            .expect("redirect location should be a valid header"),
+                    );
+                }
+                request.respond(response).map_err(|error| error.to_string())?;
             }
             Ok(())
         });
@@ -831,6 +869,120 @@ mod tests {
                 .expect("backend body should be JSON");
             assert_eq!(body["url"], "https://2ch.org/b/src/1/clip.webm");
             assert!(body.get("action_id").is_none());
+        }
+    }
+
+    #[test]
+    fn forwarding_does_not_follow_redirects_and_keeps_only_status() {
+        let (backend_url, _, backend_thread) = start_backend(vec![307]);
+        let config = test_config(free_loopback_address(), backend_url.clone());
+        let service = CompanionService::new(&config);
+        let endpoint = format!("{backend_url}/private-url-sentinel");
+        let payload = BackendIngestRequest {
+            url: "https://source-payload-sentinel.invalid/media",
+            page_url: Some("https://page-payload-sentinel.invalid/thread"),
+            page_title: Some("private-title-sentinel"),
+            description: Some("private-description-sentinel"),
+            tags: &["private-tag-sentinel".to_owned()],
+            requested_action: Some(RequestedAction::Queue),
+            requested_publish_at: None,
+            requested_post_caption: Some("private-caption-sentinel"),
+        };
+
+        let error = forward(
+            &service.agent,
+            &endpoint,
+            "backend-token-sentinel",
+            "idempotency-key-sentinel",
+            &payload,
+        )
+        .expect_err("redirect status should be returned as a backend failure");
+        assert_eq!(error, BackendForwardError::HttpStatus(307));
+        let diagnostic = error.to_string();
+        assert_eq!(diagnostic, "backend returned HTTP status 307");
+        for private_value in [
+            "backend-token-sentinel",
+            "private-url-sentinel",
+            "source-payload-sentinel",
+            "private-title-sentinel",
+            "private-description-sentinel",
+            "private-tag-sentinel",
+            "private-caption-sentinel",
+            "backend-response-secret",
+        ] {
+            assert!(!diagnostic.contains(private_value));
+        }
+        backend_thread.join().expect("backend thread should join").expect("backend should finish");
+    }
+
+    #[test]
+    fn http_submit_maps_transport_failure_to_generic_502() {
+        let backend_address = free_loopback_address();
+        let config = test_config(
+            free_loopback_address(),
+            format!("http://{backend_address}/private-url-sentinel"),
+        );
+        let (companion_url, stop, companion_thread) = start_companion(config);
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(2)).build();
+        let response = send_json(
+            &agent,
+            &format!("{companion_url}{SUBMIT_PATH}"),
+            "local-secret",
+            &submission_value("transport-failure"),
+        );
+        assert_eq!(response.0, 502);
+        let body = serde_json::from_str::<serde_json::Value>(&response.1)
+            .expect("error body should be JSON");
+        assert_eq!(body["error"], "backend_request_failed");
+
+        stop.store(true, Ordering::Release);
+        companion_thread
+            .join()
+            .expect("companion thread should join")
+            .expect("companion should stop");
+    }
+
+    #[test]
+    fn forwarding_transport_diagnostic_excludes_request_details() {
+        let backend_address = free_loopback_address();
+        let backend_url = format!("http://{backend_address}/private-url-sentinel");
+        let payload = BackendIngestRequest {
+            url: "https://source-payload-sentinel.invalid/media",
+            page_url: Some("https://page-payload-sentinel.invalid/thread"),
+            page_title: Some("private-title-sentinel"),
+            description: Some("private-description-sentinel"),
+            tags: &["private-tag-sentinel".to_owned()],
+            requested_action: Some(RequestedAction::Queue),
+            requested_publish_at: None,
+            requested_post_caption: Some("private-caption-sentinel"),
+        };
+        let agent =
+            ureq::AgentBuilder::new().timeout(Duration::from_millis(500)).redirects(0).build();
+
+        let error = forward(
+            &agent,
+            &backend_url,
+            "backend-token-sentinel",
+            "idempotency-key-sentinel",
+            &payload,
+        )
+        .expect_err("unavailable backend should produce a transport error");
+        let BackendForwardError::Transport(kind) = error else {
+            panic!("unavailable backend should produce a transport failure");
+        };
+        let diagnostic = error.to_string();
+        assert_eq!(diagnostic, format!("backend transport failure ({kind:?})"));
+        for private_value in [
+            "backend-token-sentinel",
+            "private-url-sentinel",
+            "source-payload-sentinel",
+            "private-title-sentinel",
+            "private-description-sentinel",
+            "private-tag-sentinel",
+            "private-caption-sentinel",
+            "backend-response-secret",
+        ] {
+            assert!(!diagnostic.contains(private_value));
         }
     }
 

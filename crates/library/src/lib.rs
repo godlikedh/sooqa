@@ -45,8 +45,10 @@ impl TryFrom<&str> for MediaKind {
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaStorageState {
+    #[serde(rename = "pending_storage")]
     Pending,
     Ready,
+    #[serde(rename = "storage_unknown")]
     Unknown,
     Missing,
 }
@@ -138,6 +140,14 @@ impl TryFrom<&str> for MediaStorageState {
             "missing" => Ok(Self::Missing),
             unknown => Err(unknown.to_owned()),
         }
+    }
+}
+
+impl TryFrom<String> for MediaStorageState {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
     }
 }
 
@@ -668,6 +678,35 @@ mod tests {
     fn storage_states_preserve_ambiguous_uploads() {
         assert_eq!(MediaStorageState::try_from("storage_unknown"), Ok(MediaStorageState::Unknown));
         assert_eq!(MediaStorageState::Unknown.as_str(), "storage_unknown");
+    }
+
+    #[test]
+    fn media_storage_states_serialize_using_database_values() {
+        for (state, expected) in [
+            (MediaStorageState::Pending, "pending_storage"),
+            (MediaStorageState::Ready, "ready"),
+            (MediaStorageState::Unknown, "storage_unknown"),
+            (MediaStorageState::Missing, "missing"),
+        ] {
+            let encoded = serde_json::to_string(&state).expect("storage state should serialize");
+            assert_eq!(encoded, format!("\"{expected}\""));
+            assert_eq!(
+                serde_json::from_str::<MediaStorageState>(&encoded)
+                    .expect("storage state should deserialize"),
+                state
+            );
+            assert_eq!(MediaStorageState::try_from(expected), Ok(state));
+            assert_eq!(state.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn media_storage_states_reject_unknown_and_legacy_serde_values() {
+        for value in ["unrecognized", "pending", "unknown"] {
+            let encoded = format!("\"{value}\"");
+            assert!(serde_json::from_str::<MediaStorageState>(&encoded).is_err());
+            assert!(MediaStorageState::try_from(value).is_err());
+        }
     }
 
     #[test]

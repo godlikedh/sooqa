@@ -11,10 +11,11 @@ use async_trait::async_trait;
 use image::{DynamicImage, ImageBuffer, Rgb};
 use serde_json::json;
 use sooqa_inbox::{
-    AssetNormalization, IngestStatus, IngestSubmission, IngestSubmissionInput, SourceInspection,
-    SourceMediaKind, SubmittedVia, TelegramSubmissionInput,
+    AssetNormalization, AssetThumbnailNormalization, IngestStatus, IngestSubmission,
+    IngestSubmissionInput, SourceInspection, SourceMediaKind, SubmittedVia,
+    TelegramSubmissionInput,
 };
-use sooqa_jobs::{JobType, NewJob};
+use sooqa_jobs::{Job, JobType, NewJob};
 use sooqa_library::{
     MediaIngest, MediaKind, MediaMetadata, MediaSourceInput, NewMedia, SourceKind,
     VideoFingerprintInput,
@@ -32,7 +33,8 @@ use sooqa_worker::{
     IdentityAlignmentHook, TelegramSourceDownloader, WorkspaceAdmission, cleanup_workspace_handler,
     compute_fingerprint_handler, compute_fingerprint_handler_with_admission,
     compute_fingerprint_handler_with_alignment_hook, download_source_handler,
-    inspect_source_handler, probe_asset_handler_with_telegram_source, upload_storage_asset_handler,
+    finalize_ingest_handler, inspect_source_handler, probe_asset_handler_with_telegram_source,
+    upload_storage_asset_handler,
 };
 use thiserror::Error;
 use tokio::fs;
@@ -309,71 +311,234 @@ async fn force_save_reconstructs_telegram_source_after_workspace_cleanup(pool: s
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires PostgreSQL"]
-async fn non_video_normalization_queues_finalization_without_fingerprint_job(pool: sqlx::PgPool) {
+async fn non_video_finalization_persists_media_preview_and_reuses_exact_sha(pool: sqlx::PgPool) {
     let database = Database::from_pool(pool);
+    let work_root =
+        std::env::temp_dir().join(format!("sooqa-worker-finalize-image-{}", Uuid::new_v4()));
+    let canonical_bytes = encoded_rgb_image(48, 32, Rgb([40, 80, 120]), image::ImageFormat::Png);
+    let first_preview_bytes =
+        encoded_rgb_image(24, 16, Rgb([200, 40, 60]), image::ImageFormat::Jpeg);
+    let second_preview_bytes =
+        encoded_rgb_image(24, 16, Rgb([20, 180, 100]), image::ImageFormat::Jpeg);
+    let first = prepare_non_video_finalization(
+        &database,
+        &work_root,
+        image_ingest_submission(
+            "image-first",
+            "First image title",
+            "first internal description",
+            vec!["Cats".to_owned(), "Wallpapers".to_owned()],
+        ),
+        &canonical_bytes,
+        &first_preview_bytes,
+    )
+    .await;
+
+    let finalize = finalize_ingest_handler(database.inbox(), database.library(), work_root.clone());
+    finalize(first.finalize_job.clone()).await.unwrap();
+
+    let first_ingest = database.inbox().find(first.ingest_id).await.unwrap().unwrap();
+    assert_eq!(first_ingest.status, IngestStatus::Storing);
+    let first_media_id = first_ingest.media_id.expect("finalization should attach media");
+    let first_media = database.library().find_media(first_media_id).await.unwrap().unwrap();
+    assert_eq!(first_media.kind, MediaKind::Image);
+    assert_eq!(first_media.title.as_deref(), Some("First image title"));
+    assert_eq!(first_media.description.as_deref(), Some("first internal description"));
+    assert_eq!(first_media.tags, ["cats", "wallpapers"]);
+    assert_eq!(first_media.mime_type.as_deref(), Some("image/png"));
+    assert_eq!(first_media.container.as_deref(), Some("png"));
+    assert_eq!(first_media.width, Some(48));
+    assert_eq!(first_media.height, Some(32));
+    assert_eq!(first_media.file_size_bytes, Some(first.normalization.file_size_bytes));
+    assert_eq!(first_media.sha256, Some(hex_bytes(&first.normalization.sha256)));
+    assert_eq!(first_media.storage_state, sooqa_library::MediaStorageState::Pending);
+    assert_eq!(
+        first_media.local_work_path.as_deref(),
+        Some(first.normalization.local_work_path.as_str())
+    );
+
+    let preview = database.library().find_media_preview(first_media_id).await.unwrap().unwrap();
+    assert_eq!(preview.bytes, first_preview_bytes);
+    assert_eq!(preview.metadata.mime_type, "image/jpeg");
+    assert_eq!((preview.metadata.width, preview.metadata.height), (24, 16));
+
+    let first_details =
+        database.library().find_media_details(first_media_id).await.unwrap().unwrap();
+    assert_eq!(
+        first_details.source.unwrap().original_url.as_deref(),
+        Some(first.source_url.as_str())
+    );
+    assert_eq!(count_ingest_jobs(&database, first.ingest_id, "compute_fingerprint").await, 0);
+    assert_eq!(count_ingest_jobs(&database, first.ingest_id, "finalize_ingest").await, 1);
+    assert_eq!(
+        job_state(&database, first.finalize_job.id).await,
+        "succeeded",
+        "finalization and queue success should commit together"
+    );
+    assert_eq!(storage_jobs_for_media(&database, first_media_id).await, 1);
+
+    let second = prepare_non_video_finalization(
+        &database,
+        &work_root,
+        image_ingest_submission(
+            "image-second",
+            "Second image title",
+            "second internal description",
+            vec!["second-tag".to_owned()],
+        ),
+        &canonical_bytes,
+        &second_preview_bytes,
+    )
+    .await;
+    finalize(second.finalize_job.clone()).await.unwrap();
+
+    let second_ingest = database.inbox().find(second.ingest_id).await.unwrap().unwrap();
+    assert_eq!(second_ingest.status, IngestStatus::Storing);
+    assert_eq!(second_ingest.media_id, Some(first_media_id));
+    assert_eq!(count_media_with_sha(&database, hex_bytes(&first.normalization.sha256)).await, 1);
+    assert_eq!(storage_jobs_for_media(&database, first_media_id).await, 1);
+    assert_eq!(
+        job_state(&database, second.finalize_job.id).await,
+        "succeeded",
+        "exact-SHA reuse should also settle its finalization job"
+    );
+    assert_eq!(
+        database.library().find_media_preview(first_media_id).await.unwrap().unwrap().bytes,
+        first_preview_bytes,
+        "exact reuse should keep the existing media preview"
+    );
+
+    fs::remove_dir_all(work_root).await.unwrap();
+}
+
+struct PreparedNonVideoFinalization {
+    ingest_id: Uuid,
+    source_url: String,
+    normalization: AssetNormalization,
+    finalize_job: Job,
+}
+
+async fn prepare_non_video_finalization(
+    database: &Database,
+    work_root: &Path,
+    submission: IngestSubmissionInput,
+    canonical_bytes: &[u8],
+    preview_bytes: &[u8],
+) -> PreparedNonVideoFinalization {
+    let source_url = submission.source_url.clone();
     let ingest = database
         .inbox()
-        .create_ingest(
-            IngestSubmission::try_new(IngestSubmissionInput::new(
-                format!("https://example.test/image-{}", Uuid::new_v4()),
-                SubmittedVia::Api,
-            ))
-            .unwrap(),
-        )
+        .create_ingest(IngestSubmission::try_new(submission).unwrap())
         .await
         .unwrap();
-    sqlx::query("DELETE FROM queue.jobs WHERE payload->>'ingest_id' = $1")
-        .bind(ingest.ingest.id.to_string())
-        .execute(database.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "DELETE FROM queue.jobs WHERE kind = 'inspect_source' AND payload->>'ingest_id' = $1",
+    )
+    .bind(ingest.ingest.id.to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
     sqlx::query("UPDATE ingests SET state = 'normalizing' WHERE id = $1")
         .bind(ingest.ingest.id)
         .execute(database.pool())
         .await
         .unwrap();
+
+    let workspace = MediaWorkspace::create(work_root, ingest.ingest.workspace_id).await.unwrap();
+    let canonical_path = workspace.path(WorkspaceArea::Normalized, "canonical.png").unwrap();
+    let preview_path = workspace.path(WorkspaceArea::Previews, "thumbnail.jpg").unwrap();
+    fs::write(&canonical_path, canonical_bytes).await.unwrap();
+    fs::write(&preview_path, preview_bytes).await.unwrap();
+    let digest = sha256_file(&canonical_path).await.unwrap();
+    let preview_digest = sha256_file(&preview_path).await.unwrap();
+    let normalization = AssetNormalization {
+        local_work_path: canonical_path.to_string_lossy().into_owned(),
+        file_size_bytes: digest.bytes,
+        sha256: digest.sha256,
+        media_kind: SourceMediaKind::Image,
+        profile_version: None,
+        mime_type: Some("image/png".to_owned()),
+        container: Some("png".to_owned()),
+        video_codec: None,
+        audio_codec: None,
+        width: Some(48),
+        height: Some(32),
+        duration_ms: None,
+        bit_rate: None,
+        thumbnail: Some(AssetThumbnailNormalization {
+            local_work_path: preview_path.to_string_lossy().into_owned(),
+            file_size_bytes: preview_digest.bytes,
+            sha256: preview_digest.sha256,
+            mime_type: Some("image/jpeg".to_owned()),
+            width: Some(24),
+            height: Some(16),
+        }),
+    };
     database
         .jobs()
         .enqueue(
-            sooqa_jobs::NewJob::normalize_asset(ingest.ingest.id)
+            NewJob::normalize_asset(ingest.ingest.id)
                 .dedupe_key(format!("test:normalize:{}", ingest.ingest.id)),
         )
         .await
         .unwrap();
-    let job = database
+    let normalization_job = database
         .jobs()
         .claim_next("image-normalizer", Duration::from_secs(30), &[JobType::NormalizeAsset])
         .await
         .unwrap()
         .expect("normalization job should be claimable");
-    let attempt = job.lease().unwrap();
     let completed = database
         .inbox()
         .complete_asset_normalization(
             ingest.ingest.id,
-            &attempt,
-            AssetNormalization {
-                local_work_path: "/tmp/sooqa-image.png".to_owned(),
-                file_size_bytes: 10,
-                sha256: "11".repeat(32),
-                media_kind: SourceMediaKind::Image,
-                profile_version: None,
-                mime_type: Some("image/png".to_owned()),
-                container: Some("png".to_owned()),
-                video_codec: None,
-                audio_codec: None,
-                width: Some(10),
-                height: Some(10),
-                duration_ms: None,
-                bit_rate: None,
-                thumbnail: None,
-            },
+            &normalization_job.lease().unwrap(),
+            normalization.clone(),
         )
         .await
         .unwrap();
     assert_eq!(completed.status, IngestStatus::Storing);
-    assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "compute_fingerprint").await, 0);
-    assert_eq!(count_ingest_jobs(&database, ingest.ingest.id, "finalize_ingest").await, 1);
+
+    let finalize_job = database
+        .jobs()
+        .claim_next("image-finalizer", Duration::from_secs(30), &[JobType::FinalizeIngest])
+        .await
+        .unwrap()
+        .expect("non-video normalization should enqueue finalization");
+    PreparedNonVideoFinalization {
+        ingest_id: ingest.ingest.id,
+        source_url,
+        normalization,
+        finalize_job,
+    }
+}
+
+fn image_ingest_submission(
+    name: &str,
+    title: &str,
+    description: &str,
+    tags: Vec<String>,
+) -> IngestSubmissionInput {
+    let mut submission = IngestSubmissionInput::new(
+        format!("https://example.test/{name}-{}", Uuid::new_v4()),
+        SubmittedVia::Api,
+    );
+    submission.page_title = Some(title.to_owned());
+    submission.supplied_description = Some(description.to_owned());
+    submission.supplied_tags = tags;
+    submission
+}
+
+fn encoded_rgb_image(
+    width: u32,
+    height: u32,
+    color: Rgb<u8>,
+    format: image::ImageFormat,
+) -> Vec<u8> {
+    let image = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(width, height, color));
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut cursor, format).expect("test image should encode");
+    cursor.into_inner()
 }
 
 #[derive(Clone)]
@@ -1094,6 +1259,24 @@ async fn count_ingest_jobs(database: &Database, ingest_id: Uuid, kind: &str) -> 
     )
     .bind(ingest_id.to_string())
     .bind(kind)
+    .fetch_one(database.pool())
+    .await
+    .unwrap()
+}
+
+async fn job_state(database: &Database, job_id: Uuid) -> String {
+    sqlx::query_scalar("SELECT state FROM queue.jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap()
+}
+
+async fn storage_jobs_for_media(database: &Database, media_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM queue.jobs WHERE kind = 'upload_storage_asset' AND payload->>'media_id' = $1",
+    )
+    .bind(media_id.to_string())
     .fetch_one(database.pool())
     .await
     .unwrap()

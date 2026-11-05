@@ -1,6 +1,7 @@
 /target/
 /work-data/
 /config.toml
+/.desloppify/
 
 .env
 .env.*

@@ -46,7 +46,11 @@ async fn claim_retry_and_fencing_use_the_queue_jobs_row(pool: sqlx::PgPool) {
         .expect("a queued job should be available");
     let lease = claimed.lease().expect("claim should carry a fence");
     let retried = repository
-        .retry_lease(&lease, OffsetDateTime::now_utc(), "test", "retry")
+        .settle_lease(
+            &claimed,
+            &lease,
+            JobSettlement::retry(OffsetDateTime::now_utc(), "test", "retry"),
+        )
         .await
         .expect("retry should update the same row");
     assert_eq!(retried.status, JobStatus::Queued);
@@ -75,11 +79,14 @@ async fn claim_retry_and_fencing_use_the_queue_jobs_row(pool: sqlx::PgPool) {
         .expect("bounded job should claim")
         .expect("bounded job should be available");
     let exhausted = repository
-        .retry_lease(
+        .settle_lease(
+            &bounded_claim,
             &bounded_claim.lease().expect("bounded claim should have a lease"),
-            OffsetDateTime::now_utc(),
-            "test_exhausted",
-            "simulated final retry",
+            JobSettlement::retry(
+                OffsetDateTime::now_utc(),
+                "test_exhausted",
+                "simulated final retry",
+            ),
         )
         .await
         .expect("last retry should persist a terminal state");
@@ -308,11 +315,14 @@ async fn deferral_consumes_the_final_attempt(pool: sqlx::PgPool) {
     assert_eq!(claimed.attempt_count, 1);
 
     let deferred = repository
-        .defer_lease(
+        .settle_lease(
+            &claimed,
             &claimed.lease().expect("claim should carry a lease"),
-            OffsetDateTime::now_utc(),
-            "work_disk_low",
-            "synthetic reserve is full",
+            JobSettlement::defer(
+                OffsetDateTime::now_utc(),
+                "work_disk_low",
+                "synthetic reserve is full",
+            ),
         )
         .await
         .expect("resource deferral should remain durable");
@@ -349,11 +359,14 @@ async fn scheduled_deferral_without_consuming_attempt_is_reclaimable(pool: sqlx:
     assert_eq!(claimed.attempt_count, 1);
 
     let deferred = repository
-        .defer_lease_without_consuming_attempt(
+        .settle_lease(
+            &claimed,
             &claimed.lease().expect("claim should carry a lease"),
-            OffsetDateTime::now_utc(),
-            "work_disk_low",
-            "synthetic reserve is full",
+            JobSettlement::defer_without_consuming_attempt(
+                OffsetDateTime::now_utc(),
+                "work_disk_low",
+                "synthetic reserve is full",
+            ),
         )
         .await
         .expect("resource deferral should remain durable");
@@ -405,18 +418,32 @@ async fn expired_final_attempt_reconciles_ingest_and_fences_all_mutations(pool: 
     assert!(
         database
             .jobs()
-            .retry_lease(&lease, OffsetDateTime::now_utc(), "stale", "stale")
+            .settle_lease(
+                &claimed,
+                &lease,
+                JobSettlement::retry(OffsetDateTime::now_utc(), "stale", "stale")
+            )
             .await
             .is_err()
     );
     assert!(
         database
             .jobs()
-            .defer_lease(&lease, OffsetDateTime::now_utc(), "stale", "stale")
+            .settle_lease(
+                &claimed,
+                &lease,
+                JobSettlement::defer(OffsetDateTime::now_utc(), "stale", "stale")
+            )
             .await
             .is_err()
     );
-    assert!(database.jobs().fail_lease(&lease, "stale", "stale").await.is_err());
+    assert!(
+        database
+            .jobs()
+            .settle_lease(&claimed, &lease, JobSettlement::fail("stale", "stale"))
+            .await
+            .is_err()
+    );
 
     assert_eq!(database.jobs().recover_stale_leases().await.unwrap(), 1);
     let job_state = sqlx::query_scalar::<_, String>("SELECT state FROM queue.jobs WHERE id = $1")

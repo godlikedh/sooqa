@@ -16,7 +16,8 @@ use time::{OffsetDateTime, Time};
 use uuid::Uuid;
 
 use super::{
-    ApiError, ApiState, authorize, map_library_error, map_publisher_error, required_header,
+    ApiError, ApiState, authorize, cursor, map_json_rejection, map_library_error,
+    map_publisher_error, required_header,
 };
 
 const MAX_CAPTION_LENGTH: usize = 1_024;
@@ -596,14 +597,6 @@ fn validate_caption(
     Ok(())
 }
 
-fn map_json_rejection(rejection: JsonRejection, headers: &HeaderMap) -> ApiError {
-    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        ApiError::payload_too_large(headers)
-    } else {
-        ApiError::bad_request("invalid_json", "The request body must be valid JSON", headers)
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreatePostRequest {
@@ -706,14 +699,11 @@ struct PostListParams {
 }
 
 fn encode_post_cursor(cursor: &PostCursor) -> String {
-    format!("{}:{}", cursor.scheduled_at.unix_timestamp_nanos(), cursor.id)
+    cursor::encode(cursor.scheduled_at, cursor.id)
 }
 
 fn decode_post_cursor(value: &str) -> Result<PostCursor, ()> {
-    let (timestamp, id) = value.split_once(':').ok_or(())?;
-    let timestamp = timestamp.parse::<i128>().map_err(|_| ())?;
-    let scheduled_at = OffsetDateTime::from_unix_timestamp_nanos(timestamp).map_err(|_| ())?;
-    let id = Uuid::parse_str(id).map_err(|_| ())?;
+    let (scheduled_at, id) = cursor::decode(value)?;
     Ok(PostCursor { scheduled_at, id })
 }
 
